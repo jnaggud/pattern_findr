@@ -8,3 +8,5 @@ mplfinance
 optuna
 pandas-ta
 scikit-learn
+scipy
+numpy

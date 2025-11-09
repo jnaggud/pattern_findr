@@ -4,7 +4,7 @@ from scipy import stats
 from scipy.signal import find_peaks, argrelextrema
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import IsolationForest
-import talib
+import pandas_ta as ta
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -68,11 +68,10 @@ class TimeSeriesPatternDetector:
         slope, intercept, r_value, p_value, std_err = stats.linregress(x, close)
         
         # ADX-based trend strength
-        adx = talib.ADX(self.data['high'], self.data['low'], self.data['close'], timeperiod=14)
-        
-        # Directional movement
-        plus_di = talib.PLUS_DI(self.data['high'], self.data['low'], self.data['close'], timeperiod=14)
-        minus_di = talib.MINUS_DI(self.data['high'], self.data['low'], self.data['close'], timeperiod=14)
+        adx_data = ta.adx(self.data['high'], self.data['low'], self.data['close'], length=14)
+        adx = adx_data['ADX_14'] if 'ADX_14' in adx_data.columns else pd.Series([0] * len(self.data))
+        plus_di = adx_data['DMP_14'] if 'DMP_14' in adx_data.columns else pd.Series([0] * len(self.data))
+        minus_di = adx_data['DMN_14'] if 'DMN_14' in adx_data.columns else pd.Series([0] * len(self.data))
         
         return {
             'slope': slope,
@@ -108,7 +107,7 @@ class TimeSeriesPatternDetector:
         volume = self.data.get('volume', pd.Series([1] * len(close)))
         
         # RSI divergence
-        rsi = talib.RSI(close, timeperiod=14)
+        rsi = ta.rsi(close, length=14)
         
         # Volume analysis
         avg_volume = volume.rolling(window=20).mean()
@@ -209,14 +208,17 @@ class TimeSeriesPatternDetector:
         close = self.data['close']
         
         # Calculate ATR
-        atr = talib.ATR(self.data['high'], self.data['low'], self.data['close'], timeperiod=14)
+        atr = ta.atr(self.data['high'], self.data['low'], self.data['close'], length=14)
         atr_avg = atr.rolling(window=20).mean()
         
         current_atr = atr.iloc[-1] if not pd.isna(atr.iloc[-1]) else 0
         avg_atr = atr_avg.iloc[-1] if not pd.isna(atr_avg.iloc[-1]) else 0
         
         # Bollinger Bands squeeze
-        bb_upper, bb_middle, bb_lower = talib.BBANDS(close, timeperiod=20, nbdevup=2, nbdevdn=2)
+        bb_bands = ta.bbands(close, length=20, std=2)
+        bb_upper = bb_bands['BBU_20_2.0'] if 'BBU_20_2.0' in bb_bands.columns else close
+        bb_middle = bb_bands['BBM_20_2.0'] if 'BBM_20_2.0' in bb_bands.columns else close
+        bb_lower = bb_bands['BBL_20_2.0'] if 'BBL_20_2.0' in bb_bands.columns else close
         bb_width = (bb_upper - bb_lower) / bb_middle
         bb_squeeze = bb_width.iloc[-1] < bb_width.rolling(window=20).quantile(0.1).iloc[-1]
         
@@ -267,7 +269,7 @@ class TimeSeriesPatternDetector:
         volume_spike = volume.iloc[-1] > avg_volume.iloc[-1] * 1.5 if not pd.isna(avg_volume.iloc[-1]) else False
         
         # Price momentum
-        momentum = talib.MOM(close, timeperiod=10)
+        momentum = ta.mom(close, length=10)
         strong_momentum = abs(momentum.iloc[-1]) > momentum.rolling(window=20).std().iloc[-1] * 2 if not pd.isna(momentum.iloc[-1]) else False
         
         return {
@@ -281,14 +283,17 @@ class TimeSeriesPatternDetector:
         close = self.data['close']
         
         # Bollinger Bands
-        bb_upper, bb_middle, bb_lower = talib.BBANDS(close, timeperiod=20, nbdevup=2, nbdevdn=2)
+        bb_bands = ta.bbands(close, length=20, std=2)
+        bb_upper = bb_bands['BBU_20_2.0'] if 'BBU_20_2.0' in bb_bands.columns else close
+        bb_middle = bb_bands['BBM_20_2.0'] if 'BBM_20_2.0' in bb_bands.columns else close  
+        bb_lower = bb_bands['BBL_20_2.0'] if 'BBL_20_2.0' in bb_bands.columns else close
         
         # Current position relative to bands
         current_price = close.iloc[-1]
         bb_position = (current_price - bb_lower.iloc[-1]) / (bb_upper.iloc[-1] - bb_lower.iloc[-1]) if not pd.isna(bb_upper.iloc[-1]) else 0.5
         
         # RSI mean reversion
-        rsi = talib.RSI(close, timeperiod=14)
+        rsi = ta.rsi(close, length=14)
         rsi_mean_reversion = (rsi.iloc[-1] < 30 and rsi.iloc[-2] > rsi.iloc[-1]) or (rsi.iloc[-1] > 70 and rsi.iloc[-2] < rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else False
         
         return {
@@ -304,9 +309,11 @@ class TimeSeriesPatternDetector:
         close = self.data['close']
         
         # Multiple oscillators
-        rsi = talib.RSI(close, timeperiod=14)
-        stoch_k, stoch_d = talib.STOCH(self.data['high'], self.data['low'], self.data['close'])
-        williams_r = talib.WILLR(self.data['high'], self.data['low'], self.data['close'], timeperiod=14)
+        rsi = ta.rsi(close, length=14)
+        stoch_data = ta.stoch(self.data['high'], self.data['low'], self.data['close'])
+        stoch_k = stoch_data['STOCHk_14_3_3'] if 'STOCHk_14_3_3' in stoch_data.columns else pd.Series([50] * len(close))
+        stoch_d = stoch_data['STOCHd_14_3_3'] if 'STOCHd_14_3_3' in stoch_data.columns else pd.Series([50] * len(close))
+        williams_r = ta.willr(self.data['high'], self.data['low'], self.data['close'], length=14)
         
         # Consensus scoring
         oversold_signals = 0
@@ -445,10 +452,12 @@ class TimeSeriesPatternDetector:
         low = self.data['low']
         
         # MACD
-        macd, macd_signal, macd_hist = talib.MACD(close)
+        macd_data = ta.macd(close)
+        macd = macd_data['MACD_12_26_9'] if 'MACD_12_26_9' in macd_data.columns else pd.Series([0] * len(close))
+        macd_signal = macd_data['MACDs_12_26_9'] if 'MACDs_12_26_9' in macd_data.columns else pd.Series([0] * len(close))
         
         # RSI
-        rsi = talib.RSI(close, timeperiod=14)
+        rsi = ta.rsi(close, length=14)
         
         # Find recent highs and lows
         recent_high_price_idx = np.argmax(high.iloc[-20:].values) + len(high) - 20
@@ -482,13 +491,15 @@ class TimeSeriesPatternDetector:
         close = self.data['close']
         
         # Rate of Change
-        roc = talib.ROC(close, timeperiod=10)
+        roc = ta.roc(close, length=10)
         
         # Momentum
-        momentum = talib.MOM(close, timeperiod=10)
+        momentum = ta.mom(close, length=10)
         
         # Stochastic
-        stoch_k, stoch_d = talib.STOCH(self.data['high'], self.data['low'], self.data['close'])
+        stoch_data = ta.stoch(self.data['high'], self.data['low'], self.data['close'])
+        stoch_k = stoch_data['STOCHk_14_3_3'] if 'STOCHk_14_3_3' in stoch_data.columns else pd.Series([50] * len(close))
+        stoch_d = stoch_data['STOCHd_14_3_3'] if 'STOCHd_14_3_3' in stoch_data.columns else pd.Series([50] * len(close))
         
         # Check for slowing momentum
         roc_slowing = roc.iloc[-1] < roc.iloc[-2] < roc.iloc[-3] if not pd.isna(roc.iloc[-1]) else False
@@ -514,7 +525,7 @@ class TimeSeriesPatternDetector:
         correlation = np.corrcoef(returns.iloc[-20:], volume_change.iloc[-20:])[0, 1] if len(returns) >= 20 else 0
         
         # On-Balance Volume
-        obv = talib.OBV(close, volume)
+        obv = ta.obv(close, volume)
         obv_trend = 1 if obv.iloc[-1] > obv.iloc[-5] else -1 if not pd.isna(obv.iloc[-1]) else 0
         
         return {
@@ -532,10 +543,10 @@ class TimeSeriesPatternDetector:
         volume = self.data.get('volume', pd.Series([1] * len(close)))
         
         # Money Flow Index
-        mfi = talib.MFI(high, low, close, volume, timeperiod=14)
+        mfi = ta.mfi(high, low, close, volume, length=14)
         
         # Accumulation/Distribution Line
-        ad_line = talib.AD(high, low, close, volume)
+        ad_line = ta.ad(high, low, close, volume)
         
         # Volume Price Trend
         vpt = volume.iloc[0]  # Initialize
