@@ -7,3 +7,4 @@ matplotlib
 mplfinance
 optuna
 pandas-ta
+scikit-learn

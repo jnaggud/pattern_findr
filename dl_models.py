@@ -417,14 +417,48 @@ class PatternDetectionEnsemble:
 
 # Main patterns to detect
 CHART_PATTERNS = [
+    # Classic reversal patterns
     'head_and_shoulders',
     'inverse_head_and_shoulders',
     'cup_and_handle',
     'double_top',
     'double_bottom',
+    'triple_top',
+    'triple_bottom',
+    'rounding_top',
+    'rounding_bottom',
+    
+    # Continuation patterns  
     'triangle',
+    'ascending_triangle',
+    'descending_triangle',
+    'symmetrical_triangle',
     'flag',
-    'pennant'
+    'pennant',
+    'wedge_rising',
+    'wedge_falling',
+    'rectangle',
+    
+    # Gap patterns
+    'breakaway_gap',
+    'runaway_gap',
+    'exhaustion_gap',
+    
+    # Candlestick patterns
+    'hammer',
+    'doji',
+    'shooting_star',
+    'engulfing_bullish',
+    'engulfing_bearish',
+    'harami_bullish',
+    'harami_bearish',
+    'morning_star',
+    'evening_star',
+    
+    # Volume-price patterns
+    'volume_spike_breakout',
+    'volume_divergence',
+    'accumulation_distribution'
 ]
 
 def get_pattern_ensemble():

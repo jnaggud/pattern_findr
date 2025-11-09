@@ -1,6 +1,8 @@
 import pandas as pd
 import pandas_ta as ta
 import warnings
+from advanced_indicators import calculate_advanced_technical_signals, ADVANCED_INDICATORS
+from enhanced_pattern_detector import integrate_enhanced_patterns_with_optimization, ENHANCED_PATTERN_INDICATORS
 
 # Suppress specific FutureWarning from pandas_ta
 warnings.filterwarnings("ignore", category=FutureWarning, module="pandas_ta.candles.ha")
@@ -52,6 +54,43 @@ def get_all_indicators(data):
     # 3. RSI of VWAP
     if 'VWAP_D' in data.columns:
         data['rsi_vwap'] = ta.rsi(close=data['VWAP_D'], length=14)
+
+    # --- Add Advanced Time-Series Pattern Indicators ---
+    try:
+        # Reset index temporarily for advanced indicators processing
+        temp_data = data.reset_index()
+        temp_data.rename(columns={'date': 'date'}, inplace=True)
+        
+        # Get advanced technical signals
+        advanced_signals = calculate_advanced_technical_signals(temp_data)
+        
+        # Add advanced signals as boolean indicators
+        for signal_name, signal_value in advanced_signals.items():
+            data[f'adv_{signal_name}'] = signal_value
+            
+    except Exception as e:
+        print(f"Warning: Could not calculate advanced indicators: {e}")
+        # Add default values for advanced indicators if calculation fails
+        for indicator in ADVANCED_INDICATORS:
+            data[f'adv_{indicator}'] = False
+
+    # --- Add Enhanced Pattern Detection Indicators ---
+    try:
+        # Reset index temporarily for enhanced pattern processing
+        temp_data = data.reset_index()
+        
+        # Get enhanced pattern signals
+        enhanced_signals = integrate_enhanced_patterns_with_optimization(temp_data)
+        
+        # Add enhanced pattern signals as boolean indicators
+        for signal_name, signal_value in enhanced_signals.items():
+            data[f'enh_{signal_name}'] = signal_value
+            
+    except Exception as e:
+        print(f"Warning: Could not calculate enhanced pattern indicators: {e}")
+        # Add default values for enhanced pattern indicators if calculation fails
+        for indicator in ENHANCED_PATTERN_INDICATORS:
+            data[f'enh_{indicator}'] = False
 
     # Clean up columns with too many NaNs and drop rows with any remaining NaNs
     data.dropna(axis=1, thresh=len(data) - 50, inplace=True)
