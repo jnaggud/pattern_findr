@@ -1,0 +1,9 @@
+streamlit
+yfinance
+pandas
+plotly
+tensorflow
+matplotlib
+mplfinance
+optuna
+pandas-ta
