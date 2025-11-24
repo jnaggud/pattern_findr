@@ -393,7 +393,7 @@ def enhanced_universal_strategy(data, params, use_signal_optimization=True):
     
     return signals
 
-def single_trial_optimization(n_trials_worker, data, trade_preference, numerical_indicators, boolean_indicators):
+def single_trial_optimization(n_trials_worker, data, trade_preference, numerical_indicators, boolean_indicators, enable_position_sizing):
     """Run optimization trials in an isolated worker process"""
     import uuid
     import os
@@ -404,14 +404,14 @@ def single_trial_optimization(n_trials_worker, data, trade_preference, numerical
     
     # Run trials for this worker
     worker_study.optimize(
-        lambda trial: objective(trial, data, trade_preference, numerical_indicators, boolean_indicators),
+        lambda trial: objective(trial, data, trade_preference, numerical_indicators, boolean_indicators, enable_position_sizing),
         n_trials=n_trials_worker,
         show_progress_bar=False
     )
     
     return worker_study.trials
 
-def objective(trial, data, trade_preference=0.5, numerical_indicators=None, boolean_indicators=None):
+def objective(trial, data, trade_preference=0.5, numerical_indicators=None, boolean_indicators=None, enable_position_sizing=True):
     """
     Objective function for Optuna to dynamically build and test hybrid strategies.
     Args:
@@ -601,8 +601,8 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
     
     # === ENHANCEMENT #2: POSITION SIZING & RISK MANAGEMENT ===
     if POSITION_SIZING_AVAILABLE:
-        # FORCE AGGRESSIVE POSITIONING: Always enable position sizing for maximum returns
-        params['enable_position_sizing'] = trial.suggest_categorical('enable_position_sizing', [True])  # Always True
+        # Use the setting from Streamlit app (user can toggle on/off)
+        params['enable_position_sizing'] = enable_position_sizing
         
         if params['enable_position_sizing']:
             # MAXIMUM AGGRESSIVE: Optimize maximum position size (50% to 100% of capital per position)
@@ -745,7 +745,7 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
 
 # Removed old batch function - now using joblib-based individual trial optimization
 
-def run_optimization(data, n_trials=1000, n_jobs=None, progress_callback=None, trade_preference=0.5):
+def run_optimization(data, n_trials=1000, n_jobs=None, progress_callback=None, trade_preference=0.5, enable_position_sizing=True):
     """
     Runs the new dynamic optimization and returns top 3 strategies.
     
@@ -753,6 +753,7 @@ def run_optimization(data, n_trials=1000, n_jobs=None, progress_callback=None, t
         data: Market data for optimization
         n_trials: Number of optimization trials
         n_jobs: Number of parallel jobs (None = auto-detect cores, 1 = single-threaded)
+        enable_position_sizing: Whether to use enhanced position sizing (True) or standard 100% capital (False)
     """
     import multiprocessing as mp
     
@@ -806,7 +807,7 @@ def run_optimization(data, n_trials=1000, n_jobs=None, progress_callback=None, t
         import uuid
         study_name = f"main_study_{uuid.uuid4().hex[:8]}"
         study = optuna.create_study(direction='maximize', study_name=study_name)
-        study.optimize(lambda trial: objective(trial, data, trade_preference, numerical_indicators, boolean_indicators), 
+        study.optimize(lambda trial: objective(trial, data, trade_preference, numerical_indicators, boolean_indicators, enable_position_sizing), 
                       n_trials=n_trials, show_progress_bar=True)
         all_trials = study.trials
     else:
@@ -824,7 +825,7 @@ def run_optimization(data, n_trials=1000, n_jobs=None, progress_callback=None, t
         # Run parallel optimization with isolated studies
         from joblib import Parallel, delayed
         all_worker_trials = Parallel(n_jobs=n_jobs, verbose=10)(
-            delayed(single_trial_optimization)(worker_trials[i], data, trade_preference, numerical_indicators, boolean_indicators) 
+            delayed(single_trial_optimization)(worker_trials[i], data, trade_preference, numerical_indicators, boolean_indicators, enable_position_sizing) 
             for i in range(n_jobs)
         )
         

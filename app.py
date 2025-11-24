@@ -2401,6 +2401,24 @@ starting_capital = st.sidebar.number_input(
     help="Initial capital for backtesting strategies"
 )
 
+# Position Sizing Toggle
+st.sidebar.subheader("🎯 Position Sizing Strategy")
+enable_position_sizing = st.sidebar.checkbox(
+    "🚀 Enable Enhanced Position Sizing",
+    value=True,
+    help="Enable dynamic position sizing (50-100% per trade) with volatility adjustments and risk management. When disabled, uses 100% of available capital per trade (standard mode)."
+)
+
+if enable_position_sizing:
+    st.sidebar.success("🚀 Enhanced Mode: Dynamic position sizing (50-100%)")
+    st.sidebar.caption("• Volatility-based adjustments")
+    st.sidebar.caption("• Confidence-weighted positions") 
+    st.sidebar.caption("• Risk management features")
+else:
+    st.sidebar.info("📊 Standard Mode: Full capital per trade (100%)")
+    st.sidebar.caption("• All available capital deployed")
+    st.sidebar.caption("• Original backtester behavior")
+
 # Benchmark option in sidebar
 run_benchmark = st.sidebar.checkbox(
     "🏁 Run Benchmark First", 
@@ -2607,7 +2625,7 @@ if st.sidebar.button("Find and Optimize Top Strategies"):
             with st.spinner("Running optimization..."):
                 # TensorFlow already configured for CPU-only at startup
                 print(f"🔧 Running optimization with CPU-only TensorFlow")
-                top_trials = run_optimization(enriched_data, n_trials=n_trials, n_jobs=n_jobs, progress_callback=progress_callback, trade_preference=trade_preference)
+                top_trials = run_optimization(enriched_data, n_trials=n_trials, n_jobs=n_jobs, progress_callback=progress_callback, trade_preference=trade_preference, enable_position_sizing=enable_position_sizing)
             
             # Show completion
             elapsed_total = time.time() - start_time
