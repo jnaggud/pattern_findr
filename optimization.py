@@ -801,8 +801,8 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
             for regime in ['bull', 'bear', 'crash', 'sideways']:
                 # Score thresholds for each regime (ADJUSTED for market conditions)
                 if regime in ['bull', 'sideways']:
-                    # Bull/sideways markets: indicators rarely oversold, use lower thresholds
-                    regime_buy_max = min(3, actual_active)  # Cap at 3 for trending markets
+                    # Bull/sideways markets: indicators rarely oversold, use very low thresholds
+                    regime_buy_max = min(2, actual_active)  # Cap at 2 for sustained trending markets
                     regime_sell_max = min(8, actual_active)  # Normal range for sells
                     params[f'{regime}_buy_score_threshold'] = trial.suggest_int(f'{regime}_buy_score_threshold', 1, regime_buy_max)
                     params[f'{regime}_sell_score_threshold'] = trial.suggest_int(f'{regime}_sell_score_threshold', 1, regime_sell_max)
