@@ -248,3 +248,24 @@ docs/build/
 datasets/
 training_data/
 historical_data/
+
+# Project-specific virtual environments
+venv-3.11/
+venv-3.12/
+
+# Project-specific model directories  
+trained_models/
+ml_models/
+
+# Generated charts and images
+chart_images/
+*.png
+*.jpg
+*.jpeg
+
+# Debug and optimization logs
+debug_optimization.log
+model_training.log
+
+# Lock files that can be large
+requirements.lock.txt
