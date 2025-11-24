@@ -422,6 +422,70 @@ def get_all_indicators(data, optuna_params=None):
     
     data['trend_filter'] = trend_filter
     
+    # === ADD CUSTOM CRASH DETECTION INDICATORS ===
+    # These trigger during extreme crashes when traditional indicators fail
+    
+    # 1. CRASH VELOCITY - Rapid price declines
+    returns_3d = data['close'].pct_change(3) * 100
+    data['crash_velocity_3d'] = returns_3d < -8.0  # 8% decline in 3 days
+    
+    # 2. VOLUME PANIC - High volume + decline  
+    if 'volume' in data.columns:
+        volume_avg_20d = data['volume'].rolling(20).mean()
+        volume_ratio = data['volume'] / volume_avg_20d
+        daily_return = data['close'].pct_change() * 100
+        data['volume_panic'] = (volume_ratio > 2.5) & (daily_return < -3.0)
+    else:
+        data['volume_panic'] = False
+    
+    # 3. DRAWDOWN CAPITULATION - Severe drawdown from highs
+    rolling_high_20d = data['close'].rolling(20).max()
+    drawdown = (data['close'] / rolling_high_20d - 1) * 100
+    data['drawdown_capitulation'] = drawdown < -15.0  # 15% drawdown
+    
+    # 4. GAP DOWN PANIC - Market open gaps
+    if 'open' in data.columns:
+        prev_close = data['close'].shift(1) 
+        gap_return = (data['open'] / prev_close - 1) * 100
+        data['gap_down_panic'] = gap_return < -4.0  # 4% gap down
+    else:
+        data['gap_down_panic'] = False
+    
+    # 5. MULTI-DAY CARNAGE - Sustained decline
+    returns_5d = data['close'].pct_change(5) * 100
+    data['multi_day_carnage'] = returns_5d < -12.0  # 12% decline in 5 days
+    
+    # 6. FEAR COMPOSITE SCORE - Multiple fear signals
+    fear_score = pd.Series(0, index=data.index)
+    
+    # RSI extreme fear
+    if 'RSI_14' in data.columns:
+        fear_score += (data['RSI_14'] < 18).astype(int)  # Extreme oversold
+    
+    # Williams %R extreme fear
+    if 'WILLR_14' in data.columns:
+        fear_score += (data['WILLR_14'] < -95).astype(int)  # Extreme oversold
+    
+    # Volume spike fear
+    if 'volume' in data.columns:
+        fear_score += (volume_ratio > 3.0).astype(int)
+    
+    # Sharp decline fear
+    fear_score += (daily_return < -5.0).astype(int)
+    
+    # Severe drawdown fear  
+    fear_score += (drawdown < -20.0).astype(int)
+    
+    data['fear_composite_score'] = fear_score
+    
+    # 7. CRASH COMPOSITE - Ultimate crash detector
+    crash_signals = ['crash_velocity_3d', 'volume_panic', 'drawdown_capitulation', 
+                    'gap_down_panic', 'multi_day_carnage']
+    data['crash_composite_score'] = data[crash_signals].sum(axis=1)
+    
+    # 8. CRASH BUY SIGNAL - When to buy the crash
+    data['crash_buy_signal'] = (data['crash_composite_score'] >= 2) | (data['fear_composite_score'] >= 3)
+
     # Mark rows where indicators aren't ready (first 50 rows as warmup period)
     data['indicators_ready'] = True
     data.iloc[:50, data.columns.get_loc('indicators_ready')] = False

@@ -301,10 +301,29 @@ def universal_strategy(data, params):
         print(f"🔍 STATIC THRESHOLD DEBUG:")
         print(f"   max_buy_score={max_buy_score:.1f}, buy_threshold={buy_threshold}, buy_signals={buy_count}")
 
+    # === CRASH DETECTION OVERRIDE ===
+    # CRITICAL: Bypass trend filter during extreme crashes
+    # Traditional indicators often fail during major crashes, so we need crash-specific signals
+    crash_override_signals = pd.Series(False, index=data.index)
+    
+    if 'crash_buy_signal' in data.columns:
+        # Force buy signals when crash indicators trigger
+        crash_override_signals = data['crash_buy_signal']
+        
+        # Add crash signals to buy score with high priority
+        crash_boost = crash_override_signals.astype(float) * 5  # Major boost during crashes
+        buy_score_persistent += crash_boost
+        
+        # Debug crash detection
+        crash_days = crash_override_signals.sum()
+        if debug_mode and crash_days > 0:
+            print(f"🚨 CRASH OVERRIDE: {crash_days} days with crash buy signals detected")
+
     # === APPLY TREND FILTER ===
     # If enabled, we only allow BUY signals when the trend filter is positive.
     # This acts as a safety net, allowing us to use more sensitive indicator thresholds
     # (e.g., buying dips) without catching falling knives in a crash.
+    # EXCEPTION: Always allow crash override signals to bypass trend filter
     if params.get('use_trend_filter', False):
         # === APPROACH A: RECALCULATE TREND FILTER WITH OPTIMIZED PARAMETERS ===
         # Instead of using static trend filter, recalculate with trial-specific thresholds
@@ -346,7 +365,8 @@ def universal_strategy(data, params):
             dynamic_trend_filter = dynamic_trend_filter | stoch_oversold
         
         # Apply the dynamically calculated trend filter
-        buy_signals = buy_signals & dynamic_trend_filter
+        # EXCEPTION: Always allow crash override signals to bypass trend filter
+        buy_signals = (buy_signals & dynamic_trend_filter) | crash_override_signals
 
     # CRITICAL FIX: Make signals mutually exclusive to prevent backtester conflicts
     # When both buy and sell trigger, choose the stronger signal DETERMINISTICALLY
