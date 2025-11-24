@@ -47,6 +47,14 @@ def universal_strategy(data, params):
     # its condition is met. No composite indicators or weighting.
     indicators_processed = 0
 
+    # SIGNAL PERSISTENCE SYSTEM - Allow signals to "stack up" over time
+    # This catches opportunities when indicators trigger at different times
+    signal_persistence_days = 2  # Signals remain active for 2 days
+    
+    # Create persistent buy/sell scores that decay over time
+    buy_score_persistent = pd.Series(0.0, index=data.index)
+    sell_score_persistent = pd.Series(0.0, index=data.index)
+
     for indicator in active_indicators:
         if indicator not in data.columns:
             print(f"MISSING COLUMN: {indicator}")
@@ -58,23 +66,30 @@ def universal_strategy(data, params):
             sell_param = params.get(f'{indicator}_sell')
 
             if buy_param is not None and data[indicator].any():
-                buy_score[data[indicator] == buy_param] += 1
+                # Add 1.0 to buy score when condition is met, then decay over next days
+                raw_signals = (data[indicator] == buy_param).astype(float)
+                buy_score_persistent += raw_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
                 indicators_processed += 1
             if sell_param is not None and data[indicator].any():
-                sell_score[data[indicator] == sell_param] += 1
+                raw_signals = (data[indicator] == sell_param).astype(float)
+                sell_score_persistent += raw_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
         else:
             # Numerical indicators: compare against thresholds
             buy_threshold = params.get(f'{indicator}_buy')
             sell_threshold = params.get(f'{indicator}_sell')
 
             if buy_threshold is not None:
-                buy_score[data[indicator] < buy_threshold] += 1
+                # Add 1.0 to buy score when condition is met, then decay over next days
+                raw_signals = (data[indicator] < buy_threshold).astype(float)
+                buy_score_persistent += raw_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
                 indicators_processed += 1
             if sell_threshold is not None:
-                sell_score[data[indicator] > sell_threshold] += 1
+                raw_signals = (data[indicator] > sell_threshold).astype(float)
+                sell_score_persistent += raw_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
 
-    buy_signals = buy_score >= params['buy_score_threshold']
-    sell_signals = sell_score >= params['sell_score_threshold']
+    # Convert persistent scores back to integer-like for threshold comparison
+    buy_signals = buy_score_persistent >= params['buy_score_threshold']
+    sell_signals = sell_score_persistent >= params['sell_score_threshold']
 
     # === APPLY TREND FILTER ===
     # If enabled, we only allow BUY signals when the trend filter is positive.
@@ -93,8 +108,8 @@ def universal_strategy(data, params):
     conflicting_bars = buy_signals & sell_signals
     if conflicting_bars.any():
         # On conflicting bars, choose based on absolute score difference (deterministic)
-        buy_excess = buy_score - params['buy_score_threshold']
-        sell_excess = sell_score - params['sell_score_threshold']
+        buy_excess = buy_score_persistent - params['buy_score_threshold']
+        sell_excess = sell_score_persistent - params['sell_score_threshold']
         
         # Where buy excess is greater, keep buy signal and remove sell
         stronger_buy = conflicting_bars & (buy_excess > sell_excess)
@@ -107,7 +122,7 @@ def universal_strategy(data, params):
     # Optional debug output
     if debug_mode and universal_strategy.call_count <= 3:
         print(f"  PROCESSED: {indicators_processed} indicators")
-        print(f"  FINAL SCORES: max_buy={buy_score.max()}, max_sell={sell_score.max()}")
+        print(f"  FINAL SCORES: max_buy={buy_score_persistent.max():.1f}, max_sell={sell_score_persistent.max():.1f}")
         print(f"  SIGNALS: {buy_signals.sum()} buy, {sell_signals.sum()} sell")
         if conflicting_bars.any():
             print(f"  CONFLICTS RESOLVED: {conflicting_bars.sum()} conflicting bars fixed")
@@ -315,15 +330,15 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
         return -1e9
     
     # Apply trade preference to calculate percentage-based thresholds
-    if trade_preference < 0.4:  # Conservative: 40-70% agreement needed
-        buy_pct_min, buy_pct_max = 0.4, 0.7
-        sell_pct_min, sell_pct_max = 0.4, 0.7
-    elif trade_preference < 0.7:  # Balanced: 25-50% agreement needed
-        buy_pct_min, buy_pct_max = 0.25, 0.5
-        sell_pct_min, sell_pct_max = 0.25, 0.5
-    else:  # Aggressive: 1-8% agreement needed (EXTREME trading)
-        buy_pct_min, buy_pct_max = 0.01, 0.08
-        sell_pct_min, sell_pct_max = 0.01, 0.08
+    if trade_preference < 0.4:  # Conservative: 15-35% agreement needed
+        buy_pct_min, buy_pct_max = 0.15, 0.35
+        sell_pct_min, sell_pct_max = 0.15, 0.35
+    elif trade_preference < 0.7:  # Balanced: 8-25% agreement needed
+        buy_pct_min, buy_pct_max = 0.08, 0.25
+        sell_pct_min, sell_pct_max = 0.08, 0.25
+    else:  # Aggressive: 0.5-4% agreement needed (EXTREMELY sensitive)
+        buy_pct_min, buy_pct_max = 0.005, 0.04
+        sell_pct_min, sell_pct_max = 0.005, 0.04
     
     # Calculate proper thresholds based on actual active indicators  
     # REMOVE CAPS for maximum performance - let Optuna find the best thresholds

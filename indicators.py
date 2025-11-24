@@ -359,10 +359,21 @@ def get_all_indicators(data):
         trend_filter = trend_filter | price_trend  # OR logic: either ADX strong OR price trending
 
     if 'RSI_14' in data.columns:
-        # Oversold bailout: If RSI is very low (< 30), allow buying regardless of trend
+        # Oversold bailout: If RSI is very low (< 25), allow buying regardless of trend
         # This catches "V-shape" bottoms where trend is broken but asset is cheap
-        oversold_bailout = data['RSI_14'] < 30
+        oversold_bailout = data['RSI_14'] < 25
         trend_filter = trend_filter | oversold_bailout
+    
+    # Add additional oversold conditions for more aggressive dip buying
+    if 'WILLR_14' in data.columns:
+        # Williams %R below -80 is extremely oversold
+        willr_oversold = data['WILLR_14'] < -80
+        trend_filter = trend_filter | willr_oversold
+        
+    if 'STOCHk_14_3_3' in data.columns:
+        # Stochastic %K below 15 is very oversold
+        stoch_oversold = data['STOCHk_14_3_3'] < 15
+        trend_filter = trend_filter | stoch_oversold
     
     data['trend_filter'] = trend_filter
     
