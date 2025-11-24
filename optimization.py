@@ -601,11 +601,12 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
     
     # === ENHANCEMENT #2: POSITION SIZING & RISK MANAGEMENT ===
     if POSITION_SIZING_AVAILABLE:
-        params['enable_position_sizing'] = trial.suggest_categorical('enable_position_sizing', [True, False])
+        # FORCE AGGRESSIVE POSITIONING: Always enable position sizing for maximum returns
+        params['enable_position_sizing'] = trial.suggest_categorical('enable_position_sizing', [True])  # Always True
         
         if params['enable_position_sizing']:
-            # AGGRESSIVE: Optimize maximum position size (20% to 75% of capital per position)
-            params['max_position_pct'] = trial.suggest_float('max_position_pct', 0.20, 0.75)
+            # ULTRA-AGGRESSIVE: Optimize maximum position size (40% to 75% of capital per position)
+            params['max_position_pct'] = trial.suggest_float('max_position_pct', 0.40, 0.75)
             
             # Optimize risk management features
             params['kelly_optimization'] = trial.suggest_categorical('kelly_optimization', [True, False])
@@ -676,6 +677,9 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
             
             if trial.number <= 2:
                 print(f"   🚀 Using Enhanced Backtester with {params.get('max_position_pct', 0.20):.1%} max position size")
+                print(f"   📊 Aggressive settings: exposure={params.get('max_total_exposure', 0.6):.1%}, "
+                      f"vol_scaling={params.get('aggressive_vol_scaling', False)}, "
+                      f"risk_mult={params.get('confidence_risk_multiplier', 1.0):.1f}x")
         else:
             backtester = Backtester(data, strategy_name, universal_strategy, params)
             if trial.number <= 2:
