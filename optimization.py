@@ -652,7 +652,16 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
     # CRASH-SENSITIVE thresholds to catch major market bottoms
     # April 2025 analysis: Only 2 indicators (RSI + WillR) were oversold at the bottom
     # Need to ensure buy thresholds can be low enough (1-3) to catch these opportunities
-    max_reasonable_threshold = min(8, actual_active)  # Cap at 8 for crash sensitivity
+    
+    # Check if regime-aware mode is enabled
+    if params.get('enable_regime_aware', False) and SIMPLE_REGIME_AVAILABLE:
+        # For regime-aware mode, we only use 3 key indicators (RSI_14, WILLR_14, MACD_12_26_9)
+        regime_indicators_count = 3
+        max_reasonable_threshold = min(3, regime_indicators_count)  # Cap at 3 for regime-aware
+        print(f"   🎯 REGIME-AWARE MODE: Using {regime_indicators_count} indicators, max threshold = {max_reasonable_threshold}")
+    else:
+        # For standard mode, use all active indicators
+        max_reasonable_threshold = min(8, actual_active)  # Cap at 8 for crash sensitivity
     
     params['buy_score_threshold'] = trial.suggest_int('buy_score_threshold', 1, max_reasonable_threshold)
     params['sell_score_threshold'] = trial.suggest_int('sell_score_threshold', 1, max_reasonable_threshold)
@@ -736,7 +745,8 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
     
     # === SIMPLE REGIME-AWARE STRATEGY ===
     if SIMPLE_REGIME_AVAILABLE:
-        params['enable_regime_aware'] = trial.suggest_categorical('enable_regime_aware', [True, False])
+        # Default to regime-aware mode since it's designed to solve April 2025 bottom miss
+        params['enable_regime_aware'] = trial.suggest_categorical('enable_regime_aware', [True, True, False])
         
         if params['enable_regime_aware']:
             print(f"   🎯 Regime-aware optimization enabled - separate parameters for each market condition")
@@ -751,9 +761,9 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
                 params[f'{regime}_MACD_12_26_9_buy'] = trial.suggest_float(f'{regime}_MACD_12_26_9_buy', -10, 5)
                 params[f'{regime}_MACD_12_26_9_sell'] = trial.suggest_float(f'{regime}_MACD_12_26_9_sell', -5, 15)
                 
-                # Score thresholds for each regime
-                params[f'{regime}_buy_score_threshold'] = trial.suggest_int(f'{regime}_buy_score_threshold', 1, min(3, actual_active))
-                params[f'{regime}_sell_score_threshold'] = trial.suggest_int(f'{regime}_sell_score_threshold', 1, min(3, actual_active))
+                # Score thresholds for each regime (max 3 since we only use 3 key indicators)
+                params[f'{regime}_buy_score_threshold'] = trial.suggest_int(f'{regime}_buy_score_threshold', 1, 3)
+                params[f'{regime}_sell_score_threshold'] = trial.suggest_int(f'{regime}_sell_score_threshold', 1, 3)
         else:
             print(f"   📊 Using single parameter set for all market conditions")
     else:
