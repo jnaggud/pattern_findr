@@ -55,12 +55,28 @@ except Exception as e:
     MARKET_REGIME_AVAILABLE = False
     print(f"❌ Enhancement #3 import error: {e}")
 
+# Import Simple Regime Detection
+try:
+    from simple_regime_detector import detect_market_regime, get_regime_parameters
+    SIMPLE_REGIME_AVAILABLE = True
+    print("✅ Simple Regime Detection available")
+except ImportError as e:
+    SIMPLE_REGIME_AVAILABLE = False
+    print(f"⚠️  Simple Regime Detection not available: {e}")
+except Exception as e:
+    SIMPLE_REGIME_AVAILABLE = False
+    print(f"❌ Simple Regime Detection import error: {e}")
+
 def universal_strategy(data, params):
     """
     A universal strategy that uses a scoring system to combine signals.
+    Now supports regime-aware parameter switching.
     """
     buy_score = pd.Series(0, index=data.index)
     sell_score = pd.Series(0, index=data.index)
+    
+    # Check if regime-aware mode is enabled
+    use_regime_aware = params.get('enable_regime_aware', False) and SIMPLE_REGIME_AVAILABLE
 
     # Extract active indicators from the flat params structure
     # EXCLUDE meta-flags like trend_filter, dynamic sizing, weighted scoring, regime detection, etc.
@@ -81,6 +97,16 @@ def universal_strategy(data, params):
         'sell_pct_min',
         # Enhancement #3: Market Regime Detection
         'enable_market_regime',
+        'enable_regime_aware',
+        # Regime-specific parameters (exclude from active indicator counting)
+        'bull_RSI_14_buy', 'bull_RSI_14_sell', 'bull_WILLR_14_buy', 'bull_WILLR_14_sell',
+        'bull_MACD_12_26_9_buy', 'bull_MACD_12_26_9_sell', 'bull_buy_score_threshold',
+        'bear_RSI_14_buy', 'bear_RSI_14_sell', 'bear_WILLR_14_buy', 'bear_WILLR_14_sell', 
+        'bear_MACD_12_26_9_buy', 'bear_MACD_12_26_9_sell', 'bear_buy_score_threshold',
+        'crash_RSI_14_buy', 'crash_RSI_14_sell', 'crash_WILLR_14_buy', 'crash_WILLR_14_sell',
+        'crash_MACD_12_26_9_buy', 'crash_MACD_12_26_9_sell', 'crash_buy_score_threshold',
+        'sideways_RSI_14_buy', 'sideways_RSI_14_sell', 'sideways_WILLR_14_buy', 'sideways_WILLR_14_sell',
+        'sideways_MACD_12_26_9_buy', 'sideways_MACD_12_26_9_sell', 'sideways_buy_score_threshold',
         # Enhancement #2: Position Sizing & Risk Management
         'enable_position_sizing',
         'max_position_pct',
@@ -159,8 +185,25 @@ def universal_strategy(data, params):
                 sell_score_persistent += raw_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
         else:
             # Numerical indicators: compare against thresholds
-            buy_threshold = params.get(f'{indicator}_buy')
-            sell_threshold = params.get(f'{indicator}_sell')
+            # Get thresholds (either static or regime-aware)
+            if use_regime_aware and indicator in ['RSI_14', 'WILLR_14', 'MACD_12_26_9']:
+                # Use regime-aware thresholds - detect regime for each row
+                buy_threshold_series = pd.Series(dtype=float, index=data.index)
+                sell_threshold_series = pd.Series(dtype=float, index=data.index)
+                
+                for i in range(len(data)):
+                    current_regime = detect_market_regime(data, i)
+                    regime_prefix = current_regime
+                    
+                    buy_threshold_series.iloc[i] = params.get(f'{regime_prefix}_{indicator}_buy', params.get(f'{indicator}_buy', 30))
+                    sell_threshold_series.iloc[i] = params.get(f'{regime_prefix}_{indicator}_sell', params.get(f'{indicator}_sell', 70))
+                
+                buy_threshold = buy_threshold_series
+                sell_threshold = sell_threshold_series
+            else:
+                # Use static thresholds
+                buy_threshold = params.get(f'{indicator}_buy')
+                sell_threshold = params.get(f'{indicator}_sell')
 
             if buy_threshold is not None:
                 # Add 1.0 to buy score when condition is met, then decay over next days
@@ -171,9 +214,23 @@ def universal_strategy(data, params):
                 raw_signals = (data[indicator] > sell_threshold).astype(float)
                 sell_score_persistent += raw_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
 
-    # Convert persistent scores to signals with base thresholds
-    buy_signals = buy_score_persistent >= params['buy_score_threshold']
-    sell_signals = sell_score_persistent >= params['sell_score_threshold']
+    # Convert persistent scores to signals with thresholds (static or regime-aware)
+    if use_regime_aware:
+        # Use regime-aware score thresholds
+        buy_signals = pd.Series(False, index=data.index)
+        sell_signals = pd.Series(False, index=data.index)
+        
+        for i in range(len(data)):
+            current_regime = detect_market_regime(data, i)
+            regime_buy_threshold = params.get(f'{current_regime}_buy_score_threshold', params.get('buy_score_threshold', 1))
+            regime_sell_threshold = params.get(f'{current_regime}_sell_score_threshold', params.get('sell_score_threshold', 1))
+            
+            buy_signals.iloc[i] = buy_score_persistent.iloc[i] >= regime_buy_threshold
+            sell_signals.iloc[i] = sell_score_persistent.iloc[i] >= regime_sell_threshold
+    else:
+        # Use static thresholds
+        buy_signals = buy_score_persistent >= params['buy_score_threshold']
+        sell_signals = sell_score_persistent >= params['sell_score_threshold']
 
     # === APPLY TREND FILTER ===
     # If enabled, we only allow BUY signals when the trend filter is positive.
@@ -676,7 +733,31 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
             print(f"   📊 Using static thresholds for all market conditions")
     else:
         params['enable_market_regime'] = False
-        params['max_total_exposure'] = 1.00
+    
+    # === SIMPLE REGIME-AWARE STRATEGY ===
+    if SIMPLE_REGIME_AVAILABLE:
+        params['enable_regime_aware'] = trial.suggest_categorical('enable_regime_aware', [True, False])
+        
+        if params['enable_regime_aware']:
+            print(f"   🎯 Regime-aware optimization enabled - separate parameters for each market condition")
+            
+            # Optimize parameters for each regime separately
+            for regime in ['bull', 'bear', 'crash', 'sideways']:
+                # Key indicator thresholds for each regime
+                params[f'{regime}_RSI_14_buy'] = trial.suggest_float(f'{regime}_RSI_14_buy', 15, 45)
+                params[f'{regime}_RSI_14_sell'] = trial.suggest_float(f'{regime}_RSI_14_sell', 55, 85)
+                params[f'{regime}_WILLR_14_buy'] = trial.suggest_float(f'{regime}_WILLR_14_buy', -90, -50)
+                params[f'{regime}_WILLR_14_sell'] = trial.suggest_float(f'{regime}_WILLR_14_sell', -50, -10)
+                params[f'{regime}_MACD_12_26_9_buy'] = trial.suggest_float(f'{regime}_MACD_12_26_9_buy', -10, 5)
+                params[f'{regime}_MACD_12_26_9_sell'] = trial.suggest_float(f'{regime}_MACD_12_26_9_sell', -5, 15)
+                
+                # Score thresholds for each regime
+                params[f'{regime}_buy_score_threshold'] = trial.suggest_int(f'{regime}_buy_score_threshold', 1, min(3, actual_active))
+                params[f'{regime}_sell_score_threshold'] = trial.suggest_int(f'{regime}_sell_score_threshold', 1, min(3, actual_active))
+        else:
+            print(f"   📊 Using single parameter set for all market conditions")
+    else:
+        params['enable_regime_aware'] = False
     
     # Keep it simple - core strategy only
     params['use_weighted_scoring'] = False
