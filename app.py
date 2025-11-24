@@ -2718,7 +2718,23 @@ if 'optimization_results' in st.session_state:
                 if 'sell_score_threshold' not in final_params:
                     final_params['sell_score_threshold'] = 1
                 
-                backtester = Backtester(enriched_data, strategy_name, universal_strategy, final_params, starting_capital)
+                # Use the same backtester type that was used during optimization
+                if enable_position_sizing and 'max_position_pct' in final_params:
+                    # Use enhanced backtester with position sizing (same as optimization)
+                    from enhanced_backtester import EnhancedBacktester
+                    backtester = EnhancedBacktester(
+                        data=enriched_data,
+                        strategy_name=strategy_name,
+                        strategy_func=universal_strategy,
+                        params=final_params,
+                        starting_capital=starting_capital,
+                        enable_position_sizing=True,
+                        max_position_pct=final_params.get('max_position_pct', 0.50)
+                    )
+                else:
+                    # Use standard backtester (100% capital deployment)
+                    backtester = Backtester(enriched_data, strategy_name, universal_strategy, final_params, starting_capital)
+                
                 backtester.run()
                 trade_log, summary = backtester.get_results()
                 
