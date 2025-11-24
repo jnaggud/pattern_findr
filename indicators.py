@@ -422,69 +422,92 @@ def get_all_indicators(data, optuna_params=None):
     
     data['trend_filter'] = trend_filter
     
-    # === ADD CUSTOM CRASH DETECTION INDICATORS ===
-    # These trigger during extreme crashes when traditional indicators fail
+    # === BOTTOM DETECTION INDICATORS ===
+    # These trigger at actual market bottoms, not crash starts - better timing!
     
-    # 1. CRASH VELOCITY - Rapid price declines
-    returns_3d = data['close'].pct_change(3) * 100
-    data['crash_velocity_3d'] = returns_3d < -8.0  # 8% decline in 3 days
-    
-    # 2. VOLUME PANIC - High volume + decline  
+    # Prepare common variables
     if 'volume' in data.columns:
         volume_avg_20d = data['volume'].rolling(20).mean()
         volume_ratio = data['volume'] / volume_avg_20d
-        daily_return = data['close'].pct_change() * 100
-        data['volume_panic'] = (volume_ratio > 2.5) & (daily_return < -3.0)
     else:
-        data['volume_panic'] = False
+        volume_ratio = pd.Series(1.0, index=data.index)
+        
+    daily_return = data['close'].pct_change() * 100
+    returns_2d = data['close'].pct_change(2) * 100
     
-    # 3. DRAWDOWN CAPITULATION - Severe drawdown from highs
-    rolling_high_20d = data['close'].rolling(20).max()
-    drawdown = (data['close'] / rolling_high_20d - 1) * 100
-    data['drawdown_capitulation'] = drawdown < -15.0  # 15% drawdown
+    # 1. SELLING EXHAUSTION - High volume but price stops falling
+    data['selling_exhaustion'] = (volume_ratio > 2.5) & (daily_return > -2.0) & (daily_return < 0.5)
     
-    # 4. GAP DOWN PANIC - Market open gaps
+    # 2. HAMMER PATTERN - Rejection of lower prices
+    if 'high' in data.columns and 'low' in data.columns:
+        candle_range = data['high'] - data['low']
+        lower_wick = data['close'] - data['low']
+        upper_wick = data['high'] - data['close']
+        # Hammer: Long lower wick, small upper wick
+        data['hammer_pattern'] = (lower_wick > candle_range * 0.6) & (upper_wick < candle_range * 0.2)
+    else:
+        data['hammer_pattern'] = False
+    
+    # 3. PANIC RECOVERY - Sharp decline followed by recovery
+    data['panic_recovery'] = (daily_return.shift(1) < -4.0) & (daily_return > 1.0)
+    
+    # 4. OVERSOLD BOUNCE - End of oversold condition with bounce
+    up_days = (daily_return > 0).rolling(3).sum()
+    oversold_proxy = up_days == 0  # 0 up days in last 3 = oversold
+    data['oversold_bounce'] = oversold_proxy.shift(1) & (daily_return > 0.5)
+    
+    # 5. VOLUME CONFIRMATION - High volume on bounce (smart money)
+    high_volume = volume_ratio > 2.0
+    data['volume_confirmation'] = (
+        high_volume.shift(1) &  # Yesterday high volume
+        (daily_return > 0.5) &  # Today bounce
+        high_volume             # Today also high volume
+    )
+    
+    # 6. STABILIZATION BOTTOM - Price stabilizes after decline
+    big_decline = returns_2d < -5.0
+    small_moves = abs(daily_return) < 1.5
+    stability = small_moves & small_moves.shift(1)
+    data['stabilization_bottom'] = big_decline.shift(2) & stability
+    
+    # 7. GAP FILL RECOVERY - Gap down followed by gap fill
     if 'open' in data.columns:
-        prev_close = data['close'].shift(1) 
-        gap_return = (data['open'] / prev_close - 1) * 100
-        data['gap_down_panic'] = gap_return < -4.0  # 4% gap down
+        prev_close = data['close'].shift(1)
+        gap_down = (data['open'] / prev_close - 1) * 100 < -2.0
+        gap_fill = data['close'] > prev_close
+        data['gap_fill_recovery'] = gap_down & gap_fill
     else:
-        data['gap_down_panic'] = False
+        data['gap_fill_recovery'] = False
     
-    # 5. MULTI-DAY CARNAGE - Sustained decline
-    returns_5d = data['close'].pct_change(5) * 100
-    data['multi_day_carnage'] = returns_5d < -12.0  # 12% decline in 5 days
+    # 8. FEAR CAPITULATION - Extreme fear followed by relief
+    fear_indicators = [
+        daily_return < -3.0,    # Big decline
+        volume_ratio > 3.0,     # Huge volume
+    ]
     
-    # 6. FEAR COMPOSITE SCORE - Multiple fear signals
     fear_score = pd.Series(0, index=data.index)
+    for indicator in fear_indicators:
+        fear_score += indicator.astype(int)
     
-    # RSI extreme fear
-    if 'RSI_14' in data.columns:
-        fear_score += (data['RSI_14'] < 18).astype(int)  # Extreme oversold
+    # High fear yesterday, lower fear today
+    data['fear_capitulation'] = (fear_score.shift(1) >= 2) & (fear_score <= 1)
     
-    # Williams %R extreme fear
-    if 'WILLR_14' in data.columns:
-        fear_score += (data['WILLR_14'] < -95).astype(int)  # Extreme oversold
+    # 9. BOTTOM COMPOSITE SCORE
+    bottom_indicators = [
+        'selling_exhaustion', 'hammer_pattern', 'panic_recovery',
+        'oversold_bounce', 'volume_confirmation', 'stabilization_bottom',
+        'gap_fill_recovery', 'fear_capitulation'
+    ]
     
-    # Volume spike fear
-    if 'volume' in data.columns:
-        fear_score += (volume_ratio > 3.0).astype(int)
+    data['crash_composite_score'] = data[bottom_indicators].sum(axis=1)  # Renamed for compatibility
     
-    # Sharp decline fear
-    fear_score += (daily_return < -5.0).astype(int)
-    
-    # Severe drawdown fear  
-    fear_score += (drawdown < -20.0).astype(int)
-    
-    data['fear_composite_score'] = fear_score
-    
-    # 7. CRASH COMPOSITE - Ultimate crash detector
-    crash_signals = ['crash_velocity_3d', 'volume_panic', 'drawdown_capitulation', 
-                    'gap_down_panic', 'multi_day_carnage']
-    data['crash_composite_score'] = data[crash_signals].sum(axis=1)
-    
-    # 8. CRASH BUY SIGNAL - When to buy the crash
-    data['crash_buy_signal'] = (data['crash_composite_score'] >= 2) | (data['fear_composite_score'] >= 3)
+    # 10. BOTTOM BUY SIGNAL - Ultimate bottom detection
+    data['crash_buy_signal'] = (
+        (data['crash_composite_score'] >= 2) |      # 2+ bottom indicators OR
+        data['panic_recovery'] |                    # Panic recovery OR
+        data['volume_confirmation'] |               # Volume confirmation OR
+        (data['hammer_pattern'] & (volume_ratio > 2.0))  # Hammer + high volume
+    )
 
     # Mark rows where indicators aren't ready (first 50 rows as warmup period)
     data['indicators_ready'] = True
