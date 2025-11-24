@@ -554,30 +554,35 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
         if range_min is None:
             data_min, data_max = data[indicator].min(), data[indicator].max()
             range_size = data_max - data_min
-            # Suggest indicator-specific buy/sell thresholds within CRASH-AWARE ranges
-            # CRASH-AWARE ranges that can catch market bottoms like April 2025
+            # THEORETICAL ranges - no look-ahead bias, based on general market knowledge
             if 'RSI' in indicator or 'MFI' in indicator:
-                # RSI: Must be able to catch RSI 21.6 (April bottom), so use reasonable range
-                params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', 20, 40)  # Was 10-40
-                params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', 60, 80)  # Was 60-90
+                # RSI/MFI: 0-100 scale, standard oversold/overbought levels
+                params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', 15, 45)  # Oversold range
+                params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', 55, 85)  # Overbought range
             elif 'STOCH' in indicator:
-                params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', 10, 30)
-                params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', 70, 90)
+                # Stochastic: 0-100 scale, similar to RSI
+                params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', 10, 40)
+                params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', 60, 90)
             elif 'WILLR' in indicator:
-                # Williams %R: Must catch -84.5 (April bottom)
-                params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', -90, -50)  # Was -90 to -60
-                params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', -40, -10)
+                # Williams %R: -100 to 0 scale, reversed from RSI
+                params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', -90, -50)  # More oversold
+                params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', -50, -10)  # Less oversold
             elif 'CCI' in indicator:
-                params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', -200, -50)  # More oversold range
-                params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', 50, 150)
+                # CCI: Can go extreme, typical range ±200
+                params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', -200, -50)
+                params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', 50, 200)
             elif 'MACD' in indicator and not indicator.endswith('s'):
-                # MACD: Must work with bearish MACD during crashes (-16.975 at April bottom)
-                params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', -10, 2)  # Was -5 to 2 
-                params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', -2, 10)  # Was -2 to 5
+                # MACD: Can be positive/negative, typical range varies by asset
+                params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', -10, 5)    # Allow bearish MACD buys
+                params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', -5, 15)   # Bullish MACD sells
+            elif 'ADX' in indicator:
+                # ADX: 0-100, measures trend strength
+                params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', 10, 40)
+                params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', 20, 60)
             else:
-                # Generic ranges for unknown indicators
-                params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', -100, 50)
-                params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', -50, 100)  # === DIRECT OPTUNA OPTIMIZATION OF SIGNAL THRESHOLDS ===
+                # Generic ranges - conservative assumptions
+                params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', -50, 25)
+                params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', -25, 50)  # === DIRECT OPTUNA OPTIMIZATION OF SIGNAL THRESHOLDS ===
     # Let Optuna directly optimize the exact number of indicators needed
     # This removes all percentage-based constraints and artificial minimums
     
