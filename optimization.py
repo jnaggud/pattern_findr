@@ -17,10 +17,34 @@ def universal_strategy(data, params):
     # EXCLUDE meta-flags like trend_filter, dynamic sizing, weighted scoring, regime detection, etc.
     meta_flags = {
         'use_trend_filter',
-        'use_dynamic_position_sizing',
+        'use_dynamic_position_sizing', 
         'use_weighted_scoring',
         'use_regime_detection',
         'use_indicators_ready',
+        'use_volatility_sizing',        # Removed feature
+        'use_dynamic_thresholds',       # Removed feature
+        'volatility_multiplier',
+        'volatility_threshold',
+        'high_vol_threshold_reduction',
+        'volatility_percentile_threshold',
+        'buy_pct_min',
+        'buy_pct_max', 
+        'sell_pct_min',
+        'sell_pct_max',
+        # Old trade preference parameters
+        'min_hold_days',
+        'require_confirmation',
+        'confirmation_weight',
+        'trend_filter_weight',
+        # APPROACH A: New optimization parameters with unique names
+        'trend_adx_threshold',
+        'trend_rsi_oversold',
+        'trend_willr_threshold',
+        'trend_stoch_threshold',
+        'trend_sma_period',
+        'signal_persistence_days',
+        'buy_score_threshold',
+        'sell_score_threshold',
     }
 
     active_indicators = [
@@ -31,7 +55,7 @@ def universal_strategy(data, params):
         and param not in meta_flags
     ]
     
-    # Debug output for first few calls only - ALWAYS print for debugging
+    # Debug output for first few calls only
     debug_mode = True  # Temporarily enabled for debugging
     # Reset counter and always print to force debug output
     if not hasattr(universal_strategy, 'call_count'):
@@ -49,7 +73,7 @@ def universal_strategy(data, params):
 
     # SIGNAL PERSISTENCE SYSTEM - Allow signals to "stack up" over time
     # This catches opportunities when indicators trigger at different times
-    signal_persistence_days = 2  # Signals remain active for 2 days
+    signal_persistence_days = params.get('signal_persistence_days', 2)  # Now optimized by Optuna!
     
     # Create persistent buy/sell scores that decay over time
     buy_score_persistent = pd.Series(0.0, index=data.index)
@@ -87,7 +111,7 @@ def universal_strategy(data, params):
                 raw_signals = (data[indicator] > sell_threshold).astype(float)
                 sell_score_persistent += raw_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
 
-    # Convert persistent scores back to integer-like for threshold comparison
+    # Convert persistent scores to signals with base thresholds
     buy_signals = buy_score_persistent >= params['buy_score_threshold']
     sell_signals = sell_score_persistent >= params['sell_score_threshold']
 
@@ -96,12 +120,47 @@ def universal_strategy(data, params):
     # This acts as a safety net, allowing us to use more sensitive indicator thresholds
     # (e.g., buying dips) without catching falling knives in a crash.
     if params.get('use_trend_filter', False):
-        if 'trend_filter' in data.columns:
-            # Only allow buys when trend_filter is True
-            buy_signals = buy_signals & data['trend_filter']
-        else:
-            # Should not happen given indicators.py, but good for safety
-            pass
+        # === APPROACH A: RECALCULATE TREND FILTER WITH OPTIMIZED PARAMETERS ===
+        # Instead of using static trend filter, recalculate with trial-specific thresholds
+        
+        # Get optimized thresholds with new parameter names
+        adx_threshold = params.get('trend_adx_threshold', 20)
+        rsi_oversold_threshold = params.get('trend_rsi_oversold', 35)
+        willr_threshold = params.get('trend_willr_threshold', -80)
+        stoch_threshold = params.get('trend_stoch_threshold', 15)
+        sma_period = params.get('trend_sma_period', 50)
+        
+        # Recalculate trend filter with optimized parameters
+        dynamic_trend_filter = pd.Series(True, index=data.index)
+        
+        if 'ADX_14' in data.columns:
+            adx_trend = data['ADX_14'] > adx_threshold
+            dynamic_trend_filter = dynamic_trend_filter & adx_trend
+        
+        # Use optimized SMA period
+        sma_column = f'SMA_{sma_period}'
+        if sma_column in data.columns and 'close' in data.columns:
+            price_trend = data['close'] > data[sma_column]
+            dynamic_trend_filter = dynamic_trend_filter | price_trend
+        elif 'SMA_50' in data.columns and 'close' in data.columns:
+            # Fallback to SMA_50 if optimized period not available
+            price_trend = data['close'] > data['SMA_50']
+            dynamic_trend_filter = dynamic_trend_filter | price_trend
+
+        if 'RSI_14' in data.columns:
+            oversold_bailout = data['RSI_14'] < rsi_oversold_threshold
+            dynamic_trend_filter = dynamic_trend_filter | oversold_bailout
+        
+        if 'WILLR_14' in data.columns:
+            willr_oversold = data['WILLR_14'] < willr_threshold
+            dynamic_trend_filter = dynamic_trend_filter | willr_oversold
+            
+        if 'STOCHk_14_3_3' in data.columns:
+            stoch_oversold = data['STOCHk_14_3_3'] < stoch_threshold
+            dynamic_trend_filter = dynamic_trend_filter | stoch_oversold
+        
+        # Apply the dynamically calculated trend filter
+        buy_signals = buy_signals & dynamic_trend_filter
 
     # CRITICAL FIX: Make signals mutually exclusive to prevent backtester conflicts
     # When both buy and sell trigger, choose the stronger signal DETERMINISTICALLY
@@ -207,34 +266,7 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
         confirmation_weight = trial.suggest_float('confirmation_weight', 0.0, 1.0)
         params['require_confirmation'] = confirmation_raw if not confirmation_raw else (confirmation_weight < 0.2)
     
-    # 3. use_trend_filter: FIXED choices to maintain consistent parameter space
-    # Always use same choices, but suggest weighted parameter based on trade_preference
-    trend_filter_raw = trial.suggest_categorical('use_trend_filter', [True, False])
-    
-    # Apply trade preference weighting (bias the result)
-    if trade_preference < 0.4:  # Conservative: 80% chance of using trend filter
-        # If raw suggests False, override to True 80% of the time
-        trend_weight = trial.suggest_float('trend_filter_weight', 0.0, 1.0)
-        params['use_trend_filter'] = trend_filter_raw if trend_filter_raw else (trend_weight > 0.2)
-    elif trade_preference < 0.7:  # Balanced: 50/50 - use raw suggestion
-        params['use_trend_filter'] = trend_filter_raw
-    else:  # Aggressive: 20% chance of using trend filter  
-        # If raw suggests True, override to False 80% of the time
-        trend_weight = trial.suggest_float('trend_filter_weight', 0.0, 1.0)
-        params['use_trend_filter'] = trend_filter_raw if not trend_filter_raw else (trend_weight < 0.2)
-    
-    # 4. adx_threshold: Conservative = higher threshold, Aggressive = lower threshold
-    if trade_preference < 0.4:  # Conservative: 22-30 (strong trends only)
-        adx_min, adx_max = 22, 30
-    elif trade_preference < 0.7:  # Balanced: 18-26
-        adx_min, adx_max = 18, 26
-    else:  # Aggressive: 10-18 (VERY weak trends allowed for max trades)
-        adx_min, adx_max = 10, 18
-    params['adx_threshold'] = trial.suggest_int('adx_threshold', adx_min, adx_max)
-    
-    # Debug output for dynamic parameters (moved to after threshold recalculation)
-    
-    # === TRUE OPTIMIZATION (BASELINE) ===
+    # === TRUE OPTIMIZATION (APPROACH A) ===
     # Let Optuna search the space of:
     # - Which standard indicators to use (via use_* flags)
     # - Optimal buy/sell thresholds for each indicator
@@ -261,9 +293,23 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
         'TSI': (-100.0, 100.0)
     }
 
+    # Debug the indicator detection logic
+    if trial.number <= 2:  # Only for first few trials
+        print(f"\n🔧 OBJECTIVE FUNCTION DEBUG - TRIAL {trial.number}")
+        print(f"   Numerical indicators count: {len(numerical_indicators)}")
+        print(f"   First 5 numerical: {numerical_indicators[:5] if numerical_indicators else 'NONE'}")
+        print(f"   Boolean indicators count: {len(boolean_indicators)}")
+        print(f"   First 5 boolean: {boolean_indicators[:5] if boolean_indicators else 'NONE'}")
+
     for indicator in numerical_indicators:
-        # Always suggest whether to use this indicator
-        use_indicator = trial.suggest_categorical(f'use_{indicator}', [True, False])
+        # === APPROACH A: ALWAYS include all numerical indicators ===
+        # Use trial.suggest_categorical with single True value to ensure it's stored in trial.params
+        params[f'use_{indicator}'] = trial.suggest_categorical(f'use_{indicator}', [True])
+        active_indicators.append(indicator)
+        
+        # Debug for first trial
+        if trial.number <= 1 and len(active_indicators) <= 5:
+            print(f"   ✅ Suggesting use_{indicator} = True")
         
         # Determine range: Use theoretical if available, otherwise data-driven
         range_min, range_max = None, None
@@ -278,90 +324,95 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
         if range_min is None:
             data_min, data_max = data[indicator].min(), data[indicator].max()
             range_size = data_max - data_min
-            if range_size == 0: range_size = 1.0 # Prevent zero range
-            # Expand by 50% to catch extremes
-            range_min = data_min - (range_size * 0.5)
-            range_max = data_max + (range_size * 0.5)
-
-        # Suggest thresholds using the determined wide range
-        buy_threshold = trial.suggest_float(f'{indicator}_buy', range_min, range_max)
-        sell_threshold = trial.suggest_float(f'{indicator}_sell', range_min, range_max)
+            # Expand by 25% beyond actual data range to find extreme strategies
+            range_min = data_min - 0.25 * range_size
+            range_max = data_max + 0.25 * range_size
         
-        # Ensure buy < sell for logical consistency
-        if buy_threshold >= sell_threshold:
-             # Swap and force a small gap
-            range_span = range_max - range_min
-            buy_threshold, sell_threshold = sell_threshold, buy_threshold
-            if buy_threshold == sell_threshold:
-                 buy_threshold -= range_span * 0.01
-
-        if use_indicator:
-            params[f'use_{indicator}'] = True
-            active_indicators.append(indicator)
-        else:
-            params[f'use_{indicator}'] = False
+        buy_param = trial.suggest_float(f'{indicator}_buy', range_min, range_max)
+        sell_param = trial.suggest_float(f'{indicator}_sell', range_min, range_max)
         
-        params[f'{indicator}_buy'] = buy_threshold
-        params[f'{indicator}_sell'] = sell_threshold
+        # Ensure buy < sell for momentum indicators (buy oversold, sell overbought)
+        if buy_param > sell_param:
+            buy_param, sell_param = sell_param, buy_param
+            
+        params[f'{indicator}_buy'] = buy_param
+        params[f'{indicator}_sell'] = sell_param
 
-    # Decide which boolean indicators to use (ALWAYS suggest ALL parameters for consistent parameter space)
     for indicator in boolean_indicators:
-        use_indicator = trial.suggest_categorical(f'use_{indicator}', [True, False])
-        # ALWAYS suggest buy/sell parameters to maintain consistent parameter space
+        # === APPROACH A: ALWAYS include all boolean indicators ===
+        # Use trial.suggest_categorical with single True value to ensure it's stored in trial.params
+        params[f'use_{indicator}'] = trial.suggest_categorical(f'use_{indicator}', [True])
+        active_indicators.append(indicator)
+        
         buy_param = trial.suggest_categorical(f'{indicator}_buy', [True, False])
         sell_param = trial.suggest_categorical(f'{indicator}_sell', [True, False])
-        
-        if use_indicator:
-            params[f'use_{indicator}'] = True
-            active_indicators.append(indicator)
-            params[f'{indicator}_buy'] = buy_param
-            params[f'{indicator}_sell'] = sell_param
-        else:
-            # Still set parameters even when not used to maintain consistent parameter space
-            params[f'use_{indicator}'] = False
-            params[f'{indicator}_buy'] = buy_param  # Dummy value
-            params[f'{indicator}_sell'] = sell_param  # Dummy value
+        params[f'{indicator}_buy'] = buy_param
+        params[f'{indicator}_sell'] = sell_param
 
-    # === RECALCULATE THRESHOLDS BASED ON ACTUAL ACTIVE INDICATORS ===
+    # === DIRECT OPTUNA OPTIMIZATION OF SIGNAL THRESHOLDS ===
+    # Let Optuna directly optimize the exact number of indicators needed
+    # This removes all percentage-based constraints and artificial minimums
+    
     actual_active = len(active_indicators)
     if actual_active == 0:
         if trial.number <= 10:
             print(f"  SKIPPING TRIAL {trial.number}: No valid indicators")
         return -1e9
     
-    # Apply trade preference to calculate percentage-based thresholds
-    if trade_preference < 0.4:  # Conservative: 15-35% agreement needed
-        buy_pct_min, buy_pct_max = 0.15, 0.35
-        sell_pct_min, sell_pct_max = 0.15, 0.35
-    elif trade_preference < 0.7:  # Balanced: 8-25% agreement needed
-        buy_pct_min, buy_pct_max = 0.08, 0.25
-        sell_pct_min, sell_pct_max = 0.08, 0.25
-    else:  # Aggressive: 0.5-4% agreement needed (EXTREMELY sensitive)
-        buy_pct_min, buy_pct_max = 0.005, 0.04
-        sell_pct_min, sell_pct_max = 0.005, 0.04
+    # ULTRA-LOW thresholds to catch single-indicator opportunities
+    # During crashes, sometimes only 1-2 indicators scream "BUY" at the exact bottom
+    # With ALL 85 indicators, we need higher thresholds but still keep them reasonable
+    max_reasonable_threshold = min(25, actual_active)  # Cap at 25 or total indicators
     
-    # Calculate proper thresholds based on actual active indicators  
-    # REMOVE CAPS for maximum performance - let Optuna find the best thresholds
-    proper_buy_min = max(1, int(actual_active * buy_pct_min))
-    proper_buy_max = max(2, int(actual_active * buy_pct_max))  # No artificial cap
-    proper_sell_min = max(1, int(actual_active * sell_pct_min))  
-    proper_sell_max = max(2, int(actual_active * sell_pct_max))  # No artificial cap
+    params['buy_score_threshold'] = trial.suggest_int('buy_score_threshold', 1, max_reasonable_threshold)
+    params['sell_score_threshold'] = trial.suggest_int('sell_score_threshold', 1, max_reasonable_threshold)
     
-    # NOW suggest the thresholds with proper ranges (Optuna will use these correctly)
-    params['buy_score_threshold'] = trial.suggest_int('buy_score_threshold', proper_buy_min, proper_buy_max)
-    params['sell_score_threshold'] = trial.suggest_int('sell_score_threshold', proper_sell_min, proper_sell_max)
+    # === APPROACH A: OPTIMIZE ALL TREND FILTER PARAMETERS ===
+    # In APPROACH A, trend filter is always enabled (already suggested above)
+    # Use unique parameter names to avoid Optuna conflicts
     
-    # Baseline scoring: no weighted scoring or meta-weights – each indicator
-    # contributes equally to the buy/sell score.
+    if params.get('use_trend_filter', True):  # Default to True for APPROACH A
+        # Optimize ADX threshold with unique name
+        params['trend_adx_threshold'] = trial.suggest_float('trend_adx_threshold', 15, 35)
+        
+        # Optimize RSI oversold threshold with unique name
+        params['trend_rsi_oversold'] = trial.suggest_float('trend_rsi_oversold', 20, 45)
+        
+        # Optimize Williams %R threshold with unique name
+        params['trend_willr_threshold'] = trial.suggest_float('trend_willr_threshold', -95, -65)
+        
+        # Optimize Stochastic threshold with unique name
+        params['trend_stoch_threshold'] = trial.suggest_float('trend_stoch_threshold', 8, 25)
+        
+        # Optimize SMA period with unique name
+        params['trend_sma_period'] = trial.suggest_int('trend_sma_period', 20, 100)
+    else:
+        # Set default values when trend filter is disabled
+        params['trend_adx_threshold'] = 20
+        params['trend_rsi_oversold'] = 35
+        params['trend_willr_threshold'] = -80
+        params['trend_stoch_threshold'] = 15
+        params['trend_sma_period'] = 50
+        
+    # === APPROACH A: OPTIMIZE SIGNAL PERSISTENCE ===
+    # Instead of static 2-day persistence, let Optuna find optimal window
+    params['signal_persistence_days'] = trial.suggest_int('signal_persistence_days', 1, 5)
+    
+    # Keep it simple - core strategy only
     params['use_weighted_scoring'] = False
 
     # Debug output for first few trials
     if trial.number <= 3:
         actual_buy_pct = params['buy_score_threshold'] / actual_active * 100
         actual_sell_pct = params['sell_score_threshold'] / actual_active * 100
-        print(f"TRIAL {trial.number}: {actual_active} active indicators: {active_indicators[:3]}")
-        print(f"   📊 CORRECTED THRESHOLDS: buy={params['buy_score_threshold']} ({actual_buy_pct:.1f}%), sell={params['sell_score_threshold']} ({actual_sell_pct:.1f}%)")
-        print(f"   📊 Proper ranges: buy={proper_buy_min}-{proper_buy_max}, sell={proper_sell_min}-{proper_sell_max}")
+        print(f"TRIAL {trial.number}: {actual_active} active indicators (ALL INDICATORS APPROACH)")
+        print(f"   📊 OPTUNA THRESHOLDS: buy={params['buy_score_threshold']} ({actual_buy_pct:.1f}%), sell={params['sell_score_threshold']} ({actual_sell_pct:.1f}%)")
+        print(f"   📊 Threshold range: 1-{max_reasonable_threshold} (capped at 25 for all 85 indicators)")
+        print(f"   📊 SIGNAL PERSISTENCE: {params.get('signal_persistence_days', 2)} days")
+        if params.get('use_trend_filter', False):
+            print(f"   📊 TREND FILTER: RSI<{params.get('trend_rsi_oversold', 35):.1f}, ADX>{params.get('trend_adx_threshold', 20):.1f}, WILLR<{params.get('trend_willr_threshold', -80):.1f}")
+        else:
+            print(f"   📊 TREND FILTER: Disabled")
     
     try:
         strategy_name = ' + '.join(active_indicators)
@@ -469,10 +520,26 @@ def run_optimization(data, n_trials=1000, n_jobs=None, progress_callback=None, t
     
     # PRE-DETERMINE STATIC INDICATOR LISTS (crucial for consistent parameter space)
     print("📋 Pre-determining indicator lists for consistent parameter space...")
-    numerical_indicators = [col for col in data.columns if data[col].dtype != 'bool' and col not in ['open', 'high', 'low', 'close', 'volume']]
-    boolean_indicators = [col for col in data.columns if data[col].dtype == 'bool']
-    print(f"   📊 Numerical indicators: {len(numerical_indicators)}")
-    print(f"   🔘 Boolean indicators: {len(boolean_indicators)}")
+    
+    # More inclusive numerical indicator detection
+    # Include all numeric-like columns that aren't OHLCV or metadata
+    exclude_cols = {'date', 'open', 'high', 'low', 'close', 'volume', 'adj_close'}
+    
+    numerical_indicators = []
+    boolean_indicators = []
+    
+    for col in data.columns:
+        if col.lower() in exclude_cols:
+            continue
+        elif data[col].dtype == 'bool':
+            boolean_indicators.append(col)
+        else:
+            # Include all other columns as numerical indicators
+            # This includes float64, int64, object (that contain numbers), etc.
+            numerical_indicators.append(col)
+    
+    print(f"   📊 Numerical indicators: {len(numerical_indicators)} (first 5: {numerical_indicators[:5]})")
+    print(f"   🔘 Boolean indicators: {len(boolean_indicators)} (first 5: {boolean_indicators[:5]})")
     
     # BRING BACK JOBLIB PARALLELIZATION with proper isolation
     if n_jobs == 1:

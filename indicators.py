@@ -18,9 +18,10 @@ from ml_indicators import integrate_ml_indicators, ML_INDICATOR_LIST
 # Suppress specific FutureWarning from pandas_ta
 warnings.filterwarnings("ignore", category=FutureWarning, module="pandas_ta.candles.ha")
 
-def get_all_indicators(data):
+def get_all_indicators(data, optuna_params=None):
     """
     Adds a comprehensive set of technical indicators to the data.
+    optuna_params: Optional dictionary with optimized trend filter parameters
     """
     # Ensure data is sorted by date and set it as the index
     data = data.sort_values(by='date').set_index('date')
@@ -344,35 +345,79 @@ def get_all_indicators(data):
             # For boolean columns, fill with False (no signal)
             data[col].fillna(False, inplace=True)
     
+    # PERFORMANCE ENHANCEMENT 1: Multi-timeframe RSI for better crash detection
+    if 'RSI_14' in data.columns:
+        # 3-day average RSI - catches sustained oversold conditions
+        data['RSI_14_3day'] = data['RSI_14'].rolling(window=3, min_periods=1).mean()
+        # 7-day average RSI - catches longer-term oversold trends  
+        data['RSI_14_7day'] = data['RSI_14'].rolling(window=7, min_periods=1).mean()
+    
+    # PERFORMANCE ENHANCEMENT 2: Enhanced multi-period RSI ensemble
+    for period in [7, 21, 28]:
+        try:
+            rsi_col = f'RSI_{period}'
+            if rsi_col not in data.columns:
+                data[rsi_col] = ta.rsi(data['close'], length=period)
+        except Exception as e:
+            print(f"Failed to add {rsi_col}: {e}")
+    
+    # PERFORMANCE ENHANCEMENT 3: Volatility-adjusted indicators
+    if 'close' in data.columns:
+        # 20-day volatility (annualized)
+        returns = data['close'].pct_change()
+        data['volatility_20d'] = returns.rolling(20).std() * (252**0.5)
+        
+        # Crash detection: 5-day return < -10% AND RSI oversold
+        data['return_5d'] = data['close'].pct_change(5)
+        data['crash_detected'] = (data['return_5d'] < -0.10) & (data['RSI_14'] < 25)
+        
+        # Volume surge detection (if volume data available)
+        if 'volume' in data.columns:
+            data['volume_avg_20d'] = data['volume'].rolling(20).mean()
+            data['volume_surge'] = data['volume'] > (1.5 * data['volume_avg_20d'])
+
     # Add trend_filter indicator (used by optimization.py for trend filtering)
     # This combines ADX trend strength with price/MA trend direction
+    # === APPROACH A: USE OPTIMIZED PARAMETERS FROM OPTUNA ===
     trend_filter = pd.Series(True, index=data.index)  # Default to True (allow trading)
     
+    # Get optimized parameters or use defaults - USE NEW PARAMETER NAMES
+    adx_threshold = optuna_params.get('trend_adx_threshold', 20) if optuna_params else 20
+    rsi_oversold_threshold = optuna_params.get('trend_rsi_oversold', 35) if optuna_params else 35
+    willr_threshold = optuna_params.get('trend_willr_threshold', -80) if optuna_params else -80
+    stoch_threshold = optuna_params.get('trend_stoch_threshold', 15) if optuna_params else 15
+    sma_period = optuna_params.get('trend_sma_period', 50) if optuna_params else 50
+    
     if 'ADX_14' in data.columns:
-        # Strong trend = ADX > 20
-        adx_trend = data['ADX_14'] > 20
+        # Strong trend = ADX > optimized threshold (was static 20)
+        adx_trend = data['ADX_14'] > adx_threshold
         trend_filter = trend_filter & adx_trend
     
-    if 'SMA_50' in data.columns and 'close' in data.columns:
-        # Price trend = close above 50-day SMA
-        price_trend = data['close'] > data['SMA_50']
+    # Use optimized SMA period for trend detection
+    sma_column = f'SMA_{sma_period}'
+    if sma_column in data.columns and 'close' in data.columns:
+        # Price trend = close above optimized SMA period
+        price_trend = data['close'] > data[sma_column]
         trend_filter = trend_filter | price_trend  # OR logic: either ADX strong OR price trending
+    elif 'SMA_50' in data.columns and 'close' in data.columns:
+        # Fallback to SMA_50 if optimized period not available
+        price_trend = data['close'] > data['SMA_50']
+        trend_filter = trend_filter | price_trend
 
     if 'RSI_14' in data.columns:
-        # Oversold bailout: If RSI is very low (< 25), allow buying regardless of trend
-        # This catches "V-shape" bottoms where trend is broken but asset is cheap
-        oversold_bailout = data['RSI_14'] < 25
+        # More aggressive oversold condition - optimized threshold
+        oversold_bailout = data['RSI_14'] < rsi_oversold_threshold
         trend_filter = trend_filter | oversold_bailout
     
-    # Add additional oversold conditions for more aggressive dip buying
+    # Add additional oversold conditions with optimized thresholds
     if 'WILLR_14' in data.columns:
-        # Williams %R below -80 is extremely oversold
-        willr_oversold = data['WILLR_14'] < -80
+        # Williams %R below optimized threshold (was static -80)
+        willr_oversold = data['WILLR_14'] < willr_threshold
         trend_filter = trend_filter | willr_oversold
         
     if 'STOCHk_14_3_3' in data.columns:
-        # Stochastic %K below 15 is very oversold
-        stoch_oversold = data['STOCHk_14_3_3'] < 15
+        # Stochastic %K below optimized threshold (was static 15)
+        stoch_oversold = data['STOCHk_14_3_3'] < stoch_threshold
         trend_filter = trend_filter | stoch_oversold
     
     data['trend_filter'] = trend_filter

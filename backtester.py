@@ -76,9 +76,13 @@ class Backtester:
         signals = signals.fillna(0) # Safeguard against any NaNs
 
         for i in range(1, len(self.data)):
-            # Buy signal
+            # Buy signal - simple universal position sizing
             if signals.iloc[i] == 1 and self.position is None:
-                self.position = {'entry_price': self.data['close'].iloc[i], 'entry_date': self.data.index[i], 'size': self.current_capital / self.data['close'].iloc[i]}
+                self.position = {
+                    'entry_price': self.data['close'].iloc[i], 
+                    'entry_date': self.data.index[i], 
+                    'size': self.current_capital / self.data['close'].iloc[i]
+                }
 
             # Sell signal
             elif signals.iloc[i] == -1 and self.position is not None:
