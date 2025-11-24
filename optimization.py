@@ -313,30 +313,32 @@ def universal_strategy(data, params):
     # When both buy and sell trigger, choose the stronger signal DETERMINISTICALLY
     conflicting_bars = buy_signals & sell_signals
     if conflicting_bars.any():
-        # On conflicting bars, choose based on absolute score difference (deterministic)
+        # FIXED: Use percentage-based excess to eliminate sell bias
+        # Previous logic used absolute excess which favored sell signals with naturally higher scores
         buy_threshold = params['buy_score_threshold']
         sell_threshold = params['sell_score_threshold']
         
-        buy_excess = buy_score_persistent - buy_threshold
-        sell_excess = sell_score_persistent - sell_threshold
+        # Use percentage excess to normalize comparison
+        buy_excess_pct = (buy_score_persistent - buy_threshold) / buy_threshold
+        sell_excess_pct = (sell_score_persistent - sell_threshold) / sell_threshold
         
         # Debug the first few conflicts
         conflict_indices = conflicting_bars[conflicting_bars].index[:3]
         if len(conflict_indices) > 0:
-            print(f"🔍 CONFLICT RESOLUTION DEBUG (first 3 conflicts):")
+            print(f"🔍 CONFLICT RESOLUTION DEBUG (first 3 conflicts - PERCENTAGE-BASED):")
             for idx in conflict_indices:
                 b_score = buy_score_persistent[idx]
                 s_score = sell_score_persistent[idx]
-                b_excess = buy_excess[idx]
-                s_excess = sell_excess[idx]
-                print(f"   Index {idx}: buy_score={b_score:.1f} (thresh={buy_threshold}, excess={b_excess:.1f}) vs sell_score={s_score:.1f} (thresh={sell_threshold}, excess={s_excess:.1f})")
+                b_excess_pct = buy_excess_pct[idx]
+                s_excess_pct = sell_excess_pct[idx]
+                print(f"   Index {idx}: buy_score={b_score:.1f} (thresh={buy_threshold}, excess={b_excess_pct:.1%}) vs sell_score={s_score:.1f} (thresh={sell_threshold}, excess={s_excess_pct:.1%})")
         
-        # Where buy excess is greater, keep buy signal and remove sell
-        stronger_buy = conflicting_bars & (buy_excess > sell_excess)
+        # Where buy percentage excess is greater, keep buy signal and remove sell
+        stronger_buy = conflicting_bars & (buy_excess_pct > sell_excess_pct)
         sell_signals.loc[stronger_buy] = False
         
-        # Where sell excess is greater or equal, keep sell signal and remove buy  
-        stronger_sell = conflicting_bars & (sell_excess >= buy_excess)
+        # Where sell percentage excess is greater or equal, keep sell signal and remove buy  
+        stronger_sell = conflicting_bars & (sell_excess_pct >= buy_excess_pct)
         buy_signals.loc[stronger_sell] = False
         
         # Debug summary
@@ -797,10 +799,18 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
             
             # Optimize parameters for each regime separately
             for regime in ['bull', 'bear', 'crash', 'sideways']:
-                # Score thresholds for each regime (using ALL active indicators)
-                regime_max_threshold = min(8, actual_active)  # Same as base threshold logic
-                params[f'{regime}_buy_score_threshold'] = trial.suggest_int(f'{regime}_buy_score_threshold', 1, regime_max_threshold)
-                params[f'{regime}_sell_score_threshold'] = trial.suggest_int(f'{regime}_sell_score_threshold', 1, regime_max_threshold)
+                # Score thresholds for each regime (ADJUSTED for market conditions)
+                if regime in ['bull', 'sideways']:
+                    # Bull/sideways markets: indicators rarely oversold, use lower thresholds
+                    regime_buy_max = min(3, actual_active)  # Cap at 3 for trending markets
+                    regime_sell_max = min(8, actual_active)  # Normal range for sells
+                    params[f'{regime}_buy_score_threshold'] = trial.suggest_int(f'{regime}_buy_score_threshold', 1, regime_buy_max)
+                    params[f'{regime}_sell_score_threshold'] = trial.suggest_int(f'{regime}_sell_score_threshold', 1, regime_sell_max)
+                else:
+                    # Bear/crash markets: can use higher thresholds as more indicators trigger
+                    regime_max_threshold = min(8, actual_active)  # Same as base threshold logic  
+                    params[f'{regime}_buy_score_threshold'] = trial.suggest_int(f'{regime}_buy_score_threshold', 1, regime_max_threshold)
+                    params[f'{regime}_sell_score_threshold'] = trial.suggest_int(f'{regime}_sell_score_threshold', 1, regime_max_threshold)
                 
                 # Regime-specific thresholds for ALL indicators (sample key ones for now)
                 # Note: In practice, we'd generate these for all active indicators, but that's too many parameters
