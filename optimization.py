@@ -6,6 +6,18 @@ from backtester import Backtester
 import joblib
 from joblib import Parallel, delayed
 
+# Import signal optimization enhancements
+try:
+    from signal_optimization import (
+        analyze_signal_distribution, 
+        enhance_signal_scoring,
+        optimize_signal_parameters
+    )
+    SIGNAL_OPTIMIZATION_AVAILABLE = True
+except ImportError:
+    SIGNAL_OPTIMIZATION_AVAILABLE = False
+    print("⚠️  Signal optimization module not available - using basic optimization")
+
 def universal_strategy(data, params):
     """
     A universal strategy that uses a scoring system to combine signals.
@@ -186,6 +198,173 @@ def universal_strategy(data, params):
         if conflicting_bars.any():
             print(f"  CONFLICTS RESOLVED: {conflicting_bars.sum()} conflicting bars fixed")
 
+    signals = pd.Series(0, index=data.index)
+    signals.loc[buy_signals] = 1
+    signals.loc[sell_signals] = -1
+    
+    return signals
+
+def enhanced_universal_strategy(data, params, use_signal_optimization=True):
+    """
+    Enhanced universal strategy with signal optimization features from Enhancement #1
+    """
+    if not use_signal_optimization or not SIGNAL_OPTIMIZATION_AVAILABLE:
+        print(f"🔄 FALLBACK: Using original strategy (opt={use_signal_optimization}, avail={SIGNAL_OPTIMIZATION_AVAILABLE})")
+        return universal_strategy(data, params)
+    
+    print(f"🚀 ENHANCED: Using enhanced strategy with signal optimization")
+    
+    # Enhancement #1: Use adaptive thresholds and confidence weighting
+    enhanced_params = enhance_signal_scoring(data, params)
+    
+    # Get base signal scores using the enhanced parameters
+    buy_score = pd.Series(0.0, index=data.index)
+    sell_score = pd.Series(0.0, index=data.index)
+    
+    # Extract active indicators (same logic as original)
+    meta_flags = {
+        'buy_score_threshold', 'sell_score_threshold', 'signal_persistence_days',
+        'min_hold_days', 'require_confirmation', 'confirmation_weight',
+        'use_weighted_scoring', 'use_volatility_sizing', 'use_dynamic_thresholds',
+        'use_regime_detection', 'use_dynamic_position_sizing', 'use_trend_filter',
+        'trend_adx_threshold', 'trend_rsi_oversold', 'trend_willr_threshold',
+        'trend_stoch_threshold', 'trend_sma_period', 'trend_filter_weight',
+        'volatility_threshold', 'volatility_multiplier', 'volatility_percentile_threshold',
+        'high_vol_threshold_reduction', 'buy_pct_min', 'buy_pct_max',
+        'sell_pct_min', 'sell_pct_max', 'use_indicators_ready',
+        # New enhancement parameters
+        'adaptive_buy_threshold', 'adaptive_sell_threshold', 
+        'buy_confidence_weights', 'sell_confidence_weights', 'market_volatility'
+    }
+    
+    active_indicators = [
+        param.replace('use_', '')
+        for param in enhanced_params.keys()
+        if param.startswith('use_')
+        and enhanced_params[param] is True
+        and param not in meta_flags
+    ]
+    
+    # Get confidence weights and adaptive thresholds
+    buy_confidence = enhanced_params.get('buy_confidence_weights', pd.Series(1.0, index=data.index))
+    sell_confidence = enhanced_params.get('sell_confidence_weights', pd.Series(1.0, index=data.index))
+    adaptive_buy_thresh = enhanced_params.get('adaptive_buy_threshold', enhanced_params['buy_score_threshold'])
+    adaptive_sell_thresh = enhanced_params.get('adaptive_sell_threshold', enhanced_params['sell_score_threshold'])
+    
+    # Signal persistence with enhancement
+    signal_persistence_days = enhanced_params.get('signal_persistence_days', 2)
+    
+    # Initialize enhanced persistent scores  
+    buy_score_persistent = pd.Series(0.0, index=data.index)
+    sell_score_persistent = pd.Series(0.0, index=data.index)
+    
+    # Process indicators with confidence weighting
+    indicators_processed = 0
+    
+    for indicator in active_indicators:
+        if indicator not in data.columns:
+            continue
+            
+        if indicator.startswith('pattern_') or indicator.startswith('dl_signal_'):
+            # Boolean indicators with confidence weighting
+            buy_param = enhanced_params.get(f'{indicator}_buy')
+            sell_param = enhanced_params.get(f'{indicator}_sell')
+            
+            if buy_param is not None and data[indicator].any():
+                raw_signals = (data[indicator] == buy_param).astype(float)
+                # Apply confidence weighting
+                weighted_signals = raw_signals * buy_confidence
+                buy_score_persistent += weighted_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
+                indicators_processed += 1
+                
+            if sell_param is not None and data[indicator].any():
+                raw_signals = (data[indicator] == sell_param).astype(float)
+                weighted_signals = raw_signals * sell_confidence
+                sell_score_persistent += weighted_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
+        else:
+            # Numerical indicators with confidence weighting
+            buy_threshold = enhanced_params.get(f'{indicator}_buy')
+            sell_threshold = enhanced_params.get(f'{indicator}_sell')
+            
+            if buy_threshold is not None:
+                raw_signals = (data[indicator] < buy_threshold).astype(float)
+                weighted_signals = raw_signals * buy_confidence
+                buy_score_persistent += weighted_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
+                indicators_processed += 1
+                
+            if sell_threshold is not None:
+                raw_signals = (data[indicator] > sell_threshold).astype(float)
+                weighted_signals = raw_signals * sell_confidence
+                sell_score_persistent += weighted_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
+    
+    # Apply adaptive thresholds instead of static ones
+    if isinstance(adaptive_buy_thresh, pd.Series):
+        buy_signals = buy_score_persistent >= adaptive_buy_thresh
+    else:
+        buy_signals = buy_score_persistent >= adaptive_buy_thresh
+        
+    if isinstance(adaptive_sell_thresh, pd.Series):
+        sell_signals = sell_score_persistent >= adaptive_sell_thresh
+    else:
+        sell_signals = sell_score_persistent >= adaptive_sell_thresh
+    
+    # Apply trend filter (same logic as original)
+    if enhanced_params.get('use_trend_filter', False):
+        # Use the same trend filter logic as the original function
+        adx_threshold = enhanced_params.get('trend_adx_threshold', 20)
+        rsi_oversold_threshold = enhanced_params.get('trend_rsi_oversold', 35)
+        willr_threshold = enhanced_params.get('trend_willr_threshold', -80)
+        stoch_threshold = enhanced_params.get('trend_stoch_threshold', 15)
+        sma_period = enhanced_params.get('trend_sma_period', 50)
+        
+        dynamic_trend_filter = pd.Series(True, index=data.index)
+        
+        if 'ADX_14' in data.columns:
+            adx_trend = data['ADX_14'] > adx_threshold
+            dynamic_trend_filter = dynamic_trend_filter & adx_trend
+        
+        sma_column = f'SMA_{sma_period}'
+        if sma_column in data.columns and 'close' in data.columns:
+            price_trend = data['close'] > data[sma_column]
+            dynamic_trend_filter = dynamic_trend_filter | price_trend
+        elif 'SMA_50' in data.columns and 'close' in data.columns:
+            price_trend = data['close'] > data['SMA_50']
+            dynamic_trend_filter = dynamic_trend_filter | price_trend
+
+        if 'RSI_14' in data.columns:
+            oversold_bailout = data['RSI_14'] < rsi_oversold_threshold
+            dynamic_trend_filter = dynamic_trend_filter | oversold_bailout
+        
+        if 'WILLR_14' in data.columns:
+            willr_oversold = data['WILLR_14'] < willr_threshold
+            dynamic_trend_filter = dynamic_trend_filter | willr_oversold
+            
+        if 'STOCHk_14_3_3' in data.columns:
+            stoch_oversold = data['STOCHk_14_3_3'] < stoch_threshold
+            dynamic_trend_filter = dynamic_trend_filter | stoch_oversold
+        
+        buy_signals = buy_signals & dynamic_trend_filter
+    
+    # Handle conflicts with enhanced logic
+    conflicting_bars = buy_signals & sell_signals
+    if conflicting_bars.any():
+        # Use confidence-weighted excess for conflict resolution
+        buy_excess = (buy_score_persistent * buy_confidence) - (adaptive_buy_thresh if isinstance(adaptive_buy_thresh, (int, float)) else adaptive_buy_thresh.fillna(enhanced_params['buy_score_threshold']))
+        sell_excess = (sell_score_persistent * sell_confidence) - (adaptive_sell_thresh if isinstance(adaptive_sell_thresh, (int, float)) else adaptive_sell_thresh.fillna(enhanced_params['sell_score_threshold']))
+        
+        stronger_buy = conflicting_bars & (buy_excess > sell_excess)
+        sell_signals.loc[stronger_buy] = False
+        
+        stronger_sell = conflicting_bars & (sell_excess >= buy_excess)
+        buy_signals.loc[stronger_sell] = False
+    
+    # Debug output for enhanced strategy
+    print(f"📈 ENHANCED STRATEGY: {indicators_processed} indicators, {buy_signals.sum()} buy, {sell_signals.sum()} sell signals")
+    if isinstance(adaptive_buy_thresh, pd.Series):
+        print(f"   📊 Adaptive thresholds: buy={adaptive_buy_thresh.mean():.1f}±{adaptive_buy_thresh.std():.1f}, sell={adaptive_sell_thresh.mean():.1f}±{adaptive_sell_thresh.std():.1f}")
+    else:
+        print(f"   📊 Adaptive thresholds: buy={adaptive_buy_thresh}, sell={adaptive_sell_thresh}")
+    
     signals = pd.Series(0, index=data.index)
     signals.loc[buy_signals] = 1
     signals.loc[sell_signals] = -1
@@ -417,12 +596,13 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
     try:
         strategy_name = ' + '.join(active_indicators)
         
-        # Test the strategy function first
+        # Test the strategy function first - use original strategy for consistency
+        print(f"🔍 TRIAL {trial.number}: Using original strategy for consistent results")
         signals = universal_strategy(data, params)
         buy_signals = (signals == 1).sum()
         sell_signals = (signals == -1).sum()
         
-        if buy_signals == 0 and sell_signals == 0:
+        if buy_signals + sell_signals == 0:
             print(f"DEBUG: No trades generated for trial {trial.number}. Signals: {signals}")
             return -1e9
             
@@ -632,6 +812,15 @@ def run_optimization(data, n_trials=1000, n_jobs=None, progress_callback=None, t
         start_cap = summary.get('starting_capital', 100000)
         end_cap = summary['ending_capital']
         true_return = (end_cap - start_cap) / start_cap * 100
+
+        # Debug: Track return calculation discrepancy
+        original_return = getattr(t, 'value', 0)
+        if abs(true_return - original_return) > 1.0:  # More than 1% difference
+            print(f"🔍 RETURN DISCREPANCY DETECTED:")
+            print(f"   Original optimization return: {original_return:.2f}%")
+            print(f"   Final sanity check return: {true_return:.2f}%")
+            print(f"   Difference: {true_return - original_return:.2f}%")
+            print(f"   Strategy: {strategy_name[:50]}...")
 
         # Overwrite trial.value so the UI header uses the true return
         try:
