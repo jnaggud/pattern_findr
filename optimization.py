@@ -162,8 +162,14 @@ def universal_strategy(data, params):
     signal_persistence_days = params.get('signal_persistence_days', 2)  # Now optimized by Optuna!
     crash_persistence_days = params.get('crash_signal_persistence', signal_persistence_days)  # Enhanced crash persistence
     
+    # PERFORMANCE OPTIMIZATION: Pre-calculate regimes once if using regime-aware persistence
+    if use_regime_aware and crash_persistence_days != signal_persistence_days:
+        regime_series = pd.Series([detect_market_regime(data, i) for i in range(len(data))], index=data.index)
+        use_enhanced_persistence = True
+    else:
+        use_enhanced_persistence = False
+    
     # Create persistent buy/sell scores that decay over time
-    # For regime-aware strategies, we'll apply different persistence windows by regime
     buy_score_persistent = pd.Series(0.0, index=data.index)
     sell_score_persistent = pd.Series(0.0, index=data.index)
 
@@ -181,20 +187,16 @@ def universal_strategy(data, params):
                 # Add 1.0 to buy score when condition is met, then decay over next days
                 raw_signals = (data[indicator] == buy_param).astype(float)
                 
-                # Apply regime-aware persistence if enabled
-                if use_regime_aware:
-                    # Calculate regime-aware persistence for each point
-                    persistence_scores = pd.Series(0.0, index=data.index)
-                    for i in range(len(data)):
-                        current_regime = detect_market_regime(data, i)
-                        persistence_window = crash_persistence_days if current_regime in ['crash', 'bear'] else signal_persistence_days
-                        
-                        # Apply rolling window around current point
-                        start_idx = max(0, i - persistence_window + 1)
-                        end_idx = i + 1
-                        window_sum = raw_signals.iloc[start_idx:end_idx].sum()
-                        persistence_scores.iloc[i] = window_sum
+                # OPTIMIZED: Apply regime-aware persistence using vectorized operations
+                if use_enhanced_persistence:
+                    # Use different rolling windows based on pre-calculated regime
+                    crash_mask = regime_series.isin(['crash', 'bear'])
+                    normal_persistence = raw_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
+                    crash_persistence = raw_signals.rolling(window=crash_persistence_days, min_periods=1).sum()
                     
+                    # Combine based on regime
+                    persistence_scores = normal_persistence.copy()
+                    persistence_scores[crash_mask] = crash_persistence[crash_mask]
                     buy_score_persistent += persistence_scores
                 else:
                     buy_score_persistent += raw_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
@@ -230,20 +232,16 @@ def universal_strategy(data, params):
                 # Add 1.0 to buy score when condition is met, then decay over next days
                 raw_signals = (data[indicator] < buy_threshold).astype(float)
                 
-                # Apply regime-aware persistence if enabled
-                if use_regime_aware:
-                    # Calculate regime-aware persistence for each point
-                    persistence_scores = pd.Series(0.0, index=data.index)
-                    for i in range(len(data)):
-                        current_regime = detect_market_regime(data, i)
-                        persistence_window = crash_persistence_days if current_regime in ['crash', 'bear'] else signal_persistence_days
-                        
-                        # Apply rolling window around current point
-                        start_idx = max(0, i - persistence_window + 1)
-                        end_idx = i + 1
-                        window_sum = raw_signals.iloc[start_idx:end_idx].sum()
-                        persistence_scores.iloc[i] = window_sum
+                # OPTIMIZED: Apply regime-aware persistence using vectorized operations
+                if use_enhanced_persistence:
+                    # Use different rolling windows based on pre-calculated regime
+                    crash_mask = regime_series.isin(['crash', 'bear'])
+                    normal_persistence = raw_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
+                    crash_persistence = raw_signals.rolling(window=crash_persistence_days, min_periods=1).sum()
                     
+                    # Combine based on regime
+                    persistence_scores = normal_persistence.copy()
+                    persistence_scores[crash_mask] = crash_persistence[crash_mask]
                     buy_score_persistent += persistence_scores
                 else:
                     buy_score_persistent += raw_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
@@ -780,7 +778,11 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
     if params.get('enable_regime_aware', False) and SIMPLE_REGIME_AVAILABLE:
         # Regime-aware signal persistence - longer for crashes to catch multi-day bottoms
         params['signal_persistence_days'] = trial.suggest_int('signal_persistence_days', 2, 5)  # Crash-optimized range
-        params['crash_signal_persistence'] = trial.suggest_int('crash_signal_persistence', 3, 7)  # Extra persistence for crashes
+        
+        # PERFORMANCE OPTIMIZATION: Only suggest enhanced persistence if it's actually different
+        # This allows Optuna to sometimes choose equal values for faster computation
+        base_persistence = params['signal_persistence_days']
+        params['crash_signal_persistence'] = trial.suggest_int('crash_signal_persistence', base_persistence, max(base_persistence + 2, 7))
     else:
         params['signal_persistence_days'] = trial.suggest_int('signal_persistence_days', 1, 5)
     
