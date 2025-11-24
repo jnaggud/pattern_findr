@@ -2625,7 +2625,7 @@ if st.sidebar.button("Find and Optimize Top Strategies"):
             with st.spinner("Running optimization..."):
                 # TensorFlow already configured for CPU-only at startup
                 print(f"🔧 Running optimization with CPU-only TensorFlow")
-                top_trials = run_optimization(enriched_data, n_trials=n_trials, n_jobs=n_jobs, progress_callback=progress_callback, trade_preference=trade_preference, enable_position_sizing=enable_position_sizing)
+                top_trials = run_optimization(enriched_data, n_trials=n_trials, n_jobs=n_jobs, progress_callback=progress_callback, trade_preference=trade_preference, enable_position_sizing=enable_position_sizing, ticker=ticker)
             
             # Show completion
             elapsed_total = time.time() - start_time

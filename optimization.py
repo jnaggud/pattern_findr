@@ -24,9 +24,36 @@ try:
     from position_sizing import PositionSizer, optimize_position_sizing_parameters
     POSITION_SIZING_AVAILABLE = True
     print("✅ Enhancement #2: Position Sizing & Risk Management available")
-except ImportError:
+except ImportError as e:
     POSITION_SIZING_AVAILABLE = False
-    print("⚠️  Position sizing module not available - using basic backtesting")
+    print(f"⚠️  Enhancement #2 not available: {e}")
+except Exception as e:
+    POSITION_SIZING_AVAILABLE = False
+    print(f"❌ Enhancement #2 import error: {e}")
+
+# Import Detailed Logging System
+try:
+    from detailed_logger import create_comprehensive_strategy_log
+    DETAILED_LOGGING_AVAILABLE = True
+    print("✅ Detailed CSV logging system available")
+except ImportError as e:
+    DETAILED_LOGGING_AVAILABLE = False
+    print(f"⚠️  Detailed logging not available: {e}")
+except Exception as e:
+    DETAILED_LOGGING_AVAILABLE = False
+    print(f"❌ Detailed logging import error: {e}")
+
+# Import Enhancement #3: Market Regime Detection
+try:
+    from market_regime_detector import MarketRegimeDetector, create_regime_aware_strategy_params
+    MARKET_REGIME_AVAILABLE = True
+    print("✅ Enhancement #3: Market Regime Detection available")
+except ImportError as e:
+    MARKET_REGIME_AVAILABLE = False
+    print(f"⚠️  Enhancement #3 not available: {e}")
+except Exception as e:
+    MARKET_REGIME_AVAILABLE = False
+    print(f"❌ Enhancement #3 import error: {e}")
 
 def universal_strategy(data, params):
     """
@@ -52,6 +79,8 @@ def universal_strategy(data, params):
         'buy_pct_min',
         'buy_pct_max', 
         'sell_pct_min',
+        # Enhancement #3: Market Regime Detection
+        'enable_market_regime',
         # Enhancement #2: Position Sizing & Risk Management
         'enable_position_sizing',
         'max_position_pct',
@@ -525,32 +554,35 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
         if range_min is None:
             data_min, data_max = data[indicator].min(), data[indicator].max()
             range_size = data_max - data_min
-            # Expand by 25% beyond actual data range to find extreme strategies
-            range_min = data_min - 0.25 * range_size
-            range_max = data_max + 0.25 * range_size
-        
-        buy_param = trial.suggest_float(f'{indicator}_buy', range_min, range_max)
-        sell_param = trial.suggest_float(f'{indicator}_sell', range_min, range_max)
-        
-        # Ensure buy < sell for momentum indicators (buy oversold, sell overbought)
-        if buy_param > sell_param:
-            buy_param, sell_param = sell_param, buy_param
-            
-        params[f'{indicator}_buy'] = buy_param
-        params[f'{indicator}_sell'] = sell_param
-
-    for indicator in boolean_indicators:
-        # === APPROACH A: ALWAYS include all boolean indicators ===
-        # Use trial.suggest_categorical with single True value to ensure it's stored in trial.params
-        params[f'use_{indicator}'] = trial.suggest_categorical(f'use_{indicator}', [True])
-        active_indicators.append(indicator)
-        
-        buy_param = trial.suggest_categorical(f'{indicator}_buy', [True, False])
-        sell_param = trial.suggest_categorical(f'{indicator}_sell', [True, False])
-        params[f'{indicator}_buy'] = buy_param
-        params[f'{indicator}_sell'] = sell_param
-
-    # === DIRECT OPTUNA OPTIMIZATION OF SIGNAL THRESHOLDS ===
+            # Suggest indicator-specific buy/sell thresholds within CRASH-AWARE ranges
+            if indicator in universal_strategy_thresholds:
+                min_val, max_val = universal_strategy_thresholds[indicator]
+                params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', min_val, max_val)
+                params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', min_val, max_val)
+            else:
+                # CRASH-AWARE ranges that can catch market bottoms like April 2025
+                if 'RSI' in indicator or 'MFI' in indicator:
+                    # RSI: Must be able to catch RSI 21.6 (April bottom), so use reasonable range
+                    params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', 20, 40)  # Was 10-40
+                    params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', 60, 80)  # Was 60-90
+                elif 'STOCH' in indicator:
+                    params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', 10, 30)
+                    params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', 70, 90)
+                elif 'WILLR' in indicator:
+                    # Williams %R: Must catch -84.5 (April bottom)
+                    params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', -90, -50)  # Was -90 to -60
+                    params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', -40, -10)
+                elif 'CCI' in indicator:
+                    params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', -200, -50)  # More oversold range
+                    params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', 50, 150)
+                elif 'MACD' in indicator and not indicator.endswith('s'):
+                    # MACD: Must work with bearish MACD during crashes (-16.975 at April bottom)
+                    params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', -10, 2)  # Was -5 to 2 
+                    params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', -2, 10)  # Was -2 to 5
+                else:
+                    # Generic ranges for unknown indicators
+                    params[f'{indicator}_buy'] = trial.suggest_float(f'{indicator}_buy', -100, 50)
+                    params[f'{indicator}_sell'] = trial.suggest_float(f'{indicator}_sell', -50, 100)  # === DIRECT OPTUNA OPTIMIZATION OF SIGNAL THRESHOLDS ===
     # Let Optuna directly optimize the exact number of indicators needed
     # This removes all percentage-based constraints and artificial minimums
     
@@ -632,6 +664,18 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
         params['max_position_pct'] = 1.00
         params['kelly_optimization'] = False
         params['volatility_adjustment'] = False
+    
+    # === ENHANCEMENT #3: MARKET REGIME DETECTION ===
+    if MARKET_REGIME_AVAILABLE:
+        params['enable_market_regime'] = trial.suggest_categorical('enable_market_regime', [True, False])
+        
+        if params['enable_market_regime']:
+            # When regime detection is enabled, it will override thresholds dynamically
+            print(f"   🎯 Market regime adaptation enabled - thresholds will adapt to market conditions")
+        else:
+            print(f"   📊 Using static thresholds for all market conditions")
+    else:
+        params['enable_market_regime'] = False
         params['max_total_exposure'] = 1.00
     
     # Keep it simple - core strategy only
@@ -745,7 +789,7 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
 
 # Removed old batch function - now using joblib-based individual trial optimization
 
-def run_optimization(data, n_trials=1000, n_jobs=None, progress_callback=None, trade_preference=0.5, enable_position_sizing=True):
+def run_optimization(data, n_trials=1000, n_jobs=None, progress_callback=None, trade_preference=0.5, enable_position_sizing=True, ticker="SPY"):
     """
     Runs the new dynamic optimization and returns top 3 strategies.
     
@@ -903,11 +947,42 @@ def run_optimization(data, n_trials=1000, n_jobs=None, progress_callback=None, t
             bt = Backtester(data, strategy_name or "Top Trial", universal_strategy, params)
         
         bt.run()
-        _, summary = bt.get_results()
+        trade_log, summary = bt.get_results()
 
         start_cap = summary.get('starting_capital', 100000)
         end_cap = summary['ending_capital']
         true_return = (end_cap - start_cap) / start_cap * 100
+        
+        # Generate comprehensive CSV log for analysis
+        if DETAILED_LOGGING_AVAILABLE and len(sanitized_top_trials) < 3:  # Only log top 3 strategies
+            try:
+                # Generate signals and scores for logging
+                signals_for_log = universal_strategy(data, params)
+                
+                # Create buy/sell score series (simplified for logging)
+                buy_scores_log = pd.Series(0, index=data.index)
+                sell_scores_log = pd.Series(0, index=data.index)
+                
+                # Use the ticker parameter passed to run_optimization
+                
+                # Create comprehensive log
+                log_filepath = create_comprehensive_strategy_log(
+                    ticker=ticker,
+                    data=data,
+                    strategy_params=params,
+                    signals=signals_for_log,
+                    buy_scores_series=buy_scores_log,
+                    sell_scores_series=sell_scores_log,
+                    trades_df=trade_log,
+                    trial_number=getattr(t, 'number', len(sanitized_top_trials) + 1),
+                    return_pct=true_return
+                )
+                
+                print(f"📊 Created detailed log for strategy #{len(sanitized_top_trials) + 1}")
+                
+            except Exception as e:
+                print(f"⚠️  Failed to create detailed log: {e}")
+                # Continue without failing the optimization
 
         # Debug: Track return calculation discrepancy
         original_return = getattr(t, 'value', 0)
