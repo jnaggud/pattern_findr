@@ -1,8 +1,19 @@
-import pandas as pd
-import pandas_ta as ta
+import os
 import warnings
+import pandas as pd
+import numpy as np
+import pandas_ta as ta
 from advanced_indicators import calculate_advanced_technical_signals, ADVANCED_INDICATORS
-from enhanced_pattern_detector import integrate_enhanced_patterns_with_optimization, ENHANCED_PATTERN_INDICATORS
+
+try:
+    from enhanced_pattern_detector import integrate_enhanced_patterns_with_optimization, ENHANCED_PATTERN_INDICATORS
+    # NO PRINT STATEMENTS - causes spam during indicator calculation
+except Exception as e:
+    # NO PRINT STATEMENTS - causes spam during indicator calculation
+    ENHANCED_PATTERN_INDICATORS = []
+    def integrate_enhanced_patterns_with_optimization(data):
+        return {}
+from ml_indicators import integrate_ml_indicators, ML_INDICATOR_LIST
 
 # Suppress specific FutureWarning from pandas_ta
 warnings.filterwarnings("ignore", category=FutureWarning, module="pandas_ta.candles.ha")
@@ -15,29 +26,177 @@ def get_all_indicators(data):
     data = data.sort_values(by='date').set_index('date')
 
     # Create a custom strategy with a curated list of reliable indicators
-    custom_strategy = ta.Strategy(
-        name="Comprehensive Strategy",
-        description="A collection of reliable, non-TA-Lib indicators",
-        ta=[
-            # Momentum
-            {"kind": "rsi"}, {"kind": "macd"}, {"kind": "ppo"}, {"kind": "roc"}, 
-            {"kind": "stoch"}, {"kind": "bop"}, {"kind": "cmo"}, {"kind": "willr"},
+    # Some pandas_ta versions (like the lightweight ones on certain platforms)
+    # do not expose ta.Strategy at all. In that case we skip the strategy
+    # application and rely on our custom/fallback indicators below.
+    custom_strategy = None
+    try:
+        custom_strategy = ta.Strategy(
+            name="Comprehensive Strategy",
+            description="A collection of reliable, non-TA-Lib indicators with bear market enhancements",
+            ta=[
+                # Momentum
+                {"kind": "rsi"}, {"kind": "macd"}, {"kind": "ppo"}, {"kind": "roc"}, 
+                {"kind": "stoch"}, {"kind": "bop"}, {"kind": "cmo"}, {"kind": "willr"},
+                {"kind": "cci"}, {"kind": "tsi"}, {"kind": "uo"},  # Bear market momentum indicators
+                {"kind": "kdj"}, {"kind": "pgo"}, {"kind": "squeeze"},  # Additional momentum
+                {"kind": "ao"}, {"kind": "bias"},  # Awesome Oscillator, Bias
 
-            # Trend
-            {"kind": "adx"}, {"kind": "aroon"}, {"kind": "psar"}, {"kind": "vwap"}, 
-            {"kind": "ichimoku"}, {"kind": "sma", "length": 50}, {"kind": "ema", "length": 50},
+                # Trend
+                {"kind": "adx"}, {"kind": "aroon"}, {"kind": "psar"}, {"kind": "vwap"}, 
+                {"kind": "ichimoku"}, {"kind": "sma", "length": 50}, {"kind": "ema", "length": 50},
+                {"kind": "supertrend"}, {"kind": "vortex"},  # Bear market trend indicators
+                {"kind": "dema", "length": 20}, {"kind": "tema", "length": 20},  # Double/Triple EMA
+                {"kind": "hma", "length": 20}, {"kind": "wma", "length": 20},  # Hull/Weighted MA
+                {"kind": "kama", "length": 20}, {"kind": "t3", "length": 20},  # Adaptive MAs
+                {"kind": "qstick"},  # Quantitative Stick (ht_trendline added custom below)
 
-            # Volatility
-            {"kind": "bbands"}, {"kind": "atr"}, {"kind": "donchian", "lower_length": 20, "upper_length": 20},
-            {"kind": "kc"},
+                # Volatility
+                {"kind": "bbands"}, {"kind": "atr"}, {"kind": "donchian", "lower_length": 20, "upper_length": 20},
+                {"kind": "kc"}, {"kind": "ui"},  # ui = Ulcer Index (downside volatility)
+                {"kind": "massi"}, {"kind": "natr"}, {"kind": "thermo"},  # Additional volatility
+                {"kind": "hwc"},  # Holt-Winter Channel
+                {"kind": "true_range"},  # True Range
 
-            # Volume
-            {"kind": "obv"}, {"kind": "cmf"}, {"kind": "mfi"}, {"kind": "eom"}, {"kind": "ad"}
-        ]
-    )
+                # Volume
+                {"kind": "obv"}, {"kind": "cmf"}, {"kind": "mfi"}, {"kind": "eom"}, {"kind": "ad"},
+                {"kind": "pvt"},  # Price Volume Trend
+                {"kind": "nvi"}, {"kind": "pvi"},  # Negative/Positive Volume Index
+                {"kind": "vwma", "length": 20},  # Volume Weighted MA
+                {"kind": "kvo"},  # Klinger Volume Oscillator
+                {"kind": "aobv"}  # Archer On-Balance Volume
+            ]
+        )
+    except AttributeError:
+        # Older / minimal pandas_ta builds without Strategy support
+        custom_strategy = None
 
-    # Apply the custom strategy
-    data.ta.strategy(custom_strategy)
+    # Apply the custom strategy (with error handling for missing indicators)
+    if custom_strategy is not None:
+        try:
+            data.ta.strategy(custom_strategy)
+        except AttributeError as e:
+            # Some indicators might not be available in this pandas_ta version
+            # Continue with available indicators
+            print(f"Note: Some indicators not available in pandas_ta, will compute custom versions: {e}")
+    
+    # --- Add Custom Implementations for Missing Indicators ---
+    
+    # Hilbert Transform Trendline (if not available from pandas_ta)
+    if 'HT_TRENDLINE' not in data.columns and 'close' in data.columns:
+        # Simple approximation using weighted moving average
+        data['HT_TRENDLINE'] = data['close'].ewm(span=7, adjust=False).mean()
+    
+    # Pretty Good Oscillator (PGO) - if missing
+    if 'PGO_14' not in data.columns and 'close' in data.columns:
+        sma_14 = data['close'].rolling(window=14).mean()
+        atr_14 = data['high'].rolling(14).max() - data['low'].rolling(14).min()
+        data['PGO_14'] = ((data['close'] - sma_14) / atr_14) * 100
+    
+    # Awesome Oscillator (AO) - if missing
+    if 'AO_5_34' not in data.columns and 'high' in data.columns and 'low' in data.columns:
+        median_price = (data['high'] + data['low']) / 2
+        ao_fast = median_price.rolling(window=5).mean()
+        ao_slow = median_price.rolling(window=34).mean()
+        data['AO_5_34'] = ao_fast - ao_slow
+    
+    # Bias Indicator - if missing
+    if 'BIAS_SMA_26' not in data.columns and 'close' in data.columns:
+        sma_26 = data['close'].rolling(window=26).mean()
+        data['BIAS_SMA_26'] = ((data['close'] - sma_26) / sma_26) * 100
+    
+    # QStick - if missing
+    if 'QS_14' not in data.columns and 'open' in data.columns and 'close' in data.columns:
+        data['QS_14'] = (data['close'] - data['open']).rolling(window=14).mean()
+    
+    # TTM Squeeze - if missing (simplified version)
+    if 'SQZ_20_2.0_20_1.5' not in data.columns:
+        # Bollinger Bands
+        if 'BBL_20_2.0' in data.columns and 'BBU_20_2.0' in data.columns:
+            bb_width = data['BBU_20_2.0'] - data['BBL_20_2.0']
+        else:
+            sma_20 = data['close'].rolling(window=20).mean()
+            std_20 = data['close'].rolling(window=20).std()
+            bb_width = 4 * std_20
+        
+        # Keltner Channels
+        if 'KCLe_20_2' in data.columns and 'KCUe_20_2' in data.columns:
+            kc_width = data['KCUe_20_2'] - data['KCLe_20_2']
+        else:
+            ema_20 = data['close'].ewm(span=20, adjust=False).mean()
+            atr = (data['high'] - data['low']).rolling(window=20).mean()
+            kc_width = 4 * atr
+        
+        # Squeeze: 1 when BB inside KC, 0 otherwise
+        data['SQZ_20_2.0_20_1.5'] = (bb_width < kc_width).astype(int)
+    
+    # KDJ - if missing (Stochastic + J line)
+    if 'K_14_3' not in data.columns or 'D_3' not in data.columns:
+        # Calculate Stochastic if needed
+        low_min = data['low'].rolling(window=14).min()
+        high_max = data['high'].rolling(window=14).max()
+        
+        k_value = 100 * ((data['close'] - low_min) / (high_max - low_min))
+        data['K_14_3'] = k_value.rolling(window=3).mean()
+        data['D_3'] = data['K_14_3'].rolling(window=3).mean()
+        data['J_14_3'] = 3 * data['K_14_3'] - 2 * data['D_3']  # J line
+    
+    # Holt-Winter Channel (HWC) - if missing (simplified)
+    if 'HWC_20' not in data.columns and 'close' in data.columns:
+        hwc_ma = data['close'].ewm(span=20, adjust=False).mean()
+        hwc_std = data['close'].rolling(window=20).std()
+        data['HWC_20'] = hwc_ma
+        data['HWCu_20'] = hwc_ma + 2 * hwc_std
+        data['HWCl_20'] = hwc_ma - 2 * hwc_std
+    
+    # MASSI (Mass Index) - if missing
+    if 'MASSI_9_25' not in data.columns and 'high' in data.columns and 'low' in data.columns:
+        range_hl = data['high'] - data['low']
+        ema9 = range_hl.ewm(span=9, adjust=False).mean()
+        ema9_ema9 = ema9.ewm(span=9, adjust=False).mean()
+        mass_ratio = ema9 / ema9_ema9
+        data['MASSI_9_25'] = mass_ratio.rolling(window=25).sum()
+    
+    # Thermo (Thermometer Indicator) - if missing
+    if 'THERMO_20_2_0.5' not in data.columns:
+        data['THERMO_20_2_0.5'] = (data['high'] - data['low']).rolling(window=20).mean()
+    
+    # Negative/Positive Volume Index - if missing
+    if 'NVI' not in data.columns and 'volume' in data.columns:
+        nvi = pd.Series(1000, index=data.index)
+        pvi = pd.Series(1000, index=data.index)
+        
+        for i in range(1, len(data)):
+            price_change = (data['close'].iloc[i] - data['close'].iloc[i-1]) / data['close'].iloc[i-1]
+            
+            if data['volume'].iloc[i] < data['volume'].iloc[i-1]:
+                # Volume decreased - update NVI
+                nvi.iloc[i] = nvi.iloc[i-1] * (1 + price_change)
+                pvi.iloc[i] = pvi.iloc[i-1]
+            else:
+                # Volume increased - update PVI
+                pvi.iloc[i] = pvi.iloc[i-1] * (1 + price_change)
+                nvi.iloc[i] = nvi.iloc[i-1]
+        
+        data['NVI'] = nvi
+        data['PVI'] = pvi
+    
+    # Klinger Volume Oscillator - if missing
+    if 'KVO_34_55_13' not in data.columns and 'volume' in data.columns:
+        # Simplified KVO
+        typical_price = (data['high'] + data['low'] + data['close']) / 3
+        trend = (typical_price > typical_price.shift(1)).astype(int) * 2 - 1  # 1 or -1
+        volume_force = data['volume'] * trend * 100
+        
+        kvo_fast = volume_force.ewm(span=34, adjust=False).mean()
+        kvo_slow = volume_force.ewm(span=55, adjust=False).mean()
+        data['KVO_34_55_13'] = kvo_fast - kvo_slow
+        data['KVOs_13'] = data['KVO_34_55_13'].ewm(span=13, adjust=False).mean()
+    
+    # Archer On-Balance Volume (AOBV) - if missing
+    if 'AOBV' not in data.columns and 'volume' in data.columns:
+        obv = (data['volume'] * ((data['close'] > data['close'].shift(1)).astype(int) * 2 - 1)).cumsum()
+        data['AOBV'] = obv.ewm(span=20, adjust=False).mean()
 
     # --- Add Novel/Custom Indicators ---
 
@@ -54,6 +213,43 @@ def get_all_indicators(data):
     # 3. RSI of VWAP
     if 'VWAP_D' in data.columns:
         data['rsi_vwap'] = ta.rsi(close=data['VWAP_D'], length=14)
+    
+    # 4. Bear Market Strength Indicator (custom)
+    # Measures sustained downward pressure
+    if 'close' in data.columns:
+        # Calculate percentage below 20-day high
+        rolling_max = data['close'].rolling(window=20).max()
+        data['drawdown_pct'] = ((data['close'] - rolling_max) / rolling_max) * 100
+        
+        # Downtrend consistency (how many recent days were down)
+        data['down_days_ratio'] = (data['close'] < data['close'].shift(1)).rolling(window=10).mean()
+    
+    # 5. Volume-Weighted Downtrend Indicator
+    # Heavy volume on down days = stronger bear trend
+    if 'close' in data.columns and 'volume' in data.columns:
+        # Calculate if it's a down day
+        down_day = (data['close'] < data['close'].shift(1))
+        # Volume on down days
+        down_volume = data['volume'].where(down_day, 0)
+        total_volume = data['volume']
+        # Ratio of down volume to total volume (10-day rolling)
+        data['bear_volume_ratio'] = (down_volume.rolling(window=10).sum() / 
+                                      total_volume.rolling(window=10).sum())
+    
+    # 6. Trend Strength Score (combines multiple trend indicators)
+    # Higher negative score = stronger bear trend
+    trend_score = 0
+    score_count = 0
+    if 'ADX_14' in data.columns and 'DMP_14' in data.columns and 'DMN_14' in data.columns:
+        # ADX shows trend strength, DMN > DMP shows bearish
+        trend_score += ((data['DMN_14'] - data['DMP_14']) / 100) * (data['ADX_14'] / 100)
+        score_count += 1
+    if 'AROOND_14' in data.columns and 'AROONU_14' in data.columns:
+        # Aroon Down > Aroon Up = bearish
+        trend_score += (data['AROOND_14'] - data['AROONU_14']) / 100
+        score_count += 1
+    if score_count > 0:
+        data['bear_trend_strength'] = trend_score / score_count
 
     # --- Add Advanced Time-Series Pattern Indicators ---
     try:
@@ -92,8 +288,86 @@ def get_all_indicators(data):
         for indicator in ENHANCED_PATTERN_INDICATORS:
             data[f'enh_{indicator}'] = False
 
-    # Clean up columns with too many NaNs and drop rows with any remaining NaNs
+    # --- Add Machine Learning Indicators ---
+    try:
+        # Reset index temporarily for ML indicator processing
+        temp_data = data.reset_index()
+        
+        # Get ML indicator signals
+        ml_signals = integrate_ml_indicators(temp_data)
+        
+        # Add ML signals as indicators
+        for signal_name, signal_value in ml_signals.items():
+            data[f'ml_{signal_name}'] = signal_value
+            
+    except Exception as e:
+        print(f"Warning: Could not calculate ML indicators: {e}")
+        # Add default values for ML indicators if calculation fails
+        for indicator in ML_INDICATOR_LIST:
+            data[f'ml_{indicator}'] = 0
+
+    # Clean up columns with too many NaNs (drop columns that are >80% NaN)
     data.dropna(axis=1, thresh=len(data) - 50, inplace=True)
-    data.dropna(inplace=True)
+    
+    # CRITICAL FOR LIVE TRADING: Check if indicators work on the LAST (most recent) row
+    # This simulates "Can we trade TODAY?"
+    last_row_nan_cols = []
+    if len(data) > 0:
+        last_row = data.iloc[-1]
+        for col in data.columns:
+            if col not in ['open', 'high', 'low', 'close', 'volume']:  # Skip OHLCV
+                if pd.isna(last_row[col]):
+                    last_row_nan_cols.append(col)
+    
+    # Remove indicators that can't produce signals for the current day
+    if last_row_nan_cols:
+        print(f"\n⚠️  WARNING: Removing {len(last_row_nan_cols)} indicators that cannot produce real-time signals:")
+        print(f"   These indicators have NaN values on the most recent date (live trading requirement)")
+        for col in last_row_nan_cols[:10]:  # Show first 10
+            print(f"   - {col}")
+        if len(last_row_nan_cols) > 10:
+            print(f"   ... and {len(last_row_nan_cols) - 10} more")
+        
+        # Drop these unreliable indicators
+        data.drop(columns=last_row_nan_cols, inplace=True)
+    
+    # Fill remaining NaN values with neutral/default values (for warmup period only)
+    # This preserves the full date range for visualization
+    for col in data.columns:
+        if data[col].dtype in ['float64', 'int64']:
+            # For numeric columns, use forward fill then backward fill
+            data[col].fillna(method='ffill', inplace=True)
+            data[col].fillna(method='bfill', inplace=True)
+            # If still NaN (empty column), fill with 0
+            data[col].fillna(0, inplace=True)
+        elif data[col].dtype == 'bool':
+            # For boolean columns, fill with False (no signal)
+            data[col].fillna(False, inplace=True)
+    
+    # Add trend_filter indicator (used by optimization.py for trend filtering)
+    # This combines ADX trend strength with price/MA trend direction
+    trend_filter = pd.Series(True, index=data.index)  # Default to True (allow trading)
+    
+    if 'ADX_14' in data.columns:
+        # Strong trend = ADX > 20
+        adx_trend = data['ADX_14'] > 20
+        trend_filter = trend_filter & adx_trend
+    
+    if 'SMA_50' in data.columns and 'close' in data.columns:
+        # Price trend = close above 50-day SMA
+        price_trend = data['close'] > data['SMA_50']
+        trend_filter = trend_filter | price_trend  # OR logic: either ADX strong OR price trending
+
+    if 'RSI_14' in data.columns:
+        # Oversold bailout: If RSI is very low (< 30), allow buying regardless of trend
+        # This catches "V-shape" bottoms where trend is broken but asset is cheap
+        oversold_bailout = data['RSI_14'] < 30
+        trend_filter = trend_filter | oversold_bailout
+    
+    data['trend_filter'] = trend_filter
+    
+    # Mark rows where indicators aren't ready (first 50 rows as warmup period)
+    data['indicators_ready'] = True
+    data.iloc[:50, data.columns.get_loc('indicators_ready')] = False
 
     return data

@@ -1,3 +1,33 @@
+import os
+import warnings
+import logging
+
+# CRITICAL: Universal TensorFlow configuration for all machines
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Force CPU-only on ALL machines
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'   # Suppress TensorFlow logs completely
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'  # Prevent library conflicts
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'false'  # Disable GPU memory growth
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Disable oneDNN optimizations that can hang
+
+# Aggressively suppress ALL Streamlit runtime warnings
+os.environ['STREAMLIT_SERVER_HEADLESS'] = 'true'
+os.environ['STREAMLIT_BROWSER_GATHER_USAGE_STATS'] = 'false'
+
+# CRITICAL: Global flag to prevent duplicate import messages across ALL modules
+os.environ['PATTERN_FINDR_IMPORTS_LOGGED'] = 'false'
+
+# Suppress all warnings that clutter console - MAXIMUM SUPPRESSION
+warnings.filterwarnings("ignore")
+logging.getLogger("tensorflow").setLevel(logging.CRITICAL)
+logging.getLogger("streamlit").setLevel(logging.CRITICAL)
+logging.getLogger("streamlit.runtime").setLevel(logging.CRITICAL)
+logging.getLogger("streamlit.runtime.caching").setLevel(logging.CRITICAL)
+logging.getLogger("streamlit.runtime.state").setLevel(logging.CRITICAL)
+
+# Additional warning suppression (without accessing non-existent attributes)
+logging.getLogger("streamlit.runtime.caching.cache_data_api").setLevel(logging.CRITICAL)
+logging.getLogger("streamlit.runtime.state.session_state_proxy").setLevel(logging.CRITICAL)
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -5,16 +35,39 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-import logging
 import json
-import os
 from datetime import datetime
 import random
+
+# Print BEFORE any TensorFlow imports to prevent module import loops
+print("🔧 TensorFlow CPU-only mode enabled for universal compatibility")
+
+# Import TensorFlow with universal CPU-only configuration
 import tensorflow as tf
+
+# Immediately configure TensorFlow for CPU-only operation
+tf.config.set_visible_devices([], 'GPU')
+
+# Import deep learning modules (these may also import TensorFlow)
 from dl_pattern_detector import create_chart_image, generate_training_data, build_cnn_model, load_and_preprocess_image, use_synthetic_data_for_training
+
+HAS_TENSORFLOW = True
 from backtester import Backtester
 from optimization import run_optimization
 from indicators import get_all_indicators
+
+def save_portfolio_config():
+    """Save current portfolio configuration for model training sync"""
+    try:
+        config = {
+            'tickers': st.session_state.get('portfolio_tickers', []),
+            'saved_by': 'streamlit_app',
+            'timestamp': datetime.now().isoformat()
+        }
+        with open('portfolio_config.json', 'w') as f:
+            json.dump(config, f, indent=2)
+    except Exception:
+        pass  # Silent fail - not critical
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -224,10 +277,12 @@ def create_strategy_chart(data, trade_log, strategy_name, summary, baseline=None
     )
     
     # Add buy-and-hold baseline line if provided
+    baseline_vals = []
     if baseline is not None:
         # Calculate daily buy-and-hold value
         baseline_shares = baseline['starting_capital'] / data.iloc[0]['close']
         baseline_daily_value = [baseline_shares * price for price in data['close']]
+        baseline_vals = baseline_daily_value
         
         fig.add_trace(
             go.Scatter(
@@ -264,7 +319,7 @@ def create_strategy_chart(data, trade_log, strategy_name, summary, baseline=None
         xaxis_title="Date",
         yaxis_title="Price ($)",
         yaxis2_title="Portfolio Value ($)",
-        height=900,  # Increased height
+        height=1200,  # Increased height for better visibility
         width=None,  # Use full container width
         showlegend=True,
         legend=dict(
@@ -275,19 +330,35 @@ def create_strategy_chart(data, trade_log, strategy_name, summary, baseline=None
             x=0.5,
             font=dict(size=11)
         ),
-        margin=dict(l=60, r=60, t=120, b=60),
-        hovermode='x unified'  # Better hover interaction
+        margin=dict(l=80, r=80, t=120, b=100),  # Increased margins
+        hovermode='x unified',  # Better hover interaction
+        xaxis=dict(
+            rangeslider=dict(visible=False)  # DISABLE THE RANGE SLIDER
+        )
     )
     
+    # Force x-axis to show full data range (prevent auto-zoom to trades only)
+    if len(data) > 0:
+        fig.update_xaxes(
+            range=[data.index[0], data.index[-1]],
+            row=1, col=1
+        )
+        fig.update_xaxes(
+            range=[data.index[0], data.index[-1]],
+            row=2, col=1
+        )
+    
     # Format the portfolio value y-axis with better scaling
-    if portfolio_value:
-        min_val = min(portfolio_value)
-        max_val = max(portfolio_value)
+    # Incorporate baseline values into range calculation
+    all_values = portfolio_value + baseline_vals
+    if all_values:
+        min_val = min(all_values)
+        max_val = max(all_values)
         
         # Use more generous padding for better visibility
         value_range = max_val - min_val
         if value_range > 0:
-            padding = value_range * 0.15  # 15% padding for better visibility
+            padding = value_range * 0.20  # 20% padding for better visibility
         else:
             padding = max_val * 0.05  # 5% of max value if flat line
         
@@ -295,7 +366,7 @@ def create_strategy_chart(data, trade_log, strategy_name, summary, baseline=None
             title_text="Portfolio Value ($)",
             tickformat='$,.0f',
             range=[max(0, min_val - padding), max_val + padding],  # Don't go below $0
-            nticks=8,  # More tick marks for better readability
+            nticks=10,  # More tick marks for better readability
             row=2, col=1
         )
     else:
@@ -316,6 +387,61 @@ def create_strategy_chart(data, trade_log, strategy_name, summary, baseline=None
     
     return fig
 
+def create_30day_performance_chart(ticker, price_data, trade_log, strategy_name, return_pct):
+    """Create a compact chart showing 30-day performance with trades"""
+    if price_data is None or len(price_data) == 0:
+        return None
+    
+    fig = go.Figure()
+    
+    # Add price line
+    fig.add_trace(go.Scatter(
+        x=price_data.index,
+        y=price_data['close'],
+        mode='lines',
+        name='Price',
+        line=dict(color='#2962FF', width=2),
+        hovertemplate='%{x}<br>Price: $%{y:.2f}<extra></extra>'
+    ))
+    
+    # Add buy and sell markers from trade log
+    # Trade log has: entry_date, exit_date, entry_price, exit_price
+    if len(trade_log) > 0 and 'entry_date' in trade_log.columns:
+        # Add entry (buy) markers
+        fig.add_trace(go.Scatter(
+            x=trade_log['entry_date'],
+            y=trade_log['entry_price'],
+            mode='markers',
+            name='Buy',
+            marker=dict(symbol='triangle-up', size=12, color='#00C853'),
+            hovertemplate='BUY<br>%{x}<br>Price: $%{y:.2f}<extra></extra>'
+        ))
+        
+        # Add exit (sell) markers
+        fig.add_trace(go.Scatter(
+            x=trade_log['exit_date'],
+            y=trade_log['exit_price'],
+            mode='markers',
+            name='Sell',
+            marker=dict(symbol='triangle-down', size=12, color='#FF1744'),
+            hovertemplate='SELL<br>%{x}<br>Price: $%{y:.2f}<extra></extra>'
+        ))
+    
+    # Layout
+    fig.update_layout(
+        title=f"{ticker} - Last 30 Days Performance: {return_pct:+.1f}%",
+        xaxis_title="Date",
+        yaxis_title="Price ($)",
+        hovermode='x unified',
+        height=400,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=60, r=20, t=60, b=60),
+        template='plotly_dark'
+    )
+    
+    return fig
+
 def save_strategy_to_storage(strategy_data):
     """Save a strategy to persistent storage"""
     storage_dir = "saved_strategies"
@@ -332,6 +458,9 @@ def save_strategy_to_storage(strategy_data):
         'timestamp': timestamp,
         'rank': strategy_data['rank'],
         'name': strategy_data['name'],
+        'ticker': strategy_data.get('ticker', 'Unknown'),
+        'period': strategy_data.get('period', '1y'),
+        'interval': strategy_data.get('interval', '1d'),
         'performance': {
             'total_return_pct': strategy_data['summary']['total_return_pct'],
             'total_trades': strategy_data['summary']['total_trades'],
@@ -354,6 +483,19 @@ def save_strategy_to_storage(strategy_data):
     
     return filepath
 
+# Conditionally apply cache decorator only when in Streamlit runtime context
+def _cache_if_streamlit(func):
+    """Apply Streamlit cache decorator only if in runtime context"""
+    try:
+        # Test if we're in Streamlit runtime
+        if hasattr(st, 'runtime') and st.runtime.exists():
+            return st.cache_data(ttl=300)(func)
+        else:
+            return func
+    except:
+        return func
+
+@_cache_if_streamlit
 def load_saved_strategies(sort_by='timestamp', ascending=False, min_return=None, max_return=None, search_term=''):
     """Load all saved strategies from storage with filtering and sorting options"""
     storage_dir = "saved_strategies"
@@ -362,6 +504,7 @@ def load_saved_strategies(sort_by='timestamp', ascending=False, min_return=None,
     
     strategies = []
     errors = []
+    seen_timestamps = set()  # Track unique strategies by timestamp
     
     for filename in os.listdir(storage_dir):
         if filename.endswith('.json'):
@@ -369,8 +512,18 @@ def load_saved_strategies(sort_by='timestamp', ascending=False, min_return=None,
             try:
                 with open(filepath, 'r') as f:
                     strategy_data = json.load(f)
+                    
+                    # Skip duplicates based on timestamp
+                    timestamp = strategy_data.get('timestamp')
+                    if timestamp in seen_timestamps:
+                        continue
+                    seen_timestamps.add(timestamp)
+                    
                     strategy_data['filepath'] = filepath
                     strategy_data['filename'] = filename
+                    # Ensure ticker field exists for older strategies
+                    if 'ticker' not in strategy_data:
+                        strategy_data['ticker'] = 'Unknown'
                     strategies.append(strategy_data)
             except Exception as e:
                 errors.append(f"Error loading {filename}: {e}")
@@ -617,10 +770,22 @@ def load_and_validate_data(ticker, period, interval):
     cache_filename = f"{ticker}_{period}_{interval}.csv"
     cache_path = os.path.join(CACHE_DIR, cache_filename)
     
+    # Determine cache expiry based on interval
+    if interval in ['1m', '5m']:
+        cache_expiry = timedelta(minutes=30)  # Refresh intraday data frequently
+    elif interval in ['15m', '30m']:
+        cache_expiry = timedelta(hours=2)
+    elif interval in ['1h']:
+        cache_expiry = timedelta(hours=6)
+    elif interval in ['1d']:
+        cache_expiry = timedelta(days=1)  # Daily data refreshes daily
+    else:
+        cache_expiry = timedelta(days=3)  # Weekly/monthly can be cached longer
+    
     if os.path.exists(cache_path):
         try:
             file_mod_time = datetime.fromtimestamp(os.path.getmtime(cache_path))
-            if datetime.now() - file_mod_time < timedelta(days=3):
+            if datetime.now() - file_mod_time < cache_expiry:
                 logging.info(f"Loading data from cache: {cache_path}")
                 cached_data = pd.read_csv(cache_path, parse_dates=['date'])
                 # Final validation on cached data
@@ -648,6 +813,10 @@ def load_and_validate_data(ticker, period, interval):
         data = data.reset_index()
         # Standardize all columns, including the one from reset_index
         data.columns = [str(col).lower() for col in data.columns]
+        
+        # Handle both 'date' and 'datetime' column names (depends on interval)
+        if 'datetime' in data.columns and 'date' not in data.columns:
+            data.rename(columns={'datetime': 'date'}, inplace=True)
 
         required = {'open', 'high', 'low', 'close', 'volume', 'date'}
         if not required.issubset(data.columns):
@@ -668,13 +837,690 @@ def load_and_validate_data(ticker, period, interval):
         logging.error(f"Unhandled error in data loading: {e}", exc_info=True)
         return None
 
+# Display Trade section if requested
+if st.session_state.get('show_trade_section', False):
+    st.write("# 🎯 Trade - Daily Portfolio Signals")
+    
+    if st.button("⬅️ Back to Main"):
+        st.session_state.show_trade_section = False
+        st.rerun()
+    
+    st.markdown("---")
+    
+    # Initialize portfolio in session state if not exists
+    if 'portfolio_tickers' not in st.session_state:
+        # Try to load from saved portfolio config
+        try:
+            if os.path.exists('portfolio_config.json'):
+                with open('portfolio_config.json', 'r') as f:
+                    portfolio_data = json.load(f)
+                    st.session_state.portfolio_tickers = portfolio_data.get('tickers', ['SPY', 'MSTY', 'MSTR'])
+            else:
+                st.session_state.portfolio_tickers = ['SPY', 'MSTY', 'MSTR']
+        except Exception:
+            st.session_state.portfolio_tickers = ['SPY', 'MSTY', 'MSTR']
+    
+    if 'trade_signals' not in st.session_state:
+        st.session_state.trade_signals = []
+    
+    if 'alert_settings' not in st.session_state:
+        st.session_state.alert_settings = {
+            'sms_enabled': False,
+            'phone_number': '',
+            'twilio_account_sid': '',
+            'twilio_auth_token': '',
+            'twilio_phone_number': '',
+            'email_alerts': False,
+            'email_address': ''
+        }
+    
+    # Portfolio Management Section
+    st.subheader("📊 Portfolio Management")
+    
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        st.write("**Current Portfolio:**")
+        portfolio_display = ", ".join(st.session_state.portfolio_tickers)
+        st.info(f"🎯 {len(st.session_state.portfolio_tickers)} tickers: {portfolio_display}")
+    
+    with col2:
+        if st.button("💾 Save Portfolio"):
+            portfolio_data = {
+                'tickers': st.session_state.portfolio_tickers,
+                'saved_at': datetime.now().isoformat()
+            }
+            with open('portfolio_config.json', 'w') as f:
+                json.dump(portfolio_data, f, indent=2)
+            st.success("Portfolio saved!")
+    
+    st.markdown("---")
+    
+    # Add/Remove Tickers
+    col1, col2, col3 = st.columns([2, 1, 1])
+    
+    with col1:
+        new_ticker = st.text_input("Add Ticker", "", key="new_ticker").upper()
+    
+    with col2:
+        st.write("")
+        st.write("")
+        if st.button("➕ Add") and new_ticker:
+            if new_ticker not in st.session_state.portfolio_tickers:
+                st.session_state.portfolio_tickers.append(new_ticker)
+                save_portfolio_config()  # Save for model training sync
+                st.success(f"Added {new_ticker}")
+                st.rerun()
+            else:
+                st.warning(f"{new_ticker} already in portfolio")
+    
+    with col3:
+        ticker_to_remove = st.selectbox("Remove", [""] + st.session_state.portfolio_tickers, key="remove_ticker")
+        if st.button("➖ Remove") and ticker_to_remove:
+            st.session_state.portfolio_tickers.remove(ticker_to_remove)
+            save_portfolio_config()  # Save for model training sync
+            st.success(f"Removed {ticker_to_remove}")
+            st.rerun()
+    
+    st.markdown("---")
+    
+    # Signal Generation Section
+    st.subheader("🚀 Generate Daily Signals")
+    
+    col1, col2, col3 = st.columns([1, 1, 1])
+    
+    with col1:
+        st.metric("Portfolio Size", len(st.session_state.portfolio_tickers))
+    
+    with col2:
+        saved_strats, _ = load_saved_strategies()
+        st.metric("Saved Strategies", len(saved_strats))
+    
+    with col3:
+        last_run = st.session_state.get('last_signal_run', 'Never')
+        if isinstance(last_run, str) and last_run != 'Never':
+            last_run = datetime.fromisoformat(last_run).strftime('%m/%d %H:%M')
+        st.metric("Last Run", last_run)
+    
+    # Per-Ticker Strategy Selection
+    st.markdown("---")
+    st.write("**📊 Strategy Selection per Ticker:**")
+    
+    if not saved_strats:
+        st.warning("⚠️ No saved strategies found! Please optimize and save strategies first.")
+    else:
+        # Sort strategies by return (highest first)
+        sorted_strats = sorted(saved_strats, key=lambda x: x['performance']['total_return_pct'], reverse=True)
+        
+        # Create strategy options for dropdown
+        strategy_options = []
+        for strat in sorted_strats:
+            return_pct = strat['performance']['total_return_pct']
+            ticker = strat.get('ticker', 'Unknown')
+            period = strat.get('period', '1y')
+            name_short = strat['name'][:40] + "..." if len(strat['name']) > 40 else strat['name']
+            label = f"{return_pct:+.1f}% | {ticker} {period} | {name_short}"
+            strategy_options.append((label, strat['timestamp']))
+        
+        # Initialize strategy selections in session state
+        if 'ticker_strategy_map' not in st.session_state:
+            st.session_state.ticker_strategy_map = {}
+        
+        # Quick selection buttons
+        st.write("**Quick Actions:**")
+        col_btn1, col_btn2, col_btn3 = st.columns(3)
+        with col_btn1:
+            if st.button("All → Highest Return", use_container_width=True):
+                highest_timestamp = sorted_strats[0]['timestamp']
+                for ticker in st.session_state.portfolio_tickers:
+                    st.session_state.ticker_strategy_map[ticker] = highest_timestamp
+                st.rerun()
+        with col_btn2:
+            if st.button("All → Most Recent", use_container_width=True):
+                most_recent = max(saved_strats, key=lambda x: x['timestamp'])
+                for ticker in st.session_state.portfolio_tickers:
+                    st.session_state.ticker_strategy_map[ticker] = most_recent['timestamp']
+                st.rerun()
+        with col_btn3:
+            if st.button("Reset All", use_container_width=True):
+                st.session_state.ticker_strategy_map = {}
+                st.rerun()
+        
+        st.markdown("---")
+        
+        # Display dropdown for each ticker
+        st.info("💡 Select which strategy to use for each ticker. Strategies are sorted by return (highest first).")
+        
+        for ticker in st.session_state.portfolio_tickers:
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                st.write(f"**{ticker}**")
+            with col2:
+                # Default to highest return strategy for THIS specific ticker
+                default_idx = 0
+                if ticker in st.session_state.ticker_strategy_map:
+                    # Find index of previously selected strategy
+                    selected_timestamp = st.session_state.ticker_strategy_map[ticker]
+                    try:
+                        default_idx = [s[1] for s in strategy_options].index(selected_timestamp)
+                    except ValueError:
+                        default_idx = 0
+                else:
+                    # Not set yet - find highest return strategy optimized on THIS ticker
+                    ticker_strategies = [(i, strat) for i, strat in enumerate(sorted_strats) 
+                                        if strat.get('ticker', '').upper() == ticker.upper()]
+                    if ticker_strategies:
+                        # Use the highest return strategy for this ticker
+                        default_idx = ticker_strategies[0][0]
+                    # else: default_idx stays 0 (overall highest if no ticker match)
+                
+                selected_label = st.selectbox(
+                    f"Strategy for {ticker}",
+                    options=[opt[0] for opt in strategy_options],
+                    index=default_idx,
+                    key=f"strategy_select_{ticker}",
+                    label_visibility="collapsed"
+                )
+                
+                # Store selection
+                selected_idx = [opt[0] for opt in strategy_options].index(selected_label)
+                st.session_state.ticker_strategy_map[ticker] = strategy_options[selected_idx][1]
+    
+    if st.button("🎯 Generate Signals for Portfolio", type="primary", use_container_width=True):
+        st.session_state.trade_signals = []
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        total_tickers = len(st.session_state.portfolio_tickers)
+        
+        for idx, ticker in enumerate(st.session_state.portfolio_tickers):
+            status_text.text(f"Analyzing {ticker}... ({idx+1}/{total_tickers})")
+            progress_bar.progress((idx + 1) / total_tickers)
+            
+            try:
+                # Download data
+                data = load_and_validate_data(ticker, period='1y', interval='1d')
+                
+                if data is None:
+                    st.session_state.trade_signals.append({
+                        'ticker': ticker,
+                        'signal': 'ERROR',
+                        'price': 0,
+                        'error': 'No data available'
+                    })
+                    continue
+                
+                # Calculate indicators
+                enriched_data = get_all_indicators(data)
+                
+                # Load strategy based on per-ticker selection
+                if saved_strats:
+                    # Get the selected strategy for this ticker
+                    if ticker in st.session_state.ticker_strategy_map:
+                        selected_timestamp = st.session_state.ticker_strategy_map[ticker]
+                        # Find the strategy with matching timestamp
+                        best_strategy = next((s for s in saved_strats if s['timestamp'] == selected_timestamp), None)
+                        if best_strategy is None:
+                            # Fallback to highest return if selected strategy not found
+                            best_strategy = max(saved_strats, key=lambda x: x['performance']['total_return_pct'])
+                    else:
+                        # Default to highest return if no selection made
+                        best_strategy = max(saved_strats, key=lambda x: x['performance']['total_return_pct'])
+                    
+                    # Generate signals
+                    from optimization import universal_strategy
+                    signals = universal_strategy(enriched_data, best_strategy['parameters'])
+                    
+                    # BACKTEST THE STRATEGY ON THIS TICKER - FULL YEAR
+                    year_return = 0.0
+                    year_trades = 0
+                    try:
+                        backtester_year = Backtester(
+                            enriched_data,
+                            best_strategy['name'],
+                            universal_strategy,
+                            best_strategy['parameters'],
+                            100000  # Starting capital
+                        )
+                        backtester_year.run()
+                        trade_log_year, summary_year = backtester_year.get_results()
+                        
+                        if len(trade_log_year) > 0:
+                            year_return = summary_year['total_return_pct']
+                            year_trades = len(trade_log_year)
+                        else:
+                            baseline_year = calculate_buy_and_hold_baseline(enriched_data, 100000)
+                            year_return = baseline_year['total_return_pct']
+                    except:
+                        try:
+                            baseline_year = calculate_buy_and_hold_baseline(enriched_data, 100000)
+                            year_return = baseline_year['total_return_pct']
+                        except:
+                            year_return = 0.0
+                    
+                    # BACKTEST THE STRATEGY - LAST 30 DAYS (to match typical optimization period)
+                    recent_return = 0.0
+                    recent_trades = 0
+                    return_note = ""
+                    trade_log_recent = pd.DataFrame()
+                    recent_data_for_chart = None
+                    
+                    try:
+                        # Filter to last 30 days of data (matches optimization window)
+                        current_date = enriched_data.index[-1]
+                        days_ago_30 = current_date - pd.Timedelta(days=30)
+                        recent_data = enriched_data[enriched_data.index >= days_ago_30]
+                        recent_data_for_chart = recent_data.copy()  # Save for chart
+                        
+                        if len(recent_data) > 10:  # Need enough data for backtest
+                            backtester_recent = Backtester(
+                                recent_data,
+                                best_strategy['name'],
+                                universal_strategy,
+                                best_strategy['parameters'],
+                                100000
+                            )
+                            backtester_recent.run()
+                            trade_log_recent, summary_recent = backtester_recent.get_results()
+                            
+                            if len(trade_log_recent) > 0:
+                                recent_return = summary_recent['total_return_pct']
+                                recent_trades = len(trade_log_recent)
+                                return_note = f"{recent_trades} trades in last 30 days"
+                            else:
+                                baseline_recent = calculate_buy_and_hold_baseline(recent_data, 100000)
+                                recent_return = baseline_recent['total_return_pct']
+                                return_note = "Buy-and-hold (no trades in last 30 days)"
+                        else:
+                            recent_return = 0.0
+                            return_note = "Insufficient data for recent period"
+                            
+                    except Exception as e:
+                        try:
+                            baseline_recent = calculate_buy_and_hold_baseline(recent_data, 100000)
+                            recent_return = baseline_recent['total_return_pct']
+                            return_note = "Buy-and-hold (last 30 days)"
+                        except:
+                            recent_return = 0.0
+                            return_note = "Error calculating recent return"
+                    
+                    # Get most recent signal
+                    last_signal = signals.iloc[-1]
+                    last_close = enriched_data['close'].iloc[-1]
+                    last_date = enriched_data.index[-1]
+                    
+                    # Price changes
+                    price_change_1d = ((enriched_data['close'].iloc[-1] / enriched_data['close'].iloc[-2]) - 1) * 100 if len(enriched_data) >= 2 else 0
+                    price_change_5d = ((enriched_data['close'].iloc[-1] / enriched_data['close'].iloc[-5]) - 1) * 100 if len(enriched_data) >= 5 else 0
+                    
+                    signal_type = "BUY" if last_signal == 1 else "SELL" if last_signal == -1 else "HOLD"
+                    
+                    # Get original strategy performance (from when it was saved/optimized)
+                    original_return = best_strategy['performance'].get('total_return_pct', 0)
+                    original_ticker = best_strategy.get('ticker', 'Unknown')
+                    original_period = best_strategy.get('period', '1y')
+                    
+                    signal_data = {
+                        'ticker': ticker,
+                        'signal': signal_type,
+                        'price': round(last_close, 2),
+                        'price_change_1d': round(price_change_1d, 2),
+                        'price_change_5d': round(price_change_5d, 2),
+                        'strategy': best_strategy['name'],
+                        'original_return': round(original_return, 2),
+                        'original_ticker': original_ticker,
+                        'month_return': round(recent_return, 2),
+                        'year_return': round(year_return, 2),
+                        'original_label': f"Optimized ({original_period} on {original_ticker})",
+                        'month_label': "Last 30 Days (Current)",
+                        'year_label': "Full Year Backtest",
+                        'return_note': return_note,
+                        'date': last_date.strftime('%Y-%m-%d'),
+                        'timestamp': datetime.now().isoformat(),
+                        # Chart data (not serialized)
+                        'trade_log_30d': trade_log_recent,
+                        'price_data_30d': recent_data_for_chart
+                    }
+                    
+                    st.session_state.trade_signals.append(signal_data)
+                else:
+                    st.session_state.trade_signals.append({
+                        'ticker': ticker,
+                        'signal': 'ERROR',
+                        'price': 0,
+                        'error': 'No strategies saved'
+                    })
+                    
+            except Exception as e:
+                st.session_state.trade_signals.append({
+                    'ticker': ticker,
+                    'signal': 'ERROR',
+                    'price': 0,
+                    'error': str(e)
+                })
+        
+        st.session_state.last_signal_run = datetime.now().isoformat()
+        progress_bar.empty()
+        status_text.empty()
+        st.success(f"✅ Generated signals for {total_tickers} tickers!")
+        st.rerun()
+    
+    # Display Signals
+    if st.session_state.trade_signals:
+        st.markdown("---")
+        st.subheader("📊 Today's Signals")
+        
+        # Add explanation about returns
+        st.info("""
+        **💡 Understanding the THREE Performance Metrics:**
+        
+        **1. Optimized (1y on MSTY)** - Your original optimization result:
+        - Shows the period you optimized on (e.g., 1y, 3mo, 1mo)
+        - Shows which ticker (e.g., MSTY, SPY)
+        - This is what convinced you to save this strategy!
+        - Example: +115.8% on 30 days of MSTY data
+        
+        **2. Last 30 Days (Current)** - Recent performance on THIS ticker:
+        - Tests strategy on LAST 30 DAYS of THIS ticker
+        - Tells you if strategy works RIGHT NOW
+        - ✅ Positive = Working now | ❌ Negative = Not working
+        
+        **3. Full Year Backtest** - Long-term test on THIS ticker:
+        - Tests strategy on FULL 365 DAYS of THIS ticker
+        - Shows long-term reliability
+        - **Often differs from original if you optimized on shorter period!**
+        
+        **CRITICAL: Why Original and Full Year differ:**
+        Example: You optimized on 30 days (Oct 12 - Nov 11):
+        - Found patterns that worked great → +115.8% ✅
+        - But those patterns only existed in that specific 30-day window!
+        - Full year test (365 days) includes 11 other months where it failed → -23.5% ❌
+        - **This is NORMAL!** Short-term optimizations often fail long-term.
+        
+        **What to look for:**
+        - ✅ All three positive = Robust strategy (rare!)
+        - ✅ Original & 30-day positive, 1-year negative = Works short-term (trade cautiously)
+        - ❌ 30-day negative = Don't trade (even if original was great)
+        """)
+        
+        # Filter signals
+        buy_signals = [s for s in st.session_state.trade_signals if s['signal'] == 'BUY']
+        sell_signals = [s for s in st.session_state.trade_signals if s['signal'] == 'SELL']
+        hold_signals = [s for s in st.session_state.trade_signals if s['signal'] == 'HOLD']
+        error_signals = [s for s in st.session_state.trade_signals if s['signal'] == 'ERROR']
+        
+        # Summary metrics
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("🟢 BUY", len(buy_signals))
+        with col2:
+            st.metric("🔴 SELL", len(sell_signals))
+        with col3:
+            st.metric("⚪ HOLD", len(hold_signals))
+        with col4:
+            st.metric("❌ ERRORS", len(error_signals))
+        
+        # Display signals in tabs
+        tab1, tab2, tab3, tab4 = st.tabs(["🟢 BUY Signals", "🔴 SELL Signals", "⚪ HOLD Signals", "📊 All Signals"])
+        
+        with tab1:
+            if buy_signals:
+                for signal in buy_signals:
+                    with st.container():
+                        col1, col2, col3, col4, col5, col6 = st.columns([1, 1.5, 1.5, 2, 2, 2])
+                        with col1:
+                            st.markdown(f"### {signal['ticker']}")
+                        with col2:
+                            st.metric("Price", f"${signal['price']:.2f}", f"{signal['price_change_1d']:+.2f}%")
+                        with col3:
+                            st.metric("5-Day", f"{signal['price_change_5d']:+.2f}%")
+                        with col4:
+                            original_label = signal.get('original_label', 'Strategy Return')
+                            st.metric(original_label, f"{signal.get('original_return', 0):.1f}%")
+                        with col5:
+                            month_label = signal.get('month_label', 'Last 30 Days')
+                            st.metric(month_label, f"{signal.get('month_return', 0):.1f}%")
+                        with col6:
+                            year_label = signal.get('year_label', '1-Year')
+                            st.metric(year_label, f"{signal.get('year_return', 0):.1f}%")
+                        st.caption(f"Strategy: {signal['strategy']}")
+                        if 'return_note' in signal:
+                            st.caption(f"📊 {signal['return_note']}")
+                        
+                        # Add 30-day performance chart
+                        if 'price_data_30d' in signal and signal['price_data_30d'] is not None:
+                            with st.expander("📈 View 30-Day Performance Chart", expanded=False):
+                                chart = create_30day_performance_chart(
+                                    signal['ticker'],
+                                    signal['price_data_30d'],
+                                    signal.get('trade_log_30d', pd.DataFrame()),
+                                    signal['strategy'],
+                                    signal['month_return']
+                                )
+                                if chart:
+                                    st.plotly_chart(chart, use_container_width=True)
+                        
+                        st.markdown("---")
+            else:
+                st.info("No BUY signals today")
+        
+        with tab2:
+            if sell_signals:
+                for signal in sell_signals:
+                    with st.container():
+                        col1, col2, col3, col4, col5, col6 = st.columns([1, 1.5, 1.5, 2, 2, 2])
+                        with col1:
+                            st.markdown(f"### {signal['ticker']}")
+                        with col2:
+                            st.metric("Price", f"${signal['price']:.2f}", f"{signal['price_change_1d']:+.2f}%")
+                        with col3:
+                            st.metric("5-Day", f"{signal['price_change_5d']:+.2f}%")
+                        with col4:
+                            original_label = signal.get('original_label', 'Strategy Return')
+                            st.metric(original_label, f"{signal.get('original_return', 0):.1f}%")
+                        with col5:
+                            month_label = signal.get('month_label', 'Last 30 Days')
+                            st.metric(month_label, f"{signal.get('month_return', 0):.1f}%")
+                        with col6:
+                            year_label = signal.get('year_label', '1-Year')
+                            st.metric(year_label, f"{signal.get('year_return', 0):.1f}%")
+                        st.caption(f"Strategy: {signal['strategy']}")
+                        if 'return_note' in signal:
+                            st.caption(f"📊 {signal['return_note']}")
+                        
+                        # Add 30-day performance chart
+                        if 'price_data_30d' in signal and signal['price_data_30d'] is not None:
+                            with st.expander("📈 View 30-Day Performance Chart", expanded=False):
+                                chart = create_30day_performance_chart(
+                                    signal['ticker'],
+                                    signal['price_data_30d'],
+                                    signal.get('trade_log_30d', pd.DataFrame()),
+                                    signal['strategy'],
+                                    signal['month_return']
+                                )
+                                if chart:
+                                    st.plotly_chart(chart, use_container_width=True)
+                        
+                        st.markdown("---")
+            else:
+                st.info("No SELL signals today")
+        
+        with tab3:
+            if hold_signals:
+                for signal in hold_signals:
+                    with st.container():
+                        col1, col2, col3, col4, col5, col6 = st.columns([1, 1.5, 1.5, 2, 2, 2])
+                        with col1:
+                            st.markdown(f"### {signal['ticker']}")
+                        with col2:
+                            st.metric("Price", f"${signal['price']:.2f}", f"{signal['price_change_1d']:+.2f}%")
+                        with col3:
+                            st.metric("5-Day", f"{signal['price_change_5d']:+.2f}%")
+                        with col4:
+                            original_label = signal.get('original_label', 'Strategy Return')
+                            st.metric(original_label, f"{signal.get('original_return', 0):.1f}%")
+                        with col5:
+                            month_label = signal.get('month_label', 'Last 30 Days')
+                            st.metric(month_label, f"{signal.get('month_return', 0):.1f}%")
+                        with col6:
+                            year_label = signal.get('year_label', '1-Year')
+                            st.metric(year_label, f"{signal.get('year_return', 0):.1f}%")
+                        st.caption(f"Strategy: {signal['strategy']}")
+                        if 'return_note' in signal:
+                            st.caption(f"📊 {signal['return_note']}")
+                        
+                        # Add 30-day performance chart
+                        if 'price_data_30d' in signal and signal['price_data_30d'] is not None:
+                            with st.expander("📈 View 30-Day Performance Chart", expanded=False):
+                                chart = create_30day_performance_chart(
+                                    signal['ticker'],
+                                    signal['price_data_30d'],
+                                    signal.get('trade_log_30d', pd.DataFrame()),
+                                    signal['strategy'],
+                                    signal['month_return']
+                                )
+                                if chart:
+                                    st.plotly_chart(chart, use_container_width=True)
+                        
+                        st.markdown("---")
+            else:
+                st.info("No HOLD signals today")
+        
+        with tab4:
+            # Create DataFrame - exclude non-serializable fields
+            serializable_signals = []
+            for signal in st.session_state.trade_signals:
+                # Create a copy without the DataFrame fields
+                signal_copy = {k: v for k, v in signal.items() 
+                              if k not in ['trade_log_30d', 'price_data_30d']}
+                serializable_signals.append(signal_copy)
+            
+            df = pd.DataFrame(serializable_signals)
+            st.dataframe(df, use_container_width=True)
+            
+            # Export options
+            col1, col2 = st.columns([1, 1])
+            
+            with col1:
+                # CSV Export
+                csv = df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download CSV",
+                    data=csv,
+                    file_name=f"signals_{datetime.now().strftime('%Y-%m-%d')}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            
+            with col2:
+                # JSON Export - exclude DataFrames that aren't JSON serializable
+                serializable_signals = []
+                for signal in st.session_state.trade_signals:
+                    # Create a copy without the DataFrame fields
+                    signal_copy = {k: v for k, v in signal.items() 
+                                  if k not in ['trade_log_30d', 'price_data_30d']}
+                    serializable_signals.append(signal_copy)
+                
+                json_str = json.dumps(serializable_signals, indent=2)
+                st.download_button(
+                    label="📥 Download JSON",
+                    data=json_str,
+                    file_name=f"signals_{datetime.now().strftime('%Y-%m-%d')}.json",
+                    mime="application/json",
+                    use_container_width=True
+                )
+    
+    # Alert Settings Section
+    st.markdown("---")
+    st.subheader("📱 Alert Settings")
+    
+    with st.expander("⚙️ Configure Alerts"):
+        st.write("### SMS Alerts (via Twilio)")
+        st.info("📱 Get instant text messages for BUY/SELL signals")
+        
+        sms_enabled = st.checkbox("Enable SMS Alerts", value=st.session_state.alert_settings['sms_enabled'])
+        
+        if sms_enabled:
+            st.write("**Twilio Configuration:**")
+            st.caption("Get free Twilio account at: https://www.twilio.com/try-twilio")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                account_sid = st.text_input("Twilio Account SID", value=st.session_state.alert_settings['twilio_account_sid'], type="password")
+                auth_token = st.text_input("Twilio Auth Token", value=st.session_state.alert_settings['twilio_auth_token'], type="password")
+            
+            with col2:
+                twilio_phone = st.text_input("Twilio Phone Number", value=st.session_state.alert_settings['twilio_phone_number'], placeholder="+1234567890")
+                your_phone = st.text_input("Your Phone Number", value=st.session_state.alert_settings['phone_number'], placeholder="+1234567890")
+            
+            if st.button("💾 Save SMS Settings"):
+                st.session_state.alert_settings['sms_enabled'] = sms_enabled
+                st.session_state.alert_settings['twilio_account_sid'] = account_sid
+                st.session_state.alert_settings['twilio_auth_token'] = auth_token
+                st.session_state.alert_settings['twilio_phone_number'] = twilio_phone
+                st.session_state.alert_settings['phone_number'] = your_phone
+                st.success("SMS settings saved!")
+            
+            # Send test SMS
+            if st.button("📱 Send Test SMS"):
+                try:
+                    from twilio.rest import Client
+                    client = Client(account_sid, auth_token)
+                    message = client.messages.create(
+                        body=f"🎯 Pattern_FindR Test Alert\n\nThis is a test message. You're all set up!",
+                        from_=twilio_phone,
+                        to=your_phone
+                    )
+                    st.success(f"✅ Test SMS sent! Message SID: {message.sid}")
+                except Exception as e:
+                    st.error(f"❌ Error sending SMS: {e}")
+                    st.caption("Make sure Twilio credentials are correct and phone numbers are in E.164 format (+1234567890)")
+        
+        st.markdown("---")
+        st.write("### Email Alerts")
+        st.info("📧 Get email notifications for signals")
+        st.warning("⚠️ Email alerts coming soon! For now, use SMS or check the app daily.")
+    
+    st.stop()
+
 # Display saved strategies if requested
 if st.session_state.get('show_saved_strategies', False):
     st.write("# 💾 Saved Strategies")
     
-    if st.button("⬅️ Back to Main"):
-        st.session_state.show_saved_strategies = False
-        st.experimental_rerun()
+    col_back, col_cache, col_delete = st.columns([1, 2, 2])
+    with col_back:
+        if st.button("⬅️ Back to Main"):
+            st.session_state.show_saved_strategies = False
+            st.rerun()
+    with col_cache:
+        if st.button("🔄 Clear Cache & Reload"):
+            st.cache_data.clear()
+            st.success("Cache cleared! Reloading strategies...")
+            st.rerun()
+    with col_delete:
+        if st.button("🗑️ Delete ALL Strategies", type="secondary"):
+            import shutil
+            storage_dir = "saved_strategies"
+            if os.path.exists(storage_dir):
+                shutil.rmtree(storage_dir)
+                os.makedirs(storage_dir)
+                st.cache_data.clear()
+                st.success("✅ All strategies deleted! Starting fresh.")
+                st.rerun()
+            else:
+                st.warning("No strategies to delete.")
+    
+    # Info box for old strategies
+    st.info("""
+    **💡 Seeing "Unknown" ticker?** Your strategies were saved before ticker tracking was added.
+    
+    **Fix options:**
+    1. **Quick fix:** Run `python fix_old_strategies.py` to update all at once
+    2. **Or:** Delete old strategies and re-optimize with current version
+    3. **Or:** Manually edit JSON files in `saved_strategies/` folder
+    """)
     
     # Search and Filter Controls
     st.write("## 🔍 Search & Filter")
@@ -723,47 +1569,259 @@ if st.session_state.get('show_saved_strategies', False):
     st.write(f"## 📊 Strategies ({len(saved_strategies)} found)")
     
     if saved_strategies:
+        # Group strategies by period
+        from collections import defaultdict
+        period_groups = defaultdict(list)
         for strategy in saved_strategies:
-            return_pct = strategy['performance']['total_return_pct']
-            return_icon = "📈" if return_pct > 0 else "📉"
+            period = strategy.get('period', 'Unknown')
+            period_groups[period].append(strategy)
+        
+        # Define period order for display
+        period_order = ['5y', '3y', '2y', '1y', '6mo', '3mo', '1mo', '5d', 'Unknown']
+        sorted_periods = sorted(period_groups.keys(), 
+                               key=lambda x: period_order.index(x) if x in period_order else len(period_order))
+        
+        # Display strategies grouped by period
+        for period in sorted_periods:
+            strategies_in_period = period_groups[period]
             
-            with st.expander(f"{return_icon} {strategy['name']} - {return_pct:.2f}% Return ({len(strategy['active_indicators'])} indicators)"):
-                # Performance Metrics
-                col1, col2, col3, col4 = st.columns(4)
+            # Period header with count
+            period_icon = "📅" if period != 'Unknown' else "❓"
+            st.markdown(f"### {period_icon} {period.upper()} Strategies ({len(strategies_in_period)})")
+            
+            for strategy in strategies_in_period:
+                return_pct = strategy['performance']['total_return_pct']
+                return_icon = "📈" if return_pct > 0 else "📉"
                 
-                with col1:
-                    st.metric("Total Return", f"{return_pct:.2f}%", 
-                             delta=f"{return_pct - (strategy.get('baseline_return', 0) or 0):.2f}% vs B&H")
-                    st.metric("Total Trades", strategy['performance']['total_trades'])
+                # Display ticker in expander title
+                ticker_info = f"📊 {strategy.get('ticker', 'Unknown')}"
+                period_info = f"{strategy.get('period', '1y')} {strategy.get('interval', '1d')}"
                 
-                with col2:
-                    st.metric("Win Rate", f"{strategy['performance']['win_rate']:.1f}%")
-                    st.metric("Profit Factor", f"{strategy['performance']['profit_factor']:.2f}")
+                with st.expander(f"{return_icon} {ticker_info} - {strategy['name']} - {return_pct:.2f}% Return ({len(strategy['active_indicators'])} indicators)"):
+                    # Add ticker/period banner
+                    st.info(f"**Optimized on:** {strategy.get('ticker', 'Unknown')} | **Period:** {period_info}")
+                    
+                    # Performance Metrics
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        st.metric("Total Return", f"{return_pct:.2f}%", 
+                                 delta=f"{return_pct - (strategy.get('baseline_return', 0) or 0):.2f}% vs B&H")
+                        st.metric("Total Trades", strategy['performance']['total_trades'])
+                    
+                    with col2:
+                        st.metric("Win Rate", f"{strategy['performance']['win_rate']:.1f}%")
+                        st.metric("Profit Factor", f"{strategy['performance']['profit_factor']:.2f}")
+                    
+                    with col3:
+                        st.metric("Max Drawdown", f"{strategy['performance']['max_drawdown_pct']:.2f}%")
+                        st.metric("Total Profit", f"${strategy['performance']['total_profit']:,.0f}")
+                    
+                    with col4:
+                        st.write("**Saved:**")
+                        st.write(strategy['timestamp'][:8])
+                        st.write("**File:**")
+                        st.write(strategy['filename'])
+                    
+                    # Indicators
+                    st.write("**Active Indicators:**")
+                    indicator_text = ", ".join(strategy['active_indicators'])
+                    st.write(indicator_text)
+                    
+                    # Add visualization and trade details
+                    st.markdown("---")
                 
-                with col3:
-                    st.metric("Max Drawdown", f"{strategy['performance']['max_drawdown_pct']:.2f}%")
-                    st.metric("Total Profit", f"${strategy['performance']['total_profit']:,.0f}")
+                    # Create tabs for details
+                    detail_tabs = st.tabs(["📊 Performance Chart", "📋 Trade Log", "🔧 Parameters"])
+                    
+                    with detail_tabs[0]:
+                        st.write("**Performance Visualization:**")
+                    
+                        # Check if this is an old strategy without ticker info
+                        strat_ticker = strategy.get('ticker', 'Unknown')
+                        if strat_ticker == 'Unknown':
+                            st.warning("""
+                        ⚠️ **Old Strategy - No Ticker Information**
+                        
+                        This strategy was saved before ticker tracking was added.
+                        
+                        **To fix this:**
+                        1. Remember which ticker you optimized this on (e.g., MSTY)
+                        2. Re-optimize and save a new version
+                        3. Or manually edit the JSON file to add: `"ticker": "MSTY"`
+                        
+                        **For now, visualization is disabled.**
+                            """)
+                        else:
+                            # Need to reload data and regenerate chart
+                            try:
+                                # Load the data for this strategy
+                                strat_period = strategy.get('period', '1y')
+                                strat_interval = strategy.get('interval', '1d')
+                                
+                                with st.spinner(f"Loading {strat_ticker} data..."):
+                                    strat_data = load_and_validate_data(strat_ticker, strat_period, strat_interval)
+                            
+                                if strat_data is not None:
+                                    # Get indicators
+                                    strat_enriched = get_all_indicators(strat_data)
+                                    
+                                    # Re-run backtest with saved parameters
+                                    from optimization import universal_strategy
+                                    backtester = Backtester(
+                                        strat_enriched, 
+                                        strategy['name'],
+                                        universal_strategy,
+                                        strategy['parameters'],
+                                        strategy['performance']['starting_capital']
+                                    )
+                                    backtester.run()
+                                    trade_log, summary = backtester.get_results()
+                                
+                                    # Calculate baseline
+                                    baseline = calculate_buy_and_hold_baseline(
+                                        strat_enriched, 
+                                        strategy['performance']['starting_capital']
+                                    )
+                                    
+                                    # Create chart
+                                    fig = create_strategy_chart(strat_enriched, trade_log, strategy['name'], summary, baseline)
+                                    st.plotly_chart(fig, use_container_width=True)
+                                    
+                                    # Check for recent trade activity
+                                    if len(trade_log) > 0:
+                                        last_exit = pd.to_datetime(trade_log.iloc[-1]['exit_date'])
+                                        days_since_last_trade = (datetime.now() - last_exit).days
+                                        
+                                        if days_since_last_trade > 30:
+                                            st.warning(f"""
+                                            ⚠️ **No Recent Trades Detected**
+                                            
+                                            Last trade exit: **{last_exit.strftime('%Y-%m-%d')}** ({days_since_last_trade} days ago)
+                                            
+                                            **Possible reasons:**
+                                            - 📊 **Indicator thresholds not being met** in current market conditions
+                                            - 🔒 **Filters blocking trades** (trend filter, confirmation required)
+                                            - 📉 **Market regime changed** since optimization
+                                            - 🎯 **Strategy is very selective** (designed for fewer trades)
+                                            
+                                            **What to do:**
+                                            1. Check "Active Indicators" tab to see current values
+                                            2. Try "Generate Signals" to see if there are pending signals today
+                                            3. Consider re-optimizing with current market data
+                                            4. Check if `use_trend_filter` is blocking (ADX < 25 or wrong Supertrend)
+                                            
+                                            💡 **Tip:** If strategy parameters include `min_hold_days: 7+` and `use_trend_filter: True`,
+                                            it will be VERY selective and may not trade during choppy/ranging markets.
+                                            """)
+                                            
+                                            # Show diagnostic info
+                                            with st.expander("🔍 **Diagnostics: Why No Recent Trades?**"):
+                                                st.write("**Strategy Parameters:**")
+                                                params = strategy.get('parameters', {})
+                                                
+                                                # Check key filter parameters
+                                                st.write(f"- Min Hold Days: **{params.get('min_hold_days', 'N/A')}** days")
+                                                st.write(f"- Require Confirmation: **{params.get('require_confirmation', 'N/A')}**")
+                                                st.write(f"- Use Trend Filter: **{params.get('use_trend_filter', 'N/A')}**")
+                                                st.write(f"- Buy Score Threshold: **{params.get('buy_score_threshold', 'N/A')}**")
+                                                st.write(f"- Sell Score Threshold: **{params.get('sell_score_threshold', 'N/A')}**")
+                                                
+                                                st.write("\n**Current Indicator Values (Latest):**")
+                                                if len(strat_enriched) > 0:
+                                                    latest_row = strat_enriched.iloc[-1]
+                                                    
+                                                    # Check trend indicators
+                                                    adx_cols = [c for c in strat_enriched.columns if 'ADX' in c]
+                                                    if adx_cols:
+                                                        adx_val = latest_row[adx_cols[0]]
+                                                        st.write(f"- ADX: **{adx_val:.2f}** {'✅ Strong trend (>25)' if adx_val > 25 else '❌ Weak trend (<25)'}")
+                                                    
+                                                    # Check Supertrend
+                                                    st_cols = [c for c in strat_enriched.columns if 'SUPERTd' in c]
+                                                    if st_cols:
+                                                        st_val = latest_row[st_cols[0]]
+                                                        st.write(f"- Supertrend: **{'🟢 Uptrend' if st_val == 1 else '🔴 Downtrend'}**")
+                                                    
+                                                    # Check RSI
+                                                    rsi_cols = [c for c in strat_enriched.columns if 'RSI' in c]
+                                                    if rsi_cols:
+                                                        rsi_val = latest_row[rsi_cols[0]]
+                                                        status = '🟢 Oversold' if rsi_val < 30 else '🔴 Overbought' if rsi_val > 70 else '⚪ Neutral'
+                                                        st.write(f"- RSI: **{rsi_val:.2f}** {status}")
+                                                    
+                                                    st.write("\n**Why this matters:**")
+                                                    if params.get('use_trend_filter'):
+                                                        st.write("- ⚠️ Trend filter is ENABLED - strategy only trades during strong trends (ADX > 25)")
+                                                        if adx_cols and latest_row[adx_cols[0]] < 25:
+                                                            st.write("- 🚫 **ADX < 25: All trades are currently BLOCKED**")
+                                                    
+                                                    if params.get('require_confirmation'):
+                                                        st.write("- ⚠️ Confirmation required - needs 2 consecutive days of same signal")
+                                                    
+                                                    if params.get('min_hold_days', 0) > 5:
+                                                        st.write(f"- ⚠️ High min_hold_days ({params['min_hold_days']}) - very selective, fewer trades")
+                                else:
+                                    st.warning("Unable to load market data for visualization")
+                            except Exception as e:
+                                st.error(f"Error generating chart: {e}")
                 
-                with col4:
-                    st.write("**Saved:**")
-                    st.write(strategy['timestamp'][:8])
-                    st.write("**File:**")
-                    st.write(strategy['filename'])
-                
-                # Indicators
-                st.write("**Active Indicators:**")
-                indicator_text = ", ".join(strategy['active_indicators'])
-                st.write(indicator_text)
-                
-                # Action buttons
-                button_col1, button_col2 = st.columns([1, 4])
-                with button_col1:
-                    # Use filename for unique key since timestamps might be identical
-                    unique_key = strategy['filename'].replace('.json', '').replace('strategy_', '')
-                    if st.button(f"🗑️ Delete", key=f"delete_{unique_key}"):
-                        os.remove(strategy['filepath'])
-                        st.success("Strategy deleted!")
-                        st.experimental_rerun()
+                    with detail_tabs[1]:
+                        st.write("**Trade Details:**")
+                        if 'trade_log' in strategy and strategy['trade_log']:
+                            trade_df = pd.DataFrame(strategy['trade_log'])
+                            st.dataframe(trade_df, use_container_width=True)
+                        else:
+                            # Try to regenerate trade log
+                            try:
+                                strat_ticker = strategy.get('ticker', 'SPY')
+                                strat_period = strategy.get('period', '1y')
+                                strat_interval = strategy.get('interval', '1d')
+                                
+                                strat_data = load_and_validate_data(strat_ticker, strat_period, strat_interval)
+                                if strat_data is not None:
+                                    strat_enriched = get_all_indicators(strat_data)
+                                    from optimization import universal_strategy
+                                    backtester = Backtester(
+                                        strat_enriched,
+                                        strategy['name'],
+                                        universal_strategy,
+                                        strategy['parameters'],
+                                        strategy['performance']['starting_capital']
+                                    )
+                                    backtester.run()
+                                    trade_log, _ = backtester.get_results()
+                                    
+                                    if len(trade_log) > 0:
+                                        st.dataframe(trade_log, use_container_width=True)
+                                    else:
+                                        st.info("No trades generated with this strategy")
+                                else:
+                                    st.warning("Unable to load data for trade details")
+                            except Exception as e:
+                                st.error(f"Error loading trade details: {e}")
+                    
+                    with detail_tabs[2]:
+                        st.write("**Strategy Parameters:**")
+                        param_data = []
+                        for key, value in strategy['parameters'].items():
+                            param_data.append({
+                                'Parameter': key,
+                                'Value': str(value)
+                            })
+                        st.table(param_data)
+                    
+                    st.markdown("---")
+                    
+                    # Action buttons
+                    button_col1, button_col2 = st.columns([1, 4])
+                    with button_col1:
+                        # Use filename for unique key since timestamps might be identical
+                        unique_key = strategy['filename'].replace('.json', '').replace('strategy_', '')
+                        if st.button(f"🗑️ Delete", key=f"delete_{unique_key}"):
+                            os.remove(strategy['filepath'])
+                            st.success("Strategy deleted!")
+                            st.rerun()
     else:
         if search_term or min_return is not None or max_return is not None:
             st.info("🔍 No strategies match your search criteria. Try adjusting your filters.")
@@ -774,17 +1832,54 @@ if st.session_state.get('show_saved_strategies', False):
 
 # --- User Inputs ---
 st.sidebar.header("User Inputs")
-ticker = st.sidebar.text_input("Stock Ticker", "SPY").upper()
+
+# Ticker input with quick-select options
+col1, col2 = st.sidebar.columns([3, 1])
+with col1:
+    ticker = st.text_input("Stock Ticker", "SPY").upper()
+with col2:
+    st.write("")
+    st.write("Quick:")
+    if st.button("MSTY", key="btn_msty"):
+        ticker = "MSTY"
+    if st.button("MSTR", key="btn_mstr"):
+        ticker = "MSTR"
+
 interval = st.sidebar.selectbox(
     "Select Timeframe",
-    ['1d', '5d', '1wk', '1mo', '3mo'],
-    index=0
+    ['1m', '5m', '15m', '30m', '1h', '1d', '5d', '1wk', '1mo', '3mo'],
+    index=5,  # Default to '1d'
+    help="Intraday data (1m-1h) is limited to recent periods. Use daily (1d+) for longer history."
 )
-period = st.sidebar.selectbox(
-    "Select Period",
-    ['1mo', '3mo', '6mo', '1y', '2y', '5y', 'max'],
-    index=3
-)
+
+# Period selection with constraints for intraday data
+if interval in ['1m', '5m', '15m', '30m', '1h']:
+    # Intraday intervals require shorter periods
+    if interval == '1m':
+        period_options = ['1d', '5d', '7d']
+        default_period = '5d'
+        st.sidebar.info("⏰ 1-minute data limited to last 7 days")
+    elif interval in ['5m', '15m', '30m']:
+        period_options = ['1d', '5d', '1mo', '2mo']
+        default_period = '1mo'
+        st.sidebar.info("⏰ Intraday data limited to last 60 days")
+    else:  # 1h
+        period_options = ['1d', '5d', '1mo', '3mo', '6mo', '1y', '2y']
+        default_period = '3mo'
+        st.sidebar.info("⏰ Hourly data limited to last 730 days")
+    
+    period = st.sidebar.selectbox(
+        "Select Period",
+        period_options,
+        index=period_options.index(default_period)
+    )
+else:
+    # Daily and higher intervals can use any period
+    period = st.sidebar.selectbox(
+        "Select Period",
+        ['1mo', '3mo', '6mo', '1y', '2y', '5y', 'max'],
+        index=3  # Default to '1y'
+    )
 
 # Deep Learning Options
 st.sidebar.header("Deep Learning Options")
@@ -1168,6 +2263,25 @@ if st.sidebar.button("Find Patterns"):
 else:
     st.info("Enter a stock ticker and select a timeframe to begin.")
 
+# --- Trade Section ---
+st.sidebar.header("🎯 Trade")
+
+if st.sidebar.button("📊 Portfolio & Daily Signals", use_container_width=True):
+    st.session_state.show_trade_section = True
+    st.rerun()
+
+# Load portfolio info for sidebar display
+portfolio_file = 'portfolio_config.json'
+if os.path.exists(portfolio_file):
+    try:
+        with open(portfolio_file, 'r') as f:
+            portfolio_data = json.load(f)
+            st.sidebar.write(f"**Portfolio:** {len(portfolio_data.get('tickers', []))} tickers")
+    except:
+        pass
+
+st.sidebar.markdown("---")
+
 # --- Saved Strategies Viewer ---
 st.sidebar.header("💾 Saved Strategies")
 
@@ -1220,8 +2334,59 @@ optimization_method = st.sidebar.selectbox(
     help="Joblib is usually fastest. Advanced uses distributed processing."
 )
 
+# Number of trials selection
+n_trials = st.sidebar.selectbox(
+    "🎯 Number of Trials",
+    options=[100, 500, 1000, 2500, 5000, 10000, 25000],
+    index=4,  # Default to 5000
+    help="More trials = better strategies but takes longer. Start with 1000 for testing."
+)
+
+# Trade Preference Slider (NEW!)
+st.sidebar.subheader("📊 Trade Frequency Control")
+trade_preference = st.sidebar.slider(
+    "How many trades do you want?",
+    min_value=0.0,
+    max_value=1.0,
+    value=0.4,  # Default to Conservative (fewer trades)
+    step=0.1,
+    help="""
+    **🎯 Controls how selective strategies are:**
+    
+    • **0.0-0.3 = Very Conservative** (5-15 trades/year)
+      Catches only the best setups, big moves
+    
+    • **0.4-0.6 = Balanced** (15-30 trades/year)
+      Good mix of selectivity and activity
+    
+    • **0.7-1.0 = Aggressive** (30-60 trades/year)
+      More active trading, smaller moves
+    
+    **💡 Tip:** Start with 0.3-0.4 to avoid overtrading!
+    """
+)
+
+# Show trade preference label
+if trade_preference < 0.3:
+    pref_label = "🐢 Very Conservative"
+    pref_desc = "~5-15 trades/year (best for swing trading)"
+elif trade_preference < 0.4:
+    pref_label = "🎯 Conservative"
+    pref_desc = "~10-20 trades/year (recommended)"
+elif trade_preference < 0.6:
+    pref_label = "⚖️ Balanced"
+    pref_desc = "~20-30 trades/year"
+elif trade_preference < 0.8:
+    pref_label = "🔥 Aggressive"
+    pref_desc = "~30-50 trades/year"
+else:
+    pref_label = "⚡ Very Aggressive"
+    pref_desc = "~50-80 trades/year"
+
+st.sidebar.caption(f"{pref_label}: {pref_desc}")
+
 # Show estimated time
-estimated_time = (5000 / n_jobs) / 60
+estimated_time = (n_trials / n_jobs) / 60
 speedup_text = f"{n_jobs}x speedup" if n_jobs > 1 else "single-core"
 st.sidebar.metric("Estimated Time", f"{estimated_time:.1f} min", speedup_text)
 
@@ -1242,6 +2407,18 @@ run_benchmark = st.sidebar.checkbox(
     help="Test methods to find fastest (adds 2-3 min but optimizes the full run)"
 )
 
+# Live Trading Simulation Mode
+st.sidebar.subheader("🔴 Live Trading Mode")
+live_trading_mode = st.sidebar.checkbox(
+    "🚨 Live Trading Simulation",
+    value=False,
+    help="Test on ONLY the most recent 30 days to verify real-time readiness. All indicators must work on TODAY's candle."
+)
+
+if live_trading_mode:
+    st.sidebar.warning("⚠️ Live mode: Using only last 30 days!")
+    st.sidebar.info("This tests if your strategy can trade TODAY")
+
 if st.sidebar.button("Find and Optimize Top Strategies"):
     st.subheader("Optimized Strategy Results")
     
@@ -1255,6 +2432,11 @@ if st.sidebar.button("Find and Optimize Top Strategies"):
         data = load_and_validate_data(ticker, period, interval)
         if data is not None:
             with st.spinner("Calculating indicators and patterns..."):
+                # Console output to help user see progress  
+                print(f"\n🔄 CALCULATING INDICATORS FOR {ticker}")
+                print(f"   Data range: {len(data)} rows")
+                print(f"   Adding candlestick patterns...")
+                
                 # Add candlestick patterns as boolean columns
                 data['pattern_bullish_engulfing'] = find_bullish_engulfing(data)
                 data['pattern_bearish_engulfing'] = find_bearish_engulfing(data)
@@ -1306,8 +2488,33 @@ if st.sidebar.button("Find and Optimize Top Strategies"):
                         data['dl_signal_buy'] = pd.Series(False, index=data.index)
                         data['dl_signal_sell'] = pd.Series(False, index=data.index)
 
+                print(f"   Adding technical indicators and advanced patterns...")
                 enriched_data = get_all_indicators(data)
+                print(f"✅ INDICATORS COMPLETE: {len(enriched_data.columns)} total indicators")
+                
             st.success("Indicator and pattern calculation complete!")
+            
+            # LIVE TRADING MODE: Filter to most recent 30 days only
+            if live_trading_mode:
+                original_length = len(enriched_data)
+                # Keep only the last 30 trading days
+                enriched_data = enriched_data.iloc[-30:]
+                st.warning(f"🔴 **LIVE TRADING SIMULATION MODE**")
+                st.info(f"📊 Using only the most recent 30 trading days ({original_length - 30} days excluded)")
+                st.info(f"✅ This verifies your strategy can trade TODAY with current indicators")
+            
+            # Show data range - date might be in index or column
+            if 'date' in enriched_data.columns:
+                data_start = enriched_data['date'].min()
+                data_end = enriched_data['date'].max()
+            else:
+                # Date is in the index
+                data_start = enriched_data.index.min()
+                data_end = enriched_data.index.max()
+            
+            # Show data range with live trading indicator
+            range_label = "🔴 LIVE MODE Data Range" if live_trading_mode else "📅 Data Range"
+            st.info(f"**{range_label}:** {data_start.strftime('%B %d, %Y')} to {data_end.strftime('%B %d, %Y')} ({len(enriched_data)} trading days)")
 
             # Run benchmark if requested
             if run_benchmark:
@@ -1342,32 +2549,70 @@ if st.sidebar.button("Find and Optimize Top Strategies"):
                 
                 st.markdown("---")
 
-            # FORCE DEBUG - ALWAYS PRINT THIS
-            print(f"\n🚨🚨🚨 OPTIMIZATION ENTRY POINT - METHOD: {optimization_method} 🚨🚨🚨")
-            print(f"🚨🚨🚨 FORCING STANDARD OPTIMIZATION FOR DEBUGGING 🚨🚨🚨\n")
+            # Create progress tracking UI elements
+            st.write(f"### 🚀 Running Optimization")
+            st.write(f"**Method:** {optimization_method} | **Workers:** {n_jobs} | **Trials:** {n_trials:,}")
             
-            with st.spinner(f"Running {optimization_method} optimization with {n_jobs} parallel workers... This may take several minutes."):
-                # Temporarily force standard optimization for debugging
-                if True:  # Force standard for now
-                    st.info("🔍 Using standard optimization for debugging")
-                    print("🔥🔥🔥 CALLING run_optimization FROM optimization.py 🔥🔥🔥")
-                    top_trials = run_optimization(enriched_data, n_trials=10000, n_jobs=n_jobs)  # Use parallel processing
-                else:
-                    if optimization_method == 'standard':
-                        top_trials = run_optimization(enriched_data, n_trials=5000, n_jobs=n_jobs)
+            # Import time for ETA calculation
+            import time
+            start_time = time.time()
+            
+            # Progress tracking depends on worker count
+            if n_jobs == 1:
+                # Single-threaded: Use progress bar (works perfectly)
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                eta_text = st.empty()
+                
+                def update_progress(current_trial, total_trials):
+                    progress = current_trial / total_trials
+                    progress_bar.progress(min(progress, 1.0))
+                    
+                    elapsed = time.time() - start_time
+                    if current_trial > 0:
+                        avg_time_per_trial = elapsed / current_trial
+                        remaining_trials = total_trials - current_trial
+                        eta_seconds = avg_time_per_trial * remaining_trials
+                        eta_minutes = eta_seconds / 60
+                        
+                        status_text.text(f"📊 Progress: {current_trial:,} / {total_trials:,} trials ({progress*100:.1f}%)")
+                        eta_text.text(f"⏱️ Estimated time remaining: {eta_minutes:.1f} minutes")
                     else:
-                        try:
-                            from advanced_optimization import run_optimization_distributed
-                            method_map = {'joblib': 'joblib', 'advanced': 'distributed'}
-                            top_trials = run_optimization_distributed(
-                                enriched_data, 
-                                n_trials=5000, 
-                                n_jobs=n_jobs,
-                                method=method_map[optimization_method]
-                            )
-                        except ImportError:
-                            st.warning("Advanced optimization not available, using standard method")
-                            top_trials = run_optimization(enriched_data, n_trials=5000, n_jobs=n_jobs)
+                        status_text.text(f"📊 Starting optimization...")
+                        eta_text.text(f"⏱️ Calculating ETA...")
+                
+                progress_callback = update_progress
+            else:
+                # Multi-threaded: Progress callbacks don't work with parallel processes
+                # Show terminal instructions instead
+                st.info(f"🔄 **Optimization running with {n_jobs} parallel workers**")
+                st.write("📺 **Watch progress in your terminal** - Streamlit can't update UI from parallel workers")
+                st.write("You'll see a `tqdm` progress bar like this:")
+                st.code("Parallel Trials: 45%|████████▌         | 4,500/10,000 [08:15<09:45,  9.41it/s]")
+                st.write("⏳ This page will update automatically when optimization completes...")
+                progress_callback = None
+            
+            # Start optimization with appropriate mode
+            print(f"\n{'='*60}")
+            print("🚨 OPTIMIZATION STARTING FROM STREAMLIT APP")
+            print(f"{'='*60}")
+            print(f"🎯 Ticker: {ticker}")
+            print(f"📊 Trials: {n_trials:,}")
+            print(f"⚙️  Workers: {n_jobs}")
+            print(f"📋 Method: {optimization_method}")
+            print(f"📈 Data points: {len(enriched_data):,}")
+            print(f"🔧 Watch console for real-time progress...")
+            print(f"{'='*60}\n")
+            
+            with st.spinner("Running optimization..."):
+                # TensorFlow already configured for CPU-only at startup
+                print(f"🔧 Running optimization with CPU-only TensorFlow")
+                top_trials = run_optimization(enriched_data, n_trials=n_trials, n_jobs=n_jobs, progress_callback=progress_callback, trade_preference=trade_preference)
+            
+            # Show completion
+            elapsed_total = time.time() - start_time
+            st.success(f"✅ Completed {n_trials:,} trials in {elapsed_total/60:.1f} minutes")
+            st.write(f"🎯 Found {len(top_trials)} successful strategies")
             
             # Store optimization results in session state
             st.session_state.optimization_results = {
@@ -1391,6 +2636,16 @@ if 'optimization_results' in st.session_state:
     enriched_data = results['enriched_data']
     
     st.subheader("📊 Strategy Results")
+    
+    # Show data range for clarity - date might be in index or column
+    if 'date' in enriched_data.columns:
+        data_start = enriched_data['date'].min()
+        data_end = enriched_data['date'].max()
+    else:
+        # Date is in the index
+        data_start = enriched_data.index.min()
+        data_end = enriched_data.index.max()
+    st.info(f"📅 **Data Range:** {data_start.strftime('%B %d, %Y')} to {data_end.strftime('%B %d, %Y')} ({len(enriched_data)} days)")
     
     st.write("**Top 3 Discovered Strategies:**")
     
@@ -1461,7 +2716,10 @@ if 'optimization_results' in st.session_state:
                     'summary': summary,
                     'trade_log': trade_log,
                     'active_indicators': active_indicators,
-                    'baseline': None  # Will be updated below
+                    'baseline': None,  # Will be updated below
+                    'ticker': ticker,
+                    'period': period,
+                    'interval': interval
                 }
                 
                 # Calculate buy-and-hold baseline for comparison  

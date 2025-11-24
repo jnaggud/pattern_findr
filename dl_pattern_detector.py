@@ -6,6 +6,8 @@ import matplotlib.pyplot as plt
 import mplfinance as mpf
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+# TensorFlow CPU-only mode already set by app.py environment variables
+# Import quietly without additional configuration
 import tensorflow as tf
 from tensorflow.keras import layers, models
 from datetime import datetime

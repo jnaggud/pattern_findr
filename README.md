@@ -85,7 +85,12 @@ No additional training is required unless you want to retrain models on custom d
 The app will open in your browser at `http://localhost:8503`
 
 ### 2. Configure Settings
-- **Stock Symbol**: Enter any valid ticker (e.g., AAPL, MSFT, TSLA)
+- **Stock Symbol**: Enter any valid ticker (e.g., AAPL, MSFT, TSLA, MSTY, MSTR)
+  - Quick-select buttons available for MSTY and MSTR
+- **Timeframe**: Select data interval (1m, 5m, 15m, 30m, 1h, 1d, 5d, 1wk, 1mo, 3mo)
+  - Intraday data (1m-1h) limited to recent periods per yfinance API constraints
+  - Daily (1d) and higher available for extended history
+- **Period**: Select historical data range (auto-adjusted for intraday intervals)
 - **Starting Capital**: Set your backtesting capital ($100K default)
 - **Optimization Method**: Choose parallelization method (joblib recommended)
 - **Number of Trials**: Set optimization iterations (5000+ for best results)
@@ -138,12 +143,33 @@ methods = ['standard', 'joblib', 'advanced']
 capital = 1000 to 10,000,000  # $1K to $10M
 ```
 
+### Supported Timeframes
+Pattern_FindR supports both **intraday** and **daily+** timeframes:
+
+#### Intraday Intervals
+- **1m** (1 minute) - Limited to last 7 days
+- **5m** (5 minutes) - Limited to last 60 days
+- **15m** (15 minutes) - Limited to last 60 days
+- **30m** (30 minutes) - Limited to last 60 days
+- **1h** (1 hour) - Limited to last 730 days
+
+#### Daily+ Intervals
+- **1d** (daily) - Full historical data available
+- **5d** (5 days) - Full historical data available
+- **1wk** (weekly) - Full historical data available
+- **1mo** (monthly) - Full historical data available
+- **3mo** (3 months) - Full historical data available
+
+**Note**: Intraday data limitations are enforced by the yfinance API. The app automatically adjusts available period options based on selected interval.
+
 ### Technical Indicators Available
 - **Momentum**: RSI, Stochastic, Williams %R, ROC
 - **Trend**: MACD, EMA, SMA, ADX, Parabolic SAR
 - **Volatility**: Bollinger Bands, ATR, Standard Deviation
 - **Volume**: OBV, Volume SMA, VWAP
 - **Pattern Recognition**: CNN-based chart patterns
+- **Advanced**: Volume-weighted patterns, price action signals
+- **Enhanced**: Multi-timeframe pattern detection
 
 ## 💡 Best Practices
 

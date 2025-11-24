@@ -10,3 +10,4 @@ pandas-ta
 scikit-learn
 scipy
 numpy
+twilio

@@ -1,6 +1,9 @@
 import os
 import numpy as np
 import pandas as pd
+
+# TensorFlow CPU-only mode already set by app.py environment variables
+# Import quietly without additional configuration
 import tensorflow as tf
 from tensorflow.keras import layers, models, callbacks
 from tensorflow.keras.applications import MobileNetV2
