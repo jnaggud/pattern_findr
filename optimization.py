@@ -852,7 +852,8 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
                 elif regime in ['crash', 'bear']:
                     # ENHANCED DIP-BUYING: Force ultra-aggressive thresholds for crash/bear markets
                     # This ensures we catch major market bottoms like April 2025
-                    params[f'{regime}_buy_score_threshold'] = 1  # ALWAYS use threshold=1 for dips
+                    # CRITICAL: Use trial.suggest_categorical to ensure Optuna tracks this parameter
+                    params[f'{regime}_buy_score_threshold'] = trial.suggest_categorical(f'{regime}_buy_score_threshold', [1])
                     regime_sell_max = min(8, actual_active)  # Allow normal sell range
                     params[f'{regime}_sell_score_threshold'] = trial.suggest_int(f'{regime}_sell_score_threshold', 1, regime_sell_max)
                 else:
