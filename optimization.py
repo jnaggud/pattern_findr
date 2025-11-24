@@ -254,7 +254,8 @@ def universal_strategy(data, params):
 
     # Convert persistent scores to signals with thresholds (static or regime-aware)
     if use_regime_aware:
-        # Use regime-aware score thresholds
+        # CRITICAL: Always use regime-aware score thresholds when regime_aware is enabled
+        # This is separate from persistence logic and must always be active
         buy_signals = pd.Series(False, index=data.index)
         sell_signals = pd.Series(False, index=data.index)
         
@@ -755,7 +756,8 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
     # Use unique parameter names to avoid Optuna conflicts
     
     # ALWAYS enable trend filter for dip protection (especially important for crash detection)
-    params['use_trend_filter'] = True  # Force enable for safety
+    # CRITICAL: Use trial.suggest_categorical to ensure Optuna tracks this parameter
+    params['use_trend_filter'] = trial.suggest_categorical('use_trend_filter', [True])
     
     # Optimize ADX threshold with unique name
     params['trend_adx_threshold'] = trial.suggest_float('trend_adx_threshold', 15, 35)
