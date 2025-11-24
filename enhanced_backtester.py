@@ -66,47 +66,62 @@ class EnhancedBacktester(Backtester):
     
     def _calculate_enhanced_position_sizes(self, signals: pd.Series) -> pd.Series:
         """
-        Calculate enhanced position sizes based on signal strength
+        Calculate AGGRESSIVE enhanced position sizes for higher returns
         """
-        # Simplified position sizing for initial implementation
-        # Use the max_position_pct directly with some volatility adjustment
-        
-        max_pos_pct = self.params.get('max_position_pct', 0.20)
+        max_pos_pct = self.params.get('max_position_pct', 0.50)  # More aggressive default
         volatility_adjustment = self.params.get('volatility_adjustment', True)
+        aggressive_vol_scaling = self.params.get('aggressive_vol_scaling', False)
+        confidence_risk_multiplier = self.params.get('confidence_risk_multiplier', 1.5)
         
         # Start with base position size
         position_sizes = pd.Series(0.0, index=signals.index)
         
-        # Calculate volatility multiplier if enabled
+        # Calculate volatility multiplier
         if volatility_adjustment and 'close' in self.data.columns:
             returns = self.data['close'].pct_change()
             volatility = returns.rolling(window=20, min_periods=5).std().fillna(0.02)
-            
-            # High volatility = reduce positions, Low volatility = increase positions
             vol_median = volatility.median()
             vol_multiplier = pd.Series(1.0, index=signals.index)
             
-            # Reduce position size when volatility is high
-            high_vol_mask = volatility > vol_median * 1.5
-            vol_multiplier.loc[high_vol_mask] = 0.7
-            
-            # Increase position size when volatility is low  
-            low_vol_mask = volatility < vol_median * 0.7
-            vol_multiplier.loc[low_vol_mask] = 1.2
+            if aggressive_vol_scaling:
+                # AGGRESSIVE: Less conservative volatility adjustments
+                high_vol_mask = volatility > vol_median * 2.0  # Only reduce on extreme vol
+                vol_multiplier.loc[high_vol_mask] = 0.8  # Less reduction
+                
+                low_vol_mask = volatility < vol_median * 0.5  # More aggressive on low vol
+                vol_multiplier.loc[low_vol_mask] = 1.5  # Higher increase
+            else:
+                # Standard volatility adjustments  
+                high_vol_mask = volatility > vol_median * 1.5
+                vol_multiplier.loc[high_vol_mask] = 0.7
+                
+                low_vol_mask = volatility < vol_median * 0.7
+                vol_multiplier.loc[low_vol_mask] = 1.2
         else:
             vol_multiplier = pd.Series(1.0, index=signals.index)
         
-        # Apply position sizes to signals
+        # AGGRESSIVE: Signal strength with higher variance (0.6x to 2.0x)
         signal_mask = signals != 0
-        base_position_sizes = max_pos_pct * vol_multiplier
-        
-        # Add some randomness for signal strength simulation (0.8x to 1.2x)
         np.random.seed(42)
-        signal_strength = 0.8 + 0.4 * np.random.random(len(signals))
+        
+        # More aggressive signal strength simulation
+        if confidence_risk_multiplier > 1.3:
+            # High confidence multiplier = more aggressive sizing
+            signal_strength = 0.6 + 1.4 * np.random.random(len(signals))  # 0.6x to 2.0x
+        else:
+            # Standard signal strength
+            signal_strength = 0.8 + 0.4 * np.random.random(len(signals))  # 0.8x to 1.2x
+        
         strength_series = pd.Series(signal_strength, index=signals.index)
         
-        position_sizes = base_position_sizes * strength_series
-        position_sizes = position_sizes.clip(lower=0.01, upper=max_pos_pct * 1.2)
+        # Apply confidence risk multiplier
+        strength_series = strength_series * confidence_risk_multiplier
+        
+        # Calculate aggressive position sizes
+        base_position_sizes = max_pos_pct * vol_multiplier * strength_series
+        
+        # AGGRESSIVE: Allow positions up to 150% of max_pos_pct for extreme confidence
+        position_sizes = base_position_sizes.clip(lower=0.01, upper=max_pos_pct * 1.5)
         
         # Only apply to actual signals
         position_sizes.loc[~signal_mask] = 0.0

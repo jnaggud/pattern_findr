@@ -59,6 +59,8 @@ def universal_strategy(data, params):
         'volatility_adjustment',
         'position_confidence_weighting',
         'max_total_exposure',
+        'aggressive_vol_scaling',
+        'confidence_risk_multiplier',
         'sell_pct_max',
         # Old trade preference parameters
         'min_hold_days',
@@ -602,15 +604,21 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
         params['enable_position_sizing'] = trial.suggest_categorical('enable_position_sizing', [True, False])
         
         if params['enable_position_sizing']:
-            # Optimize maximum position size (5% to 25% of capital per position)
-            params['max_position_pct'] = trial.suggest_float('max_position_pct', 0.05, 0.25)
+            # AGGRESSIVE: Optimize maximum position size (20% to 75% of capital per position)
+            params['max_position_pct'] = trial.suggest_float('max_position_pct', 0.20, 0.75)
             
             # Optimize risk management features
             params['kelly_optimization'] = trial.suggest_categorical('kelly_optimization', [True, False])
             params['volatility_adjustment'] = trial.suggest_categorical('volatility_adjustment', [True, False])
             
-            # Maximum total exposure (30% to 80% of capital)
-            params['max_total_exposure'] = trial.suggest_float('max_total_exposure', 0.30, 0.80)
+            # AGGRESSIVE: Maximum total exposure (60% to 95% of capital)
+            params['max_total_exposure'] = trial.suggest_float('max_total_exposure', 0.60, 0.95)
+            
+            # NEW: Aggressive volatility scaling
+            params['aggressive_vol_scaling'] = trial.suggest_categorical('aggressive_vol_scaling', [True, False])
+            
+            # NEW: Risk multiplier for high-confidence signals
+            params['confidence_risk_multiplier'] = trial.suggest_float('confidence_risk_multiplier', 1.0, 2.0)
         else:
             # Default values when position sizing is disabled
             params['max_position_pct'] = 1.00  # Full capital deployment (original behavior)
