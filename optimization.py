@@ -560,10 +560,10 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
             print(f"  SKIPPING TRIAL {trial.number}: No valid indicators")
         return -1e9
     
-    # ULTRA-LOW thresholds to catch single-indicator opportunities
-    # During crashes, sometimes only 1-2 indicators scream "BUY" at the exact bottom
-    # With ALL 85 indicators, we need higher thresholds but still keep them reasonable
-    max_reasonable_threshold = min(25, actual_active)  # Cap at 25 or total indicators
+    # CRASH-SENSITIVE thresholds to catch major market bottoms
+    # April 2025 analysis: Only 2 indicators (RSI + WillR) were oversold at the bottom
+    # Need to ensure buy thresholds can be low enough (1-3) to catch these opportunities
+    max_reasonable_threshold = min(8, actual_active)  # Cap at 8 for crash sensitivity
     
     params['buy_score_threshold'] = trial.suggest_int('buy_score_threshold', 1, max_reasonable_threshold)
     params['sell_score_threshold'] = trial.suggest_int('sell_score_threshold', 1, max_reasonable_threshold)
