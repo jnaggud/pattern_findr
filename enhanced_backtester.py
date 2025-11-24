@@ -100,17 +100,20 @@ class EnhancedBacktester(Backtester):
         else:
             vol_multiplier = pd.Series(1.0, index=signals.index)
         
-        # AGGRESSIVE: Signal strength with higher variance (0.6x to 2.0x)
+        # DETERMINISTIC: Signal strength based on date hash for consistency
         signal_mask = signals != 0
-        np.random.seed(42)
+        
+        # Create deterministic signal strength based on date index
+        # This ensures the same parameters always produce the same results
+        date_hashes = [hash(str(date)) % 1000 / 1000.0 for date in signals.index]
         
         # More aggressive signal strength simulation
         if confidence_risk_multiplier > 1.3:
             # High confidence multiplier = more aggressive sizing
-            signal_strength = 0.6 + 1.4 * np.random.random(len(signals))  # 0.6x to 2.0x
+            signal_strength = [0.6 + 1.4 * h for h in date_hashes]  # 0.6x to 2.0x
         else:
             # Standard signal strength
-            signal_strength = 0.8 + 0.4 * np.random.random(len(signals))  # 0.8x to 1.2x
+            signal_strength = [0.8 + 0.4 * h for h in date_hashes]  # 0.8x to 1.2x
         
         strength_series = pd.Series(signal_strength, index=signals.index)
         

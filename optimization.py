@@ -885,7 +885,10 @@ def run_optimization(data, n_trials=1000, n_jobs=None, progress_callback=None, t
         ])
 
         # Enhancement #2: Use enhanced backtester for final sanity check if position sizing was enabled
-        if POSITION_SIZING_AVAILABLE and params.get('enable_position_sizing', False):
+        # Use the same setting from the Streamlit app to ensure consistency
+        if POSITION_SIZING_AVAILABLE and enable_position_sizing:
+            max_pos = params.get('max_position_pct', 0.20)
+            print(f"🚀 FINAL SANITY CHECK: Using EnhancedBacktester with {max_pos:.1%} max position")
             bt = EnhancedBacktester(
                 data=data,
                 strategy_name=strategy_name or "Top Trial",
@@ -893,9 +896,10 @@ def run_optimization(data, n_trials=1000, n_jobs=None, progress_callback=None, t
                 params=params,
                 starting_capital=100000,
                 enable_position_sizing=True,
-                max_position_pct=params.get('max_position_pct', 0.20)
+                max_position_pct=max_pos
             )
         else:
+            print(f"📊 FINAL SANITY CHECK: Using Standard Backtester (100% capital)")
             bt = Backtester(data, strategy_name or "Top Trial", universal_strategy, params)
         
         bt.run()
