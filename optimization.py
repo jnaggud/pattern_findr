@@ -187,7 +187,7 @@ def universal_strategy(data, params):
             # Numerical indicators: compare against thresholds
             # Get thresholds (either static or regime-aware)
             if use_regime_aware and indicator in ['RSI_14', 'WILLR_14', 'MACD_12_26_9']:
-                # Use regime-aware thresholds - detect regime for each row
+                # Use regime-aware thresholds for key indicators - detect regime for each row
                 buy_threshold_series = pd.Series(dtype=float, index=data.index)
                 sell_threshold_series = pd.Series(dtype=float, index=data.index)
                 
@@ -201,7 +201,7 @@ def universal_strategy(data, params):
                 buy_threshold = buy_threshold_series
                 sell_threshold = sell_threshold_series
             else:
-                # Use static thresholds
+                # Use static thresholds for all other indicators (still using ALL indicators)
                 buy_threshold = params.get(f'{indicator}_buy')
                 sell_threshold = params.get(f'{indicator}_sell')
 
@@ -220,17 +220,47 @@ def universal_strategy(data, params):
         buy_signals = pd.Series(False, index=data.index)
         sell_signals = pd.Series(False, index=data.index)
         
+        debug_info = {'regimes': [], 'thresholds': [], 'scores': [], 'signals': []}
+        
         for i in range(len(data)):
             current_regime = detect_market_regime(data, i)
             regime_buy_threshold = params.get(f'{current_regime}_buy_score_threshold', params.get('buy_score_threshold', 1))
             regime_sell_threshold = params.get(f'{current_regime}_sell_score_threshold', params.get('sell_score_threshold', 1))
             
-            buy_signals.iloc[i] = buy_score_persistent.iloc[i] >= regime_buy_threshold
-            sell_signals.iloc[i] = sell_score_persistent.iloc[i] >= regime_sell_threshold
+            current_buy_score = buy_score_persistent.iloc[i]
+            current_sell_score = sell_score_persistent.iloc[i]
+            
+            buy_signal = current_buy_score >= regime_buy_threshold
+            sell_signal = current_sell_score >= regime_sell_threshold
+            
+            buy_signals.iloc[i] = buy_signal
+            sell_signals.iloc[i] = sell_signal
+            
+            # Collect debug info for first few and last few points
+            if i < 5 or i >= len(data) - 5:
+                debug_info['regimes'].append(current_regime)
+                debug_info['thresholds'].append(f'buy={regime_buy_threshold}')
+                debug_info['scores'].append(f'buy={current_buy_score:.1f}')
+                debug_info['signals'].append(f'buy={buy_signal}')
+        
+        # Debug output for first trial
+        if len(debug_info['regimes']) > 0:
+            print(f"🔍 REGIME-AWARE DEBUG (sample points):")
+            for i in range(min(3, len(debug_info['regimes']))):
+                print(f"   Point {i}: {debug_info['regimes'][i]} | {debug_info['thresholds'][i]} | {debug_info['scores'][i]} | {debug_info['signals'][i]}")
     else:
         # Use static thresholds
-        buy_signals = buy_score_persistent >= params['buy_score_threshold']
-        sell_signals = sell_score_persistent >= params['sell_score_threshold']
+        buy_threshold = params['buy_score_threshold']
+        sell_threshold = params['sell_score_threshold']
+        
+        buy_signals = buy_score_persistent >= buy_threshold
+        sell_signals = sell_score_persistent >= sell_threshold
+        
+        # Debug output for first trial
+        max_buy_score = buy_score_persistent.max()
+        buy_count = buy_signals.sum()
+        print(f"🔍 STATIC THRESHOLD DEBUG:")
+        print(f"   max_buy_score={max_buy_score:.1f}, buy_threshold={buy_threshold}, buy_signals={buy_count}")
 
     # === APPLY TREND FILTER ===
     # If enabled, we only allow BUY signals when the trend filter is positive.
@@ -284,8 +314,22 @@ def universal_strategy(data, params):
     conflicting_bars = buy_signals & sell_signals
     if conflicting_bars.any():
         # On conflicting bars, choose based on absolute score difference (deterministic)
-        buy_excess = buy_score_persistent - params['buy_score_threshold']
-        sell_excess = sell_score_persistent - params['sell_score_threshold']
+        buy_threshold = params['buy_score_threshold']
+        sell_threshold = params['sell_score_threshold']
+        
+        buy_excess = buy_score_persistent - buy_threshold
+        sell_excess = sell_score_persistent - sell_threshold
+        
+        # Debug the first few conflicts
+        conflict_indices = conflicting_bars[conflicting_bars].index[:3]
+        if len(conflict_indices) > 0:
+            print(f"🔍 CONFLICT RESOLUTION DEBUG (first 3 conflicts):")
+            for idx in conflict_indices:
+                b_score = buy_score_persistent[idx]
+                s_score = sell_score_persistent[idx]
+                b_excess = buy_excess[idx]
+                s_excess = sell_excess[idx]
+                print(f"   Index {idx}: buy_score={b_score:.1f} (thresh={buy_threshold}, excess={b_excess:.1f}) vs sell_score={s_score:.1f} (thresh={sell_threshold}, excess={s_excess:.1f})")
         
         # Where buy excess is greater, keep buy signal and remove sell
         stronger_buy = conflicting_bars & (buy_excess > sell_excess)
@@ -294,6 +338,9 @@ def universal_strategy(data, params):
         # Where sell excess is greater or equal, keep sell signal and remove buy  
         stronger_sell = conflicting_bars & (sell_excess >= buy_excess)
         buy_signals.loc[stronger_sell] = False
+        
+        # Debug summary
+        print(f"   Conflicts: {conflicting_bars.sum()} total, {stronger_buy.sum()} favor buy, {stronger_sell.sum()} favor sell")
 
     # Optional debug output
     if debug_mode and universal_strategy.call_count <= 3:
@@ -653,15 +700,12 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
     # April 2025 analysis: Only 2 indicators (RSI + WillR) were oversold at the bottom
     # Need to ensure buy thresholds can be low enough (1-3) to catch these opportunities
     
-    # Check if regime-aware mode is enabled
+    # For both standard and regime-aware modes, use all active indicators
+    # Regime-aware mode just changes the thresholds dynamically, not the indicator count
+    max_reasonable_threshold = min(8, actual_active)  # Cap at 8 for crash sensitivity
+    
     if params.get('enable_regime_aware', False) and SIMPLE_REGIME_AVAILABLE:
-        # For regime-aware mode, we only use 3 key indicators (RSI_14, WILLR_14, MACD_12_26_9)
-        regime_indicators_count = 3
-        max_reasonable_threshold = min(3, regime_indicators_count)  # Cap at 3 for regime-aware
-        print(f"   🎯 REGIME-AWARE MODE: Using {regime_indicators_count} indicators, max threshold = {max_reasonable_threshold}")
-    else:
-        # For standard mode, use all active indicators
-        max_reasonable_threshold = min(8, actual_active)  # Cap at 8 for crash sensitivity
+        print(f"   🎯 REGIME-AWARE MODE: Using ALL {actual_active} indicators with dynamic regime thresholds")
     
     params['buy_score_threshold'] = trial.suggest_int('buy_score_threshold', 1, max_reasonable_threshold)
     params['sell_score_threshold'] = trial.suggest_int('sell_score_threshold', 1, max_reasonable_threshold)
@@ -753,17 +797,20 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
             
             # Optimize parameters for each regime separately
             for regime in ['bull', 'bear', 'crash', 'sideways']:
-                # Key indicator thresholds for each regime
+                # Score thresholds for each regime (using ALL active indicators)
+                regime_max_threshold = min(8, actual_active)  # Same as base threshold logic
+                params[f'{regime}_buy_score_threshold'] = trial.suggest_int(f'{regime}_buy_score_threshold', 1, regime_max_threshold)
+                params[f'{regime}_sell_score_threshold'] = trial.suggest_int(f'{regime}_sell_score_threshold', 1, regime_max_threshold)
+                
+                # Regime-specific thresholds for ALL indicators (sample key ones for now)
+                # Note: In practice, we'd generate these for all active indicators, but that's too many parameters
+                # So we'll focus on key crash-detection indicators
                 params[f'{regime}_RSI_14_buy'] = trial.suggest_float(f'{regime}_RSI_14_buy', 15, 45)
                 params[f'{regime}_RSI_14_sell'] = trial.suggest_float(f'{regime}_RSI_14_sell', 55, 85)
                 params[f'{regime}_WILLR_14_buy'] = trial.suggest_float(f'{regime}_WILLR_14_buy', -90, -50)
                 params[f'{regime}_WILLR_14_sell'] = trial.suggest_float(f'{regime}_WILLR_14_sell', -50, -10)
                 params[f'{regime}_MACD_12_26_9_buy'] = trial.suggest_float(f'{regime}_MACD_12_26_9_buy', -10, 5)
                 params[f'{regime}_MACD_12_26_9_sell'] = trial.suggest_float(f'{regime}_MACD_12_26_9_sell', -5, 15)
-                
-                # Score thresholds for each regime (max 3 since we only use 3 key indicators)
-                params[f'{regime}_buy_score_threshold'] = trial.suggest_int(f'{regime}_buy_score_threshold', 1, 3)
-                params[f'{regime}_sell_score_threshold'] = trial.suggest_int(f'{regime}_sell_score_threshold', 1, 3)
         else:
             print(f"   📊 Using single parameter set for all market conditions")
     else:

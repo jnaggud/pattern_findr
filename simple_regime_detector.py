@@ -7,6 +7,9 @@ No look-ahead bias - uses only historical data at each point
 import pandas as pd
 import numpy as np
 
+# Flag to indicate that simple regime detection is available
+SIMPLE_REGIME_AVAILABLE = True
+
 def detect_market_regime(data, current_idx, lookback=20):
     """
     Detect market regime at current_idx using only past data
