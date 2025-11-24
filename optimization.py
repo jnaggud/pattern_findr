@@ -160,8 +160,10 @@ def universal_strategy(data, params):
     # SIGNAL PERSISTENCE SYSTEM - Allow signals to "stack up" over time
     # This catches opportunities when indicators trigger at different times
     signal_persistence_days = params.get('signal_persistence_days', 2)  # Now optimized by Optuna!
+    crash_persistence_days = params.get('crash_signal_persistence', signal_persistence_days)  # Enhanced crash persistence
     
     # Create persistent buy/sell scores that decay over time
+    # For regime-aware strategies, we'll apply different persistence windows by regime
     buy_score_persistent = pd.Series(0.0, index=data.index)
     sell_score_persistent = pd.Series(0.0, index=data.index)
 
@@ -178,10 +180,29 @@ def universal_strategy(data, params):
             if buy_param is not None and data[indicator].any():
                 # Add 1.0 to buy score when condition is met, then decay over next days
                 raw_signals = (data[indicator] == buy_param).astype(float)
-                buy_score_persistent += raw_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
+                
+                # Apply regime-aware persistence if enabled
+                if use_regime_aware:
+                    # Calculate regime-aware persistence for each point
+                    persistence_scores = pd.Series(0.0, index=data.index)
+                    for i in range(len(data)):
+                        current_regime = detect_market_regime(data, i)
+                        persistence_window = crash_persistence_days if current_regime in ['crash', 'bear'] else signal_persistence_days
+                        
+                        # Apply rolling window around current point
+                        start_idx = max(0, i - persistence_window + 1)
+                        end_idx = i + 1
+                        window_sum = raw_signals.iloc[start_idx:end_idx].sum()
+                        persistence_scores.iloc[i] = window_sum
+                    
+                    buy_score_persistent += persistence_scores
+                else:
+                    buy_score_persistent += raw_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
                 indicators_processed += 1
+                
             if sell_param is not None and data[indicator].any():
                 raw_signals = (data[indicator] == sell_param).astype(float)
+                # Sells use standard persistence (no enhanced crash persistence needed)
                 sell_score_persistent += raw_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
         else:
             # Numerical indicators: compare against thresholds
@@ -208,10 +229,29 @@ def universal_strategy(data, params):
             if buy_threshold is not None:
                 # Add 1.0 to buy score when condition is met, then decay over next days
                 raw_signals = (data[indicator] < buy_threshold).astype(float)
-                buy_score_persistent += raw_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
+                
+                # Apply regime-aware persistence if enabled
+                if use_regime_aware:
+                    # Calculate regime-aware persistence for each point
+                    persistence_scores = pd.Series(0.0, index=data.index)
+                    for i in range(len(data)):
+                        current_regime = detect_market_regime(data, i)
+                        persistence_window = crash_persistence_days if current_regime in ['crash', 'bear'] else signal_persistence_days
+                        
+                        # Apply rolling window around current point
+                        start_idx = max(0, i - persistence_window + 1)
+                        end_idx = i + 1
+                        window_sum = raw_signals.iloc[start_idx:end_idx].sum()
+                        persistence_scores.iloc[i] = window_sum
+                    
+                    buy_score_persistent += persistence_scores
+                else:
+                    buy_score_persistent += raw_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
                 indicators_processed += 1
+                
             if sell_threshold is not None:
                 raw_signals = (data[indicator] > sell_threshold).astype(float)
+                # Sells use standard persistence (no enhanced crash persistence needed)
                 sell_score_persistent += raw_signals.rolling(window=signal_persistence_days, min_periods=1).sum()
 
     # Convert persistent scores to signals with thresholds (static or regime-aware)
@@ -716,32 +756,33 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
     # In APPROACH A, trend filter is always enabled (already suggested above)
     # Use unique parameter names to avoid Optuna conflicts
     
-    if params.get('use_trend_filter', True):  # Default to True for APPROACH A
-        # Optimize ADX threshold with unique name
-        params['trend_adx_threshold'] = trial.suggest_float('trend_adx_threshold', 15, 35)
-        
-        # Optimize RSI oversold threshold with unique name
-        params['trend_rsi_oversold'] = trial.suggest_float('trend_rsi_oversold', 20, 45)
-        
-        # Optimize Williams %R threshold with unique name
-        params['trend_willr_threshold'] = trial.suggest_float('trend_willr_threshold', -95, -65)
-        
-        # Optimize Stochastic threshold with unique name
-        params['trend_stoch_threshold'] = trial.suggest_float('trend_stoch_threshold', 8, 25)
-        
-        # Optimize SMA period with unique name
-        params['trend_sma_period'] = trial.suggest_int('trend_sma_period', 20, 100)
-    else:
-        # Set default values when trend filter is disabled
-        params['trend_adx_threshold'] = 20
-        params['trend_rsi_oversold'] = 35
-        params['trend_willr_threshold'] = -80
-        params['trend_stoch_threshold'] = 15
-        params['trend_sma_period'] = 50
+    # ALWAYS enable trend filter for dip protection (especially important for crash detection)
+    params['use_trend_filter'] = True  # Force enable for safety
+    
+    # Optimize ADX threshold with unique name
+    params['trend_adx_threshold'] = trial.suggest_float('trend_adx_threshold', 15, 35)
+    
+    # Enhanced RSI threshold for better crash detection (lower bound for deeper dips)
+    params['trend_rsi_oversold'] = trial.suggest_float('trend_rsi_oversold', 15, 40)  # Lower bound for crash detection
+    
+    # Optimize Williams %R threshold with unique name
+    params['trend_willr_threshold'] = trial.suggest_float('trend_willr_threshold', -95, -65)
+    
+    # Optimize Stochastic threshold with unique name
+    params['trend_stoch_threshold'] = trial.suggest_float('trend_stoch_threshold', 8, 25)
+    
+    # Optimize SMA period with unique name
+    params['trend_sma_period'] = trial.suggest_int('trend_sma_period', 20, 100)
         
     # === APPROACH A: OPTIMIZE SIGNAL PERSISTENCE ===
     # Instead of static 2-day persistence, let Optuna find optimal window
-    params['signal_persistence_days'] = trial.suggest_int('signal_persistence_days', 1, 5)
+    # Enhanced for crash detection: allow longer persistence during market stress
+    if params.get('enable_regime_aware', False) and SIMPLE_REGIME_AVAILABLE:
+        # Regime-aware signal persistence - longer for crashes to catch multi-day bottoms
+        params['signal_persistence_days'] = trial.suggest_int('signal_persistence_days', 2, 5)  # Crash-optimized range
+        params['crash_signal_persistence'] = trial.suggest_int('crash_signal_persistence', 3, 7)  # Extra persistence for crashes
+    else:
+        params['signal_persistence_days'] = trial.suggest_int('signal_persistence_days', 1, 5)
     
     # === ENHANCEMENT #2: POSITION SIZING & RISK MANAGEMENT ===
     if POSITION_SIZING_AVAILABLE:
@@ -799,16 +840,22 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
             
             # Optimize parameters for each regime separately
             for regime in ['bull', 'bear', 'crash', 'sideways']:
-                # Score thresholds for each regime (ADJUSTED for market conditions)
+                # Score thresholds for each regime (ENHANCED DIP-BUYING)
                 if regime in ['bull', 'sideways']:
                     # Bull/sideways markets: indicators rarely oversold, use very low thresholds
                     regime_buy_max = min(2, actual_active)  # Cap at 2 for sustained trending markets
                     regime_sell_max = min(8, actual_active)  # Normal range for sells
                     params[f'{regime}_buy_score_threshold'] = trial.suggest_int(f'{regime}_buy_score_threshold', 1, regime_buy_max)
                     params[f'{regime}_sell_score_threshold'] = trial.suggest_int(f'{regime}_sell_score_threshold', 1, regime_sell_max)
+                elif regime in ['crash', 'bear']:
+                    # ENHANCED DIP-BUYING: Force ultra-aggressive thresholds for crash/bear markets
+                    # This ensures we catch major market bottoms like April 2025
+                    params[f'{regime}_buy_score_threshold'] = 1  # ALWAYS use threshold=1 for dips
+                    regime_sell_max = min(8, actual_active)  # Allow normal sell range
+                    params[f'{regime}_sell_score_threshold'] = trial.suggest_int(f'{regime}_sell_score_threshold', 1, regime_sell_max)
                 else:
-                    # Bear/crash markets: can use higher thresholds as more indicators trigger
-                    regime_max_threshold = min(8, actual_active)  # Same as base threshold logic  
+                    # Other regimes: normal range
+                    regime_max_threshold = min(8, actual_active)
                     params[f'{regime}_buy_score_threshold'] = trial.suggest_int(f'{regime}_buy_score_threshold', 1, regime_max_threshold)
                     params[f'{regime}_sell_score_threshold'] = trial.suggest_int(f'{regime}_sell_score_threshold', 1, regime_max_threshold)
                 
