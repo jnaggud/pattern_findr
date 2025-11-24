@@ -605,15 +605,15 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
         params['enable_position_sizing'] = trial.suggest_categorical('enable_position_sizing', [True])  # Always True
         
         if params['enable_position_sizing']:
-            # ULTRA-AGGRESSIVE: Optimize maximum position size (40% to 75% of capital per position)
-            params['max_position_pct'] = trial.suggest_float('max_position_pct', 0.40, 0.75)
+            # MAXIMUM AGGRESSIVE: Optimize maximum position size (50% to 100% of capital per position)
+            params['max_position_pct'] = trial.suggest_float('max_position_pct', 0.50, 1.00)
             
             # Optimize risk management features
             params['kelly_optimization'] = trial.suggest_categorical('kelly_optimization', [True, False])
             params['volatility_adjustment'] = trial.suggest_categorical('volatility_adjustment', [True, False])
             
-            # AGGRESSIVE: Maximum total exposure (60% to 95% of capital)
-            params['max_total_exposure'] = trial.suggest_float('max_total_exposure', 0.60, 0.95)
+            # MAXIMUM AGGRESSIVE: Maximum total exposure (70% to 100% of capital)
+            params['max_total_exposure'] = trial.suggest_float('max_total_exposure', 0.70, 1.00)
             
             # NEW: Aggressive volatility scaling
             params['aggressive_vol_scaling'] = trial.suggest_categorical('aggressive_vol_scaling', [True, False])
