@@ -18,6 +18,16 @@ except ImportError:
     SIGNAL_OPTIMIZATION_AVAILABLE = False
     print("⚠️  Signal optimization module not available - using basic optimization")
 
+# Import Enhancement #2: Position Sizing & Risk Management
+try:
+    from enhanced_backtester import EnhancedBacktester, create_enhanced_backtester
+    from position_sizing import PositionSizer, optimize_position_sizing_parameters
+    POSITION_SIZING_AVAILABLE = True
+    print("✅ Enhancement #2: Position Sizing & Risk Management available")
+except ImportError:
+    POSITION_SIZING_AVAILABLE = False
+    print("⚠️  Position sizing module not available - using basic backtesting")
+
 def universal_strategy(data, params):
     """
     A universal strategy that uses a scoring system to combine signals.
@@ -42,6 +52,13 @@ def universal_strategy(data, params):
         'buy_pct_min',
         'buy_pct_max', 
         'sell_pct_min',
+        # Enhancement #2: Position Sizing & Risk Management
+        'enable_position_sizing',
+        'max_position_pct',
+        'kelly_optimization',
+        'volatility_adjustment',
+        'position_confidence_weighting',
+        'max_total_exposure',
         'sell_pct_max',
         # Old trade preference parameters
         'min_hold_days',
@@ -234,7 +251,10 @@ def enhanced_universal_strategy(data, params, use_signal_optimization=True):
         'sell_pct_min', 'sell_pct_max', 'use_indicators_ready',
         # New enhancement parameters
         'adaptive_buy_threshold', 'adaptive_sell_threshold', 
-        'buy_confidence_weights', 'sell_confidence_weights', 'market_volatility'
+        'buy_confidence_weights', 'sell_confidence_weights', 'market_volatility',
+        # Enhancement #2: Position Sizing & Risk Management parameters
+        'enable_position_sizing', 'max_position_pct', 'kelly_optimization',
+        'volatility_adjustment', 'position_confidence_weighting', 'max_total_exposure'
     }
     
     active_indicators = [
@@ -577,6 +597,34 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
     # Instead of static 2-day persistence, let Optuna find optimal window
     params['signal_persistence_days'] = trial.suggest_int('signal_persistence_days', 1, 5)
     
+    # === ENHANCEMENT #2: POSITION SIZING & RISK MANAGEMENT ===
+    if POSITION_SIZING_AVAILABLE:
+        params['enable_position_sizing'] = trial.suggest_categorical('enable_position_sizing', [True, False])
+        
+        if params['enable_position_sizing']:
+            # Optimize maximum position size (5% to 25% of capital per position)
+            params['max_position_pct'] = trial.suggest_float('max_position_pct', 0.05, 0.25)
+            
+            # Optimize risk management features
+            params['kelly_optimization'] = trial.suggest_categorical('kelly_optimization', [True, False])
+            params['volatility_adjustment'] = trial.suggest_categorical('volatility_adjustment', [True, False])
+            
+            # Maximum total exposure (30% to 80% of capital)
+            params['max_total_exposure'] = trial.suggest_float('max_total_exposure', 0.30, 0.80)
+        else:
+            # Default values when position sizing is disabled
+            params['max_position_pct'] = 1.00  # Full capital deployment (original behavior)
+            params['kelly_optimization'] = False
+            params['volatility_adjustment'] = False
+            params['max_total_exposure'] = 1.00
+    else:
+        # Position sizing not available - use defaults
+        params['enable_position_sizing'] = False
+        params['max_position_pct'] = 1.00
+        params['kelly_optimization'] = False
+        params['volatility_adjustment'] = False
+        params['max_total_exposure'] = 1.00
+    
     # Keep it simple - core strategy only
     params['use_weighted_scoring'] = False
 
@@ -606,7 +654,25 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
             print(f"DEBUG: No trades generated for trial {trial.number}. Signals: {signals}")
             return -1e9
             
-        backtester = Backtester(data, strategy_name, universal_strategy, params)
+        # Enhancement #2: Use enhanced backtester with position sizing if available and enabled
+        if POSITION_SIZING_AVAILABLE and params.get('enable_position_sizing', False):
+            backtester = EnhancedBacktester(
+                data=data,
+                strategy_name=strategy_name,
+                strategy_func=universal_strategy,
+                params=params,
+                starting_capital=100000,
+                enable_position_sizing=True,
+                max_position_pct=params.get('max_position_pct', 0.20)
+            )
+            
+            if trial.number <= 2:
+                print(f"   🚀 Using Enhanced Backtester with {params.get('max_position_pct', 0.20):.1%} max position size")
+        else:
+            backtester = Backtester(data, strategy_name, universal_strategy, params)
+            if trial.number <= 2:
+                print(f"   📊 Using Standard Backtester (100% position sizing)")
+        
         backtester.run()
         _, summary = backtester.get_results()
         
@@ -805,7 +871,20 @@ def run_optimization(data, n_trials=1000, n_jobs=None, progress_callback=None, t
             if p.startswith('use_') and params[p] is True
         ])
 
-        bt = Backtester(data, strategy_name or "Top Trial", universal_strategy, params)
+        # Enhancement #2: Use enhanced backtester for final sanity check if position sizing was enabled
+        if POSITION_SIZING_AVAILABLE and params.get('enable_position_sizing', False):
+            bt = EnhancedBacktester(
+                data=data,
+                strategy_name=strategy_name or "Top Trial",
+                strategy_func=universal_strategy,
+                params=params,
+                starting_capital=100000,
+                enable_position_sizing=True,
+                max_position_pct=params.get('max_position_pct', 0.20)
+            )
+        else:
+            bt = Backtester(data, strategy_name or "Top Trial", universal_strategy, params)
+        
         bt.run()
         _, summary = bt.get_results()
 
