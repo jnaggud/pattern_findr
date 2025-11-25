@@ -45,7 +45,12 @@ class EnhancedBacktester(Backtester):
         Enhanced backtest with dynamic position sizing
         """
         # Get signals from strategy
-        signals = self.strategy_func(self.data, self.params)
+        strategy_result = self.strategy_func(self.data, self.params)
+        # Handle new dictionary return format
+        if isinstance(strategy_result, dict):
+            signals = strategy_result['signals']
+        else:
+            signals = strategy_result  # Fallback for old format
         signals = signals.fillna(0)
         
         # Enhancement #2: Calculate dynamic position sizes if enabled

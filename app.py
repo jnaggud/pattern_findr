@@ -1070,7 +1070,9 @@ if st.session_state.get('show_trade_section', False):
                     
                     # Generate signals
                     from optimization import universal_strategy
-                    signals = universal_strategy(enriched_data, best_strategy['parameters'])
+                    strategy_result = universal_strategy(enriched_data, best_strategy['parameters'])
+                    # Handle new dictionary return format
+                    signals = strategy_result['signals'] if isinstance(strategy_result, dict) else strategy_result
                     
                     # BACKTEST THE STRATEGY ON THIS TICKER - FULL YEAR
                     year_return = 0.0
@@ -2801,14 +2803,87 @@ if 'optimization_results' in st.session_state:
                         st.metric("Total Profit", f"${summary['total_profit']:,.0f}")
 
                 # Generate signals for visualization
-                signals = universal_strategy(enriched_data, final_params)
+                strategy_result = universal_strategy(enriched_data, final_params)
+                # Handle new dictionary return format
+                signals = strategy_result['signals'] if isinstance(strategy_result, dict) else strategy_result
+                
+                # Extract buy/sell scores for enhanced visualization
+                buy_scores = None
+                sell_scores = None
+                if isinstance(strategy_result, dict):
+                    buy_scores = strategy_result.get('buy_score')
+                    sell_scores = strategy_result.get('sell_score')
                 
                 # Create interactive chart
                 st.write("**📊 Strategy Performance Visualization:**")
                 
+                # Show crash detection info if available
+                if buy_scores is not None and buy_scores.max() > 10:  # Likely has crash boost
+                    crash_days = (buy_scores > 10).sum()  # Crash boost makes scores >10
+                    max_buy_score = buy_scores.max()
+                    st.info(f"🚨 **Crash Detection Active**: {crash_days} crash-boosted days detected (max score: {max_buy_score:.1f})")
+                
                 # Create the interactive plot (simplified - only showing trade entries/exits)
                 fig = create_strategy_chart(enriched_data, trade_log, strategy_name, summary, baseline)
                 st.plotly_chart(fig, use_container_width=True)
+                
+                # Add buy/sell score chart if available
+                if buy_scores is not None and sell_scores is not None:
+                    st.write("**📈 Buy/Sell Scores (including Crash Boost):**")
+                    
+                    import plotly.graph_objects as go
+                    from plotly.subplots import make_subplots
+                    
+                    # Create subplot for scores
+                    score_fig = make_subplots(
+                        rows=2, cols=1,
+                        subplot_titles=('Buy Scores', 'Sell Scores'),
+                        shared_xaxes=True,
+                        vertical_spacing=0.1
+                    )
+                    
+                    # Add buy scores
+                    score_fig.add_trace(
+                        go.Scatter(
+                            x=enriched_data.index,
+                            y=buy_scores,
+                            mode='lines',
+                            name='Buy Score',
+                            line=dict(color='green', width=1),
+                            hovertemplate='Date: %{x}<br>Buy Score: %{y:.1f}<extra></extra>'
+                        ),
+                        row=1, col=1
+                    )
+                    
+                    # Add buy threshold line
+                    buy_threshold = final_params.get('buy_score_threshold', 1)
+                    score_fig.add_hline(y=buy_threshold, line_dash="dash", line_color="green", 
+                                      annotation_text=f"Buy Threshold ({buy_threshold})", row=1, col=1)
+                    
+                    # Add sell scores
+                    score_fig.add_trace(
+                        go.Scatter(
+                            x=enriched_data.index,
+                            y=sell_scores,
+                            mode='lines',
+                            name='Sell Score', 
+                            line=dict(color='red', width=1),
+                            hovertemplate='Date: %{x}<br>Sell Score: %{y:.1f}<extra></extra>'
+                        ),
+                        row=2, col=1
+                    )
+                    
+                    # Add sell threshold line
+                    sell_threshold = final_params.get('sell_score_threshold', 5)
+                    score_fig.add_hline(y=sell_threshold, line_dash="dash", line_color="red",
+                                      annotation_text=f"Sell Threshold ({sell_threshold})", row=2, col=1)
+                    
+                    score_fig.update_layout(height=400, showlegend=False)
+                    score_fig.update_xaxes(title_text="Date", row=2, col=1)
+                    score_fig.update_yaxes(title_text="Score", row=1, col=1)
+                    score_fig.update_yaxes(title_text="Score", row=2, col=1)
+                    
+                    st.plotly_chart(score_fig, use_container_width=True)
                 
                 # Implementation Guide
                 st.write("**🚀 Strategy Implementation Guide:**")
