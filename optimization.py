@@ -415,7 +415,14 @@ def universal_strategy(data, params):
     signals.loc[buy_signals] = 1
     signals.loc[sell_signals] = -1
     
-    return signals
+    # Return signals and scores for proper CSV logging
+    return {
+        'signals': signals,
+        'buy_signals': buy_signals, 
+        'sell_signals': sell_signals,
+        'buy_score': buy_score_persistent,  # Include crash-boosted buy scores
+        'sell_score': sell_score_persistent
+    }
 
 def enhanced_universal_strategy(data, params, use_signal_optimization=True):
     """
@@ -585,7 +592,14 @@ def enhanced_universal_strategy(data, params, use_signal_optimization=True):
     signals.loc[buy_signals] = 1
     signals.loc[sell_signals] = -1
     
-    return signals
+    # Return same format as universal_strategy for consistency
+    return {
+        'signals': signals,
+        'buy_signals': buy_signals,
+        'sell_signals': sell_signals, 
+        'buy_score': buy_score_persistent,
+        'sell_score': sell_score_persistent
+    }
 
 def single_trial_optimization(n_trials_worker, data, trade_preference, numerical_indicators, boolean_indicators, enable_position_sizing):
     """Run optimization trials in an isolated worker process"""
@@ -919,7 +933,8 @@ def objective(trial, data, trade_preference=0.5, numerical_indicators=None, bool
         
         # Test the strategy function first - use original strategy for consistency
         print(f"🔍 TRIAL {trial.number}: Using original strategy for consistent results")
-        signals = universal_strategy(data, params)
+        strategy_result = universal_strategy(data, params)
+        signals = strategy_result['signals'] if isinstance(strategy_result, dict) else strategy_result
         buy_signals = (signals == 1).sum()
         sell_signals = (signals == -1).sum()
         
@@ -1177,11 +1192,18 @@ def run_optimization(data, n_trials=1000, n_jobs=None, progress_callback=None, t
         if DETAILED_LOGGING_AVAILABLE and len(sanitized_top_trials) < 3:  # Only log top 3 strategies
             try:
                 # Generate signals and scores for logging
-                signals_for_log = universal_strategy(data, params)
+                strategy_result_log = universal_strategy(data, params)
                 
-                # Create buy/sell score series (simplified for logging)
-                buy_scores_log = pd.Series(0, index=data.index)
-                sell_scores_log = pd.Series(0, index=data.index)
+                # Extract actual buy/sell scores (including crash boost!)
+                if isinstance(strategy_result_log, dict):
+                    signals_for_log = strategy_result_log['signals']
+                    buy_scores_log = strategy_result_log['buy_score']
+                    sell_scores_log = strategy_result_log['sell_score']
+                else:
+                    # Fallback for old format
+                    signals_for_log = strategy_result_log
+                    buy_scores_log = pd.Series(0, index=data.index)
+                    sell_scores_log = pd.Series(0, index=data.index)
                 
                 # Use the ticker parameter passed to run_optimization
                 
