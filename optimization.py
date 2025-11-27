@@ -392,11 +392,21 @@ def universal_strategy(data, params):
                 s_excess_pct = sell_excess_pct[idx]
                 print(f"   Index {idx}: buy_score={b_score:.1f} (thresh={buy_threshold}, excess={b_excess_pct:.1%}) vs sell_score={s_score:.1f} (thresh={sell_threshold}, excess={s_excess_pct:.1%})")
         
-        # Where buy percentage excess is greater, keep buy signal and remove sell
-        stronger_buy = conflicting_bars & (buy_excess_pct > sell_excess_pct)
+        # ENHANCED CONFLICT RESOLUTION: Consider trading context
+        # Default: use percentage excess comparison
+        stronger_buy_raw = buy_excess_pct > sell_excess_pct
+        
+        # OVERRIDE 1: Favor sells when sell score is extremely high (likely very overbought) 
+        very_high_sell = sell_score_persistent >= sell_threshold * 20  # 20x+ threshold = very extreme overbought
+        
+        # OVERRIDE 2: Favor sells when both signals are extremely strong (exit profitable positions)
+        both_very_strong = (buy_score_persistent >= buy_threshold * 20) & (sell_score_persistent >= sell_threshold * 20)
+        
+        # Apply overrides: prioritize selling in these scenarios
+        stronger_buy = conflicting_bars & stronger_buy_raw & ~very_high_sell & ~both_very_strong
         sell_signals.loc[stronger_buy] = False
         
-        # Where sell percentage excess is greater or equal, keep sell signal and remove buy  
+        # Where sell wins (either by excess or overrides), keep sell signal and remove buy  
         stronger_sell = conflicting_bars & (sell_excess_pct >= buy_excess_pct)
         buy_signals.loc[stronger_sell] = False
         

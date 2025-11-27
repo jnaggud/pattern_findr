@@ -82,6 +82,23 @@ st.set_page_config(
 
 st.title("📈 Pattern_FindR - Professional Trading Strategy Discovery")
 
+# === NEW PAGE NAVIGATION SYSTEM ===
+page = st.selectbox(
+    "📋 Select Page:",
+    ["Strategy Optimization", "🤖 ML Trading Signals"],
+    index=0
+)
+
+st.markdown("---")
+
+# === ML TRADING SIGNALS PAGE ===
+if page == "🤖 ML Trading Signals":
+    exec(open('ml_trading_signals_page.py').read())
+    st.stop()  # Stop execution here for ML page
+
+# === EXISTING STRATEGY OPTIMIZATION PAGE ===
+# All existing functionality continues below...
+
 def calculate_buy_and_hold_baseline(data, starting_capital=100000):
     """
     Calculate buy-and-hold strategy performance for baseline comparison.

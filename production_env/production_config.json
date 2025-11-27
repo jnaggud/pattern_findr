@@ -1,0 +1,12 @@
+{
+    "active_model_path": "saved_models/xgboost_20251127_045405.joblib",
+    "deployed_at": "2025-11-27T04:54:16.023861",
+    "model_name": "xgboost",
+    "retraining_interval_days": 30,
+    "last_training_date": null,
+    "risk_settings": {
+        "stop_loss_atr": 2.0,
+        "take_profit_atr": 3.0,
+        "max_position_size": 0.1
+    }
+}

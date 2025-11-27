@@ -81,13 +81,73 @@ class Backtester:
         signals = signals.fillna(0) # Safeguard against any NaNs
 
         for i in range(1, len(self.data)):
-            # Buy signal - simple universal position sizing
-            if signals.iloc[i] == 1 and self.position is None:
-                self.position = {
-                    'entry_price': self.data['close'].iloc[i], 
-                    'entry_date': self.data.index[i], 
-                    'size': self.current_capital / self.data['close'].iloc[i]
-                }
+            # Buy signal - Allow new positions OR adding to existing positions during crashes
+            if signals.iloc[i] == 1:
+                current_price = self.data['close'].iloc[i]
+                current_date = self.data.index[i]
+                
+                if self.position is None:
+                    # New position - use 70% of capital, reserve 30% for DCA
+                    initial_investment = self.current_capital * 0.7
+                    position_size = initial_investment / current_price
+                    
+                    self.position = {
+                        'entry_price': current_price, 
+                        'entry_date': current_date, 
+                        'size': position_size,
+                        'initial_investment': initial_investment,
+                        'reserved_capital': self.current_capital * 0.3  # Reserve for DCA
+                    }
+                    
+                    # Log this as a trade entry for visualization
+                    self.trades.append({
+                        'entry_date': current_date,
+                        'exit_date': None,  # Still open
+                        'entry_price': current_price,
+                        'exit_price': None,
+                        'profit': None,  # TBD
+                        'position_value': initial_investment,
+                        'trade_type': 'NEW_POSITION'
+                    })
+                    
+                else:
+                    # Already have position - Dollar Cost Average during strong signals
+                    # Check if price has dropped significantly (likely crash scenario)
+                    price_drop = (current_price / self.position['entry_price'] - 1) * 100
+                    
+                    if price_drop < -5:  # Price dropped 5%+ from our entry - DCA opportunity!
+                        # Use reserved capital for DCA
+                        reserved_capital = self.position.get('reserved_capital', 0)
+                        
+                        if reserved_capital > 1000:  # Only DCA if significant reserved capital available
+                            # Use portion of reserved capital based on severity of drop
+                            severity_multiplier = min(abs(price_drop) / 10.0, 1.0)  # More severe = more DCA
+                            dca_amount = reserved_capital * 0.5 * severity_multiplier  # Up to 50% of reserved
+                            additional_size = dca_amount / current_price
+                            
+                            # Update position with weighted average
+                            old_cost = self.position['size'] * self.position['entry_price']
+                            new_cost = old_cost + dca_amount
+                            total_size = self.position['size'] + additional_size
+                            
+                            self.position['entry_price'] = new_cost / total_size  # Weighted average
+                            self.position['size'] = total_size
+                            self.position['reserved_capital'] -= dca_amount  # Reduce reserved capital
+                            
+                            # Log this DCA as a separate trade entry for visualization!
+                            self.trades.append({
+                                'entry_date': current_date,
+                                'exit_date': None,
+                                'entry_price': current_price,
+                                'exit_price': None,
+                                'profit': None,
+                                'position_value': dca_amount,
+                                'trade_type': 'DCA_ADD'
+                            })
+                            
+                            print(f"🎯 DCA TRIGGERED on {current_date.strftime('%Y-%m-%d')}: "
+                                  f"${dca_amount:.0f} at ${current_price:.2f} "
+                                  f"(drop: {price_drop:.1f}%)")
 
             # Sell signal
             elif signals.iloc[i] == -1 and self.position is not None:
