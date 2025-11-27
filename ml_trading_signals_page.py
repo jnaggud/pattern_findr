@@ -1151,6 +1151,19 @@ with tab5:
                                     }
                                     
                                     joblib.dump(payload, filepath)
+                                    
+                                    # CRITICAL: Save the DL Feature Extractor as well
+                                    # We need the engineer instance that trained it
+                                    if 'ml_engineer' in st.session_state:
+                                        engineer = st.session_state.ml_engineer
+                                        dl_filename = f"{model_name}_{timestamp}_dl_extractor.h5"
+                                        dl_filepath = os.path.join(save_dir, dl_filename)
+                                        success = engineer.save_dl_model(dl_filepath)
+                                        if success:
+                                            st.success(f"✅ Saved DL Feature Extractor: {dl_filename}")
+                                        else:
+                                            st.warning("⚠️ Could not save DL Extractor (maybe none used?)")
+                                    
                                     st.success(f"✅ Successfully saved {model_name} with {len(feats_list)} features!")
                                     if scaler_obj is None:
                                         st.warning("Note: Model saved without scaler (Raw Prices mode).")
@@ -1214,14 +1227,23 @@ with tab6:
         
         with col_sel1:
             if saved_models:
-                # Create display names
-                model_options = {f"{m['name']} | {m['created'].strftime('%Y-%m-%d %H:%M')} | {m['filename']}": m for m in saved_models}
+                # Create display names with NOTES
+                model_options = {}
+                for m in saved_models:
+                    # Extract notes from metadata if available
+                    meta = m.get('metadata', {})
+                    notes = meta.get('notes', '')
+                    note_str = f" | 📝 {notes}" if notes else ""
+                    
+                    # Build label
+                    label = f"{m['name']} | {m['created'].strftime('%Y-%m-%d %H:%M')}{note_str}"
+                    model_options[label] = m
                 
                 # Find current index
                 current_idx = 0
                 if config.get('active_model_path'):
-                    for i, m in enumerate(saved_models):
-                        if m['path'] == config['active_model_path']:
+                    for i, label in enumerate(model_options.keys()):
+                        if model_options[label]['path'] == config['active_model_path']:
                             current_idx = i
                             break
                 
@@ -1261,9 +1283,13 @@ with tab6:
                         pm.deploy_model(selected_model['path'])
                         st.success(f"Activated {selected_model['name']}!")
                         try:
-                            st.experimental_rerun()
+                            st.rerun()
                         except:
-                            pass
+                            # Fallback for older Streamlit versions
+                            try:
+                                st.experimental_rerun()
+                            except:
+                                pass
                 else:
                     st.button("✅ Active", disabled=True, use_container_width=True)
 
@@ -1350,7 +1376,14 @@ with tab6:
                     st.session_state.ml_live_mode = live_mode
                     
                 with col_ctrl2:
-                    force_refresh = st.button("🔄 Force Refresh Now")
+                    if st.button("🔄 Force Refresh Now"):
+                        # CRITICAL FIX: Clear session state to force FULL reload
+                        # We must also clear the 'loaded' flag to prevent other tabs from crashing
+                        keys_to_clear = ['ml_features', 'ml_raw_data', 'ml_data_loaded']
+                        for key in keys_to_clear:
+                            if key in st.session_state:
+                                del st.session_state[key]
+                        st.rerun()
                 
                 # --- DATA LOADING & INCREMENTAL UPDATE LOGIC ---
                 features = None
@@ -1370,7 +1403,7 @@ with tab6:
                     now = pd.Timestamp.now(tz=last_date.tz)
                     time_diff = now - last_date
                     
-                    should_update = force_refresh or (live_mode and time_diff.total_seconds() > 3600)
+                    should_update = (live_mode and time_diff.total_seconds() > 3600)
                     
                     if should_update:
                         ticker = meta.get('ticker', 'SPY')
@@ -1412,11 +1445,21 @@ with tab6:
                                         
                                         # Re-engineer features (Need context, so pass full updated df)
                                         engineer = MLFeatureEngineer()
+                                        
+                                        # CRITICAL: Load DL Extractor for Incremental Update too!
+                                        active_model_path = config.get('active_model_path')
+                                        if active_model_path:
+                                            dl_path = active_model_path.replace('.joblib', '_dl_extractor.h5')
+                                            if os.path.exists(dl_path):
+                                                engineer.load_dl_model(dl_path)
+                                        
+                                        # CRITICAL FIX: Ensure DL features are generated for updates too
                                         updated_features = engineer.prepare_ml_dataset(
                                             updated_raw,
                                             include_lagged=True,
                                             include_rolling=True,
-                                            feature_selection=False
+                                            feature_selection=False,
+                                            use_dl_features=True # Force DL generation
                                         )
                                         
                                         # Update Session State
@@ -1474,13 +1517,29 @@ with tab6:
                             
                             # Engineer features
                             engineer = MLFeatureEngineer()
+                            
+                            # CRITICAL: Try to load the matching DL Extractor for the ACTIVE model
+                            # Use active model path from config, not selected_model (fixes double-activation bug)
+                            active_model_path = config.get('active_model_path')
+                            if active_model_path:
+                                # Construct expected DL path: model.joblib -> model_dl_extractor.h5
+                                dl_path = active_model_path.replace('.joblib', '_dl_extractor.h5')
+                                
+                                if os.path.exists(dl_path):
+                                    st.info(f"📂 Found matching DL Extractor: {os.path.basename(dl_path)}")
+                                    engineer.load_dl_model(dl_path)
+                                else:
+                                    st.warning("⚠️ No matching DL Extractor found. Training new one (Features may drift!).")
+                            
                             # Generate ALL features (no selection) to ensure we have what the model needs
                             # We will filter to model_features later
+                            # CRITICAL FIX: Force DL features and disable selection for production consistency
                             df_features = engineer.prepare_ml_dataset(
                                 df,
                                 include_lagged=True,
                                 include_rolling=True,
-                                feature_selection=False 
+                                feature_selection=False,
+                                use_dl_features=True  # Force DL generation
                             )
                             
                             st.session_state.ml_raw_data = df
@@ -1495,7 +1554,8 @@ with tab6:
                     
                     # Dashboard Settings
                     with st.expander("⚙️ Dashboard Settings", expanded=False):
-                        lookback_days = st.slider("Chart & Stats Duration (Days)", min_value=30, max_value=730, value=180, step=30)
+                        # Increased max to 2000 to allow full history validation
+                        lookback_days = st.slider("Chart & Stats Duration (Days)", min_value=30, max_value=2000, value=180, step=30)
 
                     # [Existing Visualization Logic...]
                     prod_model = model_data['model']
@@ -1580,105 +1640,166 @@ with tab6:
                             prob_df = pd.DataFrame(probs[-5:], columns=prod_model.classes_ if hasattr(prod_model, 'classes_') else [0, 1, 2])
                             st.dataframe(prob_df)
                         
-                    # Identify Trades & Calculate Performance (Simulated)
-                    trades_to_plot = []
-                    active_trade = None
-                    
-                    # Stats Tracking
-                    sim_start_cap = 10000.0
-                    sim_cap = sim_start_cap
-                    sim_wins = 0
-                    sim_losses = 0
-                    sim_total_trades = 0
-                    
-                    # Loop through signals
-                    for i in range(len(signals)):
-                        date = subset_raw.index[i]
-                        row = subset_raw.iloc[i]
-                        price_close = row['close']
-                        price_high = row['high']
-                        price_low = row['low']
-                        sig = signals[i]
+                    # --- UNIFIED BACKTEST (Same as Tab 5) ---
+                    # Use the exact same run_ml_backtest function to ensure consistency
+                    def run_production_backtest(data, signals, starting_capital=100000):
+                        """Same backtest logic as Tab 5 - ensures consistency"""
+                        capital = starting_capital
+                        position = None
+                        trades = []
+                        equity_curve = [starting_capital]
                         
-                        # ENTRY Logic
-                        if active_trade is None and sig != 0:
-                            entry_type = 'BUY' if sig == 1 else 'SELL'
-                            active_trade = {
-                                'entry_date': date,
-                                'entry_price': price_close,
-                                'type': entry_type
-                            }
+                        # Process each day
+                        for i in range(len(data)):
+                            current_price = data['close'].iloc[i]
+                            current_date = data.index[i]
+                            signal = signals[i] if i < len(signals) else 0
                             
-                            # Visual Marker Location
-                            marker_y = price_low if entry_type == 'BUY' else price_high
-                            marker_symbol = 'triangle-up' if entry_type == 'BUY' else 'triangle-down'
-                            marker_color = 'blue' if entry_type == 'BUY' else 'red'
+                            # BUY SIGNAL: Enter long position (or exit short)
+                            if signal == 1:
+                                if position is None or position['type'] == 'short':
+                                    # Close short position if exists
+                                    if position and position['type'] == 'short':
+                                        profit = position['entry_capital'] - (position['shares'] * current_price)
+                                        capital += profit
+                                        
+                                        # Update last trade
+                                        if trades and trades[-1]['exit_date'] is None:
+                                            trades[-1].update({
+                                                'exit_date': current_date,
+                                                'exit_price': current_price,
+                                                'profit': profit
+                                            })
+                                    
+                                    # Enter new long position
+                                    shares = capital / current_price
+                                    position = {
+                                        'type': 'long',
+                                        'entry_date': current_date,
+                                        'entry_price': current_price,
+                                        'shares': shares,
+                                        'entry_capital': capital
+                                    }
+                                    
+                                    trades.append({
+                                        'entry_date': current_date,
+                                        'entry_price': current_price,
+                                        'exit_date': None,
+                                        'exit_price': None,
+                                        'shares': shares,
+                                        'position_value': capital,
+                                        'profit': None,
+                                        'signal_type': 'LONG'
+                                    })
                             
-                            if i > 0: # Don't plot start-of-chart artifacts
-                                trades_to_plot.append({
-                                    'date': date,
-                                    'y': marker_y,
-                                    'color': marker_color,
-                                    'symbol': marker_symbol,
-                                    'desc': f"{entry_type} Signal",
-                                    'size': 12
+                            # SELL SIGNAL: Enter short position (or exit long)  
+                            elif signal == -1:
+                                if position is None or position['type'] == 'long':
+                                    # Close long position if exists
+                                    if position and position['type'] == 'long':
+                                        exit_value = position['shares'] * current_price
+                                        profit = exit_value - position['entry_capital']
+                                        capital = exit_value
+                                        
+                                        # Update last trade
+                                        if trades and trades[-1]['exit_date'] is None:
+                                            trades[-1].update({
+                                                'exit_date': current_date,
+                                                'exit_price': current_price,
+                                                'profit': profit
+                                            })
+                                    
+                                    # Enter new short position (simulate by holding cash)
+                                    position = {
+                                        'type': 'short',
+                                        'entry_date': current_date,
+                                        'entry_price': current_price,
+                                        'shares': capital / current_price,  # Theoretical shares
+                                        'entry_capital': capital
+                                    }
+                                    
+                                    trades.append({
+                                        'entry_date': current_date,
+                                        'entry_price': current_price,
+                                        'exit_date': None,
+                                        'exit_price': None,
+                                        'shares': capital / current_price,
+                                        'position_value': capital,
+                                        'profit': None,
+                                        'signal_type': 'SHORT'
+                                    })
+                            
+                            # Calculate portfolio value
+                            if position:
+                                if position['type'] == 'long':
+                                    portfolio_value = position['shares'] * current_price
+                                else:  # short position
+                                    # For short: profit when price goes down
+                                    portfolio_value = position['entry_capital'] + (
+                                        position['entry_capital'] - position['shares'] * current_price
+                                    )
+                            else:
+                                portfolio_value = capital
+                            
+                            equity_curve.append(portfolio_value)
+                        
+                        # Close final position if still open
+                        if position:
+                            final_price = data['close'].iloc[-1]
+                            
+                            if position['type'] == 'long':
+                                exit_value = position['shares'] * final_price
+                                profit = exit_value - position['entry_capital']
+                                capital = exit_value
+                            else:  # short
+                                profit = position['entry_capital'] - (position['shares'] * final_price)
+                                capital += profit
+                            
+                            # Update last trade
+                            if trades and trades[-1]['exit_date'] is None:
+                                trades[-1].update({
+                                    'exit_date': data.index[-1],
+                                    'exit_price': final_price,
+                                    'profit': profit
                                 })
-
-                        # EXIT Logic (Signal Flip)
-                        elif active_trade is not None:
-                            # Check for flip
-                            is_flip = (active_trade['type'] == 'BUY' and sig == -1) or \
-                                      (active_trade['type'] == 'SELL' and sig == 1)
-                            
-                            if is_flip:
-                                # Calculate Trade Result
-                                exit_price = price_close
-                                if active_trade['type'] == 'BUY':
-                                    pnl_pct = (exit_price - active_trade['entry_price']) / active_trade['entry_price']
-                                else:
-                                    pnl_pct = (active_trade['entry_price'] - exit_price) / active_trade['entry_price']
-                                
-                                sim_cap *= (1 + pnl_pct)
-                                if pnl_pct > 0: sim_wins += 1
-                                else: sim_losses += 1
-                                sim_total_trades += 1
-                                
-                                # Re-enter new signal (Flip)
-                                entry_type = 'BUY' if sig == 1 else 'SELL'
-                                active_trade = {
-                                    'entry_date': date,
-                                    'entry_price': price_close,
-                                    'type': entry_type
-                                }
-                                
-                                # Plot Re-entry Marker
-                                marker_y = price_low if entry_type == 'BUY' else price_high
-                                marker_symbol = 'triangle-up' if entry_type == 'BUY' else 'triangle-down'
-                                marker_color = 'blue' if entry_type == 'BUY' else 'red'
-                                
-                                trades_to_plot.append({
-                                    'date': date,
-                                    'y': marker_y,
-                                    'color': marker_color,
-                                    'symbol': marker_symbol,
-                                    'desc': f"{entry_type} Signal (Flip)",
-                                    'size': 12
-                                })
+                        
+                        return trades, equity_curve, capital
                     
-                    # Current Status (Last point)
+                    # Run the unified backtest
+                    trades_list, equity_curve, final_capital = run_production_backtest(subset_raw, signals)
+                    
+                    # Calculate performance metrics (same as Tab 5)
+                    sim_return = (final_capital / 100000 - 1) * 100  # Same calculation as Tab 5
+                    completed_trades = [t for t in trades_list if t['profit'] is not None]
+                    sim_wins = len([t for t in completed_trades if t['profit'] > 0])
+                    sim_losses = len(completed_trades) - sim_wins
+                    sim_win_rate = sim_wins / len(completed_trades) if completed_trades else 0.0
+                    
+                    # Current Status (Last point) - needed for display
                     current_signal = signals[-1]
                     current_conf = confidences[-1]
                     current_price = subset_raw['close'].iloc[-1]
 
-                    # Calculate Stats for Display
+                    # Calculate current position status from trades
                     last_entry_date = "N/A"
                     days_in_trade = 0
                     trade_return = 0.0
                     
+                    # Find the most recent open trade
+                    active_trade = None
+                    for trade in reversed(trades_list):
+                        if trade['exit_date'] is None:  # Still open
+                            active_trade = {
+                                'entry_date': trade['entry_date'],
+                                'entry_price': trade['entry_price'],
+                                'type': trade['signal_type']
+                            }
+                            break
+                    
                     if active_trade:
                         last_entry_date = active_trade['entry_date'].strftime('%Y-%m-%d')
                         days_in_trade = (subset_raw.index[-1] - active_trade['entry_date']).days
-                        if active_trade['type'] == 'BUY':
+                        if active_trade['type'] == 'LONG':
                             trade_return = (current_price - active_trade['entry_price']) / active_trade['entry_price']
                         else:
                             trade_return = (active_trade['entry_price'] - current_price) / active_trade['entry_price']
@@ -1707,20 +1828,16 @@ with tab6:
                     """, unsafe_allow_html=True)
                     
                     # 2. Performance Stats (New Section)
-                    sim_return = (sim_cap - sim_start_cap) / sim_start_cap
-                    sim_win_rate = sim_wins / sim_total_trades if sim_total_trades > 0 else 0.0
-                    
                     st.markdown(f"##### 📊 Active Model Performance ({len(subset_raw)} Days)")
                     p1, p2, p3, p4 = st.columns(4)
                     with p1:
-                        st.metric("Total Return", f"{sim_return*100:+.1f}%", delta=f"${sim_cap - sim_start_cap:,.0f}")
+                        st.metric("Total Return", f"{sim_return:+.1f}%", delta=f"${final_capital - 100000:,.0f}")
                     with p2:
                         st.metric("Win Rate", f"{sim_win_rate*100:.0f}%", f"{sim_wins}W / {sim_losses}L")
                     with p3:
-                        st.metric("Trades", str(sim_total_trades))
+                        st.metric("Trades", str(len(completed_trades)))
                     with p4:
-                         # Simple Profit Factor approximation or just capital
-                        st.metric("Est. Capital", f"${sim_cap:,.0f}")
+                        st.metric("Est. Capital", f"${final_capital:,.0f}")
                     
                     st.markdown("---")
 
@@ -1737,14 +1854,24 @@ with tab6:
                         name='Price'
                     ))
                     
-                    # Plot Simulated Trades (Past)
-                    for t in trades_to_plot:
+                    # Plot trades from the unified backtest
+                    for trade in trades_list:
+                        if trade['signal_type'] == 'LONG':
+                            marker_color = 'green'
+                            marker_symbol = 'triangle-up'
+                            marker_y = subset_raw.loc[trade['entry_date'], 'low'] * 0.98  # Below price
+                        else:  # SHORT
+                            marker_color = 'red' 
+                            marker_symbol = 'triangle-down'
+                            marker_y = subset_raw.loc[trade['entry_date'], 'high'] * 1.02  # Above price
+                        
                         fig_live.add_trace(go.Scatter(
-                            x=[t['date']], y=[t['y']],
+                            x=[trade['entry_date']], y=[marker_y],
                             mode='markers',
-                            name=t['desc'],
-                            marker=dict(color=t['color'], size=t['size'], symbol=t['symbol']),
-                            hovertemplate=f"<b>{t['desc']}</b><br>Price: %{{y:.2f}}<extra></extra>"
+                            name=f"{trade['signal_type']} Entry",
+                            marker=dict(color=marker_color, size=10, symbol=marker_symbol),
+                            hovertemplate=f"<b>{trade['signal_type']} Entry</b><br>Price: ${trade['entry_price']:.2f}<extra></extra>",
+                            showlegend=False
                         ))
                     
                     # Add lines and markers if ACTIVE signal

@@ -15,6 +15,14 @@ warnings.filterwarnings('ignore')
 # Import existing indicator system (no modifications needed)
 from indicators import get_all_indicators
 
+# Import Deep Learning Extractor
+try:
+    from dl_feature_extractor import DLFeatureExtractor
+    DL_AVAILABLE = True
+except ImportError:
+    DL_AVAILABLE = False
+    print("⚠️ Deep Learning modules not found. DL features will be skipped.")
+
 class MLFeatureEngineer:
     """
     Creates ML-ready features from technical indicators and price data
@@ -24,7 +32,28 @@ class MLFeatureEngineer:
         self.feature_names = []
         self.target_columns = []
         self.correlation_matrix = None
-        
+        self.dl_extractor = None # Store the DL extractor instance
+
+    def save_dl_model(self, filepath):
+        """Save the DL extractor if it exists"""
+        if self.dl_extractor:
+            self.dl_extractor.save_model(filepath)
+            return True
+        return False
+
+    def load_dl_model(self, filepath):
+        """Load a DL extractor from file"""
+        try:
+            # Re-initialize extractor
+            self.dl_extractor = DLFeatureExtractor(sequence_length=180, encoding_dim=8)
+            success = self.dl_extractor.load_model(filepath)
+            if success:
+                print("✅ MLFeatureEngineer: Loaded DL model successfully")
+                return True
+        except Exception as e:
+            print(f"❌ MLFeatureEngineer: Failed to load DL model: {e}")
+        return False
+
     def create_base_features(self, data: pd.DataFrame) -> pd.DataFrame:
         """
         Create base features using existing indicator system
@@ -106,6 +135,31 @@ class MLFeatureEngineer:
         print(f"   ✅ Added {len(ml_data.columns) - len(data.columns)} ML-specific features")
         return ml_data
     
+    def create_dl_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Generate Deep Learning embeddings using LSTM Autoencoder
+        """
+        if not DL_AVAILABLE:
+            return data
+            
+        try:
+            # If we don't have an extractor yet, create one and train it
+            if self.dl_extractor is None:
+                # Updated to 180 to support Multi-Scale CNN (30, 60, 90, 180 days)
+                self.dl_extractor = DLFeatureExtractor(sequence_length=180, encoding_dim=8)
+                # Train and generate
+                embeddings = self.dl_extractor.generate_embeddings(data, epochs=15, train=True)
+            else:
+                # Use existing (loaded) extractor in inference mode
+                embeddings = self.dl_extractor.generate_embeddings(data, epochs=15, train=False)
+            
+            # Join embeddings
+            result = pd.concat([data, embeddings], axis=1)
+            return result
+        except Exception as e:
+            print(f"⚠️ DL Feature Generation Failed: {e}")
+            return data
+
     def create_lagged_features(self, data: pd.DataFrame, 
                              columns: List[str] = None,
                              lags: List[int] = [1, 2, 3, 5]) -> pd.DataFrame:
@@ -362,7 +416,8 @@ class MLFeatureEngineer:
     def prepare_ml_dataset(self, data: pd.DataFrame,
                           include_lagged: bool = True,
                           include_rolling: bool = True,
-                          feature_selection: bool = True) -> pd.DataFrame:
+                          feature_selection: bool = True,
+                          use_dl_features: bool = True) -> pd.DataFrame:
         """
         Complete ML dataset preparation pipeline
         
@@ -371,6 +426,7 @@ class MLFeatureEngineer:
             include_lagged: Whether to include lagged features
             include_rolling: Whether to include rolling features  
             feature_selection: Whether to perform feature selection
+            use_dl_features: Whether to generate Deep Learning embeddings
             
         Returns:
             ML-ready feature DataFrame
@@ -383,6 +439,10 @@ class MLFeatureEngineer:
         
         # Step 2: Add ML-specific features
         ml_data = self.create_ml_specific_features(ml_data)
+        
+        # Step 2.5: Add Deep Learning features (Embeddings)
+        if use_dl_features:
+            ml_data = self.create_dl_features(ml_data)
         
         # Step 3: Add lagged features (optional)
         if include_lagged:

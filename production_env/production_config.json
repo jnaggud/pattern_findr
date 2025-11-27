@@ -1,6 +1,6 @@
 {
-    "active_model_path": "saved_models/xgboost_20251127_045405.joblib",
-    "deployed_at": "2025-11-27T04:54:16.023861",
+    "active_model_path": "saved_models/xgboost_20251127_101236.joblib",
+    "deployed_at": "2025-11-27T10:12:52.092774",
     "model_name": "xgboost",
     "retraining_interval_days": 30,
     "last_training_date": null,
