@@ -1,13 +1,33 @@
-streamlit
-yfinance
-pandas
-plotly
-tensorflow
-matplotlib
-mplfinance
-optuna
-pandas-ta
-scikit-learn
-scipy
-numpy
-twilio
+# Pattern_FindR - Core Requirements with Exact Versions
+# Updated: 2024-11-28
+
+# Core App Framework
+streamlit==1.32.0
+
+# Data & Market Data  
+yfinance==0.2.61
+pandas==2.3.0
+numpy==1.26.4
+
+# Visualization
+plotly==5.18.0
+matplotlib==3.10.3
+mplfinance==0.12.10b0
+
+# Machine Learning & Deep Learning
+tensorflow==2.17.0
+tensorflow-metal==1.2.0
+scikit-learn==1.7.0
+xgboost==1.7.6
+scipy==1.15.3
+h5py==3.10.0
+joblib==1.5.1
+
+# Hyperparameter Optimization
+optuna==4.5.0
+
+# Technical Analysis
+pandas-ta==0.3.14b0
+
+# Notifications
+twilio==9.8.6

@@ -83,6 +83,45 @@ def get_all_indicators(data, optuna_params=None):
     
     # --- Add Custom Implementations for Missing Indicators ---
     
+    # CRITICAL: Ensure RSI_14 exists (required by ML features)
+    if 'RSI_14' not in data.columns and 'close' in data.columns:
+        try:
+            data['RSI_14'] = ta.rsi(data['close'], length=14)
+        except Exception as e:
+            print(f"Failed to calculate RSI_14: {e}")
+            # Manual RSI calculation as fallback
+            delta = data['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            data['RSI_14'] = 100 - (100 / (1 + rs))
+    
+    # CRITICAL: Ensure MACD exists (required by ML features)
+    if 'MACD_12_26_9' not in data.columns and 'close' in data.columns:
+        try:
+            macd_result = ta.macd(data['close'], fast=12, slow=26, signal=9)
+            if macd_result is not None:
+                data = pd.concat([data, macd_result], axis=1)
+        except Exception as e:
+            print(f"Failed to calculate MACD: {e}")
+            # Manual MACD calculation as fallback
+            ema_12 = data['close'].ewm(span=12, adjust=False).mean()
+            ema_26 = data['close'].ewm(span=26, adjust=False).mean()
+            data['MACD_12_26_9'] = ema_12 - ema_26
+            data['MACDs_12_26_9'] = data['MACD_12_26_9'].ewm(span=9, adjust=False).mean()
+            data['MACDh_12_26_9'] = data['MACD_12_26_9'] - data['MACDs_12_26_9']
+    
+    # CRITICAL: Ensure WILLR exists (required by ML features)
+    if 'WILLR_14' not in data.columns and all(col in data.columns for col in ['high', 'low', 'close']):
+        try:
+            data['WILLR_14'] = ta.willr(data['high'], data['low'], data['close'], length=14)
+        except Exception as e:
+            print(f"Failed to calculate WILLR_14: {e}")
+            # Manual Williams %R calculation as fallback
+            highest_high = data['high'].rolling(window=14).max()
+            lowest_low = data['low'].rolling(window=14).min()
+            data['WILLR_14'] = -100 * ((highest_high - data['close']) / (highest_high - lowest_low))
+    
     # Hilbert Transform Trendline (if not available from pandas_ta)
     if 'HT_TRENDLINE' not in data.columns and 'close' in data.columns:
         # Simple approximation using weighted moving average
