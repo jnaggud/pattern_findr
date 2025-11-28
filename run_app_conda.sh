@@ -4,4 +4,4 @@
 cd "$(dirname "$0")"
 
 # Use the conda environment's Python directly
-/Users/jeffersonduggan/miniconda3/envs/pattern_findr_312/bin/streamlit run app.py
+/Users/jeffersonduggan/miniconda3/envs/pattern_findr_310/bin/streamlit run app.py

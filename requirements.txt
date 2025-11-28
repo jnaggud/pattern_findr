@@ -31,3 +31,9 @@ pandas-ta==0.3.14b0
 
 # Notifications
 twilio==9.8.6
+
+# Serialization
+dill==0.4.0
+
+# Note: pandas-ta==0.3.14b0 requires special installation
+# See REQUIREMENTS_README.md for installation instructions

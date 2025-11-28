@@ -1,0 +1,17 @@
+# Temporary requirements without pandas-ta
+streamlit==1.32.0
+yfinance==0.2.61
+pandas==2.3.0
+numpy==1.26.4
+plotly==5.18.0
+matplotlib==3.10.3
+mplfinance==0.12.10b0
+tensorflow==2.17.0
+tensorflow-metal==1.2.0
+scikit-learn==1.7.0
+xgboost==1.7.6
+scipy==1.15.3
+h5py==3.10.0
+joblib==1.5.1
+optuna==4.5.0
+twilio==9.8.6
