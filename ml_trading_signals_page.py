@@ -2655,15 +2655,79 @@ with tab6:
                     from scipy.signal import argrelextrema
                     import pandas as pd
                     
-                    # Calculate rolling highs and lows for peak/valley detection
-                    window = 10  # Look for peaks/valleys over 10-day windows
+                    st.write("**🔬 REAL-TIME PEAK/VALLEY ANALYSIS:**")
                     
-                    # Find local maxima (peaks) and minima (valleys)
+                    # Test multiple windows for real-time viability
+                    windows = [3, 5, 7, 10]  # Different detection speeds
                     highs = subset_raw['high'].values
                     lows = subset_raw['low'].values
                     
-                    peak_indices = argrelextrema(highs, np.greater, order=window)[0]
-                    valley_indices = argrelextrema(lows, np.less, order=window)[0]
+                    best_window_results = {}
+                    
+                    for window in windows:
+                        # Find local maxima (peaks) and minima (valleys)  
+                        peak_indices = argrelextrema(highs, np.greater, order=window)[0]
+                        valley_indices = argrelextrema(lows, np.less, order=window)[0]
+                        
+                        if len(peak_indices) > 0 and len(valley_indices) > 0:
+                            # Calculate perfect returns for this window
+                            perfect_trades = []
+                            sorted_extremes = []
+                            
+                            # Combine and sort peaks and valleys
+                            for i in peak_indices:
+                                sorted_extremes.append((i, 'peak', highs[i]))
+                            for i in valley_indices:
+                                sorted_extremes.append((i, 'valley', lows[i]))
+                            
+                            sorted_extremes.sort()
+                            
+                            # Calculate perfect buy-low-sell-high returns
+                            position = None
+                            perfect_capital = 100000
+                            
+                            for idx, extreme_type, price in sorted_extremes:
+                                if extreme_type == 'valley' and position is None:
+                                    position = perfect_capital / price
+                                    entry_capital = perfect_capital
+                                elif extreme_type == 'peak' and position is not None:
+                                    perfect_capital = position * price
+                                    profit = perfect_capital - entry_capital
+                                    perfect_trades.append(profit)
+                                    position = None
+                            
+                            total_return = ((perfect_capital - 100000) / 100000) * 100 if len(perfect_trades) > 0 else 0
+                            
+                            best_window_results[window] = {
+                                'peaks': len(peak_indices),
+                                'valleys': len(valley_indices), 
+                                'trades': len(perfect_trades),
+                                'return': total_return,
+                                'lag_days': window,
+                                'real_time_viable': window <= 5  # 5+ day lag too slow for real-time
+                            }
+                            
+                            st.write(f"  • **Window {window} days**: {len(peak_indices)} peaks, {len(valley_indices)} valleys → {total_return:.1f}% return ({len(perfect_trades)} trades)")
+                    
+                    # Find best real-time viable window
+                    viable_windows = {k: v for k, v in best_window_results.items() if v['real_time_viable']}
+                    if viable_windows:
+                        best_viable = max(viable_windows.items(), key=lambda x: x[1]['return'])
+                        st.success(f"🎯 **BEST REAL-TIME WINDOW**: {best_viable[0]} days ({best_viable[1]['return']:.1f}% return, {best_viable[0]}-day detection lag)")
+                        
+                        # Use best viable window for the rest of the analysis
+                        window = best_viable[0]
+                        peak_indices = argrelextrema(highs, np.greater, order=window)[0]
+                        valley_indices = argrelextrema(lows, np.less, order=window)[0]
+                    else:
+                        # Fallback to 5-day window
+                        window = 5
+                        peak_indices = argrelextrema(highs, np.greater, order=window)[0]
+                        valley_indices = argrelextrema(lows, np.less, order=window)[0]
+                        st.warning(f"⚠️ Using {window}-day window as fallback")
+                    
+                    st.write("---")
+                    st.write(f"**📊 USING {window}-DAY WINDOW FOR ML TRAINING ANALYSIS:**")
                     
                     if len(peak_indices) > 0:
                         peak_dates = [subset_raw.index[i].date() for i in peak_indices]
@@ -2741,6 +2805,80 @@ with tab6:
                             total_perfect_return = ((perfect_capital - 100000) / 100000) * 100
                             st.write(f"  • **🎯 PERFECT Peak/Valley Trading**: {total_perfect_return:.1f}% return ({len(perfect_trades)} trades)")
                             st.write(f"  • **📊 ML Model Efficiency**: {0.9/total_perfect_return*100:.1f}% of perfect potential")
+                    
+                    st.write("---")
+                    
+                    # === ML TRAINING LABEL GENERATION CONCEPT ===
+                    st.write("**💡 SOLUTION: Use Peak/Valley Detection as ML Training Labels**")
+                    
+                    if len(peak_indices) > 0 and len(valley_indices) > 0:
+                        # Generate training labels for ML model
+                        training_labels = np.zeros(len(subset_raw))  # 0 = HOLD
+                        
+                        # Label peaks as SELL signals (lag-adjusted)
+                        for peak_idx in peak_indices:
+                            # For real-time: label X days BEFORE peak (leading indicator)
+                            lead_time = max(1, window // 2)  # Half the detection window
+                            early_sell_idx = max(0, peak_idx - lead_time)
+                            training_labels[early_sell_idx] = -1  # SELL
+                        
+                        # Label valleys as BUY signals (lag-adjusted)  
+                        for valley_idx in valley_indices:
+                            lead_time = max(1, window // 2)
+                            early_buy_idx = max(0, valley_idx - lead_time) 
+                            training_labels[early_buy_idx] = 1  # BUY
+                        
+                        # Calculate how many training signals this generates
+                        buy_labels = np.sum(training_labels == 1)
+                        sell_labels = np.sum(training_labels == -1) 
+                        hold_labels = np.sum(training_labels == 0)
+                        
+                        st.write(f"  • **🏷️ Generated Training Labels**: {buy_labels} BUY, {sell_labels} SELL, {hold_labels} HOLD")
+                        st.write(f"  • **⏱️ Lead Time**: {max(1, window // 2)} days before peak/valley")
+                        st.write(f"  • **🎯 Target Performance**: {total_perfect_return:.1f}% if ML learns these labels")
+                        
+                        # Show comparison with current ML signals
+                        current_buy_signals = np.sum(signals == 1)
+                        current_sell_signals = np.sum(signals == -1)
+                        
+                        st.write(f"  • **📊 Current ML**: {current_buy_signals} BUY, {current_sell_signals} SELL → 0.9% return")
+                        st.write(f"  • **🎯 Peak/Valley Labels**: {buy_labels} BUY, {sell_labels} SELL → {total_perfect_return:.1f}% potential")
+                        
+                        # Calculate label accuracy vs current signals
+                        current_signals_array = signals.copy()
+                        
+                        # Compare signal timing (within 3 days tolerance)
+                        tolerance = 3
+                        matching_buys = 0
+                        matching_sells = 0
+                        
+                        for i in range(len(training_labels)):
+                            if training_labels[i] == 1:  # Peak/valley says BUY
+                                # Check if current ML has BUY within tolerance
+                                start_idx = max(0, i - tolerance)
+                                end_idx = min(len(signals), i + tolerance + 1)
+                                if np.any(current_signals_array[start_idx:end_idx] == 1):
+                                    matching_buys += 1
+                            elif training_labels[i] == -1:  # Peak/valley says SELL
+                                start_idx = max(0, i - tolerance)
+                                end_idx = min(len(signals), i + tolerance + 1)
+                                if np.any(current_signals_array[start_idx:end_idx] == -1):
+                                    matching_sells += 1
+                        
+                        buy_accuracy = (matching_buys / buy_labels * 100) if buy_labels > 0 else 0
+                        sell_accuracy = (matching_sells / sell_labels * 100) if sell_labels > 0 else 0
+                        
+                        st.write(f"  • **🎯 Current ML Timing Accuracy**: {buy_accuracy:.1f}% BUYs, {sell_accuracy:.1f}% SELLs match peak/valley labels")
+                        
+                        if buy_accuracy < 50 or sell_accuracy < 50:
+                            st.error("🚨 **SOLUTION NEEDED**: Retrain ML model using peak/valley detection as labels!")
+                            st.write("**📋 Action Plan:**")
+                            st.write("1. Extract features at each timepoint (RSI, MACD, momentum, etc.)")
+                            st.write("2. Use peak/valley labels as training targets")
+                            st.write(f"3. Train model to predict BUY/SELL {max(1, window // 2)} days before peaks/valleys")
+                            st.write("4. Deploy retrained model for real-time trading")
+                        else:
+                            st.success("✅ Current ML model timing is reasonable - focus on filtering optimization")
                             
                     st.write("---")
                     
