@@ -44,6 +44,12 @@ class MLFeatureEngineer:
     def load_dl_model(self, filepath):
         """Load a DL extractor from file"""
         try:
+            # Force reload the module to pick up safe_mode=False fix
+            import sys
+            import importlib
+            if 'dl_feature_extractor' in sys.modules:
+                importlib.reload(sys.modules['dl_feature_extractor'])
+            
             # Re-initialize extractor
             self.dl_extractor = DLFeatureExtractor(sequence_length=180, encoding_dim=8)
             success = self.dl_extractor.load_model(filepath)
@@ -157,7 +163,10 @@ class MLFeatureEngineer:
             result = pd.concat([data, embeddings], axis=1)
             return result
         except Exception as e:
+            import traceback
             print(f"⚠️ DL Feature Generation Failed: {e}")
+            print("Full traceback:")
+            traceback.print_exc()
             return data
 
     def create_lagged_features(self, data: pd.DataFrame, 

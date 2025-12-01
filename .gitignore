@@ -229,6 +229,7 @@ config.py
 secrets.json
 .env.local
 .env.production
+api_config.json
 
 # Testing
 .pytest_cache/

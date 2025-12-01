@@ -36,6 +36,13 @@ except ImportError:
     LIGHTGBM_AVAILABLE = False
     print("⚠️  LightGBM not available. Install with: pip install lightgbm")
 
+try:
+    import optuna
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    OPTUNA_AVAILABLE = False
+    print("⚠️  Optuna not available. Install with: pip install optuna")
+
 class TradingMLModels:
     """
     Machine Learning models for trading signal prediction
@@ -519,6 +526,186 @@ class TradingMLModels:
             probabilities = model.predict_proba(features_scaled)
         
         return predictions, probabilities
+    
+    def optimize_hyperparameters(self, model_name: str, X_train: pd.DataFrame, y_train: pd.Series,
+                                 n_trials: int = 100, cv_folds: int = 3) -> Dict:
+        """
+        Optimize hyperparameters using Optuna
+        
+        Args:
+            model_name: Name of model to optimize
+            X_train: Training features
+            y_train: Training labels
+            n_trials: Number of optimization trials
+            cv_folds: Number of CV folds for evaluation
+            
+        Returns:
+            Dictionary with best parameters and score
+        """
+        if not OPTUNA_AVAILABLE:
+            raise ImportError("Optuna not available. Install with: pip install optuna")
+        
+        print(f"🔍 Optimizing {model_name} hyperparameters with {n_trials} trials...")
+        
+        # Balance training data first
+        X_train_balanced, y_train_balanced = self.balance_training_data(X_train, y_train)
+        
+        # Define objective function for Optuna
+        def objective(trial):
+            params = self._suggest_parameters(trial, model_name)
+            
+            try:
+                # Create model with trial parameters
+                if model_name == 'random_forest':
+                    model = self.create_random_forest(**params)
+                elif model_name == 'xgboost':
+                    model = self.create_xgboost(**params)
+                elif model_name == 'lightgbm':
+                    model = self.create_lightgbm(**params)
+                elif model_name == 'svm':
+                    model = self.create_svm(**params)
+                else:
+                    raise ValueError(f"Unknown model: {model_name}")
+                
+                # Prepare data (scaling if needed)
+                X_scaled = X_train_balanced
+                y_encoded = y_train_balanced
+                
+                if model_name in ['xgboost', 'lightgbm', 'svm']:
+                    # Scale features
+                    scaler = StandardScaler()
+                    X_scaled = pd.DataFrame(
+                        scaler.fit_transform(X_train_balanced),
+                        columns=X_train_balanced.columns
+                    )
+                
+                if model_name in ['xgboost', 'lightgbm']:
+                    # Encode labels
+                    label_encoder = LabelEncoder()
+                    y_encoded = pd.Series(label_encoder.fit_transform(y_train_balanced))
+                
+                # Cross-validation with time series split
+                cv_scores = cross_val_score(
+                    model, X_scaled, y_encoded,
+                    cv=TimeSeriesSplit(n_splits=cv_folds),
+                    scoring='f1_weighted',
+                    n_jobs=-1
+                )
+                
+                return cv_scores.mean()
+                
+            except Exception as e:
+                print(f"Trial failed: {e}")
+                return 0.0
+        
+        # Create and run study
+        study = optuna.create_study(direction='maximize', 
+                                   sampler=optuna.samplers.TPESampler(seed=42))
+        
+        # Suppress optuna logs
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+        
+        # Results
+        best_params = study.best_params
+        best_score = study.best_value
+        
+        print(f"✅ Optimization complete!")
+        print(f"   Best Score: {best_score:.4f}")
+        print(f"   Best Params: {best_params}")
+        
+        return {
+            'best_params': best_params,
+            'best_score': best_score,
+            'study': study,
+            'n_trials': n_trials
+        }
+    
+    def _suggest_parameters(self, trial, model_name: str) -> Dict:
+        """Suggest hyperparameters for Optuna trial"""
+        
+        if model_name == 'random_forest':
+            return {
+                'n_estimators': trial.suggest_int('n_estimators', 50, 300),
+                'max_depth': trial.suggest_int('max_depth', 3, 20),
+                'min_samples_split': trial.suggest_int('min_samples_split', 2, 20),
+                'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 10),
+                'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2', None]),
+                'bootstrap': trial.suggest_categorical('bootstrap', [True, False]),
+            }
+        
+        elif model_name == 'xgboost':
+            return {
+                'n_estimators': trial.suggest_int('n_estimators', 50, 300),
+                'max_depth': trial.suggest_int('max_depth', 3, 12),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                'reg_alpha': trial.suggest_float('reg_alpha', 0, 2),
+                'reg_lambda': trial.suggest_float('reg_lambda', 0, 2),
+                'min_child_weight': trial.suggest_int('min_child_weight', 1, 7),
+            }
+        
+        elif model_name == 'lightgbm':
+            return {
+                'n_estimators': trial.suggest_int('n_estimators', 50, 300),
+                'max_depth': trial.suggest_int('max_depth', 3, 12),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                'reg_alpha': trial.suggest_float('reg_alpha', 0, 2),
+                'reg_lambda': trial.suggest_float('reg_lambda', 0, 2),
+                'min_child_samples': trial.suggest_int('min_child_samples', 5, 100),
+                'num_leaves': trial.suggest_int('num_leaves', 10, 200),
+            }
+        
+        elif model_name == 'svm':
+            return {
+                'C': trial.suggest_float('C', 0.01, 100, log=True),
+                'gamma': trial.suggest_categorical('gamma', ['scale', 'auto']),
+                'kernel': trial.suggest_categorical('kernel', ['rbf', 'poly', 'sigmoid']),
+            }
+        
+        else:
+            return {}
+    
+    def train_with_optimization(self, model_name: str, X_train: pd.DataFrame, y_train: pd.Series,
+                               n_trials: int = 100) -> Dict:
+        """
+        Train model with hyperparameter optimization
+        
+        Args:
+            model_name: Name of model to train
+            X_train: Training features
+            y_train: Training labels
+            n_trials: Number of optimization trials
+            
+        Returns:
+            Training results with optimized parameters
+        """
+        print(f"🚀 Training {model_name} with hyperparameter optimization...")
+        
+        # Step 1: Optimize hyperparameters
+        optimization_result = self.optimize_hyperparameters(
+            model_name, X_train, y_train, n_trials=n_trials
+        )
+        
+        best_params = optimization_result['best_params']
+        
+        # Step 2: Train final model with best parameters
+        final_result = self.train_model(model_name, X_train, y_train, 
+                                       model_params=best_params, use_scaling=True)
+        
+        # Add optimization info to results
+        final_result['optimization'] = {
+            'best_params': best_params,
+            'best_cv_score': optimization_result['best_score'],
+            'n_trials': n_trials,
+            'optimized': True
+        }
+        
+        return final_result
     
     def save_model_version(self, model_name: str, directory: str, metadata: Dict = None) -> str:
         """

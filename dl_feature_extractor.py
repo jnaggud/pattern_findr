@@ -258,7 +258,8 @@ class DLFeatureExtractor:
     def load_model(self, filepath):
         """Load a trained encoder model from disk"""
         try:
-            self.encoder = tf.keras.models.load_model(filepath)
+            # Allow loading models with lambda functions (safe for our own models)
+            self.encoder = tf.keras.models.load_model(filepath, safe_mode=False)
             self.model = None # We don't need the full training model for inference
             print(f"✅ DL Extractor loaded from {filepath}")
             return True

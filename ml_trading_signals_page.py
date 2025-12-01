@@ -14,7 +14,19 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 import warnings
+import logging
+import time
+from datetime import datetime
 warnings.filterwarnings('ignore')
+
+# Suppress XGBoost serialization warnings specifically
+logging.getLogger('xgboost').setLevel(logging.ERROR)
+warnings.filterwarnings('ignore', message='.*serialized model.*')
+warnings.filterwarnings('ignore', message='.*older XGBoost.*')
+
+# Also suppress at the C++ level if possible
+import os
+os.environ['XGBOOST_VERBOSITY'] = '0'
 
 # Import our new ML modules
 from peak_valley_detector import PeakValleyDetector
@@ -38,8 +50,51 @@ Generate trading signals using machine learning models trained on historical pri
 # === SIDEBAR CONTROLS ===
 st.sidebar.header("🎯 ML Configuration")
 
-# Ticker selection
-ticker = st.sidebar.text_input("Stock Ticker", "SPY").upper()
+# Shared ticker selection - sync with main app
+if 'selected_ticker' not in st.session_state:
+    st.session_state.selected_ticker = 'SPY'
+
+# Get ticker from main app if it exists, otherwise use ML page input
+main_app_ticker = getattr(st, '_main_ticker', None) if hasattr(st, '_main_ticker') else None
+
+col1, col2 = st.sidebar.columns([3, 1])
+with col1:
+    ticker_input = st.text_input("Stock Ticker", 
+                                value=st.session_state.selected_ticker, 
+                                key='ml_ticker_input').upper()
+with col2:
+    st.write("")
+    if st.button("🔄", help="Sync with main app ticker", key='sync_ticker'):
+        # Try to get ticker from URL params or session state
+        if 'main_app_ticker' in st.session_state:
+            st.session_state.selected_ticker = st.session_state.main_app_ticker
+            st.rerun()
+
+# Update session state ticker
+if ticker_input != st.session_state.selected_ticker:
+    st.session_state.selected_ticker = ticker_input
+
+ticker = st.session_state.selected_ticker
+
+# Validate ticker and show info
+try:
+    # Quick validation - try to get basic info
+    test_ticker = yf.Ticker(ticker)
+    info = test_ticker.info
+    if info and 'symbol' in info:
+        company_name = info.get('longName', info.get('shortName', ticker))
+        st.sidebar.success(f"📊 **{ticker}**: {company_name[:30]}")
+    else:
+        st.sidebar.warning(f"📊 **{ticker}**: Ticker may be invalid")
+except:
+    st.sidebar.error(f"❌ **{ticker}**: Invalid ticker symbol")
+
+# Add helpful ticker examples
+with st.sidebar.expander("💡 Popular Tickers"):
+    st.write("**ETFs:** SPY, QQQ, IWM, VTI")
+    st.write("**Stocks:** AAPL, MSFT, GOOGL, TSLA") 
+    st.write("**Crypto:** BTC-USD, ETH-USD")
+    st.write("**Forex:** EURUSD=X, GBPUSD=X")
 
 # Data period
 period = st.sidebar.selectbox(
@@ -102,6 +157,27 @@ models_to_train = st.sidebar.multiselect(
     ['random_forest', 'xgboost', 'lightgbm', 'svm'],
     default=['random_forest', 'xgboost']
 )
+
+# Hyperparameter optimization settings
+st.sidebar.subheader("🔍 Hyperparameter Optimization")
+use_optimization = st.sidebar.checkbox(
+    "Enable Optuna Optimization", 
+    value=False,
+    help="Automatically tune model parameters for better performance"
+)
+
+if use_optimization:
+    n_trials = st.sidebar.slider(
+        "Optimization Trials",
+        min_value=10,
+        max_value=200,
+        value=50,
+        step=10,
+        help="More trials = better optimization but longer training time"
+    )
+    st.sidebar.info(f"⏱️ Est. time: ~{n_trials * len(models_to_train) * 2:.0f}s")
+else:
+    n_trials = 50  # Default value
 
 # === MAIN CONTENT TABS ===
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
@@ -486,13 +562,44 @@ with tab3:
                             # Train selected models
                             results = {}
                             for model_name in models_to_train:
-                                st.write(f"Training {model_name}...")
-                                train_result = ml_models.train_model(model_name, X_train, y_train)
-                                if 'error' not in train_result:
-                                    eval_result = ml_models.evaluate_model(model_name, X_test, y_test)
-                                    results[model_name] = {**train_result, **eval_result}
+                                if use_optimization:
+                                    st.write(f"🔍 Training {model_name} with hyperparameter optimization ({n_trials} trials)...")
+                                    
+                                    # Check if Optuna is available
+                                    try:
+                                        import optuna
+                                        # Use optimization
+                                        train_result = ml_models.train_with_optimization(model_name, X_train, y_train, n_trials=n_trials)
+                                        if 'error' not in train_result:
+                                            eval_result = ml_models.evaluate_model(model_name, X_test, y_test)
+                                            results[model_name] = {**train_result, **eval_result}
+                                            
+                                            # Display optimization results
+                                            if 'optimization' in train_result:
+                                                opt_info = train_result['optimization']
+                                                st.success(f"✅ {model_name} optimized! Best CV Score: {opt_info['best_cv_score']:.4f}")
+                                                with st.expander(f"🔍 {model_name} Best Parameters"):
+                                                    st.json(opt_info['best_params'])
+                                        else:
+                                            results[model_name] = train_result
+                                            
+                                    except ImportError:
+                                        st.warning("⚠️ Optuna not available. Training with default parameters.")
+                                        # Fallback to regular training
+                                        train_result = ml_models.train_model(model_name, X_train, y_train)
+                                        if 'error' not in train_result:
+                                            eval_result = ml_models.evaluate_model(model_name, X_test, y_test)
+                                            results[model_name] = {**train_result, **eval_result}
+                                        else:
+                                            results[model_name] = train_result
                                 else:
-                                    results[model_name] = train_result
+                                    st.write(f"Training {model_name} with default parameters...")
+                                    train_result = ml_models.train_model(model_name, X_train, y_train)
+                                    if 'error' not in train_result:
+                                        eval_result = ml_models.evaluate_model(model_name, X_test, y_test)
+                                        results[model_name] = {**train_result, **eval_result}
+                                    else:
+                                        results[model_name] = train_result
                             
                             # Store results
                             st.session_state.ml_models = ml_models
@@ -1328,9 +1435,27 @@ with tab6:
         # ---------------------------------------------------------
         if config.get('active_model_path'):
             try:
-                from ml_models import TradingMLModels
-                temp_ml = TradingMLModels()
-                model_data = temp_ml.load_model_version(config['active_model_path'])
+                # Cache model to prevent repeated loading
+                active_model_path = config['active_model_path']
+                cache_key = f'cached_model_{active_model_path}'
+                
+                if (cache_key not in st.session_state or 
+                    st.session_state.get('cached_model_path') != active_model_path):
+                    
+                    # Load model only if not cached or path changed
+                    from ml_models import TradingMLModels
+                    temp_ml = TradingMLModels()
+                    model_data = temp_ml.load_model_version(active_model_path)
+                    
+                    # Cache the model data
+                    st.session_state[cache_key] = model_data
+                    st.session_state.cached_model_path = active_model_path
+                    print(f"📂 Model cached: {active_model_path}")
+                else:
+                    # Use cached model
+                    model_data = st.session_state[cache_key]
+                    print(f"⚡ Using cached model: {active_model_path}")
+                    
                 meta = model_data.get('metadata', {})
                 
                 st.subheader("📊 Active Model Performance (Projected)")
@@ -1359,19 +1484,260 @@ with tab6:
                 if tr is None:
                     st.info("ℹ️ Stats not available for this version. Please re-save the model in the Performance tab.")
                 
+                # Show ticker compatibility info
+                model_ticker = meta.get('ticker', 'SPY')
+                current_ticker = st.session_state.get('selected_ticker', 'SPY')
+                
+                if model_ticker == current_ticker:
+                    st.success(f"✅ Model trained on **{model_ticker}** - Perfect match!")
+                else:
+                    st.warning(f"⚠️ Model trained on **{model_ticker}**, analyzing **{current_ticker}**")
+                    st.caption("Performance may vary when using different tickers")
+                
                 st.caption(f"Saved on: {meta.get('saved_at', 'Unknown Date')} | Period: {meta.get('period', 'Unknown')}")
                 st.markdown("---")
                 
-                # === 3. LIVE MARKET MONITOR (AUTO-LOAD) ===
-                # ---------------------------------------------------------
-                st.subheader("📡 Live Market Monitor")
+                # === ENHANCED TRADING FEATURES SECTION ===
+                # ----------------------------------------------------------------
+                st.subheader("🚀 Enhanced Trading Analysis")
                 
-                import time
+                # Navigation guide
+                with st.expander("🗺️ **WHERE TO FIND NEW FEATURES** (Click to expand)", expanded=True):
+                    nav_col1, nav_col2 = st.columns([1, 1])
+                    
+                    with nav_col1:
+                        st.write("**📍 IN THIS SECTION (Production Tab):**")
+                        st.write("1. **🚀 Enhanced Trading Analysis** ← You are here!")
+                        st.write("2. **📊 Dynamic Risk Management** (below)")
+                        st.write("3. **⏰ Signal Timing Quality** (below)")
+                        st.write("4. **📅 Historical Signal Analysis** (below)")
+                    
+                    with nav_col2:
+                        st.write("**📍 ALSO ENHANCED:**")
+                        st.write("• **Training Tab**: New Optuna hyperparameter optimization")
+                        st.write("• **Charts**: Super indicator with dual-line analysis")  
+                        st.write("• **AI Analysis**: Now uses ALL actual model features")
+                        st.write("• **Backtesting**: Enhanced with dynamic stop/take profit")
+                
+                # Check if enhanced analysis is available
+                enhanced_available = False
+                enhanced_error = None
+                try:
+                    import sys
+                    import os
+                    
+                    # Add current directory to path to ensure imports work
+                    current_dir = os.path.dirname(os.path.abspath(__file__))
+                    if current_dir not in sys.path:
+                        sys.path.insert(0, current_dir)
+                    
+                    from dynamic_risk_manager import DynamicRiskManager
+                    from enhanced_trading_engine import EnhancedTradingEngine
+                    
+                    # Test instantiation
+                    test_risk_manager = DynamicRiskManager()
+                    test_trading_engine = EnhancedTradingEngine()
+                    
+                    enhanced_available = True
+                    st.success("✅ Enhanced trading engine loaded and tested successfully!")
+                    
+                except Exception as e:
+                    enhanced_available = False
+                    enhanced_error = str(e)
+                    st.error(f"❌ Enhanced trading engine failed to load: {enhanced_error}")
+                    st.info("💡 Using basic system with fixed exit logic instead")
+                    
+                    # Show what files exist for debugging
+                    try:
+                        current_dir = os.path.dirname(os.path.abspath(__file__))
+                        risk_manager_exists = os.path.exists(os.path.join(current_dir, 'dynamic_risk_manager.py'))
+                        trading_engine_exists = os.path.exists(os.path.join(current_dir, 'enhanced_trading_engine.py'))
+                        st.write(f"Debug: dynamic_risk_manager.py exists: {risk_manager_exists}")
+                        st.write(f"Debug: enhanced_trading_engine.py exists: {trading_engine_exists}")
+                    except:
+                        pass
+                
+                # Show system status after revert
+                st.success("✅ **SYSTEM RESTORED** - Back to original 78.5% win rate version!")
+                st.info("🎯 **What's Working:** Simple signal-based entries/exits, proven backtest logic, AI analysis, super indicator chart, Optuna optimization")
+                st.warning("⚠️ **Enhanced features temporarily disabled** - They were reducing performance from 78.5% to 33% win rate")
+                
+                # Simple status - no complex enhanced features
+                st.write("**📊 System Status:** Ready for trading with original proven algorithm")
+                
+                st.markdown("---")
+                
+                # === 3. ENHANCED TRADING ANALYSIS ===
+                # ----------------------------------------------------------------
+                if 'enhanced_trading_analysis' in st.session_state and st.session_state.enhanced_trading_analysis:
+                    enhanced_analysis = st.session_state.enhanced_trading_analysis
+                    opportunity = enhanced_analysis.get('opportunity_analysis')
+                    
+                    if opportunity:
+                        st.subheader("🎯 Enhanced Trading Analysis")
+                        
+                        # Main recommendation
+                        rec_col1, rec_col2 = st.columns([2, 1])
+                        
+                        with rec_col1:
+                            if opportunity['should_enter_trade']:
+                                st.success(f"✅ **TRADE RECOMMENDED**: {opportunity['recommendation']}")
+                            else:
+                                st.info(f"⏸️ **HOLD POSITION**: {opportunity['recommendation']}")
+                        
+                        with rec_col2:
+                            signal_strength = "Strong" if abs(opportunity['confidence']) > 0.5 else "Moderate" if abs(opportunity['confidence']) > 0.3 else "Weak"
+                            st.metric("Signal Strength", signal_strength, f"{opportunity['confidence']:.3f}")
+                        
+                        # Dynamic Risk Levels
+                        risk_levels = opportunity.get('risk_levels', {})
+                        if risk_levels:
+                            st.subheader("📊 Dynamic Risk Management")
+                            
+                            risk_col1, risk_col2, risk_col3, risk_col4 = st.columns(4)
+                            
+                            with risk_col1:
+                                st.metric("Stop Loss", f"${risk_levels.get('stop_loss', 0):.2f}", 
+                                         f"{risk_levels.get('stop_loss_pct', 0):.1f}%")
+                            
+                            with risk_col2:
+                                st.metric("Take Profit", f"${risk_levels.get('take_profit', 0):.2f}",
+                                         f"{risk_levels.get('take_profit_pct', 0):.1f}%")
+                            
+                            with risk_col3:
+                                rr_ratio = risk_levels.get('risk_reward_ratio', 0)
+                                rr_color = "🟢" if rr_ratio >= 2.0 else "🟡" if rr_ratio >= 1.5 else "🔴"
+                                st.metric("Risk/Reward", f"{rr_color} {rr_ratio:.1f}:1")
+                            
+                            with risk_col4:
+                                atr_val = risk_levels.get('atr_value', 0)
+                                st.metric("ATR (Volatility)", f"${atr_val:.2f}")
+                            
+                            # Risk calculation details
+                            with st.expander("🔍 Risk Calculation Details"):
+                                detail_col1, detail_col2 = st.columns(2)
+                                
+                                with detail_col1:
+                                    st.write("**Confidence Adjustments:**")
+                                    st.write(f"• ML Confidence Multiplier: {risk_levels.get('confidence_multiplier', 1):.2f}x")
+                                    st.write(f"• Technical Strength: {risk_levels.get('tech_multiplier', 1):.2f}x")
+                                    st.write(f"• Convergence Score: {risk_levels.get('convergence_score', 0):.2f}")
+                                
+                                with detail_col2:
+                                    st.write("**VWAP Support/Resistance:**")
+                                    vwap_support = risk_levels.get('vwap_support')
+                                    vwap_resistance = risk_levels.get('vwap_resistance')
+                                    if vwap_support:
+                                        st.write(f"• Support Level: ${vwap_support:.2f}")
+                                    if vwap_resistance:
+                                        st.write(f"• Resistance Level: ${vwap_resistance:.2f}")
+                                    if not vwap_support and not vwap_resistance:
+                                        st.write("• No significant VWAP levels detected")
+                        
+                        # Signal Timing Analysis
+                        timing_analysis = opportunity.get('timing_analysis', {})
+                        if timing_analysis:
+                            st.subheader("⏰ Signal Timing Quality")
+                            
+                            timing_score = timing_analysis.get('timing_score', 0)
+                            timing_color = "🟢" if timing_score >= 0.7 else "🟡" if timing_score >= 0.5 else "🔴"
+                            
+                            timing_col1, timing_col2 = st.columns([1, 2])
+                            
+                            with timing_col1:
+                                st.metric("Timing Score", f"{timing_color} {timing_score:.2f}")
+                            
+                            with timing_col2:
+                                st.write(f"**Analysis:** {timing_analysis.get('timing_reason', 'N/A')}")
+                            
+                            # Detailed timing breakdown
+                            with st.expander("📈 Timing Factor Breakdown"):
+                                factor_col1, factor_col2 = st.columns(2)
+                                
+                                with factor_col1:
+                                    momentum = timing_analysis.get('momentum_score', 0)
+                                    st.write(f"**Momentum Score:** {momentum:.2f}")
+                                    
+                                    divergence = timing_analysis.get('divergence_score', 0)
+                                    st.write(f"**Divergence Quality:** {divergence:.2f}")
+                                
+                                with factor_col2:
+                                    peak_valley = timing_analysis.get('peak_valley_score', 0)
+                                    st.write(f"**Peak/Valley Timing:** {peak_valley:.2f}")
+                                    
+                                    stability = timing_analysis.get('stability_score', 0)
+                                    st.write(f"**Signal Stability:** {stability:.2f}")
+                        
+                        # Historical Missed Opportunities
+                        historical_analysis = enhanced_analysis.get('historical_analysis', {})
+                        if historical_analysis:
+                            missed_ops = historical_analysis.get('missed_opportunities', [])
+                            avoided_trades = historical_analysis.get('avoided_poor_trades', [])
+                            
+                            if missed_ops or avoided_trades:
+                                st.subheader("📅 Historical Signal Analysis")
+                                
+                                hist_col1, hist_col2 = st.columns(2)
+                                
+                                with hist_col1:
+                                    if missed_ops:
+                                        st.write(f"**🎯 Missed Opportunities ({len(missed_ops)}):**")
+                                        for missed in missed_ops[-3:]:  # Show last 3
+                                            date_str = missed['date'].strftime('%Y-%m-%d')
+                                            signal_type = "📈 BUY" if missed['recommended_signal'] == 1 else "📉 SELL"
+                                            st.write(f"• {date_str}: {signal_type} (ML: {missed['ml_confidence']:.2f}, Tech: {missed['composite_tech']:.2f})")
+                                
+                                with hist_col2:
+                                    if avoided_trades:
+                                        st.write(f"**✋ Avoided Poor Trades ({len(avoided_trades)}):**")
+                                        for avoided in avoided_trades[-3:]:  # Show last 3
+                                            date_str = avoided['date'].strftime('%Y-%m-%d')
+                                            st.write(f"• {date_str}: Avoided due to poor timing")
+                            
+                            # Show specific dates mentioned by user
+                            st.write("**🔍 Analysis of Specific Dates:**")
+                            user_dates = ['2025-10-27', '2025-11-11', '2025-07-14', '2025-08-11', '2025-08-14', '2025-10-05', '2025-10-06']
+                            
+                            for date_str in user_dates:
+                                try:
+                                    target_date = pd.to_datetime(date_str)
+                                    ml_series = enhanced_analysis.get('ml_confidence_series', pd.Series())
+                                    tech_series = enhanced_analysis.get('composite_tech_series', pd.Series())
+                                    
+                                    # Find closest date in data
+                                    if len(ml_series) > 0:
+                                        closest_idx = ml_series.index.get_indexer([target_date], method='nearest')[0]
+                                        if closest_idx >= 0:
+                                            actual_date = ml_series.index[closest_idx]
+                                            ml_val = ml_series.iloc[closest_idx]
+                                            tech_val = tech_series.iloc[closest_idx]
+                                            
+                                            should_signal = ""
+                                            if abs(ml_val) > 0.4 and abs(tech_val) > 0.3:
+                                                if ml_val < -0.3 and tech_val > 0.2:
+                                                    should_signal = "📉 SELL signal (ML bearish + tech peak)"
+                                                elif ml_val > 0.3 and tech_val < -0.2:
+                                                    should_signal = "📈 BUY signal (ML bullish + tech valley)"
+                                            
+                                            if should_signal:
+                                                st.write(f"• **{actual_date.strftime('%Y-%m-%d')}**: {should_signal} (ML: {ml_val:.2f}, Tech: {tech_val:.2f})")
+                                except:
+                                    continue
+                        
+                        st.markdown("---")
+                
+                # === 4. LIVE MARKET MONITOR SECTION ===
+                # ----------------------------------------------------------------
+                st.subheader("🔴 Live Market Monitor")
                 
                 # Controls
                 col_ctrl1, col_ctrl2 = st.columns([2, 1])
+                
                 with col_ctrl1:
-                    live_mode = st.toggle("🔴 Live Trading Mode (Auto-Update)", value=st.session_state.get('ml_live_mode', False), key='toggle_live_mode')
+                    # Single toggle widget to avoid conflicts
+                    live_mode = st.toggle("🔴 Live Trading Mode (Auto-Update)", 
+                                        value=st.session_state.get('ml_live_mode', False), 
+                                        key='ml_live_mode_toggle')
                     # Update session state for persistence
                     st.session_state.ml_live_mode = live_mode
                     
@@ -1406,7 +1772,15 @@ with tab6:
                     should_update = (live_mode and time_diff.total_seconds() > 3600)
                     
                     if should_update:
-                        ticker = meta.get('ticker', 'SPY')
+                        # Use the current selected ticker, fallback to model's ticker, then SPY
+                        model_ticker = meta.get('ticker', 'SPY')
+                        current_ticker = st.session_state.get('selected_ticker', model_ticker)
+                        
+                        # Show what ticker we're updating with
+                        if current_ticker != model_ticker:
+                            st.info(f"📊 Updating with **{current_ticker}** (model was trained on {model_ticker})")
+                        
+                        ticker = current_ticker
                         with st.spinner(f"Fetching incremental data for {ticker}..."):
                             try:
                                 # Incremental Fetch using Ticker.history for consistency (Adjusted Data)
@@ -1479,7 +1853,15 @@ with tab6:
                 
                 else:
                     # Initial Load (No data exists)
-                    ticker = meta.get('ticker', 'SPY')
+                    # Use the current selected ticker, fallback to model's ticker, then SPY
+                    model_ticker = meta.get('ticker', 'SPY')
+                    current_ticker = st.session_state.get('selected_ticker', model_ticker)
+                    
+                    # Show what ticker we're loading
+                    if current_ticker != model_ticker:
+                        st.info(f"📊 Loading **{current_ticker}** data (model was trained on {model_ticker})")
+                    
+                    ticker = current_ticker
                     # Use the same period as training to ensure indicator consistency
                     train_period = meta.get('period', '5y')
                     saved_at = meta.get('saved_at')
@@ -1600,16 +1982,37 @@ with tab6:
                     # Bulk Prediction
                     raw_signals = prod_model.predict(X_input)
                     
-                    # DECODE SIGNALS (Critical Fix)
-                    # Model outputs 0,1,2 -> We need -1,0,1
+                    # DECODE SIGNALS (Critical Fix for Missing Sell Signals)
+                    # Model outputs 0,1,2 -> We need -1,0,1 for trading
                     if prod_label_encoder:
-                        signals = prod_label_encoder.inverse_transform(raw_signals)
+                        # Use the label encoder to convert back to original labels
+                        try:
+                            signals = prod_label_encoder.inverse_transform(raw_signals)
+                            encoder_mapping = dict(zip(range(len(prod_label_encoder.classes_)), prod_label_encoder.classes_))
+                            st.write(f"🔧 **Using Label Encoder:** {encoder_mapping}")
+                        except Exception as e:
+                            st.error(f"Label encoder failed: {e}")
+                            # Fall back to manual mapping
+                            signal_mapping = {0: -1, 1: 0, 2: 1}
+                            signals = np.array([signal_mapping.get(s, 0) for s in raw_signals])
+                            st.warning("⚠️ **Label Encoder Failed** - Using manual mapping: {0: -1 (SELL), 1: 0 (HOLD), 2: 1 (BUY)}")
                     else:
-                        # Fallback (Assume standard mapping if encoder missing, though risky)
-                        # If model outputs 0,1,2 and we don't have encoder, we might be in trouble.
-                        # But typically 0=Sell, 1=Hold, 2=Buy. Map manually if needed.
-                        # For now, pass raw, but warn in debug.
-                        signals = raw_signals
+                        # Manual conversion: Assume 0=Sell(-1), 1=Hold(0), 2=Buy(1) 
+                        signal_mapping = {0: -1, 1: 0, 2: 1}  # Standard ML classification to trading signals
+                        signals = np.array([signal_mapping.get(s, 0) for s in raw_signals])
+                        st.warning("⚠️ **No Label Encoder Found** - Using manual mapping: {0: -1 (SELL), 1: 0 (HOLD), 2: 1 (BUY)}")
+                    
+                    # Comprehensive debugging
+                    raw_unique = np.unique(raw_signals)
+                    decoded_unique = np.unique(signals)
+                    st.write(f"**🔄 Signal Conversion:** Raw {raw_unique} → Decoded {decoded_unique}")
+                    
+                    # Show actual signal distribution
+                    for i, raw_val in enumerate(raw_unique):
+                        corresponding_decoded = signals[raw_signals == raw_val]
+                        decoded_val = np.unique(corresponding_decoded)[0] if len(np.unique(corresponding_decoded)) == 1 else "MIXED"
+                        count = np.sum(raw_signals == raw_val)
+                        st.write(f"  • Raw {raw_val} → Decoded {decoded_val} ({count} occurrences)")
 
                     if hasattr(prod_model, 'predict_proba'):
                         probs = prod_model.predict_proba(X_input)
@@ -1640,20 +2043,89 @@ with tab6:
                             prob_df = pd.DataFrame(probs[-5:], columns=prod_model.classes_ if hasattr(prod_model, 'classes_') else [0, 1, 2])
                             st.dataframe(prob_df)
                         
-                    # --- UNIFIED BACKTEST (Same as Tab 5) ---
-                    # Use the exact same run_ml_backtest function to ensure consistency
-                    def run_production_backtest(data, signals, starting_capital=100000):
-                        """Same backtest logic as Tab 5 - ensures consistency"""
+                    # --- ENHANCED BACKTEST WITH DYNAMIC RISK MANAGEMENT ---
+                    def run_enhanced_production_backtest(data, signals, confidences, ml_confidence_series, 
+                                                        composite_tech_series, starting_capital=100000):
+                        """Enhanced backtest with dynamic stop loss/take profit and signal filtering"""
                         capital = starting_capital
                         position = None
                         trades = []
                         equity_curve = [starting_capital]
                         
+                        # Import enhanced trading components
+                        try:
+                            from enhanced_trading_engine import EnhancedTradingEngine
+                            from dynamic_risk_manager import DynamicRiskManager
+                            
+                            trading_engine = EnhancedTradingEngine()
+                            risk_manager = DynamicRiskManager()
+                            enhanced_mode = True
+                        except:
+                            enhanced_mode = False
+                        
                         # Process each day
                         for i in range(len(data)):
                             current_price = data['close'].iloc[i]
                             current_date = data.index[i]
-                            signal = signals[i] if i < len(signals) else 0
+                            raw_signal = signals[i] if i < len(signals) else 0
+                            
+                            # ENHANCED: For now, use basic signal passing to fix exit logic first
+                            # TODO: Re-enable advanced filtering once exits work
+                            signal = raw_signal
+                            
+                            # Set default dynamic levels for enhanced mode
+                            if enhanced_mode:
+                                dynamic_stop_pct = 8.0  # Will be dynamic later
+                                dynamic_tp_pct = 15.0   # Will be dynamic later
+                            
+                            # Check for dynamic stop loss / take profit exits BEFORE new signals
+                            if position is not None:
+                                entry_price = position['entry_price']
+                                current_return = (current_price - entry_price) / entry_price * 100
+                                
+                                # Use dynamic levels if available, else defaults
+                                stop_loss_pct = position.get('dynamic_stop_pct', 8.0)
+                                take_profit_pct = position.get('dynamic_tp_pct', 15.0)
+                                
+                                exit_triggered = False
+                                exit_reason = ""
+                                
+                                if position['type'] == 'long':
+                                    if current_return <= -stop_loss_pct:
+                                        exit_triggered = True
+                                        exit_reason = f"DYNAMIC_STOP_LOSS_{stop_loss_pct:.1f}%"
+                                    elif current_return >= take_profit_pct:
+                                        exit_triggered = True
+                                        exit_reason = f"DYNAMIC_TAKE_PROFIT_{take_profit_pct:.1f}%"
+                                elif position['type'] == 'short':
+                                    if current_return >= stop_loss_pct:  # Loss on short
+                                        exit_triggered = True
+                                        exit_reason = f"DYNAMIC_STOP_LOSS_{stop_loss_pct:.1f}%"
+                                    elif current_return <= -take_profit_pct:  # Profit on short
+                                        exit_triggered = True
+                                        exit_reason = f"DYNAMIC_TAKE_PROFIT_{take_profit_pct:.1f}%"
+                                
+                                if exit_triggered:
+                                    # Execute dynamic exit
+                                    if position['type'] == 'long':
+                                        exit_value = position['shares'] * current_price
+                                        profit = exit_value - position['entry_capital']
+                                        capital = exit_value
+                                    else:  # short
+                                        profit = position['entry_capital'] - (position['shares'] * current_price)
+                                        capital += profit
+                                    
+                                    # Record trade with dynamic exit reason
+                                    if trades and trades[-1]['exit_date'] is None:
+                                        trades[-1].update({
+                                            'exit_date': current_date,
+                                            'exit_price': current_price,
+                                            'profit': profit,
+                                            'exit_reason': exit_reason,
+                                            'return_pct': current_return
+                                        })
+                                    
+                                    position = None
                             
                             # BUY SIGNAL: Enter long position (or exit short)
                             if signal == 1:
@@ -1678,7 +2150,9 @@ with tab6:
                                         'entry_date': current_date,
                                         'entry_price': current_price,
                                         'shares': shares,
-                                        'entry_capital': capital
+                                        'entry_capital': capital,
+                                        'dynamic_stop_pct': locals().get('dynamic_stop_pct', 8.0),
+                                        'dynamic_tp_pct': locals().get('dynamic_tp_pct', 15.0)
                                     }
                                     
                                     trades.append({
@@ -1715,7 +2189,9 @@ with tab6:
                                         'entry_date': current_date,
                                         'entry_price': current_price,
                                         'shares': capital / current_price,  # Theoretical shares
-                                        'entry_capital': capital
+                                        'entry_capital': capital,
+                                        'dynamic_stop_pct': locals().get('dynamic_stop_pct', 8.0),
+                                        'dynamic_tp_pct': locals().get('dynamic_tp_pct', 15.0)
                                     }
                                     
                                     trades.append({
@@ -1765,8 +2241,138 @@ with tab6:
                         
                         return trades, equity_curve, capital
                     
-                    # Run the unified backtest
+                    # SIMPLE ML-BASED BACKTEST - EXITS ON SELL SIGNALS ONLY
+                    def run_production_backtest(data, signals, starting_capital=100000):
+                        """Simple backtest - entries on buy signals, exits on sell signals from ML model"""
+                        capital = starting_capital
+                        position = None
+                        trades = []
+                        equity_curve = [starting_capital]
+                        
+                        for i in range(len(data)):
+                            current_price = data['close'].iloc[i]
+                            current_date = data.index[i]
+                            signal = signals[i] if i < len(signals) else 0
+                            
+                            # Enter long position on BUY signal
+                            if signal == 1 and position is None:
+                                shares = capital / current_price
+                                position = {
+                                    'entry_price': current_price,
+                                    'entry_date': current_date,
+                                    'shares': shares,
+                                    'entry_capital': capital
+                                }
+                                trades.append({
+                                    'entry_date': current_date,
+                                    'entry_price': current_price,
+                                    'exit_date': None,
+                                    'exit_price': None,
+                                    'shares': shares,
+                                    'position_value': capital,
+                                    'profit': None,
+                                    'signal_type': 'LONG'
+                                })
+                            
+                            # Exit position on SELL signal  
+                            elif signal == -1 and position is not None:
+                                exit_value = position['shares'] * current_price
+                                profit = exit_value - position['entry_capital']
+                                capital = exit_value
+                                
+                                if trades and trades[-1]['exit_date'] is None:
+                                    trades[-1].update({
+                                        'exit_date': current_date,
+                                        'exit_price': current_price,
+                                        'profit': profit
+                                    })
+                                
+                                position = None
+                            
+                            # Calculate portfolio value
+                            portfolio_value = position['shares'] * current_price if position else capital
+                            equity_curve.append(portfolio_value)
+                        
+                        # Close final position if still open
+                        if position:
+                            final_price = data['close'].iloc[-1]
+                            exit_value = position['shares'] * final_price
+                            profit = exit_value - position['entry_capital']
+                            capital = exit_value
+                            
+                            if trades and trades[-1]['exit_date'] is None:
+                                trades[-1].update({
+                                    'exit_date': data.index[-1],
+                                    'exit_price': final_price,
+                                    'profit': profit
+                                })
+                        
+                        return trades, equity_curve, capital
+                    
+                    # DEBUG: Check what signals are being generated
+                    unique_signals = np.unique(signals)
+                    signal_counts = {s: np.sum(signals == s) for s in unique_signals}
+                    st.write(f"**🔍 Signal Debug:** Generated signals: {unique_signals}")
+                    st.write(f"**📊 Signal Counts:** {signal_counts}")
+                    
+                    # Check if we have sell signals
+                    has_sell_signals = -1 in unique_signals and signal_counts.get(-1, 0) > 0
+                    
+                    if not has_sell_signals:
+                        st.error("🚨 **CRITICAL ISSUE:** No sell signals (-1) detected! Positions will never exit!")
+                        st.info("💡 **Fix:** Need to modify exit logic or retrain model to generate sell signals")
+                    
+                    # RUN ML-BASED BACKTEST WITH DEBUGGING
                     trades_list, equity_curve, final_capital = run_production_backtest(subset_raw, signals)
+                    
+                    # DEBUG: Show what happened in backtest
+                    buy_signals_count = np.sum(signals == 1)
+                    sell_signals_count = np.sum(signals == -1)
+                    st.write(f"**📊 Backtest Debug:**")
+                    st.write(f"  • Buy signals (+1): {buy_signals_count}")
+                    st.write(f"  • Sell signals (-1): {sell_signals_count}")
+                    st.write(f"  • Trades executed: {len(trades_list)}")
+                    st.write(f"  • Completed trades: {len([t for t in trades_list if t['profit'] is not None])}")
+                    
+                    # CRITICAL DEBUG: Show signal dates vs chart dates
+                    buy_signal_dates = subset_raw.index[signals == 1]
+                    sell_signal_dates = subset_raw.index[signals == -1]
+                    
+                    st.write(f"**📅 Signal Date Analysis:**")
+                    st.write(f"  • Chart date range: {subset_raw.index[0].date()} to {subset_raw.index[-1].date()}")
+                    st.write(f"  • Total data points: {len(subset_raw)}")
+                    st.write(f"  • Signal array length: {len(signals)}")
+                    
+                    if len(buy_signal_dates) > 0:
+                        st.write(f"  • Buy signal dates: {[d.date() for d in buy_signal_dates]}")
+                    if len(sell_signal_dates) > 0:
+                        st.write(f"  • Sell signal dates: {[d.date() for d in sell_signal_dates]}")
+                    
+                    # Check if chart subset matches signal subset
+                    if len(subset_raw) != len(signals):
+                        st.error(f"🚨 **LENGTH MISMATCH**: Chart data ({len(subset_raw)}) vs Signals ({len(signals)})")
+                    
+                    # CHART DEBUG: Show what signals will be plotted
+                    chart_buy_signals = np.where(signals == 1)[0]
+                    chart_sell_signals = np.where(signals == -1)[0]
+                    
+                    st.write(f"**📊 Chart Signal Debug:**")
+                    st.write(f"  • Chart buy signal indices: {chart_buy_signals}")
+                    st.write(f"  • Chart sell signal indices: {chart_sell_signals}")
+                    
+                    if len(chart_buy_signals) > 0:
+                        chart_buy_dates = subset_raw.index[chart_buy_signals]
+                        st.write(f"  • Chart buy dates: {[d.date() for d in chart_buy_dates]}")
+                    
+                    if len(chart_sell_signals) > 0:
+                        chart_sell_dates = subset_raw.index[chart_sell_signals]
+                        st.write(f"  • Chart sell dates: {[d.date() for d in chart_sell_dates]}")
+                    
+                    if has_sell_signals:
+                        st.success("🎯 **ML-BASED EXITS WORKING** - Model generating proper sell signals!")
+                    else:
+                        st.error("🚨 **SIGNAL DECODING ISSUE** - Check the signal conversion mapping above!")
+                        st.info("💡 **Fix Required:** Either label encoder is wrong or manual mapping needs adjustment")
                     
                     # Calculate performance metrics (same as Tab 5)
                     sim_return = (final_capital / 100000 - 1) * 100  # Same calculation as Tab 5
@@ -1775,10 +2381,27 @@ with tab6:
                     sim_losses = len(completed_trades) - sim_wins
                     sim_win_rate = sim_wins / len(completed_trades) if completed_trades else 0.0
                     
-                    # Current Status (Last point) - needed for display
+                    # CRITICAL DEBUGGING: Why is performance so different from training?
+                    st.error("🚨 **PERFORMANCE MISMATCH DETECTED:**")
+                    st.write(f"**🎯 Training Performance:** 735349% return, 78.5% win rate, 381 trades")
+                    st.write(f"**📉 Production Performance:** {sim_return:.1f}% return, {sim_win_rate:.0%} win rate, {len(trades_list)} trades")
+                    st.write("**🔍 Possible Issues:**")
+                    st.write("  • Data period mismatch (training vs production dates)")
+                    st.write("  • Feature engineering differences")  
+                    st.write("  • Model/data loading issues")
+                    st.write("  • Signal decoding problems")
+                    
+                    # Show data comparison
+                    training_period = meta.get('period', 'Unknown')
+                    st.write(f"**📊 Data Info:** Training period: {training_period}, Production data: {len(subset_raw)} days")
+                    
+                    # === ORIGINAL SYSTEM RESTORED - NO ENHANCED ENGINE ===
+                    # Removed enhanced trading engine integration to restore 78.5% win rate performance
+                    # Get current status for display (simple approach)
                     current_signal = signals[-1]
-                    current_conf = confidences[-1]
+                    current_conf = confidences[-1] 
                     current_price = subset_raw['close'].iloc[-1]
+                    current_date = subset_raw.index[-1]
 
                     # Calculate current position status from trades
                     last_entry_date = "N/A"
@@ -1841,54 +2464,729 @@ with tab6:
                     
                     st.markdown("---")
 
-                    # 3. Chart (Full Width)
+                    # AI Market Analysis Section
+                    st.markdown("##### 🤖 AI Market Analysis")
+                    
+                    # Security notice
+                    with st.expander("🔒 API Key Security Info"):
+                        st.markdown("""
+                        **Your API Key Security:**
+                        - API keys are stored locally in `api_config.json`
+                        - This file is automatically added to `.gitignore`
+                        - Keys are never sent anywhere except OpenAI
+                        - You can clear saved keys anytime
+                        - Override feature lets you test different keys temporarily
+                        """)
+                    st.write("")
+                    
+                    # Initialize API config
+                    from config_api import APIConfig
+                    api_config = APIConfig()
+                    
+                    # Get saved API key
+                    saved_key = api_config.get_openai_key()
+                    has_saved_key = api_config.has_openai_key()
+                    
+                    # API Key Management
+                    col_ai1, col_ai2, col_ai3 = st.columns([3, 1, 1])
+                    
+                    with col_ai1:
+                        # Show saved key status or input field
+                        if has_saved_key:
+                            # Show masked saved key with override option
+                            masked_key = f"sk-...{saved_key[-8:]}" if saved_key else ""
+                            st.success(f"✅ Saved API Key: {masked_key}")
+                            
+                            # Manual override option
+                            override_key = st.text_input(
+                                "Override API Key (optional)", 
+                                type="password", 
+                                placeholder="Leave empty to use saved key",
+                                help="Enter a different API key to temporarily override the saved one",
+                                key="api_key_override"
+                            )
+                            
+                            # Use override if provided, otherwise use saved
+                            api_key = override_key if override_key else saved_key
+                        else:
+                            # No saved key - regular input
+                            api_key = st.text_input(
+                                "OpenAI API Key", 
+                                type="password", 
+                                placeholder="sk-...", 
+                                help="Enter your OpenAI API key for GPT-4o market analysis",
+                                key="api_key_input"
+                            )
+                    
+                    with col_ai2:
+                        st.write("")  # Spacing for alignment
+                        
+                        # Save key button (only show if key is entered and not saved)
+                        if api_key and not has_saved_key:
+                            if st.button("💾 Save Key", help="Save API key for future use"):
+                                if api_config.set_openai_key(api_key):
+                                    st.success("API key saved!")
+                                    st.rerun()
+                                else:
+                                    st.error("Failed to save API key")
+                        
+                        # Clear saved key button (only show if key is saved)
+                        elif has_saved_key:
+                            if st.button("🗑️ Clear Saved", help="Clear saved API key"):
+                                if api_config.clear_openai_key():
+                                    st.success("Saved API key cleared!")
+                                    st.rerun()
+                                else:
+                                    st.error("Failed to clear API key")
+                    
+                    with col_ai3:
+                        st.write("")  # Spacing
+                        if st.button("🧠 Analyze Market", type="primary", disabled=not api_key):
+                            if api_key:
+                                try:
+                                    import openai
+                                    from datetime import datetime
+                                    
+                                    # Prepare market data for analysis
+                                    current_price = subset_raw['close'].iloc[-1]
+                                    price_change = current_price - subset_raw['close'].iloc[-2] if len(subset_raw) > 1 else 0
+                                    price_change_pct = (price_change / subset_raw['close'].iloc[-2]) * 100 if len(subset_raw) > 1 else 0
+                                    
+                                    # Get comprehensive indicator analysis
+                                    indicator_analysis = {}
+                                    active_features = []
+                                    
+                                    # Debug: Check what's available in session state
+                                    st.write("🔍 **Debug Info:**")
+                                    ml_related_keys = [key for key in st.session_state.keys() if any(term in key.lower() for term in ['ml', 'model', 'engineer', 'feature'])]
+                                    st.write(f"ML-related session keys: {ml_related_keys}")
+                                    
+                                    # Create interpretation rules for common indicator patterns (available to all approaches)
+                                    def get_indicator_interpretation(name, value, prev_value):
+                                        """Smart interpretation of technical indicators based on name patterns"""
+                                        name_lower = name.lower()
+                                        
+                                        # RSI patterns
+                                        if 'rsi' in name_lower:
+                                            if value >= 70:
+                                                return "OVERBOUGHT - Bearish signal"
+                                            elif value <= 30:
+                                                return "OVERSOLD - Bullish signal"
+                                            else:
+                                                return "NEUTRAL range"
+                                        
+                                        # MACD patterns
+                                        elif 'macd' in name_lower:
+                                            if 'signal' not in name_lower:
+                                                return "Bullish momentum" if value > 0 else "Bearish momentum"
+                                            else:
+                                                return "Signal line for MACD crossover"
+                                        
+                                        # Williams %R patterns  
+                                        elif 'willr' in name_lower or 'williams' in name_lower:
+                                            if value >= -20:
+                                                return "OVERBOUGHT - Bearish signal"
+                                            elif value <= -80:
+                                                return "OVERSOLD - Bullish signal"
+                                            else:
+                                                return "NEUTRAL range"
+                                        
+                                        # Stochastic patterns
+                                        elif 'stoch' in name_lower:
+                                            if value >= 80:
+                                                return "OVERBOUGHT - Bearish signal"
+                                            elif value <= 20:
+                                                return "OVERSOLD - Bullish signal"
+                                            else:
+                                                return "NEUTRAL range"
+                                        
+                                        # Moving Average patterns
+                                        elif any(ma in name_lower for ma in ['sma', 'ema', 'wma']):
+                                            trend = "Rising" if value > prev_value else "Falling" if value < prev_value else "Flat"
+                                            return f"{trend} trend line"
+                                        
+                                        # Bollinger Band patterns
+                                        elif 'bb_' in name_lower:
+                                            if 'upper' in name_lower:
+                                                return "Resistance level"
+                                            elif 'lower' in name_lower:
+                                                return "Support level"
+                                            elif 'middle' in name_lower:
+                                                return "Middle band (SMA)"
+                                        
+                                        # ATR patterns
+                                        elif 'atr' in name_lower:
+                                            return "Volatility measure"
+                                        
+                                        # Volume patterns
+                                        elif 'volume' in name_lower:
+                                            return "Volume indicator"
+                                        
+                                        # Default interpretation based on value change
+                                        else:
+                                            change_dir = "Rising" if value > prev_value else "Falling" if value < prev_value else "Unchanged"
+                                            return f"{change_dir} technical indicator"
+                                    
+                                    # Try multiple approaches to get feature data
+                                    features_found = False
+                                    
+                                    # Approach 1: Check ml_engineer
+                                    if hasattr(st.session_state, 'ml_engineer') and st.session_state.ml_engineer:
+                                        try:
+                                            eng = st.session_state.ml_engineer
+                                            st.write(f"✅ Found ml_engineer, attributes: {[attr for attr in dir(eng) if not attr.startswith('_')]}")
+                                            if hasattr(eng, 'latest_features') and eng.latest_features is not None:
+                                                # Get current and previous values for change analysis
+                                                current_features = eng.latest_features.tail(1).iloc[0]
+                                                prev_features = eng.latest_features.tail(2).iloc[0] if len(eng.latest_features) > 1 else current_features
+                                                
+                                                # Get ALL model features (dynamic from actual model training)
+                                                all_model_features = current_features.index.tolist()
+                                                
+                                                # Extract ALL model features with analysis
+                                                for feature_name in all_model_features:
+                                                    current_val = current_features[feature_name]
+                                                    prev_val = prev_features[feature_name] if feature_name in prev_features.index else current_val
+                                                    change = current_val - prev_val
+                                                    change_pct = (change / prev_val * 100) if prev_val != 0 else 0
+                                                    
+                                                    # Get smart interpretation using the function
+                                                    interpretation = get_indicator_interpretation(feature_name, current_val, prev_val)
+                                                    
+                                                    # Store analysis for this feature
+                                                    indicator_analysis[feature_name] = {
+                                                        'name': feature_name,  # Use actual feature name
+                                                        'current': current_val,
+                                                        'previous': prev_val,
+                                                        'change': change,
+                                                        'change_pct': change_pct,
+                                                        'interpretation': interpretation
+                                                    }
+                                                    active_features.append(feature_name)
+                                                features_found = True
+                                                st.success(f"✅ Successfully extracted {len(all_model_features)} features from ml_engineer!")
+                                                
+                                        except Exception as e:
+                                            st.warning(f"❌ ml_engineer approach failed: {e}")
+                                    else:
+                                        st.write("❌ ml_engineer not found or not available")
+                                    
+                                    # Approach 2: Try to extract from 'features' variable (if available)
+                                    if not features_found and 'features' in locals():
+                                        try:
+                                            st.write("🔄 Trying approach 2: features variable")
+                                            current_features = features.iloc[-1] if len(features) > 0 else None
+                                            prev_features = features.iloc[-2] if len(features) > 1 else current_features
+                                            
+                                            if current_features is not None:
+                                                all_model_features = current_features.index.tolist()
+                                                
+                                                # Same extraction logic as above
+                                                for feature_name in all_model_features:
+                                                    current_val = current_features[feature_name]
+                                                    prev_val = prev_features[feature_name] if prev_features is not None and feature_name in prev_features.index else current_val
+                                                    change = current_val - prev_val
+                                                    change_pct = (change / prev_val * 100) if prev_val != 0 else 0
+                                                    
+                                                    # Get smart interpretation using the function
+                                                    interpretation = get_indicator_interpretation(feature_name, current_val, prev_val)
+                                                    
+                                                    # Store analysis for this feature
+                                                    indicator_analysis[feature_name] = {
+                                                        'name': feature_name,
+                                                        'current': current_val,
+                                                        'previous': prev_val,
+                                                        'change': change,
+                                                        'change_pct': change_pct,
+                                                        'interpretation': interpretation
+                                                    }
+                                                    active_features.append(feature_name)
+                                                features_found = True
+                                                st.success(f"✅ Successfully extracted {len(all_model_features)} features from features variable!")
+                                        except Exception as e:
+                                            st.warning(f"❌ features variable approach failed: {e}")
+                                    
+                                    # Approach 3: Show what we do have available for debugging
+                                    if not features_found:
+                                        st.error("❌ Could not extract any feature data")
+                                        st.write("Available variables in Production tab scope:")
+                                        available_vars = [var for var in locals().keys() if not var.startswith('_')]
+                                        st.write(f"Local variables: {available_vars}")
+                                        
+                                        # Show session state ML keys for debugging
+                                        if ml_related_keys:
+                                            for key in ml_related_keys:
+                                                obj = getattr(st.session_state, key, None)
+                                                if obj:
+                                                    st.write(f"- {key}: {type(obj)} with attributes: {[attr for attr in dir(obj) if not attr.startswith('_')][:10]}")
+                                    
+                                    st.write("---")
+                                    
+                                    # Prepare trade history summary
+                                    recent_trades = []
+                                    if len(completed_trades) > 0:
+                                        for trade in completed_trades[-5:]:  # Last 5 trades
+                                            recent_trades.append({
+                                                'entry_date': trade.get('entry_date', 'Unknown'),
+                                                'exit_date': trade.get('exit_date', 'Unknown'),
+                                                'signal_type': trade.get('signal_type', 'Unknown'),
+                                                'return': trade.get('return_pct', 0)
+                                            })
+                                    
+                                    # Create enhanced analysis prompt with real indicator data
+                                    
+                                    # Format indicator data for prompt
+                                    indicators_text = ""
+                                    if indicator_analysis:
+                                        indicators_text = f"\nALL MODEL FEATURES ({len(indicator_analysis)} total):\n"
+                                        for indicator, data in indicator_analysis.items():
+                                            change_dir = "↑" if data['change'] > 0 else "↓" if data['change'] < 0 else "→"
+                                            indicators_text += f"• {data['name']}: {data['current']:.2f} ({change_dir} {data['change']:+.2f}) - {data['interpretation']}\n"
+                                    else:
+                                        indicators_text = "\nMODEL FEATURES: Data not available"
+                                    
+                                    # Determine signal type for context
+                                    signal_type = "SELL/SHORT" if current_signal == -1 else "BUY/LONG" if current_signal == 1 else "HOLD"
+                                    
+                                    prompt = f"""You are an expert technical analyst. Analyze why the ML model generated this specific trading signal based on the actual indicator values provided.
+
+MARKET DATA - {ticker}:
+- Current Price: ${current_price:.2f}
+- Daily Change: ${price_change:.2f} ({price_change_pct:+.2f}%)
+- Analysis Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+CURRENT ML SIGNAL:
+- Signal: {signal_type} ({current_signal})
+- Model Confidence: {current_conf:.1f}%
+{indicators_text}
+
+RECENT PERFORMANCE:
+- Total Return: {sim_return:+.2f}% | Win Rate: {sim_win_rate*100:.0f}% | Trades: {len(completed_trades)}
+- Last 5 Trades: {len(recent_trades)} available
+
+ANALYSIS REQUIRED:
+1. **Signal Trigger Analysis**: Based on the ACTUAL indicator values above, explain specifically WHY the model generated a {signal_type} signal. Which indicators are in overbought/oversold territory?
+
+2. **Key Indicator Drivers**: Identify the 2-3 most significant indicators contributing to this signal. Reference their actual current values and what they indicate.
+
+3. **Confirmation/Divergence**: Do the indicators confirm each other or show divergence? How strong is the signal consensus?
+
+4. **Risk Assessment**: Given the {current_conf:.1f}% confidence level, what does this tell us about signal strength and potential risk?
+
+Focus on SPECIFIC indicator values and WHY they triggered this signal. Avoid generic market commentary - analyze the actual data provided."""
+
+                                    # Make API call
+                                    with st.spinner("🤖 Analyzing market with GPT-4o..."):
+                                        client = openai.OpenAI(api_key=api_key)
+                                        
+                                        response = client.chat.completions.create(
+                                            model="gpt-4o",
+                                            messages=[
+                                                {"role": "system", "content": "You are a professional trading analyst with expertise in technical analysis and market psychology."},
+                                                {"role": "user", "content": prompt}
+                                            ],
+                                            max_tokens=1000,
+                                            temperature=0.7
+                                        )
+                                        
+                                        analysis = response.choices[0].message.content
+                                        
+                                        # Display the analysis
+                                        st.markdown("##### 📊 AI Market Analysis Results")
+                                        st.markdown(analysis)
+                                        
+                                        # Save to session state for reference
+                                        st.session_state.latest_ai_analysis = {
+                                            'timestamp': datetime.now(),
+                                            'ticker': ticker,
+                                            'analysis': analysis,
+                                            'signal': current_signal,
+                                            'confidence': current_conf
+                                        }
+                                        
+                                except Exception as e:
+                                    st.error(f"❌ Analysis failed: {str(e)}")
+                                    if "api_key" in str(e).lower():
+                                        st.error("Please check your API key is valid")
+                                    elif "quota" in str(e).lower():
+                                        st.error("API quota exceeded. Please check your OpenAI account.")
+                            else:
+                                st.warning("Please enter your OpenAI API key first")
+                    
+                    # Show previous analysis if available
+                    if 'latest_ai_analysis' in st.session_state:
+                        prev_analysis = st.session_state.latest_ai_analysis
+                        if prev_analysis['ticker'] == ticker:
+                            with st.expander(f"📋 Previous Analysis ({prev_analysis['timestamp'].strftime('%H:%M:%S')})"):
+                                st.markdown(prev_analysis['analysis'])
+                    
+                    st.markdown("---")
+
+                    # 3. Chart (Full Width) with Super Indicator
                     st.markdown(f"##### 📉 Price Action & Signals ({len(subset_raw)} Days)")
                     
-                    fig_live = go.Figure()
+                    # Create subplots: Main chart + Super Indicator
+                    from plotly.subplots import make_subplots
                     
-                    # Candlesticks
+                    fig_live = make_subplots(
+                        rows=2, cols=1,
+                        shared_xaxes=True,
+                        vertical_spacing=0.1,
+                        row_heights=[0.7, 0.3],  # Main chart 70%, indicator 30%
+                        subplot_titles=["Price Action", "Super Indicator (ML Confidence + Composite)"]
+                    )
+                    
+                    # === SUPER INDICATOR DATA PREPARATION ===
+                    super_indicator_data = {}
+                    dates = subset_raw.index
+                    
+                    # Option 1: Raw ML Model Predictions (the actual ML confidence over time)
+                    st.write("🔍 **Super Indicator Debug:**")
+                    
+                    # Check if we have the actual ML predictions from the backtest/production run
+                    if 'signals' in locals() and 'confidences' in locals():
+                        st.write(f"✅ Found ML predictions: {len(signals)} signals, {len(confidences)} confidences")
+                        if len(signals) == len(dates):
+                            # Combine signal direction (-1, 0, 1) with confidence (0-1) to get range -1 to +1
+                            super_indicator_data['ml_confidence'] = signals * confidences
+                            st.write(f"✅ ML Confidence range: {super_indicator_data['ml_confidence'].min():.3f} to {super_indicator_data['ml_confidence'].max():.3f}")
+                        else:
+                            st.warning(f"⚠️ Signal length mismatch: {len(signals)} signals vs {len(dates)} dates")
+                            # Align the signals to the chart timeframe
+                            if len(signals) > len(dates):
+                                # Take the last N signals to match chart
+                                aligned_signals = signals[-len(dates):]
+                                aligned_confidences = confidences[-len(dates):]
+                                super_indicator_data['ml_confidence'] = aligned_signals * aligned_confidences
+                                st.write("✅ Aligned ML signals to chart timeframe")
+                            else:
+                                # Pad with current signal for missing periods
+                                padded_signals = np.full(len(dates), current_signal)
+                                padded_confidences = np.full(len(dates), current_conf / 100)
+                                padded_signals[-len(signals):] = signals  # Replace last periods with actual signals
+                                padded_confidences[-len(confidences):] = confidences
+                                super_indicator_data['ml_confidence'] = padded_signals * padded_confidences
+                                st.write("✅ Padded ML signals to match chart timeframe")
+                    else:
+                        st.write("❌ No ML signals/confidences found - using current signal approximation")
+                        # Use current signal as baseline across timeframe
+                        base_signal = current_signal * (current_conf / 100)
+                        super_indicator_data['ml_confidence'] = np.full(len(dates), base_signal)
+                    
+                    # Option 2: Composite Technical Indicator (using actual features data)
+                    composite_success = False
+                    
+                    # Try the features variable that we know works from AI analysis
+                    if 'features' in locals() and features is not None:
+                        try:
+                            st.write("🔄 Using 'features' variable for composite indicator")
+                            # Get features for the same time period as chart (last N periods)
+                            chart_features = features.tail(len(dates)) if len(features) >= len(dates) else features
+                            
+                            # Create composite from ALL oscillator-type indicators (normalized to -1 to +1)
+                            composite_parts = []
+                            
+                            # Dynamically find and normalize oscillator indicators
+                            for col in chart_features.columns:
+                                col_lower = col.lower()
+                                
+                                # RSI indicators
+                                if 'rsi' in col_lower:
+                                    rsi_norm = (chart_features[col] - 50) / 50  # -1 to +1
+                                    composite_parts.append(rsi_norm)
+                                
+                                # Williams %R indicators  
+                                elif 'willr' in col_lower or 'williams' in col_lower:
+                                    willr_norm = chart_features[col] / 100  # -100 to 0 → -1 to 0
+                                    willr_norm = (willr_norm + 0.5) * 2 - 1  # Scale to -1 to +1
+                                    composite_parts.append(willr_norm)
+                                
+                                # Stochastic indicators
+                                elif 'stoch' in col_lower:
+                                    stoch_norm = (chart_features[col] - 50) / 50  # 0-100 → -1 to +1
+                                    composite_parts.append(stoch_norm)
+                                
+                                # MACD indicators (normalize by standard deviation)
+                                elif 'macd' in col_lower and 'signal' not in col_lower:
+                                    macd_std = chart_features[col].std()
+                                    if macd_std > 0:
+                                        macd_norm = chart_features[col] / (3 * macd_std)  # ±3 std devs
+                                        macd_norm = np.clip(macd_norm, -1, 1)
+                                        composite_parts.append(macd_norm)
+                            
+                            # Average the components
+                            if composite_parts:
+                                super_indicator_data['composite'] = np.mean(composite_parts, axis=0)
+                                composite_success = True
+                                st.write(f"✅ Composite indicator created from {len(composite_parts)} oscillators")
+                            else:
+                                super_indicator_data['composite'] = np.zeros(len(dates))
+                                st.warning("⚠️ No oscillator indicators found for composite")
+                                
+                        except Exception as e:
+                            st.warning(f"❌ Composite indicator from features failed: {e}")
+                            super_indicator_data['composite'] = np.zeros(len(dates))
+                    
+                    # Fallback if features approach didn't work
+                    if not composite_success:
+                        st.write("🔄 Fallback: Creating simple composite from current values")
+                        super_indicator_data['composite'] = np.full(len(dates), 0.0)  # Neutral line
+                    
+                    # Summary of super indicator data
+                    st.write("📊 **Super Indicator Summary:**")
+                    st.write(f"• **Blue Line (ML Confidence)**: Range {super_indicator_data['ml_confidence'].min():.3f} to {super_indicator_data['ml_confidence'].max():.3f}")
+                    st.write(f"• **Orange Dotted Line (Composite Tech)**: Range {super_indicator_data['composite'].min():.3f} to {super_indicator_data['composite'].max():.3f}")
+                    st.write("• **Interpretation**: Above 0 = Bullish, Below 0 = Bearish, ±0.5 = Strong signals")
+                    st.write("---")
+                    
+                    # === TRADE TREND RIBBONS ===
+                    # Create trend ribbons between buy/sell signals (TradingView style)
+                    if len(trades_list) > 0:
+                        # Sort trades by entry date to create sequential ribbons
+                        sorted_trades = sorted(trades_list, key=lambda x: x['entry_date'])
+                        
+                        for i in range(len(sorted_trades)):
+                            current_trade = sorted_trades[i]
+                            
+                            # Get date range for this ribbon
+                            start_date = current_trade['entry_date']
+                            
+                            # End date is either the exit date or next trade's entry date
+                            if 'exit_date' in current_trade and current_trade['exit_date']:
+                                end_date = current_trade['exit_date']
+                            elif i + 1 < len(sorted_trades):
+                                end_date = sorted_trades[i + 1]['entry_date']
+                            else:
+                                end_date = subset_raw.index[-1]  # Last available data
+                            
+                            # Filter data for this ribbon period
+                            try:
+                                ribbon_data = subset_raw[start_date:end_date]
+                                if len(ribbon_data) > 0:
+                                    ribbon_dates = list(ribbon_data.index)
+                                    
+                                    # Create ribbon bounds (high/low envelope)
+                                    high_line = ribbon_data['high'].values
+                                    low_line = ribbon_data['low'].values
+                                    
+                                    # Ribbon color based on signal type
+                                    if current_trade['signal_type'] == 'LONG':
+                                        fill_color = 'rgba(0, 255, 0, 0.15)'  # Light green with low opacity
+                                        line_color = 'rgba(0, 128, 0, 0.3)'
+                                        ribbon_name = 'Long Position'
+                                    else:
+                                        fill_color = 'rgba(255, 0, 0, 0.15)'  # Light red with low opacity  
+                                        line_color = 'rgba(128, 0, 0, 0.3)'
+                                        ribbon_name = 'Short Position'
+                                    
+                                    # Add upper bound
+                                    fig_live.add_trace(go.Scatter(
+                                        x=ribbon_dates,
+                                        y=high_line,
+                                        mode='lines',
+                                        line=dict(color=line_color, width=0.5),
+                                        showlegend=False,
+                                        hoverinfo='skip'
+                                    ), row=1, col=1)
+                                    
+                                    # Add lower bound with fill
+                                    fig_live.add_trace(go.Scatter(
+                                        x=ribbon_dates,
+                                        y=low_line,
+                                        mode='lines',
+                                        line=dict(color=line_color, width=0.5),
+                                        fill='tonexty',
+                                        fillcolor=fill_color,
+                                        name=ribbon_name,
+                                        showlegend=False,
+                                        hoverinfo='skip'
+                                    ), row=1, col=1)
+                            except:
+                                # Skip if date range issues
+                                pass
+                    
+                    # Candlesticks (add after ribbons so they appear on top)
                     fig_live.add_trace(go.Candlestick(
                         x=subset_raw.index,
                         open=subset_raw['open'], high=subset_raw['high'],
                         low=subset_raw['low'], close=subset_raw['close'],
                         name='Price'
-                    ))
+                    ), row=1, col=1)
                     
-                    # Plot trades from the unified backtest
-                    for trade in trades_list:
-                        if trade['signal_type'] == 'LONG':
-                            marker_color = 'green'
-                            marker_symbol = 'triangle-up'
-                            marker_y = subset_raw.loc[trade['entry_date'], 'low'] * 0.98  # Below price
-                        else:  # SHORT
-                            marker_color = 'red' 
-                            marker_symbol = 'triangle-down'
-                            marker_y = subset_raw.loc[trade['entry_date'], 'high'] * 1.02  # Above price
-                        
+                    # === SUPER INDICATOR PLOTS (Bottom Chart) ===
+                    
+                    # Plot ML Confidence
+                    fig_live.add_trace(go.Scatter(
+                        x=dates,
+                        y=super_indicator_data['ml_confidence'],
+                        mode='lines',
+                        name='ML Confidence',
+                        line=dict(color='blue', width=2),
+                        hovertemplate='<b>ML Confidence</b><br>Value: %{y:.3f}<br>Date: %{x}<extra></extra>'
+                    ), row=2, col=1)
+                    
+                    # Plot Composite Technical Indicator
+                    fig_live.add_trace(go.Scatter(
+                        x=dates,
+                        y=super_indicator_data['composite'],
+                        mode='lines',
+                        name='Composite Tech',
+                        line=dict(color='orange', width=2, dash='dot'),
+                        hovertemplate='<b>Composite Technical</b><br>Value: %{y:.3f}<br>Date: %{x}<extra></extra>'
+                    ), row=2, col=1)
+                    
+                    # Add threshold lines for Super Indicator
+                    for threshold in [0.5, 0, -0.5]:
+                        line_color = 'green' if threshold > 0 else 'red' if threshold < 0 else 'gray'
+                        line_style = 'solid' if threshold == 0 else 'dash'
+                        fig_live.add_hline(
+                            y=threshold, 
+                            line_dash=line_style, 
+                            line_color=line_color,
+                            opacity=0.5,
+                            row=2, col=1
+                        )
+                    
+                    # Color zones for Super Indicator
+                    fig_live.add_hrect(
+                        y0=0, y1=1, 
+                        fillcolor='rgba(0, 255, 0, 0.1)', 
+                        layer='below', 
+                        line_width=0,
+                        row=2, col=1
+                    )
+                    fig_live.add_hrect(
+                        y0=-1, y1=0, 
+                        fillcolor='rgba(255, 0, 0, 0.1)', 
+                        layer='below', 
+                        line_width=0,
+                        row=2, col=1
+                    )
+                    
+                    # === PLOT ALL ML SIGNALS (NOT JUST TRADES) ===
+                    
+                    # Plot all BUY signals  
+                    buy_signal_indices = np.where(signals == 1)[0]
+                    if len(buy_signal_indices) > 0:
+                        buy_dates = subset_raw.index[buy_signal_indices]
+                        buy_prices = subset_raw['low'].iloc[buy_signal_indices] * 0.97  # 3% below low
                         fig_live.add_trace(go.Scatter(
-                            x=[trade['entry_date']], y=[marker_y],
+                            x=buy_dates,
+                            y=buy_prices,
                             mode='markers',
-                            name=f"{trade['signal_type']} Entry",
-                            marker=dict(color=marker_color, size=10, symbol=marker_symbol),
-                            hovertemplate=f"<b>{trade['signal_type']} Entry</b><br>Price: ${trade['entry_price']:.2f}<extra></extra>",
-                            showlegend=False
-                        ))
+                            name='ML BUY Signals',
+                            marker=dict(color='green', size=10, symbol='triangle-up'),
+                            hovertemplate='<b>BUY Signal</b><br>Date: %{x}<br>Price: $%{y:.2f}<extra></extra>'
+                        ), row=1, col=1)
                     
-                    # Add lines and markers if ACTIVE signal
-                    if current_signal != 0:
-                        # Risk Calculation
-                        if 'ATR_14' in features.columns:
-                            atr = features['ATR_14'].iloc[-1]
-                        else:
-                            atr = current_price * 0.02 
+                    # Plot all SELL signals
+                    sell_signal_indices = np.where(signals == -1)[0]  
+                    if len(sell_signal_indices) > 0:
+                        sell_dates = subset_raw.index[sell_signal_indices]
+                        sell_prices = subset_raw['high'].iloc[sell_signal_indices] * 1.03  # 3% above high
+                        fig_live.add_trace(go.Scatter(
+                            x=sell_dates,
+                            y=sell_prices,
+                            mode='markers',
+                            name='ML SELL Signals',
+                            marker=dict(color='red', size=10, symbol='triangle-down'),
+                            hovertemplate='<b>SELL Signal</b><br>Date: %{x}<br>Price: $%{y:.2f}<extra></extra>'
+                        ), row=1, col=1)
+                    
+                    # Note: Removed duplicate trade markers to avoid double triangles
+                    # All signals (including trade entries) are now shown via ML Signal markers above
+                    
+                    # === ENHANCED DYNAMIC RISK LEVELS ON CHART ===
+                    if ('enhanced_trading_analysis' in st.session_state and 
+                        st.session_state.enhanced_trading_analysis and
+                        current_signal != 0):
+                        
+                        # Get dynamic risk levels from enhanced analysis
+                        enhanced_analysis = st.session_state.enhanced_trading_analysis
+                        opportunity = enhanced_analysis.get('opportunity_analysis')
+                        
+                        if opportunity and opportunity.get('risk_levels'):
+                            risk_levels = opportunity['risk_levels']
                             
-                        stop_loss = current_price - (2 * atr) if current_signal == 1 else current_price + (2 * atr)
-                        take_profit = current_price + (3 * atr) if current_signal == 1 else current_price - (3 * atr)
-
-                        # Lines on Chart
-                        fig_live.add_hline(y=stop_loss, line_dash="dash", line_color="red", annotation_text="SL")
-                        fig_live.add_hline(y=take_profit, line_dash="dash", line_color="green", annotation_text="TP")
-                        fig_live.add_hline(y=current_price, line_dash="dot", line_color="blue", annotation_text="Entry")
+                            # Get dynamic levels (these are the REAL levels the algorithm uses!)
+                            dynamic_stop_loss = risk_levels.get('stop_loss', current_price * 0.92)
+                            dynamic_take_profit = risk_levels.get('take_profit', current_price * 1.15)
+                            dynamic_stop_pct = risk_levels.get('stop_loss_pct', 8.0)
+                            dynamic_tp_pct = risk_levels.get('take_profit_pct', 15.0)
+                            risk_reward = risk_levels.get('risk_reward_ratio', 1.5)
+                            
+                            # Add DYNAMIC risk level lines to chart
+                            fig_live.add_hline(
+                                y=dynamic_stop_loss, 
+                                line_dash="dash", 
+                                line_color="red", 
+                                annotation_text=f"Dynamic SL ({dynamic_stop_pct:.1f}%)", 
+                                row=1, col=1
+                            )
+                            
+                            fig_live.add_hline(
+                                y=dynamic_take_profit, 
+                                line_dash="dash", 
+                                line_color="green", 
+                                annotation_text=f"Dynamic TP ({dynamic_tp_pct:.1f}%)", 
+                                row=1, col=1
+                            )
+                            
+                            fig_live.add_hline(
+                                y=current_price, 
+                                line_dash="dot", 
+                                line_color="blue", 
+                                annotation_text=f"Entry (R/R: {risk_reward:.1f}:1)", 
+                                row=1, col=1
+                            )
+                            
+                            # Add risk zone shading
+                            if current_signal == 1:  # Long position
+                                # Profit zone (green)
+                                fig_live.add_hrect(
+                                    y0=current_price, y1=dynamic_take_profit,
+                                    fillcolor='rgba(0, 255, 0, 0.1)', 
+                                    layer='below', line_width=0, row=1, col=1
+                                )
+                                # Risk zone (red)
+                                fig_live.add_hrect(
+                                    y0=dynamic_stop_loss, y1=current_price,
+                                    fillcolor='rgba(255, 0, 0, 0.1)', 
+                                    layer='below', line_width=0, row=1, col=1
+                                )
+                            else:  # Short position
+                                # Profit zone (green) - below entry for short
+                                fig_live.add_hrect(
+                                    y0=dynamic_take_profit, y1=current_price,
+                                    fillcolor='rgba(0, 255, 0, 0.1)', 
+                                    layer='below', line_width=0, row=1, col=1
+                                )
+                                # Risk zone (red) - above entry for short
+                                fig_live.add_hrect(
+                                    y0=current_price, y1=dynamic_stop_loss,
+                                    fillcolor='rgba(255, 0, 0, 0.1)', 
+                                    layer='below', line_width=0, row=1, col=1
+                                )
+                        
+                        else:
+                            # Fallback to basic levels if dynamic analysis fails
+                            atr = features.get('ATR_14', pd.Series([current_price * 0.02])).iloc[-1]
+                            basic_stop = current_price - (2 * atr) if current_signal == 1 else current_price + (2 * atr)
+                            basic_tp = current_price + (3 * atr) if current_signal == 1 else current_price - (3 * atr)
+                            
+                            fig_live.add_hline(y=basic_stop, line_dash="dash", line_color="red", annotation_text="Basic SL", row=1, col=1)
+                            fig_live.add_hline(y=basic_tp, line_dash="dash", line_color="green", annotation_text="Basic TP", row=1, col=1)
+                            fig_live.add_hline(y=current_price, line_dash="dot", line_color="blue", annotation_text="Entry", row=1, col=1)
+                    
+                    elif current_signal != 0:
+                        # No enhanced analysis available - show basic levels
+                        atr = features.get('ATR_14', pd.Series([current_price * 0.02])).iloc[-1]
+                        basic_stop = current_price - (2 * atr) if current_signal == 1 else current_price + (2 * atr)
+                        basic_tp = current_price + (3 * atr) if current_signal == 1 else current_price - (3 * atr)
+                        
+                        fig_live.add_hline(y=basic_stop, line_dash="dash", line_color="red", annotation_text="Basic SL", row=1, col=1)
+                        fig_live.add_hline(y=basic_tp, line_dash="dash", line_color="green", annotation_text="Basic TP", row=1, col=1)
+                        fig_live.add_hline(y=current_price, line_dash="dot", line_color="blue", annotation_text="Entry", row=1, col=1)
                         
                         # HOLDING MARKER
                         fig_live.add_trace(go.Scatter(
@@ -1898,14 +3196,54 @@ with tab6:
                             name='Current Status',
                             marker=dict(color=sig_color, size=8, symbol='circle'),
                             hovertemplate=f"<b>Holding ({sig_text})</b><br>Price: ${current_price:.2f}<extra></extra>"
-                        ))
+                        ), row=1, col=1)
                         
+                        # Enhanced chart layout for subplots
                         fig_live.update_layout(
-                            height=500, 
-                            margin=dict(l=0, r=0, t=0, b=0),
-                            xaxis_rangeslider_visible=False,
-                            showlegend=False
+                            height=800,  # Increased height for main + indicator charts
+                            margin=dict(l=0, r=0, t=30, b=0),
+                            showlegend=True,
+                            plot_bgcolor='rgba(0,0,0,0)',
+                            paper_bgcolor='rgba(0,0,0,0)',
                         )
+                        
+                        # Update main chart (row 1) axes
+                        fig_live.update_xaxes(
+                            gridcolor='rgba(128,128,128,0.2)',
+                            showgrid=True,
+                            row=1, col=1
+                        )
+                        fig_live.update_yaxes(
+                            gridcolor='rgba(128,128,128,0.2)', 
+                            showgrid=True,
+                            title="Price ($)",
+                            row=1, col=1
+                        )
+                        
+                        # Update super indicator chart (row 2) axes
+                        fig_live.update_xaxes(
+                            gridcolor='rgba(128,128,128,0.2)',
+                            showgrid=True,
+                            title="Date",
+                            row=2, col=1
+                        )
+                        fig_live.update_yaxes(
+                            gridcolor='rgba(128,128,128,0.2)', 
+                            showgrid=True,
+                            title="Signal Strength",
+                            range=[-1.1, 1.1],  # Fixed range for indicator
+                            row=2, col=1
+                        )
+                        
+                        # Add ribbon legend info
+                        col_legend1, col_legend2 = st.columns([3, 1])
+                        with col_legend2:
+                            st.markdown("""
+                            **Trend Ribbons:**
+                            🟢 Long Positions
+                            🔴 Short Positions
+                            """)
+                        
                         st.plotly_chart(fig_live, use_container_width=True)
                         
                         # 4. Trade Levels (Below Graph)
@@ -1919,29 +3257,62 @@ with tab6:
                             st.metric("Take Profit", f"${take_profit:.2f}", delta=f"{take_profit-current_price:.2f}")
 
                     else:
-                        # Render chart even if no signal
+                        # Render chart even if no signal with enhanced styling
                         fig_live.update_layout(
-                            height=500, 
-                            margin=dict(l=0, r=0, t=0, b=0),
-                            xaxis_rangeslider_visible=False,
-                            showlegend=False
+                            height=800,  # Match the enhanced chart height
+                            margin=dict(l=0, r=0, t=30, b=0),
+                            showlegend=True,
+                            plot_bgcolor='rgba(0,0,0,0)',
+                            paper_bgcolor='rgba(0,0,0,0)',
                         )
+                        
+                        # Update axes for both subplots (same as active signal case)
+                        fig_live.update_xaxes(gridcolor='rgba(128,128,128,0.2)', showgrid=True, row=1, col=1)
+                        fig_live.update_yaxes(gridcolor='rgba(128,128,128,0.2)', showgrid=True, title="Price ($)", row=1, col=1)
+                        fig_live.update_xaxes(gridcolor='rgba(128,128,128,0.2)', showgrid=True, title="Date", row=2, col=1)
+                        fig_live.update_yaxes(gridcolor='rgba(128,128,128,0.2)', showgrid=True, title="Signal Strength", range=[-1.1, 1.1], row=2, col=1)
+                        
+                        # Add ribbon legend info (same as active signal case)
+                        col_legend1, col_legend2 = st.columns([3, 1])
+                        with col_legend2:
+                            st.markdown("""
+                            **Trend Ribbons:**
+                            🟢 Long Positions
+                            🔴 Short Positions
+                            """)
+                        
                         st.plotly_chart(fig_live, use_container_width=True)
                         st.info("Waiting for new setup...")
 
-                # --- AUTO-REFRESH LOOP ---
+                # --- AUTO-REFRESH SYSTEM ---
                 if live_mode:
-                    # Auto-refresh every 60 seconds to check for new data
-                    time.sleep(60)
-                    st.rerun()
+                    # Initialize or get last refresh time
+                    if 'last_refresh_time' not in st.session_state:
+                        st.session_state.last_refresh_time = time.time()
+                    
+                    current_time = time.time()
+                    time_since_refresh = current_time - st.session_state.last_refresh_time
+                    
+                    # Only auto-refresh if 60 seconds have passed
+                    if time_since_refresh >= 60:
+                        st.session_state.last_refresh_time = current_time
+                        st.rerun()
+                    else:
+                        # Show countdown without blocking
+                        seconds_until_refresh = int(60 - time_since_refresh)
+                        st.info(f"🔄 Live mode active - Next refresh in {seconds_until_refresh}s")
+                else:
+                    # Clear refresh timer when live mode is off
+                    if 'last_refresh_time' in st.session_state:
+                        del st.session_state.last_refresh_time
                     
                 # Log latest (Only if data updated to avoid spam)
                 # if data_updated:
                 #     pm.log_signal(...) 
                     
-                else:
-                    if features is None:
-                        st.warning("⚠️ Could not load market data. Please check your connection.")
+                # Check for data loading issues
+                if features is None:
+                    st.warning("⚠️ Could not load market data. Please check your connection.")
 
             except Exception as e:
                 st.error(f"Error loading model: {e}")

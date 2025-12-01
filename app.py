@@ -1856,6 +1856,8 @@ st.sidebar.header("User Inputs")
 col1, col2 = st.sidebar.columns([3, 1])
 with col1:
     ticker = st.text_input("Stock Ticker", "SPY").upper()
+    # Share ticker with ML page
+    st.session_state.main_app_ticker = ticker
 with col2:
     st.write("")
     st.write("Quick:")
