@@ -2572,11 +2572,28 @@ with tab6:
                             # Combined filtering
                             buy_conf_mask = confidences >= min_buy_confidence_opt
                             buy_comp_mask = composite_tech_values <= buy_composite_max_opt
-                            buy_combined = np.sum((signals == 1) & buy_conf_mask & buy_comp_mask)
+                            buy_combined_mask = (signals == 1) & buy_conf_mask & buy_comp_mask
+                            buy_combined = np.sum(buy_combined_mask)
                             
                             sell_conf_mask = confidences >= min_sell_confidence_opt  
                             sell_comp_mask = composite_tech_values >= sell_composite_min_opt
-                            sell_combined = np.sum((signals == -1) & sell_conf_mask & sell_comp_mask)
+                            sell_combined_mask = (signals == -1) & sell_conf_mask & sell_comp_mask
+                            sell_combined = np.sum(sell_combined_mask)
+                            
+                            # Show exactly which dates passed the filters
+                            if buy_combined > 0:
+                                passed_buy_indices = np.where(buy_combined_mask)[0]
+                                passed_buy_dates = [subset_raw.index[i].date() for i in passed_buy_indices]
+                                st.write(f"  • ✅ **Filtered Buy Dates that PASSED**: {passed_buy_dates}")
+                            else:
+                                st.write(f"  • ❌ **No buy signals passed combined filters**")
+                                
+                            if sell_combined > 0:
+                                passed_sell_indices = np.where(sell_combined_mask)[0]
+                                passed_sell_dates = [subset_raw.index[i].date() for i in passed_sell_indices]
+                                st.write(f"  • ✅ **Filtered Sell Dates that PASSED**: {passed_sell_dates}")
+                            else:
+                                st.write(f"  • ❌ **No sell signals passed combined filters**")
                             
                             st.write(f"  • Buy signals: {buy_signals_count} total → {buy_combined} passed both filters ({buy_signals_count - buy_combined} filtered)")
                             st.write(f"  • Sell signals: {sell_signals_count} total → {sell_combined} passed both filters ({sell_signals_count - sell_combined} filtered)")
