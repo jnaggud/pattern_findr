@@ -186,8 +186,27 @@ if enable_trading_optimization:
     
     st.sidebar.info(f"⚡ Will optimize 4 parameters:\n• Buy confidence (0-100%)\n• Sell confidence (0-100%)\n• Buy composite (-1.0 to 0.0)\n• Sell composite (0.0 to 1.0)")
     st.sidebar.warning(f"⏱️ Est. time: ~{trading_trials * 3}s")
+    
+    # Show clear button if optimized parameters exist
+    if (hasattr(st.session_state, 'trading_optimization_params') and 
+        st.session_state.trading_optimization_params is not None):
+        if st.sidebar.button("🗑️ Clear Optimization"):
+            st.session_state.trading_optimization_params = None
+            st.sidebar.success("✅ Optimization cleared - back to baseline")
 else:
     trading_trials = 0
+
+# Show optimization status in sidebar
+if (hasattr(st.session_state, 'trading_optimization_params') and 
+    st.session_state.trading_optimization_params is not None):
+    params = st.session_state.trading_optimization_params
+    st.sidebar.success("🎯 **Optimized Parameters Active**")
+    st.sidebar.write(f"Buy Conf: {params['min_buy_confidence']:.1f}%")
+    st.sidebar.write(f"Sell Conf: {params['min_sell_confidence']:.1f}%") 
+    st.sidebar.write(f"Buy Comp: {params['buy_composite_max']:.3f}")
+    st.sidebar.write(f"Sell Comp: {params['sell_composite_min']:.3f}")
+elif enable_trading_optimization:
+    st.sidebar.info("⚪ Click 'Start Trading Optimization' to find optimal parameters")
 
 if use_optimization:
     n_trials = st.sidebar.slider(
@@ -2453,6 +2472,9 @@ with tab6:
                                         'best_score': study.best_value
                                     }
                                     
+                                    # Store in session state for persistence
+                                    st.session_state.trading_optimization_params = optimized_params
+                                    
                                     st.success(f"🎯 **Optimization Complete!** Best Score: {study.best_value:.4f}")
                                     st.write("**🏆 Optimal Parameters:**")
                                     st.write(f"  • Buy Confidence: {best_params['min_buy_confidence']:.1f}%")
@@ -2465,19 +2487,23 @@ with tab6:
                                 except Exception as e:
                                     st.error(f"❌ Optimization failed: {e}")
                     
-                        if optimized_params:
-                            st.info("🔄 **Using optimized parameters for backtest below**")
-                            # Use optimized parameters
-                            min_buy_confidence_opt = optimized_params['min_buy_confidence'] / 100.0
-                            min_sell_confidence_opt = optimized_params['min_sell_confidence'] / 100.0
-                            buy_composite_max_opt = optimized_params['buy_composite_max']
-                            sell_composite_min_opt = optimized_params['sell_composite_min']
-                        else:
-                            # Use baseline (no filtering)
-                            min_buy_confidence_opt = 0.0
-                            min_sell_confidence_opt = 0.0
-                            buy_composite_max_opt = -999
-                            sell_composite_min_opt = 999
+                    # Check for stored optimized parameters from session state
+                    if (enable_trading_optimization and 
+                        hasattr(st.session_state, 'trading_optimization_params') and 
+                        st.session_state.trading_optimization_params is not None):
+                        
+                        stored_params = st.session_state.trading_optimization_params
+                        st.info("🔄 **Using stored optimized parameters for backtest**")
+                        st.write(f"  • Buy Confidence: {stored_params['min_buy_confidence']:.1f}%")
+                        st.write(f"  • Sell Confidence: {stored_params['min_sell_confidence']:.1f}%") 
+                        st.write(f"  • Buy Composite Max: {stored_params['buy_composite_max']:.3f} (oversold)")
+                        st.write(f"  • Sell Composite Min: {stored_params['sell_composite_min']:.3f} (overbought)")
+                        
+                        # Use optimized parameters
+                        min_buy_confidence_opt = stored_params['min_buy_confidence'] / 100.0
+                        min_sell_confidence_opt = stored_params['min_sell_confidence'] / 100.0
+                        buy_composite_max_opt = stored_params['buy_composite_max']
+                        sell_composite_min_opt = stored_params['sell_composite_min']
                     else:
                         # Use baseline (no filtering)
                         min_buy_confidence_opt = 0.0
@@ -2485,8 +2511,10 @@ with tab6:
                         buy_composite_max_opt = -999
                         sell_composite_min_opt = 999
                     
-                    # Prepare composite technical data for backtest (if not already done in optimization)
-                    if not enable_trading_optimization or optimized_params is None:
+                    # Prepare composite technical data for backtest (if not already done in optimization)  
+                    if (not enable_trading_optimization or 
+                        not hasattr(st.session_state, 'trading_optimization_params') or 
+                        st.session_state.trading_optimization_params is None):
                         composite_tech_values = None
                         try:
                             if hasattr(st.session_state, 'ml_features') and st.session_state.ml_features is not None:
@@ -2531,12 +2559,15 @@ with tab6:
                     sell_signals_count = np.sum(signals == -1)
                     
                     # OPTION 3: Show combined filtering impact
-                    if enable_trading_optimization and optimized_params:
+                    if (enable_trading_optimization and 
+                        hasattr(st.session_state, 'trading_optimization_params') and 
+                        st.session_state.trading_optimization_params is not None):
+                        stored_debug_params = st.session_state.trading_optimization_params
                         st.write(f"**🎯 Option 3 - Combined Optimized Filter Results:**")
-                        st.write(f"  • Optimized Buy Confidence: {optimized_params['min_buy_confidence']:.1f}%")
-                        st.write(f"  • Optimized Sell Confidence: {optimized_params['min_sell_confidence']:.1f}%")
-                        st.write(f"  • Optimized Buy Composite Max: {optimized_params['buy_composite_max']:.3f} (oversold)")
-                        st.write(f"  • Optimized Sell Composite Min: {optimized_params['sell_composite_min']:.3f} (overbought)")
+                        st.write(f"  • Optimized Buy Confidence: {stored_debug_params['min_buy_confidence']:.1f}%")
+                        st.write(f"  • Optimized Sell Confidence: {stored_debug_params['min_sell_confidence']:.1f}%")
+                        st.write(f"  • Optimized Buy Composite Max: {stored_debug_params['buy_composite_max']:.3f} (oversold)")
+                        st.write(f"  • Optimized Sell Composite Min: {stored_debug_params['sell_composite_min']:.3f} (overbought)")
                         
                         # Calculate how many signals pass each filter
                         if composite_tech_values is not None:
@@ -3293,7 +3324,9 @@ Focus on SPECIFIC indicator values and WHY they triggered this signal. Avoid gen
                     # === PLOT FILTERED ML SIGNALS (MATCHES ACTUAL TRADES) ===
                     
                     # Apply same filtering as backtest for chart display
-                    if enable_trading_optimization and optimized_params:
+                    if (enable_trading_optimization and 
+                        hasattr(st.session_state, 'trading_optimization_params') and 
+                        st.session_state.trading_optimization_params is not None):
                         # Use optimized parameters for filtering
                         buy_conf_thresh = min_buy_confidence_opt
                         sell_conf_thresh = min_sell_confidence_opt
