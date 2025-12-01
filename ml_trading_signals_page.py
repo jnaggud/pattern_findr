@@ -186,15 +186,15 @@ if enable_trading_optimization:
     
     st.sidebar.info(f"⚡ Will optimize 4 parameters for MAXIMUM TOTAL RETURN:\n• Buy confidence (0-100%)\n• Sell confidence (0-100%)\n• Buy composite (-1.0 to 0.0)\n• Sell composite (0.0 to 1.0)")
     st.sidebar.warning(f"⏱️ Est. time: ~{trading_trials * 3}s")
-    
-    # Show clear button if optimized parameters exist
-    if (hasattr(st.session_state, 'trading_optimization_params') and 
-        st.session_state.trading_optimization_params is not None):
-        if st.sidebar.button("🗑️ Clear Optimization"):
-            st.session_state.trading_optimization_params = None
-            st.sidebar.success("✅ Optimization cleared - back to baseline")
 else:
     trading_trials = 0
+
+# Show clear button if optimized parameters exist (always visible when params exist)
+if (hasattr(st.session_state, 'trading_optimization_params') and 
+    st.session_state.trading_optimization_params is not None):
+    if st.sidebar.button("🗑️ Clear Optimization"):
+        st.session_state.trading_optimization_params = None
+        st.sidebar.success("✅ Optimization cleared - back to baseline")
 
 # Show optimization status in sidebar
 if (hasattr(st.session_state, 'trading_optimization_params') and 
