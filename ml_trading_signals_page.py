@@ -3290,10 +3290,39 @@ Focus on SPECIFIC indicator values and WHY they triggered this signal. Avoid gen
                         row=2, col=1
                     )
                     
-                    # === PLOT ALL ML SIGNALS (NOT JUST TRADES) ===
+                    # === PLOT FILTERED ML SIGNALS (MATCHES ACTUAL TRADES) ===
                     
-                    # Plot all BUY signals  
-                    buy_signal_indices = np.where(signals == 1)[0]
+                    # Apply same filtering as backtest for chart display
+                    if enable_trading_optimization and optimized_params:
+                        # Use optimized parameters for filtering
+                        buy_conf_thresh = min_buy_confidence_opt
+                        sell_conf_thresh = min_sell_confidence_opt
+                        buy_comp_thresh = buy_composite_max_opt
+                        sell_comp_thresh = sell_composite_min_opt
+                        chart_label = "(Optimized)"
+                    else:
+                        # No filtering (baseline)
+                        buy_conf_thresh = 0.0
+                        sell_conf_thresh = 0.0
+                        buy_comp_thresh = -999
+                        sell_comp_thresh = 999
+                        chart_label = "(Baseline)"
+                    
+                    # Apply combined filtering to chart
+                    if composite_tech_values is not None:
+                        buy_signal_mask = ((signals == 1) & 
+                                         (confidences >= buy_conf_thresh) & 
+                                         (composite_tech_values <= buy_comp_thresh))
+                        sell_signal_mask = ((signals == -1) & 
+                                          (confidences >= sell_conf_thresh) & 
+                                          (composite_tech_values >= sell_comp_thresh))
+                    else:
+                        # Only confidence filtering if no composite data
+                        buy_signal_mask = (signals == 1) & (confidences >= buy_conf_thresh)
+                        sell_signal_mask = (signals == -1) & (confidences >= sell_conf_thresh)
+                    
+                    # Plot filtered BUY signals  
+                    buy_signal_indices = np.where(buy_signal_mask)[0]
                     if len(buy_signal_indices) > 0:
                         buy_dates = subset_raw.index[buy_signal_indices]
                         buy_prices = subset_raw['low'].iloc[buy_signal_indices] * 0.97  # 3% below low
@@ -3301,13 +3330,13 @@ Focus on SPECIFIC indicator values and WHY they triggered this signal. Avoid gen
                             x=buy_dates,
                             y=buy_prices,
                             mode='markers',
-                            name='ML BUY Signals',
+                            name=f'ML BUY Signals {chart_label}',
                             marker=dict(color='green', size=10, symbol='triangle-up'),
                             hovertemplate='<b>BUY Signal</b><br>Date: %{x}<br>Price: $%{y:.2f}<extra></extra>'
                         ), row=1, col=1)
                     
-                    # Plot all SELL signals
-                    sell_signal_indices = np.where(signals == -1)[0]  
+                    # Plot filtered SELL signals
+                    sell_signal_indices = np.where(sell_signal_mask)[0]  
                     if len(sell_signal_indices) > 0:
                         sell_dates = subset_raw.index[sell_signal_indices]
                         sell_prices = subset_raw['high'].iloc[sell_signal_indices] * 1.03  # 3% above high
@@ -3315,7 +3344,7 @@ Focus on SPECIFIC indicator values and WHY they triggered this signal. Avoid gen
                             x=sell_dates,
                             y=sell_prices,
                             mode='markers',
-                            name='ML SELL Signals',
+                            name=f'ML SELL Signals {chart_label}',
                             marker=dict(color='red', size=10, symbol='triangle-down'),
                             hovertemplate='<b>SELL Signal</b><br>Date: %{x}<br>Price: $%{y:.2f}<extra></extra>'
                         ), row=1, col=1)
