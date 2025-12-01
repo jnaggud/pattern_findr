@@ -2647,6 +2647,103 @@ with tab6:
                         st.error("🚨 **SIGNAL DECODING ISSUE** - Check the signal conversion mapping above!")
                         st.info("💡 **Fix Required:** Either label encoder is wrong or manual mapping needs adjustment")
                     
+                    # === SIGNAL QUALITY ANALYSIS ===
+                    st.write("---")
+                    st.write("**🔍 SIGNAL QUALITY ANALYSIS:**")
+                    
+                    # Find actual market peaks and valleys (local maxima/minima)
+                    from scipy.signal import argrelextrema
+                    import pandas as pd
+                    
+                    # Calculate rolling highs and lows for peak/valley detection
+                    window = 10  # Look for peaks/valleys over 10-day windows
+                    
+                    # Find local maxima (peaks) and minima (valleys)
+                    highs = subset_raw['high'].values
+                    lows = subset_raw['low'].values
+                    
+                    peak_indices = argrelextrema(highs, np.greater, order=window)[0]
+                    valley_indices = argrelextrema(lows, np.less, order=window)[0]
+                    
+                    if len(peak_indices) > 0:
+                        peak_dates = [subset_raw.index[i].date() for i in peak_indices]
+                        peak_prices = [highs[i] for i in peak_indices]
+                        st.write(f"  • **📈 Market PEAKS** ({len(peak_indices)}): {peak_dates}")
+                        
+                        # Check if ML generated sell signals near peaks
+                        sell_signal_dates = [subset_raw.index[i].date() for i in range(len(signals)) if signals[i] == -1]
+                        peaks_with_sells = []
+                        for peak_date in peak_dates:
+                            # Check if any sell signal within 5 days of peak
+                            for sell_date in sell_signal_dates:
+                                if abs((peak_date - sell_date).days) <= 5:
+                                    peaks_with_sells.append(peak_date)
+                                    break
+                        
+                        st.write(f"  • **❌ MISSED Peak Opportunities**: {len(peak_indices) - len(peaks_with_sells)} out of {len(peak_indices)} peaks had no sell signals nearby")
+                        if len(peaks_with_sells) > 0:
+                            st.write(f"  • **✅ Captured Peaks**: {peaks_with_sells}")
+                    
+                    if len(valley_indices) > 0:
+                        valley_dates = [subset_raw.index[i].date() for i in valley_indices]
+                        valley_prices = [lows[i] for i in valley_indices]
+                        st.write(f"  • **📉 Market VALLEYS** ({len(valley_indices)}): {valley_dates}")
+                        
+                        # Check if ML generated buy signals near valleys
+                        buy_signal_dates = [subset_raw.index[i].date() for i in range(len(signals)) if signals[i] == 1]
+                        valleys_with_buys = []
+                        for valley_date in valley_dates:
+                            # Check if any buy signal within 5 days of valley
+                            for buy_date in buy_signal_dates:
+                                if abs((valley_date - buy_date).days) <= 5:
+                                    valleys_with_buys.append(valley_date)
+                                    break
+                        
+                        st.write(f"  • **❌ MISSED Valley Opportunities**: {len(valley_indices) - len(valleys_with_buys)} out of {len(valley_indices)} valleys had no buy signals nearby")
+                        if len(valleys_with_buys) > 0:
+                            st.write(f"  • **✅ Captured Valleys**: {valleys_with_buys}")
+                    
+                    # Calculate what perfect timing would yield
+                    if len(peak_indices) > 0 and len(valley_indices) > 0:
+                        # Simulate perfect peak/valley trading
+                        perfect_trades = []
+                        sorted_extremes = []
+                        
+                        # Combine and sort peaks and valleys
+                        for i in peak_indices:
+                            sorted_extremes.append((i, 'peak', highs[i]))
+                        for i in valley_indices:
+                            sorted_extremes.append((i, 'valley', lows[i]))
+                        
+                        sorted_extremes.sort()
+                        
+                        # Calculate perfect buy-low-sell-high returns
+                        position = None
+                        perfect_capital = 100000
+                        
+                        for idx, extreme_type, price in sorted_extremes:
+                            if extreme_type == 'valley' and position is None:
+                                # Buy at valley
+                                position = perfect_capital / price
+                                entry_capital = perfect_capital
+                            elif extreme_type == 'peak' and position is not None:
+                                # Sell at peak  
+                                perfect_capital = position * price
+                                profit = perfect_capital - entry_capital
+                                perfect_trades.append({
+                                    'type': 'valley_to_peak',
+                                    'profit': profit,
+                                    'return_pct': (profit / entry_capital) * 100
+                                })
+                                position = None
+                        
+                        if len(perfect_trades) > 0:
+                            total_perfect_return = ((perfect_capital - 100000) / 100000) * 100
+                            st.write(f"  • **🎯 PERFECT Peak/Valley Trading**: {total_perfect_return:.1f}% return ({len(perfect_trades)} trades)")
+                            st.write(f"  • **📊 ML Model Efficiency**: {0.9/total_perfect_return*100:.1f}% of perfect potential")
+                            
+                    st.write("---")
+                    
                     # Calculate performance metrics (same as Tab 5)
                     sim_return = (final_capital / 100000 - 1) * 100  # Same calculation as Tab 5
                     completed_trades = [t for t in trades_list if t['profit'] is not None]
