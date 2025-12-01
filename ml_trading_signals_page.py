@@ -184,7 +184,7 @@ if enable_trading_optimization:
         help="Number of trials to find optimal trading thresholds"
     )
     
-    st.sidebar.info(f"⚡ Will optimize 4 parameters:\n• Buy confidence (0-100%)\n• Sell confidence (0-100%)\n• Buy composite (-1.0 to 0.0)\n• Sell composite (0.0 to 1.0)")
+    st.sidebar.info(f"⚡ Will optimize 4 parameters for MAXIMUM TOTAL RETURN:\n• Buy confidence (0-100%)\n• Sell confidence (0-100%)\n• Buy composite (-1.0 to 0.0)\n• Sell composite (0.0 to 1.0)")
     st.sidebar.warning(f"⏱️ Est. time: ~{trading_trials * 3}s")
     
     # Show clear button if optimized parameters exist
@@ -2441,22 +2441,20 @@ with tab6:
                                             sell_comp_min=sell_comp_min
                                         )
                                         
-                                        # Calculate objective metric (Sharpe-like ratio)
-                                        if len(test_trades) < 2:
-                                            return -1000  # Penalty for too few trades
+                                        # Calculate objective metric (TOTAL RETURN)
+                                        if len(test_trades) < 1:
+                                            return -100  # Penalty for no trades, but not too harsh
                                         
+                                        # Calculate total return percentage
+                                        total_return_pct = ((test_capital - 100000) / 100000) * 100
+                                        
+                                        # Small penalty for too few trades to encourage some activity
                                         completed_trades = [t for t in test_trades if t['profit'] is not None]
-                                        if len(completed_trades) == 0:
-                                            return -1000
+                                        trade_penalty = max(0, (5 - len(completed_trades)) * 0.1)  # Small penalty if < 5 completed trades
                                         
-                                        profits = [t['profit'] for t in completed_trades]
-                                        avg_profit = np.mean(profits)
-                                        std_profit = np.std(profits) if len(profits) > 1 else 1
+                                        final_score = total_return_pct - trade_penalty
                                         
-                                        # Risk-adjusted return (Sharpe-like)
-                                        sharpe = avg_profit / max(std_profit, 1) if std_profit > 0 else avg_profit
-                                        
-                                        return sharpe
+                                        return final_score
                                     
                                     # Create and run study
                                     study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler())
@@ -2475,8 +2473,8 @@ with tab6:
                                     # Store in session state for persistence
                                     st.session_state.trading_optimization_params = optimized_params
                                     
-                                    st.success(f"🎯 **Optimization Complete!** Best Score: {study.best_value:.4f}")
-                                    st.write("**🏆 Optimal Parameters:**")
+                                    st.success(f"🎯 **Optimization Complete!** Best Total Return: {study.best_value:.2f}%")
+                                    st.write("**🏆 Optimal Parameters for Maximum Return:**")
                                     st.write(f"  • Buy Confidence: {best_params['min_buy_confidence']:.1f}%")
                                     st.write(f"  • Sell Confidence: {best_params['min_sell_confidence']:.1f}%") 
                                     st.write(f"  • Buy Composite Max: {best_params['buy_composite_max']:.3f} (oversold)")
