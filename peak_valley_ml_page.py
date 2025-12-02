@@ -39,17 +39,21 @@ from ml_models import TradingMLModels
 st.markdown("""
 # 🎯 Peak/Valley ML Trading Signals
 
-**Revolutionary Approach**: ML models trained on actual market peaks and valleys for optimal timing.
+**🚀 REVOLUTIONARY PREDICTIVE APPROACH**: ML models trained to predict peaks/valleys **1 DAY IN ADVANCE**
+
+**The Breakthrough:**
+- **❌ Traditional**: "A peak happened 3 days ago" (too late to trade)
+- **✅ Revolutionary**: "A peak will happen tomorrow" (actionable prediction!)
 
 **Key Advantages:**
-- 🎯 **163.8% Potential Returns** (vs 0.9% random signals)
-- 🔬 **Market Structure Learning** (peaks/valleys as training labels)
+- 🎯 **163.8% Potential Returns** if we can predict timing correctly
+- 🔮 **Predictive Labeling**: Train on day BEFORE peaks/valleys occur
 - 🧠 Multiple ML algorithms (Random Forest, XGBoost, LightGBM, SVM)
 - ⚡ Optuna hyperparameter optimization with SMOTE balancing
 - 📊 130+ technical indicators as features
-- 📈 Candlestick charts with signal overlays
+- 📈 Revolutionary timing: Buy day before valleys, sell day before peaks
 - 🏆 Complete performance analysis and backtesting
-- 🚀 Production-ready signal generation
+- 🚀 Production-ready future prediction system
 """)
 
 # === SIDEBAR CONTROLS ===
@@ -284,11 +288,42 @@ with tab1:
                         st.error("❌ No data found for this ticker")
                         st.stop()
                     
-                    # Detect peaks and valleys with current parameters
+                    # REVOLUTIONARY PREDICTIVE LABELING
+                    # Instead of labeling peaks/valleys after they happen,
+                    # we label the day BEFORE they happen (predictive)
+                    
+                    from scipy.signal import argrelextrema
+                    
+                    # Find historical peaks and valleys
+                    window = detection_params.get('window', 5)
+                    highs = data['high'].values
+                    lows = data['low'].values
+                    
+                    # Detect actual peak/valley indices
+                    peak_indices = argrelextrema(highs, np.greater, order=window)[0]
+                    valley_indices = argrelextrema(lows, np.less, order=window)[0]
+                    
+                    # CREATE PREDICTIVE LABELS (1 day before peak/valley)
+                    labels = pd.Series(0, index=data.index, name='signal')  # Default HOLD
+                    
+                    # Label day BEFORE peaks as SELL (-1)
+                    for peak_idx in peak_indices:
+                        if peak_idx > 0:  # Ensure we have a previous day
+                            prev_day = data.index[peak_idx - 1]
+                            labels.loc[prev_day] = -1  # SELL signal day before peak
+                    
+                    # Label day BEFORE valleys as BUY (1)  
+                    for valley_idx in valley_indices:
+                        if valley_idx > 0:  # Ensure we have a previous day
+                            prev_day = data.index[valley_idx - 1]
+                            labels.loc[prev_day] = 1   # BUY signal day before valley
+                    
+                    # Create basic features (technical indicators)
                     detector = PeakValleyDetector()
-                    features, labels = detector.create_labeled_dataset(
+                    features, _ = detector.create_labeled_dataset(
                         data, method=detection_method, **detection_params
                     )
+                    # Ignore the retrospective labels, use our predictive ones
                     
                     # Store in session state
                     st.session_state.ml_raw_data = data
@@ -329,8 +364,8 @@ with tab1:
             signal_ratio = (labels != 0).sum() / len(labels) * 100
             st.metric("Signal Ratio", f"{signal_ratio:.1f}%")
         
-        # Show peaks and valleys on chart
-        st.subheader("📈 Detected Peaks & Valleys")
+        # Show PREDICTIVE signals vs actual peaks/valleys
+        st.subheader("🎯 Revolutionary Predictive Labels")
         
         data = st.session_state.ml_raw_data
         fig = go.Figure()
@@ -344,7 +379,37 @@ with tab1:
             line=dict(color='blue', width=1)
         ))
         
-        # Mark peaks (SELL points)
+        # Show ACTUAL peaks (gray - reference only)
+        window = detection_params.get('window', 5)
+        from scipy.signal import argrelextrema
+        peak_indices = argrelextrema(data['high'].values, np.greater, order=window)[0]
+        valley_indices = argrelextrema(data['low'].values, np.less, order=window)[0]
+        
+        if len(peak_indices) > 0:
+            actual_peaks = data.index[peak_indices]
+            peak_prices = data.loc[actual_peaks, 'high']
+            fig.add_trace(go.Scatter(
+                x=actual_peaks,
+                y=peak_prices,
+                mode='markers',
+                name='Actual Peaks (Reference)',
+                marker=dict(color='gray', size=6, symbol='triangle-down'),
+                opacity=0.5
+            ))
+        
+        if len(valley_indices) > 0:
+            actual_valleys = data.index[valley_indices]
+            valley_prices = data.loc[actual_valleys, 'low']
+            fig.add_trace(go.Scatter(
+                x=actual_valleys,
+                y=valley_prices,
+                mode='markers',
+                name='Actual Valleys (Reference)',
+                marker=dict(color='gray', size=6, symbol='triangle-up'),
+                opacity=0.5
+            ))
+        
+        # Show PREDICTIVE signals (day before peaks/valleys)
         sell_points = labels[labels == -1].index
         if len(sell_points) > 0:
             sell_prices = data.loc[sell_points, 'close']
@@ -352,11 +417,10 @@ with tab1:
                 x=sell_points,
                 y=sell_prices,
                 mode='markers',
-                name='Peaks (SELL)',
-                marker=dict(color='red', size=8, symbol='triangle-down')
+                name='🎯 PREDICTIVE SELL (Day Before Peak)',
+                marker=dict(color='red', size=10, symbol='triangle-down')
             ))
         
-        # Mark valleys (BUY points)
         buy_points = labels[labels == 1].index
         if len(buy_points) > 0:
             buy_prices = data.loc[buy_points, 'close']
@@ -364,18 +428,41 @@ with tab1:
                 x=buy_points,
                 y=buy_prices,
                 mode='markers',
-                name='Valleys (BUY)',
-                marker=dict(color='green', size=8, symbol='triangle-up')
+                name='🎯 PREDICTIVE BUY (Day Before Valley)',
+                marker=dict(color='green', size=10, symbol='triangle-up')
             ))
         
         fig.update_layout(
-            title=f"{ticker} - Detected Peaks & Valleys ({detection_method})",
+            title=f"{ticker} - Revolutionary Predictive Labels ({detection_method})",
             xaxis_title="Date",
             yaxis_title="Price",
             height=500
         )
         
         st.plotly_chart(fig, use_container_width=True)
+        
+        # Revolutionary concept explanation
+        st.info("""
+        🎯 **Revolutionary Predictive Concept:**
+        
+        - **Gray markers**: Actual peaks/valleys (detected after they happen)  
+        - **Colored markers**: Our PREDICTIVE labels (day BEFORE peaks/valleys)
+        
+        **The Breakthrough**: Instead of detecting "A peak happened 3 days ago" (useless for trading),  
+        our ML model learns to predict "A peak will happen tomorrow" (actionable!)
+        
+        **Training Goal**: Learn patterns that occur 1 day before peaks/valleys.
+        """)
+        
+        # Show timing analysis
+        if len(sell_points) > 0 or len(buy_points) > 0:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Predictive BUY Signals", len(buy_points), 
+                         help="Signals generated day BEFORE valleys")
+            with col2:
+                st.metric("Predictive SELL Signals", len(sell_points),
+                         help="Signals generated day BEFORE peaks")
 
 # === TAB 2: FEATURE ENGINEERING ===
 with tab2:
