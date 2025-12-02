@@ -172,6 +172,19 @@ models_to_train = st.sidebar.multiselect(
     default=['random_forest', 'xgboost']
 )
 
+# SMOTE balancing toggle
+st.sidebar.subheader("⚖️ Data Balancing")
+use_smote = st.sidebar.checkbox(
+    "Enable SMOTE Balancing",
+    value=True,
+    help="Compare performance with vs without SMOTE balancing for imbalanced peak/valley data"
+)
+
+if use_smote:
+    st.sidebar.success("✅ Will apply SMOTE to balance peak/valley labels")
+else:
+    st.sidebar.info("📊 Will use original imbalanced data")
+
 # Hyperparameter optimization settings
 st.sidebar.subheader("🔍 Hyperparameter Optimization")
 use_optimization = st.sidebar.checkbox(
@@ -615,10 +628,13 @@ with tab3:
                             st.session_state.ml_train_samples = len(X_train)
                             st.session_state.ml_test_samples = len(X_test)
                             
-                            # 🎯 PEAK/VALLEY ENHANCEMENT: Apply SMOTE balancing
-                            st.info("⚖️ Applying SMOTE balancing for peak/valley labels...")
+                            # 🎯 PEAK/VALLEY ENHANCEMENT: Conditional SMOTE balancing
+                            if use_smote:
+                                st.info("⚖️ Applying SMOTE balancing for peak/valley labels...")
+                            else:
+                                st.info("📊 Using original imbalanced data (SMOTE disabled)...")
                             
-                            # Check class distribution before SMOTE
+                            # Check class distribution before balancing
                             original_counts = pd.Series(y_train).value_counts().sort_index()
                             st.write("**Original Label Distribution:**")
                             col_a, col_b, col_c = st.columns(3)
@@ -629,103 +645,107 @@ with tab3:
                             with col_c:
                                 st.metric("BUY (1)", original_counts.get(1, 0))
                             
-                            # Apply SMOTE to balance the dataset (with robust error handling)
-                            try:
-                                # First, try modern imbalanced-learn approach
-                                from imblearn.over_sampling import SMOTE, RandomOverSampler, BorderlineSMOTE
-                                from sklearn import __version__ as sklearn_version
-                                
-                                st.info(f"🔧 Using scikit-learn {sklearn_version}")
-                                
-                                # Check minimum samples for SMOTE
-                                min_samples = original_counts.min()
-                                
-                                if min_samples < 2:
-                                    st.warning("⚠️ Not enough samples in minority class for SMOTE. Using RandomOverSampler.")
-                                    balancer = RandomOverSampler(random_state=42)
-                                elif min_samples < 6:
-                                    # Use BorderlineSMOTE for small datasets
-                                    st.info("🔧 Using BorderlineSMOTE for small dataset...")
-                                    k_neighbors = min(3, min_samples - 1)
-                                    balancer = BorderlineSMOTE(random_state=42, k_neighbors=k_neighbors, m_neighbors=k_neighbors)
-                                else:
-                                    # Use regular SMOTE
-                                    k_neighbors = min(5, min_samples - 1)
-                                    balancer = SMOTE(random_state=42, k_neighbors=k_neighbors)
-                                
-                                # Apply balancing
-                                X_train_balanced, y_train_balanced = balancer.fit_resample(X_train, y_train)
-                                
-                                # Show balanced distribution
-                                balanced_counts = pd.Series(y_train_balanced).value_counts().sort_index()
-                                st.write("**After SMOTE Balancing:**")
-                                col_a, col_b, col_c = st.columns(3)
-                                with col_a:
-                                    st.metric("SELL (-1)", balanced_counts.get(-1, 0))
-                                with col_b:
-                                    st.metric("HOLD (0)", balanced_counts.get(0, 0))
-                                with col_c:
-                                    st.metric("BUY (1)", balanced_counts.get(1, 0))
-                                
-                                # Use balanced data for training
-                                X_train = X_train_balanced
-                                y_train = y_train_balanced
-                                
-                                st.success(f"✅ {type(balancer).__name__} balancing applied successfully!")
-                                
-                            except ImportError:
-                                st.warning("⚠️ imbalanced-learn not available. Using original data.")
-                            except Exception as e:
-                                st.warning(f"⚠️ SMOTE failed ({str(e)}). Trying manual balancing...")
-                                
-                                # Fallback: Manual oversampling
+                            # Apply SMOTE balancing only if enabled
+                            if use_smote:
+                                # Apply SMOTE to balance the dataset (with robust error handling)
                                 try:
-                                    from sklearn.utils import resample
+                                    # First, try modern imbalanced-learn approach
+                                    from imblearn.over_sampling import SMOTE, RandomOverSampler, BorderlineSMOTE
+                                    from sklearn import __version__ as sklearn_version
                                     
-                                    # Separate classes
-                                    X_train_df = pd.DataFrame(X_train, columns=range(X_train.shape[1]))
-                                    X_train_df['target'] = y_train
+                                    st.info(f"🔧 Using scikit-learn {sklearn_version}")
                                     
-                                    # Find majority class size
-                                    max_size = original_counts.max()
+                                    # Check minimum samples for SMOTE
+                                    min_samples = original_counts.min()
                                     
-                                    balanced_dfs = []
-                                    for class_label in original_counts.index:
-                                        class_df = X_train_df[X_train_df['target'] == class_label]
-                                        
-                                        if len(class_df) < max_size:
-                                            # Oversample minority class
-                                            upsampled = resample(class_df, 
-                                                               replace=True,
-                                                               n_samples=max_size,
-                                                               random_state=42)
-                                            balanced_dfs.append(upsampled)
-                                        else:
-                                            balanced_dfs.append(class_df)
+                                    if min_samples < 2:
+                                        st.warning("⚠️ Not enough samples in minority class for SMOTE. Using RandomOverSampler.")
+                                        balancer = RandomOverSampler(random_state=42)
+                                    elif min_samples < 6:
+                                        # Use BorderlineSMOTE for small datasets
+                                        st.info("🔧 Using BorderlineSMOTE for small dataset...")
+                                        k_neighbors = min(3, min_samples - 1)
+                                        balancer = BorderlineSMOTE(random_state=42, k_neighbors=k_neighbors, m_neighbors=k_neighbors)
+                                    else:
+                                        # Use regular SMOTE
+                                        k_neighbors = min(5, min_samples - 1)
+                                        balancer = SMOTE(random_state=42, k_neighbors=k_neighbors)
                                     
-                                    # Combine balanced classes
-                                    balanced_df = pd.concat(balanced_dfs, ignore_index=True)
-                                    
-                                    # Extract features and labels
-                                    y_train = balanced_df['target'].values
-                                    X_train = balanced_df.drop('target', axis=1).values
+                                    # Apply balancing
+                                    X_train_balanced, y_train_balanced = balancer.fit_resample(X_train, y_train)
                                     
                                     # Show balanced distribution
-                                    manual_counts = pd.Series(y_train).value_counts().sort_index()
-                                    st.write("**After Manual Balancing:**")
+                                    balanced_counts = pd.Series(y_train_balanced).value_counts().sort_index()
+                                    st.write("**After SMOTE Balancing:**")
                                     col_a, col_b, col_c = st.columns(3)
                                     with col_a:
-                                        st.metric("SELL (-1)", manual_counts.get(-1, 0))
+                                        st.metric("SELL (-1)", balanced_counts.get(-1, 0))
                                     with col_b:
-                                        st.metric("HOLD (0)", manual_counts.get(0, 0))
+                                        st.metric("HOLD (0)", balanced_counts.get(0, 0))
                                     with col_c:
-                                        st.metric("BUY (1)", manual_counts.get(1, 0))
+                                        st.metric("BUY (1)", balanced_counts.get(1, 0))
                                     
-                                    st.success("✅ Manual oversampling applied successfully!")
+                                    # Use balanced data for training
+                                    X_train = X_train_balanced
+                                    y_train = y_train_balanced
                                     
-                                except Exception as e2:
-                                    st.warning(f"⚠️ All balancing methods failed: {str(e2)}. Using original imbalanced data.")
-                                    # Keep original X_train and y_train
+                                    st.success(f"✅ {type(balancer).__name__} balancing applied successfully!")
+                                    
+                                except ImportError:
+                                    st.warning("⚠️ imbalanced-learn not available. Using original data.")
+                                except Exception as e:
+                                    st.warning(f"⚠️ SMOTE failed ({str(e)}). Trying manual balancing...")
+                                    
+                                    # Fallback: Manual oversampling
+                                    try:
+                                        from sklearn.utils import resample
+                                        
+                                        # Separate classes
+                                        X_train_df = pd.DataFrame(X_train, columns=range(X_train.shape[1]))
+                                        X_train_df['target'] = y_train
+                                        
+                                        # Find majority class size
+                                        max_size = original_counts.max()
+                                        
+                                        balanced_dfs = []
+                                        for class_label in original_counts.index:
+                                            class_df = X_train_df[X_train_df['target'] == class_label]
+                                            
+                                            if len(class_df) < max_size:
+                                                # Oversample minority class
+                                                upsampled = resample(class_df, 
+                                                                   replace=True,
+                                                                   n_samples=max_size,
+                                                                   random_state=42)
+                                                balanced_dfs.append(upsampled)
+                                            else:
+                                                balanced_dfs.append(class_df)
+                                        
+                                        # Combine balanced classes
+                                        balanced_df = pd.concat(balanced_dfs, ignore_index=True)
+                                        
+                                        # Extract features and labels
+                                        y_train = balanced_df['target'].values
+                                        X_train = balanced_df.drop('target', axis=1).values
+                                        
+                                        # Show balanced distribution
+                                        manual_counts = pd.Series(y_train).value_counts().sort_index()
+                                        st.write("**After Manual Balancing:**")
+                                        col_a, col_b, col_c = st.columns(3)
+                                        with col_a:
+                                            st.metric("SELL (-1)", manual_counts.get(-1, 0))
+                                        with col_b:
+                                            st.metric("HOLD (0)", manual_counts.get(0, 0))
+                                        with col_c:
+                                            st.metric("BUY (1)", manual_counts.get(1, 0))
+                                        
+                                        st.success("✅ Manual oversampling applied successfully!")
+                                        
+                                    except Exception as e2:
+                                        st.warning(f"⚠️ All balancing methods failed: {str(e2)}. Using original imbalanced data.")
+                                        # Keep original X_train and y_train
+                            else:
+                                st.success("📊 Skipping SMOTE - using original imbalanced data for comparison")
                             
                             # Update samples count after balancing
                             st.session_state.ml_train_samples_balanced = len(X_train)
@@ -783,14 +803,19 @@ with tab3:
                             st.error(f"❌ Error training models: {str(e)}")
         
         with col2:
+            smote_status = "✅ SMOTE Enabled" if use_smote else "❌ SMOTE Disabled"
+            smote_description = "Balanced training data" if use_smote else "Original imbalanced data"
+            
             st.info(f"""
             **🎯 Peak/Valley ML Training:**
             • Uses peaks/valleys as labels (not random)
-            • SMOTE balancing for imbalanced data
+            • {smote_status} ({smote_description})
             • 163.8% potential vs 0.9% baseline
             
             **Selected Models:**
             {chr(10).join([f"• {model}" for model in models_to_train])}
+            
+            **💡 Tip:** Toggle SMOTE to compare balanced vs imbalanced performance!
             """)
         
         # Show training results
@@ -822,6 +847,10 @@ with tab3:
                     })
             
             comparison_df = pd.DataFrame(comparison_data)
+            
+            # Add header with SMOTE status
+            smote_indicator = "🟢 WITH SMOTE" if use_smote else "🔴 WITHOUT SMOTE"
+            st.markdown(f"**Training Results {smote_indicator}**")
             st.dataframe(comparison_df, use_container_width=True)
             
             # Best model highlight
