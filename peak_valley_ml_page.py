@@ -1906,11 +1906,7 @@ with tab6:
                         try:
                             st.rerun()
                         except:
-                            # Fallback for older Streamlit versions
-                            try:
-                                st.experimental_rerun()
-                            except:
-                                pass
+                            pass  # Skip rerun if not available
                 else:
                     st.button("✅ Active", disabled=True, use_container_width=True)
 
