@@ -85,7 +85,7 @@ st.title("📈 Pattern_FindR - Professional Trading Strategy Discovery")
 # === NEW PAGE NAVIGATION SYSTEM ===
 page = st.selectbox(
     "📋 Select Page:",
-    ["Strategy Optimization", "🤖 ML Trading Signals"],
+    ["Strategy Optimization", "🤖 ML Trading Signals", "🎯 Peak/Valley ML Signals"],
     index=0
 )
 
@@ -95,6 +95,11 @@ st.markdown("---")
 if page == "🤖 ML Trading Signals":
     exec(open('ml_trading_signals_page.py').read())
     st.stop()  # Stop execution here for ML page
+
+# === PEAK/VALLEY ML SIGNALS PAGE ===
+if page == "🎯 Peak/Valley ML Signals":
+    exec(open('peak_valley_ml_page.py').read())
+    st.stop()  # Stop execution here for Peak/Valley ML page
 
 # === EXISTING STRATEGY OPTIMIZATION PAGE ===
 # All existing functionality continues below...
