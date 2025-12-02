@@ -1324,9 +1324,12 @@ with tab5:
                     labels = st.session_state.ml_labels
                     aligned_labels = labels.loc[backtest['aligned_data'].index]
                     
+                    # Get predictions from backtest results
+                    backtest_predictions = backtest['predictions']
+                    
                     # Calculate how often ML predictions align with actual peaks/valleys
-                    peak_accuracy = ((predictions[aligned_labels == -1] == -1).mean() * 100) if (aligned_labels == -1).any() else 0
-                    valley_accuracy = ((predictions[aligned_labels == 1] == 1).mean() * 100) if (aligned_labels == 1).any() else 0
+                    peak_accuracy = ((backtest_predictions[aligned_labels == -1] == -1).mean() * 100) if (aligned_labels == -1).any() else 0
+                    valley_accuracy = ((backtest_predictions[aligned_labels == 1] == 1).mean() * 100) if (aligned_labels == 1).any() else 0
                     
                     st.info(f"🎯 **Peak/Valley Learning Accuracy:** {peak_accuracy:.1f}% for peaks, {valley_accuracy:.1f}% for valleys")
                 
