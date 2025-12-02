@@ -693,6 +693,9 @@ with tab3:
                 if not models_to_train:
                     st.error("❌ Please select at least one model to train")
                 else:
+                    # Set flag to prevent Tab 6 from loading during training
+                    st.session_state.training_in_progress = True
+                    
                     with st.spinner("Training ML models..."):
                         try:
                             # Force reload ML models to ensure latest code
@@ -893,9 +896,14 @@ with tab3:
                             st.session_state.ml_results = results
                             st.session_state.ml_models_trained = True
                             
+                            # Clear training flag - allow Tab 6 to load again
+                            st.session_state.training_in_progress = False
+                            
                             st.success("✅ Model training completed!")
                             
                         except Exception as e:
+                            # Clear training flag even on error
+                            st.session_state.training_in_progress = False
                             st.error(f"❌ Error training models: {str(e)}")
         
         with col2:
@@ -1834,6 +1842,12 @@ with tab5:
 # === TAB 6: PRODUCTION ===
 with tab6:
     st.header("🚀 Peak/Valley Production Trading Dashboard")
+    
+    # GUARD: Don't load production models if training is in progress
+    # This prevents Tab 6 from interfering with Tab 3 training
+    if st.session_state.get('training_in_progress', False):
+        st.warning("⏳ Training in progress... Production tab will load after training completes.")
+        st.stop()
     
     # 🎯 PEAK/VALLEY PRODUCTION HIGHLIGHTS
     st.markdown("""
