@@ -4,6 +4,8 @@ ML Trading Signals Page for Streamlit App
 
 Standalone page for machine learning-based trading signal generation.
 Completely separate from existing optimization functionality.
+
+SOMEWHAT WORKING PROTOTYPE
 """
 
 import streamlit as st
