@@ -2914,6 +2914,103 @@ with tab6:
                         chart_sell_dates = subset_raw.index[chart_sell_signals]
                         st.write(f"  • Chart sell dates: {[d.date() for d in chart_sell_dates]}")
                     
+                    # === CRITICAL DIAGNOSTIC: WHY NO BUY SIGNALS AT VALLEYS? ===
+                    st.write("---")
+                    st.subheader("🔬 VALLEY ANALYSIS: Why No BUY Signals?")
+                    
+                    # Find actual valleys in the production data
+                    from scipy.signal import argrelextrema
+                    lows = subset_raw['low'].values
+                    valley_indices = argrelextrema(lows, np.less, order=3)[0]
+                    valley_dates = [subset_raw.index[i].date() for i in valley_indices]
+                    
+                    st.write(f"**📉 Detected Valleys (order=3):** {len(valley_indices)} valleys")
+                    st.write(f"   Dates: {valley_dates}")
+                    
+                    # For each valley, show what the model predicted and WHY
+                    st.write("**🔍 Model Predictions at Each Valley:**")
+                    
+                    for idx in valley_indices[:10]:  # Limit to first 10
+                        valley_date = subset_raw.index[idx].date()
+                        valley_price = subset_raw['low'].iloc[idx]
+                        model_signal = signals[idx]
+                        
+                        signal_name = {-1: "SELL ❌", 0: "HOLD ⚪", 1: "BUY ✅"}.get(model_signal, "?")
+                        
+                        # Check if there's a BUY signal within 2 days of this valley
+                        nearby_buy = False
+                        for offset in range(-2, 3):
+                            check_idx = idx + offset
+                            if 0 <= check_idx < len(signals) and signals[check_idx] == 1:
+                                nearby_buy = True
+                                break
+                        
+                        status = "✅ CAPTURED" if nearby_buy else "❌ MISSED"
+                        st.write(f"   • {valley_date}: Price ${valley_price:.2f} → Model: {signal_name} {status}")
+                    
+                    # Show feature values at a specific missed valley for deep analysis
+                    if len(valley_indices) > 0 and 'features' in dir() and features is not None:
+                        st.write("---")
+                        st.write("**🧪 DEEP ANALYSIS: Features at First Missed Valley**")
+                        
+                        # Find first missed valley
+                        missed_valley_idx = None
+                        for idx in valley_indices:
+                            if signals[idx] != 1:  # Not a BUY signal
+                                missed_valley_idx = idx
+                                break
+                        
+                        if missed_valley_idx is not None:
+                            valley_date = subset_raw.index[missed_valley_idx].date()
+                            st.write(f"   Analyzing valley on: **{valley_date}**")
+                            
+                            # Get features for this date if available
+                            try:
+                                if hasattr(st.session_state, 'ml_features') and st.session_state.ml_features is not None:
+                                    prod_features = st.session_state.ml_features
+                                    
+                                    # Find matching date in features
+                                    valley_ts = subset_raw.index[missed_valley_idx]
+                                    
+                                    if valley_ts in prod_features.index:
+                                        feature_row = prod_features.loc[valley_ts]
+                                        
+                                        # Show key indicator values
+                                        st.write("   **Key Indicator Values:**")
+                                        for col in feature_row.index[:20]:  # First 20 features
+                                            val = feature_row[col]
+                                            if pd.notna(val):
+                                                st.write(f"      • {col}: {val:.4f}")
+                                    else:
+                                        st.warning(f"   Valley date {valley_ts} not found in features index")
+                            except Exception as e:
+                                st.error(f"   Feature analysis error: {e}")
+                    
+                    # Compare training labels vs production predictions
+                    st.write("---")
+                    st.write("**📊 TRAINING vs PRODUCTION COMPARISON:**")
+                    
+                    if hasattr(st.session_state, 'ml_labels') and st.session_state.ml_labels is not None:
+                        train_labels = st.session_state.ml_labels
+                        train_buy_count = (train_labels == 1).sum()
+                        train_sell_count = (train_labels == -1).sum()
+                        train_hold_count = (train_labels == 0).sum()
+                        
+                        st.write(f"   **Training Labels:** {train_buy_count} BUY, {train_sell_count} SELL, {train_hold_count} HOLD")
+                        st.write(f"   **Production Predictions:** {buy_signals_count} BUY, {sell_signals_count} SELL, {np.sum(signals == 0)} HOLD")
+                        
+                        # Calculate ratios
+                        train_buy_ratio = train_buy_count / len(train_labels) * 100
+                        prod_buy_ratio = buy_signals_count / len(signals) * 100
+                        
+                        st.write(f"   **BUY Signal Ratio:** Training {train_buy_ratio:.1f}% vs Production {prod_buy_ratio:.1f}%")
+                        
+                        if prod_buy_ratio < train_buy_ratio / 2:
+                            st.error("🚨 **MAJOR DISCREPANCY:** Production generating far fewer BUY signals than training!")
+                            st.info("💡 This suggests the model is not generalizing well to new data")
+                    
+                    st.write("---")
+                    
                     if has_sell_signals:
                         st.success("🎯 **ML-BASED EXITS WORKING** - Model generating proper sell signals!")
                     else:
