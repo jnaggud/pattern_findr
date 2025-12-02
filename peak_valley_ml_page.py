@@ -963,8 +963,8 @@ with tab4:
                     # Ensure proper index alignment between labels and raw_data
                     common_label_idx = labels.index.intersection(raw_data.index)
                     
-                    # Peak points (SELL labels) - safe access
-                    peak_mask = labels.loc[common_label_idx] == -1
+                    # Peak points (SELL labels) - safe access with numpy array conversion
+                    peak_mask = (labels.loc[common_label_idx] == -1).values
                     peak_points = common_label_idx[peak_mask]
                     if len(peak_points) > 0:
                         try:
@@ -985,8 +985,8 @@ with tab4:
                         except Exception as e:
                             st.warning(f"Could not plot peaks: {e}")
                     
-                    # Valley points (BUY labels) - safe access
-                    valley_mask = labels.loc[common_label_idx] == 1
+                    # Valley points (BUY labels) - safe access with numpy array conversion
+                    valley_mask = (labels.loc[common_label_idx] == 1).values
                     valley_points = common_label_idx[valley_mask]
                     if len(valley_points) > 0:
                         try:
@@ -1015,8 +1015,8 @@ with tab4:
                         aligned_data = raw_data.loc[common_pred_idx]
                         aligned_predictions = predictions[:len(common_pred_idx)]
                         
-                        # ML BUY predictions
-                        ml_buy_mask = (aligned_predictions == 1)
+                        # ML BUY predictions - ensure boolean array
+                        ml_buy_mask = np.array(aligned_predictions == 1)
                         if ml_buy_mask.any():
                             try:
                                 ml_buy_dates = common_pred_idx[ml_buy_mask]
@@ -1037,8 +1037,8 @@ with tab4:
                             except Exception as e:
                                 st.warning(f"Could not plot ML BUY signals: {e}")
                         
-                        # ML SELL predictions
-                        ml_sell_mask = (aligned_predictions == -1)
+                        # ML SELL predictions - ensure boolean array
+                        ml_sell_mask = np.array(aligned_predictions == -1)
                         if ml_sell_mask.any():
                             try:
                                 ml_sell_dates = common_pred_idx[ml_sell_mask]
