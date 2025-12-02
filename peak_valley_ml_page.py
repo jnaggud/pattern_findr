@@ -229,6 +229,17 @@ if 'ml_models_trained' not in st.session_state:
 with tab1:
     st.header("📊 Data Preparation & Labeling")
     
+    # Add clear cache button
+    col_clear, col_spacer = st.columns([1, 3])
+    with col_clear:
+        if st.button("🗑️ Clear All Cache", help="Reset all cached data and models"):
+            # Clear all ML-related session state
+            keys_to_clear = [k for k in st.session_state.keys() if 'ml_' in k.lower() or 'model' in k.lower() or 'cached' in k.lower()]
+            for key in keys_to_clear:
+                del st.session_state[key]
+            st.success("✅ Cache cleared! Please reload data.")
+            st.rerun()
+    
     col1, col2 = st.columns([2, 1])
     
     with col1:
