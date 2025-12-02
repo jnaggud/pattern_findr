@@ -614,18 +614,16 @@ if st.session_state.pv_models and st.session_state.pv_training_results:
             st.metric("Model Accuracy", f"{accuracy:.3f}")
 
 st.markdown("---")
+st.header("🔧 Original System Comparison")
+st.markdown("""
+**Compare the new Peak/Valley system with the original approach below.**
+The original system achieves 0.9% returns while the new system targets 163.8% potential.
+""")
 
-# === ORIGINAL CONTENT TABS (Keep for comparison/debugging) ===
-with st.expander("🔧 **Advanced: Original System Comparison**"):
-    st.markdown("""
-    **Compare the new Peak/Valley system with the original approach below.**
-    The original system achieves 0.9% returns while the new system targets 163.8% potential.
-    """)
-    
-    # Original tabs
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "📊 Data & Labels", 
-        "🔧 Feature Engineering",
+# Original tabs (without expander wrapper to avoid nesting)
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📊 Data & Labels", 
+    "🔧 Feature Engineering",
     "🎯 Model Training", 
     "📈 Predictions",
     "🏆 Performance",
