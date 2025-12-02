@@ -70,7 +70,7 @@ training_period = st.sidebar.selectbox(
 
 # Shared ticker selection - sync with main app
 if 'selected_ticker' not in st.session_state:
-    st.session_state.selected_ticker = 'SPY'
+    st.session_state.selected_ticker = 'QQQ'  # Use QQQ as default instead of SPY
 
 # Get ticker from main app if it exists, otherwise use ML page input
 main_app_ticker = getattr(st, '_main_ticker', None) if hasattr(st, '_main_ticker') else None
@@ -281,12 +281,37 @@ with tab1:
             with st.spinner(f"Loading {ticker} data and detecting peaks/valleys..."):
                 try:
                     # Load price data (use training_period from sidebar)
-                    data = yf.Ticker(ticker).history(period=training_period, interval="1d")
+                    # Force real historical data - prevent test/future data
+                    from datetime import datetime, timedelta
+                    
+                    # Calculate explicit start date to ensure real historical data
+                    end_date = datetime.now().date()
+                    if training_period == '1y':
+                        start_date = end_date - timedelta(days=365)
+                    elif training_period == '2y':
+                        start_date = end_date - timedelta(days=730)
+                    elif training_period == '3y':
+                        start_date = end_date - timedelta(days=1095)
+                    elif training_period == '5y':
+                        start_date = end_date - timedelta(days=1825)
+                    else:
+                        start_date = end_date - timedelta(days=1095)  # Default 3y
+                    
+                    data = yf.Ticker(ticker).history(start=start_date, end=end_date, interval="1d")
                     data.columns = [col.lower() for col in data.columns]
                     
+                    # Verify we have recent real data
                     if len(data) == 0:
                         st.error("❌ No data found for this ticker")
                         st.stop()
+                    
+                    latest_date = data.index[-1].date()
+                    if latest_date > datetime.now().date():
+                        st.error(f"❌ Invalid future data detected: {latest_date}. Using period-based loading instead.")
+                        data = yf.Ticker(ticker).history(period=training_period, interval="1d")
+                        data.columns = [col.lower() for col in data.columns]
+                    
+                    st.success(f"✅ Loaded real data: {data.index[0].date()} to {data.index[-1].date()} ({len(data)} days)")
                     
                     # REVOLUTIONARY PREDICTIVE LABELING
                     # Instead of labeling peaks/valleys after they happen,
@@ -294,14 +319,21 @@ with tab1:
                     
                     from scipy.signal import argrelextrema
                     
-                    # Find historical peaks and valleys
-                    window = detection_params.get('window', 5)
+                    # Extract window parameter correctly based on detection method
+                    if detection_method == 'scipy_peaks':
+                        window = detection_params.get('distance', 5)  # Use distance as window for scipy
+                    elif detection_method == 'rolling_window':
+                        window = detection_params.get('window_short', 5)  # Use short window
+                    else:
+                        window = 5  # Default window
+                    
+                    # Find historical peaks and valleys with adjusted parameters for better detection
                     highs = data['high'].values
                     lows = data['low'].values
                     
-                    # Detect actual peak/valley indices
-                    peak_indices = argrelextrema(highs, np.greater, order=window)[0]
-                    valley_indices = argrelextrema(lows, np.less, order=window)[0]
+                    # Use more sensitive detection for better BUY/SELL balance
+                    peak_indices = argrelextrema(highs, np.greater, order=max(3, window//2))[0]
+                    valley_indices = argrelextrema(lows, np.less, order=max(3, window//2))[0]
                     
                     # CREATE PREDICTIVE LABELS (1 day before peak/valley)
                     labels = pd.Series(0, index=data.index, name='signal')  # Default HOLD
@@ -317,6 +349,17 @@ with tab1:
                         if valley_idx > 0:  # Ensure we have a previous day
                             prev_day = data.index[valley_idx - 1]
                             labels.loc[prev_day] = 1   # BUY signal day before valley
+                    
+                    # Debug output for predictive labeling
+                    st.info(f"""
+                    🔬 **Predictive Labeling Debug:**
+                    - Detection method: {detection_method}
+                    - Window used: {window}
+                    - Peaks found: {len(peak_indices)} 
+                    - Valleys found: {len(valley_indices)}
+                    - BUY labels generated: {(labels == 1).sum()}
+                    - SELL labels generated: {(labels == -1).sum()}
+                    """)
                     
                     # Create basic features (technical indicators)
                     detector = PeakValleyDetector()
@@ -2001,8 +2044,8 @@ with tab6:
                     st.info("ℹ️ Stats not available for this version. Please re-save the model in the Performance tab.")
                 
                 # Show ticker compatibility info
-                model_ticker = meta.get('ticker', 'SPY')
-                current_ticker = st.session_state.get('selected_ticker', 'SPY')
+                model_ticker = meta.get('ticker', st.session_state.get('selected_ticker', 'QQQ'))
+                current_ticker = st.session_state.get('selected_ticker', 'QQQ')
                 
                 if model_ticker == current_ticker:
                     st.success(f"✅ Model trained on **{model_ticker}** - Perfect match!")
@@ -2288,8 +2331,8 @@ with tab6:
                     should_update = (live_mode and time_diff.total_seconds() > 3600)
                     
                     if should_update:
-                        # Use the current selected ticker, fallback to model's ticker, then SPY
-                        model_ticker = meta.get('ticker', 'SPY')
+                        # Use the current selected ticker, fallback to model's ticker, then QQQ
+                        model_ticker = meta.get('ticker', st.session_state.get('selected_ticker', 'QQQ'))
                         current_ticker = st.session_state.get('selected_ticker', model_ticker)
                         
                         # Show what ticker we're updating with
@@ -2369,8 +2412,8 @@ with tab6:
                 
                 else:
                     # Initial Load (No data exists)
-                    # Use the current selected ticker, fallback to model's ticker, then SPY
-                    model_ticker = meta.get('ticker', 'SPY')
+                    # Use the current selected ticker, fallback to model's ticker, then QQQ
+                    model_ticker = meta.get('ticker', st.session_state.get('selected_ticker', 'QQQ'))
                     current_ticker = st.session_state.get('selected_ticker', model_ticker)
                     
                     # Show what ticker we're loading
