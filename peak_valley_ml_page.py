@@ -969,7 +969,7 @@ with tab4:
                     if len(peak_points) > 0:
                         try:
                             peak_highs = raw_data.loc[peak_points, 'high']
-                            peak_prices = peak_highs * 1.02  # Slightly above high
+                            peak_prices = peak_highs.values * 1.02  # Slightly above high
                             fig.add_trace(go.Scatter(
                                 x=peak_points,
                                 y=peak_prices,
@@ -991,7 +991,7 @@ with tab4:
                     if len(valley_points) > 0:
                         try:
                             valley_lows = raw_data.loc[valley_points, 'low']
-                            valley_prices = valley_lows * 0.98  # Slightly below low
+                            valley_prices = valley_lows.values * 0.98  # Slightly below low
                             fig.add_trace(go.Scatter(
                                 x=valley_points,
                                 y=valley_prices,
@@ -1021,7 +1021,7 @@ with tab4:
                             try:
                                 ml_buy_dates = common_pred_idx[ml_buy_mask]
                                 ml_buy_lows = aligned_data.loc[ml_buy_dates, 'low']
-                                ml_buy_prices = ml_buy_lows * 0.95  # Lower than valleys
+                                ml_buy_prices = ml_buy_lows.values * 0.95  # Lower than valleys
                                 fig.add_trace(go.Scatter(
                                     x=ml_buy_dates,
                                     y=ml_buy_prices,
@@ -1043,7 +1043,7 @@ with tab4:
                             try:
                                 ml_sell_dates = common_pred_idx[ml_sell_mask]
                                 ml_sell_highs = aligned_data.loc[ml_sell_dates, 'high']
-                                ml_sell_prices = ml_sell_highs * 1.05  # Higher than peaks
+                                ml_sell_prices = ml_sell_highs.values * 1.05  # Higher than peaks
                                 fig.add_trace(go.Scatter(
                                     x=ml_sell_dates,
                                     y=ml_sell_prices,
