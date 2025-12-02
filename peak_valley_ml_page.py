@@ -2865,174 +2865,6 @@ with tab6:
                         st.error("🚨 **CRITICAL ISSUE:** No sell signals (-1) detected! Positions will never exit!")
                         st.info("💡 **Fix:** Need to modify exit logic or retrain model to generate sell signals")
                     
-                    # Trading optimization removed - revolutionary Peak/Valley approach executes ALL ML signals
-                    optimized_params = None
-                    if False:  # Disabled - old page code
-                        st.subheader("🎯 Option 3: Auto-Optimizing Trading Filters")
-                        
-                        if st.button("🚀 Start Trading Optimization", type="primary"):
-                            
-                            # Prepare composite technical data
-                            composite_tech_values = None
-                            try:
-                                if hasattr(st.session_state, 'ml_features') and st.session_state.ml_features is not None:
-                                    features = st.session_state.ml_features
-                                    subset_features = features.tail(len(subset_raw))
-                                    
-                                    # Calculate composite technical indicator
-                                    composite_parts = []
-                                    for col in subset_features.columns:
-                                        if any(indicator in col.lower() for indicator in ['rsi', 'williams', 'stoch', 'macd']):
-                                            if 'rsi' in col.lower():
-                                                normalized = (subset_features[col] - 50) / 50
-                                            elif 'williams' in col.lower():
-                                                normalized = subset_features[col] / 50  
-                                            elif 'stoch' in col.lower() and subset_features[col].std() > 0:
-                                                normalized = (subset_features[col] - 50) / 50
-                                            elif 'macd' in col.lower() and subset_features[col].std() > 0:
-                                                normalized = subset_features[col] / (3 * subset_features[col].std())
-                                            else:
-                                                continue
-                                            composite_parts.append(normalized)
-                                    
-                                    if composite_parts:
-                                        composite_tech_values = np.mean(composite_parts, axis=0)
-                                        st.success(f"✅ Composite tech calculated from {len(composite_parts)} indicators")
-                                    else:
-                                        st.warning("⚠️ No oscillator indicators found - using neutral composite")
-                                        composite_tech_values = np.zeros(len(subset_raw))
-                                        
-                            except Exception as e:
-                                st.warning(f"⚠️ Composite calculation failed: {e} - using neutral composite")
-                                composite_tech_values = np.zeros(len(subset_raw))
-                            
-                            # Optuna optimization
-                            with st.spinner(f"🔍 Optimizing trading filters ({trading_trials} trials)..."):
-                                try:
-                                    import optuna
-                                    
-                                    def optimize_trading_objective(trial):
-                                        # Suggest 4 parameters to optimize
-                                        min_buy_conf = trial.suggest_float("min_buy_confidence", 0, 100)
-                                        min_sell_conf = trial.suggest_float("min_sell_confidence", 0, 100)
-                                        buy_comp_max = trial.suggest_float("buy_composite_max", -1.0, 0.0)
-                                        sell_comp_min = trial.suggest_float("sell_composite_min", 0.0, 1.0)
-                                        
-                                        # Convert confidence to 0-1 range for backtest
-                                        min_buy_conf_norm = min_buy_conf / 100.0
-                                        min_sell_conf_norm = min_sell_conf / 100.0
-                                        
-                                        # Run backtest with these parameters
-                                        test_trades, _, test_capital = run_production_backtest(
-                                            subset_raw, signals,
-                                            confidences=confidences,
-                                            min_buy_conf=min_buy_conf_norm,
-                                            min_sell_conf=min_sell_conf_norm,
-                                            composite_tech=composite_tech_values,
-                                            buy_comp_max=buy_comp_max,
-                                            sell_comp_min=sell_comp_min
-                                        )
-                                        
-                                        # Calculate objective metric (TOTAL RETURN)
-                                        if len(test_trades) < 1:
-                                            return -100  # Penalty for no trades, but not too harsh
-                                        
-                                        # Calculate total return percentage
-                                        total_return_pct = ((test_capital - 100000) / 100000) * 100
-                                        
-                                        # Small penalty for too few trades to encourage some activity
-                                        completed_trades = [t for t in test_trades if t['profit'] is not None]
-                                        trade_penalty = max(0, (5 - len(completed_trades)) * 0.1)  # Small penalty if < 5 completed trades
-                                        
-                                        final_score = total_return_pct - trade_penalty
-                                        
-                                        return final_score
-                                    
-                                    # Create and run study
-                                    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler())
-                                    study.optimize(optimize_trading_objective, n_trials=trading_trials, show_progress_bar=False)
-                                    
-                                    # Get best parameters
-                                    best_params = study.best_params
-                                    optimized_params = {
-                                        'min_buy_confidence': best_params['min_buy_confidence'],
-                                        'min_sell_confidence': best_params['min_sell_confidence'],
-                                        'buy_composite_max': best_params['buy_composite_max'],
-                                        'sell_composite_min': best_params['sell_composite_min'],
-                                        'best_score': study.best_value
-                                    }
-                                    
-                                    # Store in session state for persistence
-                                    st.session_state.trading_optimization_params = optimized_params
-                                    
-                                    st.success(f"🎯 **Optimization Complete!** Best Total Return: {study.best_value:.2f}%")
-                                    st.write("**🏆 Optimal Parameters for Maximum Return:**")
-                                    st.write(f"  • Buy Confidence: {best_params['min_buy_confidence']:.1f}%")
-                                    st.write(f"  • Sell Confidence: {best_params['min_sell_confidence']:.1f}%") 
-                                    st.write(f"  • Buy Composite Max: {best_params['buy_composite_max']:.3f} (oversold)")
-                                    st.write(f"  • Sell Composite Min: {best_params['sell_composite_min']:.3f} (overbought)")
-                                    
-                                except ImportError:
-                                    st.error("❌ Optuna not available. Please install: pip install optuna")
-                                except Exception as e:
-                                    st.error(f"❌ Optimization failed: {e}")
-                    
-                    # Check for stored optimized parameters from session state (disabled)
-                    if (False and  # Disabled - old page code
-                        hasattr(st.session_state, 'trading_optimization_params') and 
-                        st.session_state.trading_optimization_params is not None):
-                        
-                        stored_params = st.session_state.trading_optimization_params
-                        st.info("🔄 **Using stored optimized parameters for backtest**")
-                        st.write(f"  • Buy Confidence: {stored_params['min_buy_confidence']:.1f}%")
-                        st.write(f"  • Sell Confidence: {stored_params['min_sell_confidence']:.1f}%") 
-                        st.write(f"  • Buy Composite Max: {stored_params['buy_composite_max']:.3f} (oversold)")
-                        st.write(f"  • Sell Composite Min: {stored_params['sell_composite_min']:.3f} (overbought)")
-                        
-                        # Use optimized parameters
-                        min_buy_confidence_opt = stored_params['min_buy_confidence'] / 100.0
-                        min_sell_confidence_opt = stored_params['min_sell_confidence'] / 100.0
-                        buy_composite_max_opt = stored_params['buy_composite_max']
-                        sell_composite_min_opt = stored_params['sell_composite_min']
-                    else:
-                        # Use baseline (no filtering)
-                        min_buy_confidence_opt = 0.0
-                        min_sell_confidence_opt = 0.0
-                        buy_composite_max_opt = -999
-                        sell_composite_min_opt = 999
-                    
-                    # Prepare composite technical data for backtest (disabled - old page code)
-                    if (True or  # Always prepare composite data now
-                        not hasattr(st.session_state, 'trading_optimization_params') or 
-                        st.session_state.trading_optimization_params is None):
-                        composite_tech_values = None
-                        try:
-                            if hasattr(st.session_state, 'ml_features') and st.session_state.ml_features is not None:
-                                features = st.session_state.ml_features
-                                subset_features = features.tail(len(subset_raw))
-                                
-                                # Calculate composite technical indicator
-                                composite_parts = []
-                                for col in subset_features.columns:
-                                    if any(indicator in col.lower() for indicator in ['rsi', 'williams', 'stoch', 'macd']):
-                                        if 'rsi' in col.lower():
-                                            normalized = (subset_features[col] - 50) / 50
-                                        elif 'williams' in col.lower():
-                                            normalized = subset_features[col] / 50  
-                                        elif 'stoch' in col.lower() and subset_features[col].std() > 0:
-                                            normalized = (subset_features[col] - 50) / 50
-                                        elif 'macd' in col.lower() and subset_features[col].std() > 0:
-                                            normalized = subset_features[col] / (3 * subset_features[col].std())
-                                        else:
-                                            continue
-                                        composite_parts.append(normalized)
-                                
-                                if composite_parts:
-                                    composite_tech_values = np.mean(composite_parts, axis=0)
-                                        
-                        except Exception as e:
-                            pass  # Will use None (no filtering)
-                    
                     # RUN PEAK/VALLEY ML BACKTEST - NO FILTERING - EXECUTE ALL SIGNALS
                     trades_list, equity_curve, final_capital = run_production_backtest(
                         subset_raw, signals
@@ -4064,40 +3896,13 @@ Focus on SPECIFIC indicator values and WHY they triggered this signal. Avoid gen
                         row=2, col=1
                     )
                     
-                    # === PLOT FILTERED ML SIGNALS (MATCHES ACTUAL TRADES) ===
+                    # === PLOT ALL ML SIGNALS (NO FILTERING) ===
                     
-                    # Apply same filtering as backtest for chart display (disabled - old page code)
-                    if (False and  # Disabled - old page code
-                        hasattr(st.session_state, 'trading_optimization_params') and 
-                        st.session_state.trading_optimization_params is not None):
-                        # Use optimized parameters for filtering
-                        buy_conf_thresh = min_buy_confidence_opt
-                        sell_conf_thresh = min_sell_confidence_opt
-                        buy_comp_thresh = buy_composite_max_opt
-                        sell_comp_thresh = sell_composite_min_opt
-                        chart_label = "(Optimized)"
-                    else:
-                        # No filtering (baseline)
-                        buy_conf_thresh = 0.0
-                        sell_conf_thresh = 0.0
-                        buy_comp_thresh = -999
-                        sell_comp_thresh = 999
-                        chart_label = "(Baseline)"
+                    # Peak/Valley ML executes ALL signals - no filtering
+                    buy_signal_mask = (signals == 1)
+                    sell_signal_mask = (signals == -1)
                     
-                    # Apply combined filtering to chart
-                    if composite_tech_values is not None:
-                        buy_signal_mask = ((signals == 1) & 
-                                         (confidences >= buy_conf_thresh) & 
-                                         (composite_tech_values <= buy_comp_thresh))
-                        sell_signal_mask = ((signals == -1) & 
-                                          (confidences >= sell_conf_thresh) & 
-                                          (composite_tech_values >= sell_comp_thresh))
-                    else:
-                        # Only confidence filtering if no composite data
-                        buy_signal_mask = (signals == 1) & (confidences >= buy_conf_thresh)
-                        sell_signal_mask = (signals == -1) & (confidences >= sell_conf_thresh)
-                    
-                    # Plot filtered BUY signals  
+                    # Plot BUY signals  
                     buy_signal_indices = np.where(buy_signal_mask)[0]
                     if len(buy_signal_indices) > 0:
                         buy_dates = subset_raw.index[buy_signal_indices]
@@ -4106,7 +3911,7 @@ Focus on SPECIFIC indicator values and WHY they triggered this signal. Avoid gen
                             x=buy_dates,
                             y=buy_prices,
                             mode='markers',
-                            name=f'ML BUY Signals {chart_label}',
+                            name='ML BUY Signals',
                             marker=dict(color='green', size=10, symbol='triangle-up'),
                             hovertemplate='<b>BUY Signal</b><br>Date: %{x}<br>Price: $%{y:.2f}<extra></extra>'
                         ), row=1, col=1)
@@ -4120,7 +3925,7 @@ Focus on SPECIFIC indicator values and WHY they triggered this signal. Avoid gen
                             x=sell_dates,
                             y=sell_prices,
                             mode='markers',
-                            name=f'ML SELL Signals {chart_label}',
+                            name='ML SELL Signals',
                             marker=dict(color='red', size=10, symbol='triangle-down'),
                             hovertemplate='<b>SELL Signal</b><br>Date: %{x}<br>Price: $%{y:.2f}<extra></extra>'
                         ), row=1, col=1)
