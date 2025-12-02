@@ -85,7 +85,7 @@ st.title("📈 Pattern_FindR - Professional Trading Strategy Discovery")
 # === NEW PAGE NAVIGATION SYSTEM ===
 page = st.selectbox(
     "📋 Select Page:",
-    ["Strategy Optimization", "🤖 ML Trading Signals", "🎯 Peak/Valley ML Signals"],
+    ["Strategy Optimization", "🤖 ML Trading Signals", "🎯 Peak/Valley ML Signals", "🆕 Peak/Valley ML v2 (Clean)"],
     index=0
 )
 
@@ -96,10 +96,15 @@ if page == "🤖 ML Trading Signals":
     exec(open('ml_trading_signals_page.py').read())
     st.stop()  # Stop execution here for ML page
 
-# === PEAK/VALLEY ML SIGNALS PAGE ===
+# === PEAK/VALLEY ML SIGNALS PAGE (Original) ===
 if page == "🎯 Peak/Valley ML Signals":
     exec(open('peak_valley_ml_page.py').read())
     st.stop()  # Stop execution here for Peak/Valley ML page
+
+# === PEAK/VALLEY ML v2 (Clean Architecture) ===
+if page == "🆕 Peak/Valley ML v2 (Clean)":
+    exec(open('peak_valley_ml_v2.py').read())
+    st.stop()
 
 # === EXISTING STRATEGY OPTIMIZATION PAGE ===
 # All existing functionality continues below...
