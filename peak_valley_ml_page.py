@@ -2865,9 +2865,9 @@ with tab6:
                         st.error("🚨 **CRITICAL ISSUE:** No sell signals (-1) detected! Positions will never exit!")
                         st.info("💡 **Fix:** Need to modify exit logic or retrain model to generate sell signals")
                     
-                    # OPTION 3: AUTOMATIC TRADING FILTER OPTIMIZATION
+                    # Trading optimization removed - revolutionary Peak/Valley approach executes ALL ML signals
                     optimized_params = None
-                    if enable_trading_optimization:
+                    if False:  # Disabled - old page code
                         st.subheader("🎯 Option 3: Auto-Optimizing Trading Filters")
                         
                         if st.button("🚀 Start Trading Optimization", type="primary"):
@@ -2977,8 +2977,8 @@ with tab6:
                                 except Exception as e:
                                     st.error(f"❌ Optimization failed: {e}")
                     
-                    # Check for stored optimized parameters from session state
-                    if (enable_trading_optimization and 
+                    # Check for stored optimized parameters from session state (disabled)
+                    if (False and  # Disabled - old page code
                         hasattr(st.session_state, 'trading_optimization_params') and 
                         st.session_state.trading_optimization_params is not None):
                         
@@ -3001,8 +3001,8 @@ with tab6:
                         buy_composite_max_opt = -999
                         sell_composite_min_opt = 999
                     
-                    # Prepare composite technical data for backtest (if not already done in optimization)  
-                    if (not enable_trading_optimization or 
+                    # Prepare composite technical data for backtest (disabled - old page code)
+                    if (True or  # Always prepare composite data now
                         not hasattr(st.session_state, 'trading_optimization_params') or 
                         st.session_state.trading_optimization_params is None):
                         composite_tech_values = None
@@ -4066,8 +4066,8 @@ Focus on SPECIFIC indicator values and WHY they triggered this signal. Avoid gen
                     
                     # === PLOT FILTERED ML SIGNALS (MATCHES ACTUAL TRADES) ===
                     
-                    # Apply same filtering as backtest for chart display
-                    if (enable_trading_optimization and 
+                    # Apply same filtering as backtest for chart display (disabled - old page code)
+                    if (False and  # Disabled - old page code
                         hasattr(st.session_state, 'trading_optimization_params') and 
                         st.session_state.trading_optimization_params is not None):
                         # Use optimized parameters for filtering
