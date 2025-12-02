@@ -1780,6 +1780,14 @@ with tab5:
                                             st.warning("⚠️ Could not save DL Extractor (maybe none used?)")
                                     
                                     st.success(f"✅ Successfully saved {model_name} with {len(feats_list)} features!")
+                                    st.info(f"📁 Saved to: {filepath}")
+                                    
+                                    # CRITICAL: Clear cached model so Tab 6 loads fresh
+                                    keys_to_clear = [k for k in list(st.session_state.keys()) if 'cached_model' in k.lower()]
+                                    for key in keys_to_clear:
+                                        del st.session_state[key]
+                                    st.success("🔄 Cache cleared - Go to Tab 6 and activate your new model!")
+                                    
                                     if scaler_obj is None:
                                         st.warning("Note: Model saved without scaler (Raw Prices mode).")
 
