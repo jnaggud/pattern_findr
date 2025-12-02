@@ -777,7 +777,7 @@ class TradingMLModels:
         if not self.feature_names:
             self.feature_names = data['feature_names']
             
-        print(f"📂 Model {model_name} loaded from {filepath}")
+        # Removed noisy print statement
         return data
 
     def save_models(self, filepath: str):
@@ -791,7 +791,7 @@ class TradingMLModels:
             'best_score': self.best_score
         }
         joblib.dump(save_data, filepath)
-        print(f"💾 Models saved to {filepath}")
+        # Removed noisy print statement
     
     def load_models(self, filepath: str):
         """Load trained models from file"""
@@ -802,7 +802,7 @@ class TradingMLModels:
         self.training_history = save_data['training_history']
         self.best_model = save_data['best_model']
         self.best_score = save_data['best_score']
-        print(f"📂 Models loaded from {filepath}")
+        # Removed noisy print statement
 
 if __name__ == "__main__":
     # Test the ML models

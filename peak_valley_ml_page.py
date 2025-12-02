@@ -2061,11 +2061,11 @@ with tab6:
                     # Cache the model data
                     st.session_state[cache_key] = model_data
                     st.session_state.cached_model_path = active_model_path
-                    print(f"📂 Model cached: {active_model_path}")
+                    # Removed noisy print - was cluttering console
                 else:
                     # Use cached model
                     model_data = st.session_state[cache_key]
-                    print(f"⚡ Using cached model: {active_model_path}")
+                    # Removed noisy print - was cluttering console
                     
                 meta = model_data.get('metadata', {})
                 
