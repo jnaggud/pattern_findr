@@ -68,9 +68,9 @@ training_period = st.sidebar.selectbox(
     help="Historical data for training"
 )
 
-# Shared ticker selection - sync with main app
+# Shared ticker selection - sync with main app (NO HARDCODING)
 if 'selected_ticker' not in st.session_state:
-    st.session_state.selected_ticker = 'QQQ'  # Use QQQ as default instead of SPY
+    st.session_state.selected_ticker = ''  # Start with empty, user must select
 
 # Get ticker from main app if it exists, otherwise use ML page input
 main_app_ticker = getattr(st, '_main_ticker', None) if hasattr(st, '_main_ticker') else None
@@ -2043,9 +2043,9 @@ with tab6:
                 if tr is None:
                     st.info("ℹ️ Stats not available for this version. Please re-save the model in the Performance tab.")
                 
-                # Show ticker compatibility info
-                model_ticker = meta.get('ticker', st.session_state.get('selected_ticker', 'QQQ'))
-                current_ticker = st.session_state.get('selected_ticker', 'QQQ')
+                # Show ticker compatibility info (NO HARDCODING)
+                model_ticker = meta.get('ticker', st.session_state.get('selected_ticker'))
+                current_ticker = st.session_state.get('selected_ticker')
                 
                 if model_ticker == current_ticker:
                     st.success(f"✅ Model trained on **{model_ticker}** - Perfect match!")
@@ -2331,8 +2331,8 @@ with tab6:
                     should_update = (live_mode and time_diff.total_seconds() > 3600)
                     
                     if should_update:
-                        # Use the current selected ticker, fallback to model's ticker, then QQQ
-                        model_ticker = meta.get('ticker', st.session_state.get('selected_ticker', 'QQQ'))
+                        # Use the current selected ticker, fallback to model's ticker (NO HARDCODING)
+                        model_ticker = meta.get('ticker', st.session_state.get('selected_ticker'))
                         current_ticker = st.session_state.get('selected_ticker', model_ticker)
                         
                         # Show what ticker we're updating with
@@ -2412,8 +2412,8 @@ with tab6:
                 
                 else:
                     # Initial Load (No data exists)
-                    # Use the current selected ticker, fallback to model's ticker, then QQQ
-                    model_ticker = meta.get('ticker', st.session_state.get('selected_ticker', 'QQQ'))
+                    # Use the current selected ticker, fallback to model's ticker (NO HARDCODING)
+                    model_ticker = meta.get('ticker', st.session_state.get('selected_ticker'))
                     current_ticker = st.session_state.get('selected_ticker', model_ticker)
                     
                     # Show what ticker we're loading
