@@ -867,78 +867,104 @@ with tab4:
                     # Overlay actual peak/valley labels (ground truth)
                     labels = st.session_state.ml_labels
                     
-                    # Peak points (SELL labels)
-                    peak_points = labels[labels == -1].index
+                    # Ensure proper index alignment between labels and raw_data
+                    common_label_idx = labels.index.intersection(raw_data.index)
+                    
+                    # Peak points (SELL labels) - safe access
+                    peak_mask = labels.loc[common_label_idx] == -1
+                    peak_points = common_label_idx[peak_mask]
                     if len(peak_points) > 0:
-                        peak_prices = raw_data.loc[peak_points, 'high'] * 1.02  # Slightly above high
-                        fig.add_trace(go.Scatter(
-                            x=peak_points,
-                            y=peak_prices,
-                            mode='markers',
-                            name='Actual Peaks',
-                            marker=dict(
-                                symbol='triangle-down',
-                                size=10,
-                                color='red',
-                                line=dict(color='darkred', width=2)
-                            )
-                        ))
+                        try:
+                            peak_highs = raw_data.loc[peak_points, 'high']
+                            peak_prices = peak_highs * 1.02  # Slightly above high
+                            fig.add_trace(go.Scatter(
+                                x=peak_points,
+                                y=peak_prices,
+                                mode='markers',
+                                name='Actual Peaks',
+                                marker=dict(
+                                    symbol='triangle-down',
+                                    size=10,
+                                    color='red',
+                                    line=dict(color='darkred', width=2)
+                                )
+                            ))
+                        except Exception as e:
+                            st.warning(f"Could not plot peaks: {e}")
                     
-                    # Valley points (BUY labels) 
-                    valley_points = labels[labels == 1].index
+                    # Valley points (BUY labels) - safe access
+                    valley_mask = labels.loc[common_label_idx] == 1
+                    valley_points = common_label_idx[valley_mask]
                     if len(valley_points) > 0:
-                        valley_prices = raw_data.loc[valley_points, 'low'] * 0.98  # Slightly below low
-                        fig.add_trace(go.Scatter(
-                            x=valley_points,
-                            y=valley_prices,
-                            mode='markers',
-                            name='Actual Valleys',
-                            marker=dict(
-                                symbol='triangle-up',
-                                size=10,
-                                color='green', 
-                                line=dict(color='darkgreen', width=2)
-                            )
-                        ))
+                        try:
+                            valley_lows = raw_data.loc[valley_points, 'low']
+                            valley_prices = valley_lows * 0.98  # Slightly below low
+                            fig.add_trace(go.Scatter(
+                                x=valley_points,
+                                y=valley_prices,
+                                mode='markers',
+                                name='Actual Valleys',
+                                marker=dict(
+                                    symbol='triangle-up',
+                                    size=10,
+                                    color='green', 
+                                    line=dict(color='darkgreen', width=2)
+                                )
+                            ))
+                        except Exception as e:
+                            st.warning(f"Could not plot valleys: {e}")
                     
-                    # Overlay ML predictions (with different symbols)
-                    aligned_data = raw_data.loc[features.index]  # Align with predictions
+                    # Overlay ML predictions (with different symbols) - safe access
+                    # Align features index with raw_data index  
+                    common_pred_idx = features.index.intersection(raw_data.index)
                     
-                    # ML BUY predictions
-                    ml_buy_mask = (predictions == 1)
-                    if ml_buy_mask.any():
-                        ml_buy_dates = features.index[ml_buy_mask]
-                        ml_buy_prices = aligned_data.loc[ml_buy_dates, 'low'] * 0.95  # Lower than valleys
-                        fig.add_trace(go.Scatter(
-                            x=ml_buy_dates,
-                            y=ml_buy_prices,
-                            mode='markers',
-                            name='ML BUY Signals',
-                            marker=dict(
-                                symbol='circle',
-                                size=8,
-                                color='lightgreen',
-                                line=dict(color='green', width=1)
-                            )
-                        ))
-                    
-                    # ML SELL predictions
-                    ml_sell_mask = (predictions == -1)
-                    if ml_sell_mask.any():
-                        ml_sell_dates = features.index[ml_sell_mask]
-                        ml_sell_prices = aligned_data.loc[ml_sell_dates, 'high'] * 1.05  # Higher than peaks
-                        fig.add_trace(go.Scatter(
-                            x=ml_sell_dates,
-                            y=ml_sell_prices,
-                            mode='markers',
-                            name='ML SELL Signals',
-                            marker=dict(
-                                symbol='circle',
-                                size=8,
-                                color='lightcoral',
-                                line=dict(color='red', width=1)
-                            )
-                        ))
+                    if len(common_pred_idx) > 0:
+                        aligned_data = raw_data.loc[common_pred_idx]
+                        aligned_predictions = predictions[:len(common_pred_idx)]
+                        
+                        # ML BUY predictions
+                        ml_buy_mask = (aligned_predictions == 1)
+                        if ml_buy_mask.any():
+                            try:
+                                ml_buy_dates = common_pred_idx[ml_buy_mask]
+                                ml_buy_lows = aligned_data.loc[ml_buy_dates, 'low']
+                                ml_buy_prices = ml_buy_lows * 0.95  # Lower than valleys
+                                fig.add_trace(go.Scatter(
+                                    x=ml_buy_dates,
+                                    y=ml_buy_prices,
+                                    mode='markers',
+                                    name='ML BUY Signals',
+                                    marker=dict(
+                                        symbol='circle',
+                                        size=8,
+                                        color='lightgreen',
+                                        line=dict(color='green', width=1)
+                                    )
+                                ))
+                            except Exception as e:
+                                st.warning(f"Could not plot ML BUY signals: {e}")
+                        
+                        # ML SELL predictions
+                        ml_sell_mask = (aligned_predictions == -1)
+                        if ml_sell_mask.any():
+                            try:
+                                ml_sell_dates = common_pred_idx[ml_sell_mask]
+                                ml_sell_highs = aligned_data.loc[ml_sell_dates, 'high']
+                                ml_sell_prices = ml_sell_highs * 1.05  # Higher than peaks
+                                fig.add_trace(go.Scatter(
+                                    x=ml_sell_dates,
+                                    y=ml_sell_prices,
+                                    mode='markers',
+                                    name='ML SELL Signals',
+                                    marker=dict(
+                                        symbol='circle',
+                                        size=8,
+                                        color='lightcoral',
+                                        line=dict(color='red', width=1)
+                                    )
+                                ))
+                            except Exception as e:
+                                st.warning(f"Could not plot ML SELL signals: {e}")
                     
                     # Add train/test split line if available
                     if 'ml_split_date' in st.session_state:
@@ -975,33 +1001,38 @@ with tab4:
                     # Signal accuracy analysis
                     st.subheader("🎯 Signal Accuracy Analysis")
                     
-                    # Compare ML predictions vs actual labels
-                    aligned_labels = labels.loc[features.index]
+                    # Compare ML predictions vs actual labels - safe alignment
+                    accuracy_idx = features.index.intersection(labels.index)
+                    if len(accuracy_idx) > 0:
+                        aligned_labels = labels.loc[accuracy_idx]
+                        aligned_preds = predictions[:len(accuracy_idx)]
                     
-                    col1, col2, col3 = st.columns(3)
-                    
-                    with col1:
-                        # Overall accuracy
-                        accuracy = (predictions == aligned_labels).mean()
-                        st.metric("Overall Accuracy", f"{accuracy:.2%}")
-                    
-                    with col2:
-                        # BUY signal accuracy
-                        buy_mask = (aligned_labels == 1)
-                        if buy_mask.any():
-                            buy_accuracy = (predictions[buy_mask] == 1).mean()
-                            st.metric("BUY Signal Accuracy", f"{buy_accuracy:.2%}")
-                        else:
-                            st.metric("BUY Signal Accuracy", "N/A")
-                    
-                    with col3:
-                        # SELL signal accuracy  
-                        sell_mask = (aligned_labels == -1)
-                        if sell_mask.any():
-                            sell_accuracy = (predictions[sell_mask] == -1).mean()
-                            st.metric("SELL Signal Accuracy", f"{sell_accuracy:.2%}")
-                        else:
-                            st.metric("SELL Signal Accuracy", "N/A")
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            # Overall accuracy
+                            accuracy = (aligned_preds == aligned_labels).mean()
+                            st.metric("Overall Accuracy", f"{accuracy:.2%}")
+                        
+                        with col2:
+                            # BUY signal accuracy
+                            buy_mask = (aligned_labels == 1)
+                            if buy_mask.any():
+                                buy_accuracy = (aligned_preds[buy_mask] == 1).mean()
+                                st.metric("BUY Signal Accuracy", f"{buy_accuracy:.2%}")
+                            else:
+                                st.metric("BUY Signal Accuracy", "N/A")
+                        
+                        with col3:
+                            # SELL signal accuracy  
+                            sell_mask = (aligned_labels == -1)
+                            if sell_mask.any():
+                                sell_accuracy = (aligned_preds[sell_mask] == -1).mean()
+                                st.metric("SELL Signal Accuracy", f"{sell_accuracy:.2%}")
+                            else:
+                                st.metric("SELL Signal Accuracy", "N/A")
+                    else:
+                        st.warning("No overlapping data between predictions and labels for accuracy analysis.")
                     
                 except Exception as e:
                     st.error(f"❌ Error generating predictions: {str(e)}")
