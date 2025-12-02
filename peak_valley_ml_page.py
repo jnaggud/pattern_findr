@@ -114,12 +114,7 @@ with st.sidebar.expander("💡 Popular Tickers"):
     st.write("**Crypto:** BTC-USD, ETH-USD")
     st.write("**Forex:** EURUSD=X, GBPUSD=X")
 
-# Data period
-period = st.sidebar.selectbox(
-    "Historical Data Period",
-    ['3mo', '6mo', '1y', '2y', '5y'],
-    index=2  # Default to 1y
-)
+# Historical Data Period removed - using Training Period instead (no duplication)
 
 # Peak/Valley detection parameters
 st.sidebar.subheader("Peak/Valley Detection")
@@ -197,47 +192,7 @@ use_optimization = st.sidebar.checkbox(
     help="Automatically tune model parameters for better performance"
 )
 
-# OPTION 3: Combined Optuna Optimization
-st.sidebar.subheader("🎯 Option 3: Auto-Tune Trading Filters")
-enable_trading_optimization = st.sidebar.checkbox(
-    "Enable Trading Filter Optimization",
-    value=False,
-    help="Use Optuna to automatically find best confidence + composite thresholds"
-)
-
-if enable_trading_optimization:
-    trading_trials = st.sidebar.slider(
-        "Trading Optimization Trials",
-        min_value=10,
-        max_value=100,
-        value=30,
-        step=5,
-        help="Number of trials to find optimal trading thresholds"
-    )
-    
-    st.sidebar.info(f"⚡ Will optimize 4 parameters for MAXIMUM TOTAL RETURN:\n• Buy confidence (0-100%)\n• Sell confidence (0-100%)\n• Buy composite (-1.0 to 0.0)\n• Sell composite (0.0 to 1.0)")
-    st.sidebar.warning(f"⏱️ Est. time: ~{trading_trials * 3}s")
-else:
-    trading_trials = 0
-
-# Show clear button if optimized parameters exist (always visible when params exist)
-if (hasattr(st.session_state, 'trading_optimization_params') and 
-    st.session_state.trading_optimization_params is not None):
-    if st.sidebar.button("🗑️ Clear Optimization"):
-        st.session_state.trading_optimization_params = None
-        st.sidebar.success("✅ Optimization cleared - back to baseline")
-
-# Show optimization status in sidebar
-if (hasattr(st.session_state, 'trading_optimization_params') and 
-    st.session_state.trading_optimization_params is not None):
-    params = st.session_state.trading_optimization_params
-    st.sidebar.success("🎯 **Optimized Parameters Active**")
-    st.sidebar.write(f"Buy Conf: {params['min_buy_confidence']:.1f}%")
-    st.sidebar.write(f"Sell Conf: {params['min_sell_confidence']:.1f}%") 
-    st.sidebar.write(f"Buy Comp: {params['buy_composite_max']:.3f}")
-    st.sidebar.write(f"Sell Comp: {params['sell_composite_min']:.3f}")
-elif enable_trading_optimization:
-    st.sidebar.info("⚪ Click 'Start Trading Optimization' to find optimal parameters")
+# Trading Filter Optimization REMOVED - Revolutionary Peak/Valley approach executes ALL signals
 
 if use_optimization:
     n_trials = st.sidebar.slider(
