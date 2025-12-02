@@ -2671,11 +2671,8 @@ with tab6:
                         return trades, equity_curve, capital
                     
                     # SIMPLE ML-BASED BACKTEST - EXITS ON SELL SIGNALS ONLY
-                    def run_production_backtest(data, signals, starting_capital=100000, confidences=None, 
-                                              min_buy_conf=0.0, min_sell_conf=0.0,
-                                              composite_tech=None, buy_comp_max=-999, sell_comp_min=999):
-                        """Simple backtest - entries on buy signals, exits on sell signals from ML model
-                        Now supports Option 3: Combined confidence + composite filtering"""
+                    def run_production_backtest(data, signals, starting_capital=100000, **kwargs):
+                        """Simple Peak/Valley backtest - NO FILTERING - execute ALL signals"""
                         capital = starting_capital
                         position = None
                         trades = []
@@ -2685,13 +2682,9 @@ with tab6:
                             current_price = data['close'].iloc[i]
                             current_date = data.index[i]
                             signal = signals[i] if i < len(signals) else 0
-                            confidence = confidences[i] if confidences is not None and i < len(confidences) else 1.0
-                            comp_value = composite_tech[i] if composite_tech is not None and i < len(composite_tech) else 0.0
                             
-                            # Enter long position on BUY signal (with combined filtering)
-                            # Must pass BOTH confidence AND composite tech filters
-                            if (signal == 1 and position is None and 
-                                confidence >= min_buy_conf and comp_value <= buy_comp_max):
+                            # Enter long position on BUY signal (NO FILTERING)
+                            if signal == 1 and position is None:
                                 shares = capital / current_price
                                 position = {
                                     'entry_price': current_price,
@@ -2710,10 +2703,8 @@ with tab6:
                                     'signal_type': 'LONG'
                                 })
                             
-                            # Exit position on SELL signal (with combined filtering)
-                            # Must pass BOTH confidence AND composite tech filters
-                            elif (signal == -1 and position is not None and 
-                                  confidence >= min_sell_conf and comp_value >= sell_comp_min):
+                            # Exit position on SELL signal (NO FILTERING)
+                            elif signal == -1 and position is not None:
                                 exit_value = position['shares'] * current_price
                                 profit = exit_value - position['entry_capital']
                                 capital = exit_value
@@ -2928,67 +2919,16 @@ with tab6:
                         except Exception as e:
                             pass  # Will use None (no filtering)
                     
-                    # RUN ML-BASED BACKTEST WITH DEBUGGING (+ Option 3 optimized filtering)
+                    # RUN PEAK/VALLEY ML BACKTEST - NO FILTERING - EXECUTE ALL SIGNALS
                     trades_list, equity_curve, final_capital = run_production_backtest(
-                        subset_raw, signals,
-                        confidences=confidences,
-                        min_buy_conf=min_buy_confidence_opt,
-                        min_sell_conf=min_sell_confidence_opt,
-                        composite_tech=composite_tech_values,
-                        buy_comp_max=buy_composite_max_opt,
-                        sell_comp_min=sell_composite_min_opt
+                        subset_raw, signals
                     )
-                    
                     # DEBUG: Show what happened in backtest
                     buy_signals_count = np.sum(signals == 1)
                     sell_signals_count = np.sum(signals == -1)
                     
-                    # OPTION 3: Show combined filtering impact
-                    if (enable_trading_optimization and 
-                        hasattr(st.session_state, 'trading_optimization_params') and 
-                        st.session_state.trading_optimization_params is not None):
-                        stored_debug_params = st.session_state.trading_optimization_params
-                        st.write(f"**🎯 Option 3 - Combined Optimized Filter Results:**")
-                        st.write(f"  • Optimized Buy Confidence: {stored_debug_params['min_buy_confidence']:.1f}%")
-                        st.write(f"  • Optimized Sell Confidence: {stored_debug_params['min_sell_confidence']:.1f}%")
-                        st.write(f"  • Optimized Buy Composite Max: {stored_debug_params['buy_composite_max']:.3f} (oversold)")
-                        st.write(f"  • Optimized Sell Composite Min: {stored_debug_params['sell_composite_min']:.3f} (overbought)")
-                        
-                        # Calculate how many signals pass each filter
-                        if composite_tech_values is not None:
-                            # Combined filtering
-                            buy_conf_mask = confidences >= min_buy_confidence_opt
-                            buy_comp_mask = composite_tech_values <= buy_composite_max_opt
-                            buy_combined_mask = (signals == 1) & buy_conf_mask & buy_comp_mask
-                            buy_combined = np.sum(buy_combined_mask)
-                            
-                            sell_conf_mask = confidences >= min_sell_confidence_opt  
-                            sell_comp_mask = composite_tech_values >= sell_composite_min_opt
-                            sell_combined_mask = (signals == -1) & sell_conf_mask & sell_comp_mask
-                            sell_combined = np.sum(sell_combined_mask)
-                            
-                            # Show exactly which dates passed the filters
-                            if buy_combined > 0:
-                                passed_buy_indices = np.where(buy_combined_mask)[0]
-                                passed_buy_dates = [subset_raw.index[i].date() for i in passed_buy_indices]
-                                st.write(f"  • ✅ **Filtered Buy Dates that PASSED**: {passed_buy_dates}")
-                            else:
-                                st.write(f"  • ❌ **No buy signals passed combined filters**")
-                                
-                            if sell_combined > 0:
-                                passed_sell_indices = np.where(sell_combined_mask)[0]
-                                passed_sell_dates = [subset_raw.index[i].date() for i in passed_sell_indices]
-                                st.write(f"  • ✅ **Filtered Sell Dates that PASSED**: {passed_sell_dates}")
-                            else:
-                                st.write(f"  • ❌ **No sell signals passed combined filters**")
-                            
-                            st.write(f"  • Buy signals: {buy_signals_count} total → {buy_combined} passed both filters ({buy_signals_count - buy_combined} filtered)")
-                            st.write(f"  • Sell signals: {sell_signals_count} total → {sell_combined} passed both filters ({sell_signals_count - sell_combined} filtered)")
-                        else:
-                            st.write(f"  • Only confidence filtering applied (no composite data)")
-                    else:
-                        st.write(f"**📊 Baseline Debug (No Optimization):**")
-                        
+                    # Peak/Valley ML - All signals executed (no filtering)
+                    st.write(f"**📊 Peak/Valley ML Results (No Filtering):**")
                     st.write(f"  • Buy signals (+1): {buy_signals_count}")
                     st.write(f"  • Sell signals (-1): {sell_signals_count}")
                     st.write(f"  • Trades executed: {len(trades_list)}")
@@ -4022,6 +3962,12 @@ Focus on SPECIFIC indicator values and WHY they triggered this signal. Avoid gen
                     # Note: Removed duplicate trade markers to avoid double triangles
                     # All signals (including trade entries) are now shown via ML Signal markers above
                     
+                    # Default risk levels (fallback)
+                    dynamic_stop_loss = current_price * 0.92
+                    dynamic_take_profit = current_price * 1.15
+                    dynamic_stop_pct = 8.0
+                    dynamic_tp_pct = 15.0
+                    
                     # === ENHANCED DYNAMIC RISK LEVELS ON CHART ===
                     if ('enhanced_trading_analysis' in st.session_state and 
                         st.session_state.enhanced_trading_analysis and
@@ -4178,9 +4124,9 @@ Focus on SPECIFIC indicator values and WHY they triggered this signal. Avoid gen
                         with l1:
                             st.metric("Entry Price", f"${current_price:.2f}")
                         with l2:
-                            st.metric("Stop Loss", f"${stop_loss:.2f}", delta=f"{stop_loss-current_price:.2f}", delta_color="inverse")
+                            st.metric("Stop Loss", f"${dynamic_stop_loss:.2f}", delta=f"{dynamic_stop_loss-current_price:.2f}", delta_color="inverse")
                         with l3:
-                            st.metric("Take Profit", f"${take_profit:.2f}", delta=f"{take_profit-current_price:.2f}")
+                            st.metric("Take Profit", f"${dynamic_take_profit:.2f}", delta=f"{dynamic_take_profit-current_price:.2f}")
 
                     else:
                         # Render chart even if no signal with enhanced styling
