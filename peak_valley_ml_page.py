@@ -1480,7 +1480,7 @@ with tab5:
                 buy_signals = np.where(predictions == 1)[0]
                 if len(buy_signals) > 0:
                     buy_dates = data.index[buy_signals]
-                    buy_prices = data['close'].iloc[buy_signals] * 0.98  # 2% below price
+                    buy_prices = data['close'].iloc[buy_signals].values * 0.98  # 2% below price
                     fig.add_trace(go.Scatter(
                         x=buy_dates,
                         y=buy_prices,
@@ -1494,7 +1494,7 @@ with tab5:
                 sell_signals = np.where(predictions == -1)[0]
                 if len(sell_signals) > 0:
                     sell_dates = data.index[sell_signals]
-                    sell_prices = data['close'].iloc[sell_signals] * 1.02  # 2% above price
+                    sell_prices = data['close'].iloc[sell_signals].values * 1.02  # 2% above price
                     fig.add_trace(go.Scatter(
                         x=sell_dates,
                         y=sell_prices,
