@@ -286,9 +286,18 @@ with tab1:
                     highs = data['high'].values
                     lows = data['low'].values
                     
-                    # Use more sensitive detection for better BUY/SELL balance
-                    peak_indices = argrelextrema(highs, np.greater, order=max(3, window//2))[0]
-                    valley_indices = argrelextrema(lows, np.less, order=max(3, window//2))[0]
+                    # Use VERY sensitive detection to ensure we get signals (especially for crypto)
+                    # Start with order=3 (very sensitive) and gradually increase if needed
+                    detection_order = 3  # Very sensitive - will find many peaks/valleys
+                    
+                    peak_indices = argrelextrema(highs, np.greater, order=detection_order)[0]
+                    valley_indices = argrelextrema(lows, np.less, order=detection_order)[0]
+                    
+                    # If we still don't get enough signals, try even more sensitive
+                    if len(peak_indices) < 5 or len(valley_indices) < 5:
+                        detection_order = 2  # Even more sensitive
+                        peak_indices = argrelextrema(highs, np.greater, order=detection_order)[0]
+                        valley_indices = argrelextrema(lows, np.less, order=detection_order)[0]
                     
                     # CREATE PREDICTIVE LABELS (1 day before peak/valley)
                     labels = pd.Series(0, index=data.index, name='signal')  # Default HOLD
@@ -3954,6 +3963,58 @@ Focus on SPECIFIC indicator values and WHY they triggered this signal. Avoid gen
                         low=subset_raw['low'], close=subset_raw['close'],
                         name='Price'
                     ), row=1, col=1)
+                    
+                    # 🎯 ADD TRADE ENTRY/EXIT MARKERS
+                    if trades_list and len(trades_list) > 0:
+                        # Collect entry and exit points
+                        entry_dates = []
+                        entry_prices = []
+                        exit_dates = []
+                        exit_prices = []
+                        
+                        for trade in trades_list:
+                            # Entry markers (BUY points)
+                            if 'entry_date' in trade and 'entry_price' in trade:
+                                entry_dates.append(trade['entry_date'])
+                                entry_prices.append(trade['entry_price'])
+                            
+                            # Exit markers (SELL points)
+                            if 'exit_date' in trade and 'exit_price' in trade:
+                                if trade['exit_date'] is not None:
+                                    exit_dates.append(trade['exit_date'])
+                                    exit_prices.append(trade['exit_price'])
+                        
+                        # Add entry markers (green triangles pointing up)
+                        if entry_dates:
+                            fig_live.add_trace(go.Scatter(
+                                x=entry_dates,
+                                y=entry_prices,
+                                mode='markers',
+                                name='Entry (BUY)',
+                                marker=dict(
+                                    symbol='triangle-up',
+                                    size=12,
+                                    color='green',
+                                    line=dict(color='darkgreen', width=2)
+                                ),
+                                hovertemplate='<b>BUY</b><br>Date: %{x}<br>Price: $%{y:.2f}<extra></extra>'
+                            ), row=1, col=1)
+                        
+                        # Add exit markers (red triangles pointing down)
+                        if exit_dates:
+                            fig_live.add_trace(go.Scatter(
+                                x=exit_dates,
+                                y=exit_prices,
+                                mode='markers',
+                                name='Exit (SELL)',
+                                marker=dict(
+                                    symbol='triangle-down',
+                                    size=12,
+                                    color='red',
+                                    line=dict(color='darkred', width=2)
+                                ),
+                                hovertemplate='<b>SELL</b><br>Date: %{x}<br>Price: $%{y:.2f}<extra></extra>'
+                            ), row=1, col=1)
                     
                     # === SUPER INDICATOR PLOTS (Bottom Chart) ===
                     
