@@ -1743,7 +1743,7 @@ with tab5:
                                             'score': ml_models.best_score, 
                                             'notes': save_notes,
                                             'ticker': ticker,
-                                            'period': period,
+                                            'period': training_period,
                                             'total_return': total_return,
                                             'win_rate': win_rate,
                                             'trades_count': len(completed_trades),
@@ -2394,11 +2394,33 @@ with tab6:
                     
                     with st.spinner(f"Initializing production data for {ticker} ({train_period})..."):
                         try:
-                            # Download data using fixed start if possible, else relative period
+                            # FORCE REAL HISTORICAL DATA - prevent test/future data (same logic as Tab 1)
+                            from datetime import datetime, timedelta
+                            
                             if fixed_start:
                                 df = yf.Ticker(ticker).history(start=fixed_start, interval="1d")
                             else:
-                                df = yf.Ticker(ticker).history(period=train_period, interval="1d")
+                                # Calculate explicit start date to ensure real historical data
+                                end_date = datetime.now().date()
+                                if train_period == '1y':
+                                    start_date = end_date - timedelta(days=365)
+                                elif train_period == '2y':
+                                    start_date = end_date - timedelta(days=730)
+                                elif train_period == '3y':
+                                    start_date = end_date - timedelta(days=1095)
+                                elif train_period == '5y':
+                                    start_date = end_date - timedelta(days=1825)
+                                else:
+                                    start_date = end_date - timedelta(days=1825)  # Default 5y
+                                
+                                df = yf.Ticker(ticker).history(start=start_date, end=end_date, interval="1d")
+                            
+                            # Verify we don't have future data
+                            if not df.empty:
+                                latest_date = df.index[-1].date()
+                                if latest_date > datetime.now().date():
+                                    st.error(f"❌ Invalid future data detected: {latest_date}. Using fallback period loading.")
+                                    df = yf.Ticker(ticker).history(period=train_period, interval="1d")
                             
                             # Ticker.history returns Index name 'Date' (with timezone usually), and columns capitalized
                             if isinstance(df.columns, pd.MultiIndex):
