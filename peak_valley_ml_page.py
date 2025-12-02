@@ -961,6 +961,74 @@ with tab3:
             ml_models = st.session_state.ml_models
             if ml_models.best_model:
                 st.success(f"🏆 Best Model: **{ml_models.best_model}** (F1 Score: {ml_models.best_score:.4f})")
+                
+                # === QUICK SAVE BUTTON (Tab 3) ===
+                st.markdown("---")
+                st.subheader("💾 Quick Save Model")
+                
+                save_col1, save_col2 = st.columns([3, 1])
+                with save_col1:
+                    quick_save_notes = st.text_input("Notes (optional)", placeholder="e.g. post-fix model v2", key="tab3_save_notes")
+                with save_col2:
+                    if st.button("💾 Save Model Now", type="primary", key="tab3_save_btn"):
+                        try:
+                            import os
+                            import joblib
+                            
+                            model_name = ml_models.best_model
+                            model_obj = ml_models.models[model_name]
+                            scaler_obj = ml_models.scalers.get(model_name)
+                            
+                            # Get feature names
+                            feats_list = getattr(ml_models, 'feature_names', [])
+                            if not feats_list and 'ml_features' in st.session_state:
+                                feats_list = list(st.session_state.ml_features.columns)
+                            
+                            # Create payload
+                            timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+                            filename = f"{model_name}_{timestamp}.joblib"
+                            save_dir = "saved_models"
+                            if not os.path.exists(save_dir):
+                                os.makedirs(save_dir)
+                            
+                            filepath = os.path.join(save_dir, filename)
+                            
+                            payload = {
+                                'model_name': model_name,
+                                'model': model_obj,
+                                'scaler': scaler_obj,
+                                'label_encoder': ml_models.scalers.get(f"{model_name}_label_encoder"),
+                                'feature_names': feats_list,
+                                'timestamp': timestamp,
+                                'metadata': {
+                                    'score': ml_models.best_score,
+                                    'notes': quick_save_notes,
+                                    'ticker': ticker,
+                                    'period': training_period,
+                                    'saved_at': pd.Timestamp.now().isoformat(),
+                                    'feature_count': len(feats_list)
+                                }
+                            }
+                            
+                            joblib.dump(payload, filepath)
+                            
+                            # Save DL extractor if available
+                            if 'ml_engineer' in st.session_state:
+                                engineer = st.session_state.ml_engineer
+                                dl_filename = f"{model_name}_{timestamp}_dl_extractor.h5"
+                                dl_filepath = os.path.join(save_dir, dl_filename)
+                                engineer.save_dl_model(dl_filepath)
+                            
+                            # Clear cached models
+                            keys_to_clear = [k for k in list(st.session_state.keys()) if 'cached_model' in k.lower()]
+                            for key in keys_to_clear:
+                                del st.session_state[key]
+                            
+                            st.success(f"✅ Saved: {filename}")
+                            st.info("🚀 Go to Tab 6 (Production) and activate this model!")
+                            
+                        except Exception as e:
+                            st.error(f"❌ Save failed: {e}")
 
 # === TAB 4: PREDICTIONS ===
 with tab4:
