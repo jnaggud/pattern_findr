@@ -1165,16 +1165,11 @@ with tab5:
                             
                             # Create backtest results
                             def run_ml_backtest(data, signals, starting_capital=100000):
-                                """Enhanced backtest for ML signals - executes ALL signals"""
+                                """Simple long-only backtest: BUY on signal=1, EXIT on signal=-1"""
                                 capital = starting_capital
                                 position = None
                                 trades = []
                                 equity_curve = [starting_capital]
-                                
-                                print(f"🔍 BACKTEST DEBUG:")
-                                print(f"   Data length: {len(data)}")
-                                print(f"   Signals length: {len(signals)}")
-                                print(f"   Unique signals: {np.unique(signals, return_counts=True)}")
                                 
                                 # Process each day
                                 for i in range(len(data)):
@@ -1182,105 +1177,53 @@ with tab5:
                                     current_date = data.index[i]
                                     signal = signals[i] if i < len(signals) else 0
                                     
-                                    # BUY SIGNAL: Enter long position (or exit short)
-                                    if signal == 1:
-                                        if position is None or position['type'] == 'short':
-                                            # Close short position if exists
-                                            if position and position['type'] == 'short':
-                                                profit = position['entry_capital'] - (position['shares'] * current_price)
-                                                capital += profit
-                                                
-                                                # Update last trade
-                                                if trades and trades[-1]['exit_date'] is None:
-                                                    trades[-1].update({
-                                                        'exit_date': current_date,
-                                                        'exit_price': current_price,
-                                                        'profit': profit
-                                                    })
-                                            
-                                            # Enter new long position
-                                            shares = capital / current_price
-                                            position = {
-                                                'type': 'long',
-                                                'entry_date': current_date,
-                                                'entry_price': current_price,
-                                                'shares': shares,
-                                                'entry_capital': capital
-                                            }
-                                            
-                                            trades.append({
-                                                'entry_date': current_date,
-                                                'entry_price': current_price,
-                                                'exit_date': None,
-                                                'exit_price': None,
-                                                'shares': shares,
-                                                'position_value': capital,
-                                                'profit': None,
-                                                'signal_type': 'LONG'
+                                    # BUY SIGNAL: Enter long position if not already in one
+                                    if signal == 1 and position is None:
+                                        shares = capital / current_price
+                                        position = {
+                                            'entry_date': current_date,
+                                            'entry_price': current_price,
+                                            'shares': shares,
+                                            'entry_capital': capital
+                                        }
+                                        
+                                        trades.append({
+                                            'entry_date': current_date,
+                                            'entry_price': current_price,
+                                            'exit_date': None,
+                                            'exit_price': None,
+                                            'shares': shares,
+                                            'position_value': capital,
+                                            'profit': None,
+                                            'signal_type': 'LONG'
+                                        })
+                                    
+                                    # SELL SIGNAL: Exit long position if in one
+                                    elif signal == -1 and position is not None:
+                                        exit_value = position['shares'] * current_price
+                                        profit = exit_value - position['entry_capital']
+                                        capital = exit_value
+                                        
+                                        # Update last trade
+                                        if trades and trades[-1]['exit_date'] is None:
+                                            trades[-1].update({
+                                                'exit_date': current_date,
+                                                'exit_price': current_price,
+                                                'profit': profit
                                             })
+                                        
+                                        position = None
                                     
-                                    # SELL SIGNAL: Enter short position (or exit long)  
-                                    elif signal == -1:
-                                        if position is None or position['type'] == 'long':
-                                            # Close long position if exists
-                                            if position and position['type'] == 'long':
-                                                exit_value = position['shares'] * current_price
-                                                profit = exit_value - position['entry_capital']
-                                                capital = exit_value
-                                                
-                                                # Update last trade
-                                                if trades and trades[-1]['exit_date'] is None:
-                                                    trades[-1].update({
-                                                        'exit_date': current_date,
-                                                        'exit_price': current_price,
-                                                        'profit': profit
-                                                    })
-                                            
-                                            # Enter new short position (simulate by holding cash)
-                                            position = {
-                                                'type': 'short',
-                                                'entry_date': current_date,
-                                                'entry_price': current_price,
-                                                'shares': capital / current_price,  # Theoretical shares
-                                                'entry_capital': capital
-                                            }
-                                            
-                                            trades.append({
-                                                'entry_date': current_date,
-                                                'entry_price': current_price,
-                                                'exit_date': None,
-                                                'exit_price': None,
-                                                'shares': capital / current_price,
-                                                'position_value': capital,
-                                                'profit': None,
-                                                'signal_type': 'SHORT'
-                                            })
-                                    
-                                    # Calculate portfolio value
-                                    if position:
-                                        if position['type'] == 'long':
-                                            portfolio_value = position['shares'] * current_price
-                                        else:  # short position
-                                            # For short: profit when price goes down
-                                            portfolio_value = position['entry_capital'] + (
-                                                position['entry_capital'] - position['shares'] * current_price
-                                            )
-                                    else:
-                                        portfolio_value = capital
-                                    
+                                    # Calculate portfolio value (long-only)
+                                    portfolio_value = position['shares'] * current_price if position else capital
                                     equity_curve.append(portfolio_value)
                                 
                                 # Close final position if still open
                                 if position:
                                     final_price = data['close'].iloc[-1]
-                                    
-                                    if position['type'] == 'long':
-                                        exit_value = position['shares'] * final_price
-                                        profit = exit_value - position['entry_capital']
-                                        capital = exit_value
-                                    else:  # short
-                                        profit = position['entry_capital'] - (position['shares'] * final_price)
-                                        capital += profit
+                                    exit_value = position['shares'] * final_price
+                                    profit = exit_value - position['entry_capital']
+                                    capital = exit_value
                                     
                                     # Update last trade
                                     if trades and trades[-1]['exit_date'] is None:
@@ -1289,9 +1232,6 @@ with tab5:
                                             'exit_price': final_price,
                                             'profit': profit
                                         })
-                                
-                                print(f"   Total trades created: {len(trades)}")
-                                print(f"   Completed trades: {len([t for t in trades if t['profit'] is not None])}")
                                 
                                 return trades, equity_curve, capital
                             
