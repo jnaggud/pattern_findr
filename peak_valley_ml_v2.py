@@ -27,8 +27,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-# Configure page
-st.set_page_config(page_title="Peak/Valley ML v2", page_icon="📈", layout="wide")
+# Note: set_page_config is called in app.py, not here
 
 # =============================================================================
 # SESSION STATE INITIALIZATION (runs once)
