@@ -282,22 +282,13 @@ with tab1:
                     else:
                         window = 5  # Default window
                     
-                    # Find historical peaks and valleys with adjusted parameters for better detection
+                    # Find historical peaks and valleys
                     highs = data['high'].values
                     lows = data['low'].values
                     
-                    # Use VERY sensitive detection to ensure we get signals (especially for crypto)
-                    # Start with order=3 (very sensitive) and gradually increase if needed
-                    detection_order = 3  # Very sensitive - will find many peaks/valleys
-                    
-                    peak_indices = argrelextrema(highs, np.greater, order=detection_order)[0]
-                    valley_indices = argrelextrema(lows, np.less, order=detection_order)[0]
-                    
-                    # If we still don't get enough signals, try even more sensitive
-                    if len(peak_indices) < 5 or len(valley_indices) < 5:
-                        detection_order = 2  # Even more sensitive
-                        peak_indices = argrelextrema(highs, np.greater, order=detection_order)[0]
-                        valley_indices = argrelextrema(lows, np.less, order=detection_order)[0]
+                    # Use window parameter for detection (keeps original logic that worked well in backtest)
+                    peak_indices = argrelextrema(highs, np.greater, order=window)[0]
+                    valley_indices = argrelextrema(lows, np.less, order=window)[0]
                     
                     # CREATE PREDICTIVE LABELS (1 day before peak/valley)
                     labels = pd.Series(0, index=data.index, name='signal')  # Default HOLD
@@ -2527,9 +2518,17 @@ with tab6:
                     # Bulk Prediction
                     raw_signals = prod_model.predict(X_input)
                     
-                    # DECODE SIGNALS (Critical Fix for Missing Sell Signals)
-                    # Model outputs 0,1,2 -> We need -1,0,1 for trading
-                    if prod_label_encoder:
+                    # DECODE SIGNALS - CRITICAL FIX
+                    # Check if model already outputs trading signals (-1, 0, 1)
+                    raw_unique = np.unique(raw_signals)
+                    is_already_trading_format = set(raw_unique).issubset({-1, 0, 1})
+                    
+                    if is_already_trading_format:
+                        # Model already outputs correct trading signals - DON'T REMAP!
+                        signals = raw_signals
+                        st.success("✅ **Model outputs trading signals directly** - No decoding needed!")
+                        st.write(f"   Signals: {raw_unique} (already in -1=SELL, 0=HOLD, 1=BUY format)")
+                    elif prod_label_encoder:
                         # Use the label encoder to convert back to original labels
                         try:
                             signals = prod_label_encoder.inverse_transform(raw_signals)
@@ -2548,7 +2547,6 @@ with tab6:
                         st.warning("⚠️ **No Label Encoder Found** - Using manual mapping: {0: -1 (SELL), 1: 0 (HOLD), 2: 1 (BUY)}")
                     
                     # Comprehensive debugging
-                    raw_unique = np.unique(raw_signals)
                     decoded_unique = np.unique(signals)
                     st.write(f"**🔄 Signal Conversion:** Raw {raw_unique} → Decoded {decoded_unique}")
                     
