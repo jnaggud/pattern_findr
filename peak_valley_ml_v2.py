@@ -1084,6 +1084,161 @@ with tab2:
         
         st.plotly_chart(fig, use_container_width=True)
         
+        # =====================================================================
+        # SECOND CHART: Last 180 Days Detail View
+        # =====================================================================
+        st.subheader("📊 Last 180 Days - Detailed View")
+        
+        # Get last 180 days of data
+        days_to_show = 180
+        if len(data) > days_to_show:
+            recent_data = data.iloc[-days_to_show:]
+            recent_signals = signals.iloc[-days_to_show:]
+        else:
+            recent_data = data
+            recent_signals = signals
+        
+        # Filter trades to recent period
+        recent_trades = [t for t in backtest['trades'] 
+                        if t['entry_date'] >= recent_data.index[0]]
+        
+        # Create recent chart
+        fig2 = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                            vertical_spacing=0.05, row_heights=[0.75, 0.25],
+                            subplot_titles=('Recent Price Action & Signals', 'Recent Equity'))
+        
+        # Candlestick for recent period
+        fig2.add_trace(go.Candlestick(
+            x=recent_data.index,
+            open=recent_data['open'],
+            high=recent_data['high'],
+            low=recent_data['low'],
+            close=recent_data['close'],
+            name='Price',
+            increasing_line_color='green',
+            decreasing_line_color='red'
+        ), row=1, col=1)
+        
+        # Recent signals
+        recent_buy_mask = recent_signals == 1
+        recent_sell_mask = recent_signals == -1
+        
+        if recent_buy_mask.any():
+            recent_buy_dates = recent_signals[recent_buy_mask].index
+            recent_buy_prices = recent_data.loc[recent_buy_dates, 'low'] * 0.98
+            fig2.add_trace(go.Scatter(
+                x=recent_buy_dates,
+                y=recent_buy_prices,
+                mode='markers',
+                marker=dict(symbol='triangle-up', size=14, color='lime',
+                           line=dict(width=2, color='darkgreen')),
+                name='BUY Signal'
+            ), row=1, col=1)
+        
+        if recent_sell_mask.any():
+            recent_sell_dates = recent_signals[recent_sell_mask].index
+            recent_sell_prices = recent_data.loc[recent_sell_dates, 'high'] * 1.02
+            fig2.add_trace(go.Scatter(
+                x=recent_sell_dates,
+                y=recent_sell_prices,
+                mode='markers',
+                marker=dict(symbol='triangle-down', size=14, color='red',
+                           line=dict(width=2, color='darkred')),
+                name='SELL Signal'
+            ), row=1, col=1)
+        
+        # Recent trade markers
+        for trade in recent_trades:
+            # Entry marker
+            fig2.add_trace(go.Scatter(
+                x=[trade['entry_date']],
+                y=[trade['entry_price']],
+                mode='markers+text',
+                marker=dict(symbol='circle', size=12, color='blue',
+                           line=dict(width=2, color='white')),
+                text=['▶'],
+                textposition='middle left',
+                name='Entry',
+                showlegend=False
+            ), row=1, col=1)
+            
+            # Exit marker
+            if 'exit_date' in trade and trade['exit_date'] >= recent_data.index[0]:
+                profit_color = 'green' if trade.get('profit', 0) > 0 else 'red'
+                fig2.add_trace(go.Scatter(
+                    x=[trade['exit_date']],
+                    y=[trade['exit_price']],
+                    mode='markers',
+                    marker=dict(symbol='x', size=12, color=profit_color,
+                               line=dict(width=3, color='white')),
+                    name='Exit',
+                    showlegend=False
+                ), row=1, col=1)
+                
+                # Draw line connecting entry to exit
+                fig2.add_trace(go.Scatter(
+                    x=[trade['entry_date'], trade['exit_date']],
+                    y=[trade['entry_price'], trade['exit_price']],
+                    mode='lines',
+                    line=dict(color=profit_color, width=1, dash='dot'),
+                    showlegend=False
+                ), row=1, col=1)
+        
+        # Recent equity curve
+        recent_equity = backtest['equity_curve'][backtest['equity_curve']['date'] >= recent_data.index[0]]
+        if len(recent_equity) > 0:
+            fig2.add_trace(go.Scatter(
+                x=recent_equity['date'],
+                y=recent_equity['equity'],
+                mode='lines',
+                name='ML Strategy',
+                line=dict(color='blue', width=2),
+                fill='tozeroy',
+                fillcolor='rgba(0,100,255,0.1)'
+            ), row=2, col=1)
+            
+            # Buy and hold for recent period
+            recent_bh_start = backtest['initial_capital'] * (recent_data['close'].iloc[0] / data['close'].iloc[0])
+            recent_bh = recent_bh_start * (recent_data['close'] / recent_data['close'].iloc[0])
+            fig2.add_trace(go.Scatter(
+                x=recent_data.index,
+                y=recent_bh,
+                mode='lines',
+                name='Buy & Hold',
+                line=dict(color='gray', width=1, dash='dash')
+            ), row=2, col=1)
+        
+        fig2.update_layout(
+            title=f"Last {len(recent_data)} Trading Days - {model_ticker}",
+            height=600,
+            xaxis_rangeslider_visible=False,
+            showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        fig2.update_yaxes(title_text="Price", row=1, col=1)
+        fig2.update_yaxes(title_text="Equity ($)", row=2, col=1)
+        
+        st.plotly_chart(fig2, use_container_width=True)
+        
+        # Recent period stats
+        if len(recent_trades) > 0:
+            recent_profits = [t.get('profit', 0) for t in recent_trades if 'profit' in t]
+            recent_wins = sum(1 for p in recent_profits if p > 0)
+            recent_total_profit = sum(recent_profits)
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Recent Trades", len(recent_trades))
+            with col2:
+                st.metric("Recent Win Rate", f"{100*recent_wins/len(recent_trades):.0f}%" if recent_trades else "N/A")
+            with col3:
+                st.metric("Recent P/L", f"${recent_total_profit:,.0f}")
+            with col4:
+                # Recent signals count
+                recent_buys = (recent_signals == 1).sum()
+                recent_sells = (recent_signals == -1).sum()
+                st.metric("Recent Signals", f"{recent_buys} BUY / {recent_sells} SELL")
+        
         # Trade log
         st.subheader("📋 Trade Log")
         if backtest['trades']:
