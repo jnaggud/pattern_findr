@@ -590,36 +590,84 @@ def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float 
     }
 
 
-def calculate_theoretical_return(data: pd.DataFrame, peak_dates: list, valley_dates: list) -> float:
-    """Calculate theoretical perfect trading return"""
+def calculate_theoretical_return(data: pd.DataFrame, peak_dates: list, valley_dates: list, 
+                                  initial_capital: float = 100000) -> dict:
+    """
+    Calculate theoretical perfect trading return - buying at every valley and selling at every peak.
+    
+    Returns dict with:
+        - total_return: Percentage return from perfect trading
+        - num_trades: Number of completed round-trip trades
+        - avg_trade_return: Average return per trade
+        - trades: List of individual trade details
+    """
+    # Create events list with buy at valleys, sell at peaks
     events = []
     for d in valley_dates:
-        events.append(('buy', d))
+        if d in data.index:
+            events.append(('buy', d, data.loc[d, 'close']))
     for d in peak_dates:
-        events.append(('sell', d))
+        if d in data.index:
+            events.append(('sell', d, data.loc[d, 'close']))
+    
+    # Sort by date
     events.sort(key=lambda x: x[1])
     
-    capital = 100000
+    capital = initial_capital
     position = 0
     shares = 0
+    entry_price = 0
+    entry_date = None
+    trades = []
     
-    for action, date in events:
-        if date not in data.index:
-            continue
-        price = data.loc[date, 'close']
-        
+    for action, date, price in events:
         if action == 'buy' and position == 0:
+            # Enter long position at valley
             shares = capital / price
+            entry_price = price
+            entry_date = date
             position = 1
+            
         elif action == 'sell' and position == 1:
-            capital = shares * price
+            # Exit at peak
+            exit_value = shares * price
+            trade_return = (price - entry_price) / entry_price * 100
+            trades.append({
+                'entry_date': entry_date,
+                'entry_price': entry_price,
+                'exit_date': date,
+                'exit_price': price,
+                'return_pct': trade_return
+            })
+            capital = exit_value
             position = 0
             shares = 0
     
+    # Close any open position at last price
     if position == 1:
-        capital = shares * data['close'].iloc[-1]
+        final_price = data['close'].iloc[-1]
+        exit_value = shares * final_price
+        trade_return = (final_price - entry_price) / entry_price * 100
+        trades.append({
+            'entry_date': entry_date,
+            'entry_price': entry_price,
+            'exit_date': data.index[-1],
+            'exit_price': final_price,
+            'return_pct': trade_return,
+            'status': 'open'
+        })
+        capital = exit_value
     
-    return (capital - 100000) / 100000 * 100
+    total_return = (capital - initial_capital) / initial_capital * 100
+    avg_trade_return = np.mean([t['return_pct'] for t in trades]) if trades else 0
+    
+    return {
+        'total_return': total_return,
+        'final_capital': capital,
+        'num_trades': len(trades),
+        'avg_trade_return': avg_trade_return,
+        'trades': trades
+    }
 
 
 # =============================================================================
@@ -712,10 +760,25 @@ with tab1:
         with col3:
             st.metric("Valleys Detected", detection_info['num_valleys'])
         
-        # Calculate theoretical return
+        # Calculate theoretical return (perfect trading at every peak/valley)
         theoretical = calculate_theoretical_return(data, detection_info['peak_dates'], 
                                                    detection_info['valley_dates'])
-        st.success(f"🎯 Theoretical Perfect Trading Return: **{theoretical:.1f}%**")
+        st.session_state.v2_theoretical = theoretical  # Store for efficiency calculation
+        
+        # Display theoretical performance
+        st.markdown("### 🎯 Theoretical Maximum (Perfect Trading)")
+        st.caption("*Compounded returns from buying at every valley and selling at every peak with 100% capital*")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Perfect Return", f"{theoretical['total_return']:,.1f}%")
+        with col2:
+            st.metric("Perfect Trades", theoretical['num_trades'])
+        with col3:
+            st.metric("Avg Trade Return", f"{theoretical['avg_trade_return']:.1f}%")
+        with col4:
+            # Buy and hold for comparison
+            bh_return = (data['close'].iloc[-1] - data['close'].iloc[0]) / data['close'].iloc[0] * 100
+            st.metric("Buy & Hold", f"{bh_return:.1f}%")
         
         # Generate features
         progress.progress(30, text="Generating features...")
@@ -853,6 +916,21 @@ with tab2:
             backtest = run_backtest(data, signals)
             st.session_state.v2_backtest = backtest
             
+            # Calculate theoretical maximum for this period
+            labels_for_period, detection_info = detect_peaks_valleys(data, order=detection_order)
+            theoretical_for_period = calculate_theoretical_return(
+                data, detection_info['peak_dates'], detection_info['valley_dates']
+            )
+            backtest['theoretical_return'] = theoretical_for_period['total_return']
+            backtest['theoretical_trades'] = theoretical_for_period['num_trades']
+            
+            # Calculate efficiency (how much of theoretical max was captured)
+            if theoretical_for_period['total_return'] > 0:
+                efficiency = (backtest['total_return'] / theoretical_for_period['total_return']) * 100
+            else:
+                efficiency = 0
+            backtest['efficiency'] = efficiency
+            
             # Store period info for display
             backtest['period_label'] = period_label
             backtest['start_date'] = data.index[0]
@@ -861,6 +939,17 @@ with tab2:
         
         # Period info
         st.success(f"📅 **{backtest['period_label']}** | {backtest['start_date'].strftime('%Y-%m-%d')} to {backtest['end_date'].strftime('%Y-%m-%d')} ({backtest['total_days']} trading days)")
+        
+        # Efficiency banner
+        efficiency = backtest.get('efficiency', 0)
+        theoretical_ret = backtest.get('theoretical_return', 0)
+        if efficiency > 0:
+            if efficiency >= 50:
+                st.success(f"🎯 **Efficiency: {efficiency:.1f}%** of theoretical maximum ({theoretical_ret:,.1f}% perfect return)")
+            elif efficiency >= 25:
+                st.warning(f"🎯 **Efficiency: {efficiency:.1f}%** of theoretical maximum ({theoretical_ret:,.1f}% perfect return)")
+            else:
+                st.error(f"🎯 **Efficiency: {efficiency:.1f}%** of theoretical maximum ({theoretical_ret:,.1f}% perfect return)")
         
         # Performance metrics
         st.subheader("📈 Performance Summary")
