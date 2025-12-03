@@ -333,26 +333,25 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
         
         return mean_score
     
-    # Callback for UI progress
-    def optuna_callback(study, trial):
-        if progress_callback:
-            # Use len(study.trials) for thread-safe count
-            progress_callback(len(study.trials), n_trials)
-    
     # Determine number of parallel jobs (all cores except 1)
     import multiprocessing
     n_cores = multiprocessing.cpu_count()
     n_jobs_optuna = max(1, n_cores - 1)  # Leave 1 core free for system
     
     # Run optimization with parallel trials
+    # NOTE: Cannot use Streamlit progress callback with parallel execution (NoSessionContext error)
+    # Progress is shown via console output instead
     print(f"\n🔍 Starting Optuna optimization ({n_trials} trials)...")
     print(f"🖥️  Using {n_jobs_optuna} parallel workers (of {n_cores} cores)")
     print("-"*70)
     
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False, 
-                  callbacks=[optuna_callback], n_jobs=n_jobs_optuna)
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False, n_jobs=n_jobs_optuna)
+    
+    # Update UI progress after optimization completes
+    if progress_callback:
+        progress_callback(n_trials, n_trials)
     
     best_params = study.best_params
     
