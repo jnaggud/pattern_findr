@@ -877,6 +877,47 @@ def run_comprehensive_analysis(analysis_dir: str = "analysis") -> str:
                 label = "BUY" if sig == 1 else "SELL" if sig == -1 else "HOLD"
                 report.append(f"      {label}: {avg_val:+.3f}")
 
+    # 6. Market Regime Analysis (Bull vs Bear)
+    # Define Bull as Price > SMA200 (approx 200 days)
+    # If we don't have SMA200, we can calculate it or use a proxy
+    report.append("\n🐂 MARKET REGIME ANALYSIS (Bull vs Bear)")
+    try:
+        # Calculate SMA 200 for context
+        sma200 = df['close'].rolling(200).mean()
+        is_bull = df['close'] > sma200
+        
+        for regime_name, regime_mask in [("BULL (Price > SMA200)", is_bull), ("BEAR (Price < SMA200)", ~is_bull)]:
+            if regime_mask.sum() < 10:
+                continue
+                
+            regime_df = df[regime_mask]
+            buys = regime_df[regime_df['signal'] == 1]
+            sells = regime_df[regime_df['signal'] == -1]
+            
+            if len(buys) > 0:
+                buy_ret = buys['fwd_ret_5d'].mean() * 100
+                report.append(f"   {regime_name}:")
+                report.append(f"      BUY Signals: {len(buys)} | Avg 5d Ret: {buy_ret:+.2f}%")
+            
+            if len(sells) > 0:
+                sell_ret = sells['fwd_ret_5d'].mean() * 100
+                report.append(f"      SELL Signals: {len(sells)} | Avg 5d Ret: {sell_ret:+.2f}%")
+                
+    except Exception as e:
+        report.append(f"   Could not calculate regime metrics: {str(e)}")
+
+    # 7. Confidence Calibration (Buckets)
+    if 'confidence' in df.columns:
+        report.append("\n🎚️ CONFIDENCE CALIBRATION (BUY Signals)")
+        buy_df = df[df['signal'] == 1].copy()
+        if not buy_df.empty:
+            buy_df['conf_bucket'] = pd.cut(buy_df['confidence'], bins=[0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+            grouped = buy_df.groupby('conf_bucket')['fwd_ret_5d'].agg(['count', 'mean'])
+            
+            for bucket, row in grouped.iterrows():
+                if row['count'] > 0:
+                    report.append(f"   {bucket}: {int(row['count'])} trades | Avg 5d Ret: {row['mean']*100:+.2f}%")
+
     return "\n".join(report)
 
 
