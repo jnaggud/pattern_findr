@@ -228,6 +228,21 @@ def generate_features(data: pd.DataFrame) -> pd.DataFrame:
         df[f'composite_mean_{window}'] = df['composite_oscillator'].rolling(window).mean()
         df[f'composite_std_{window}'] = df['composite_oscillator'].rolling(window).std()
     
+    # ==============================================================================
+    # NEW: Interaction Features (Trend * Momentum)
+    # ==============================================================================
+    # Combine Trend Strength (dist_sma50) with Momentum (rsi)
+    if 'dist_sma50' in df.columns and 'rsi_14' in df.columns:
+        df['trend_momentum'] = df['dist_sma50'] * (df['rsi_14'] - 50)
+        
+    # Combine Volatility with Breakout
+    if 'volatility_20' in df.columns and 'breakout_20d' in df.columns:
+        df['vol_breakout'] = df['volatility_20'] * df['breakout_20d']
+        
+    # Relative Volume * Price Change (Volume Force)
+    if 'volume_ratio' in df.columns:
+        df['volume_force'] = df['volume_ratio'] * df['returns']
+
     # Drop NaN and select numeric features
     df = df.dropna()
     
@@ -641,11 +656,14 @@ def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float 
     return pd.Series(signals, index=features.index), prob_df
 
 
-def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float = 100000) -> dict:
-    """Run backtest with detailed trade tracking"""
+def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float = 100000, limit_pct: float = 0.0) -> dict:
+    """
+    Run backtest with detailed trade tracking.
+    If limit_pct > 0, attempts to enter at Close * (1 - limit_pct) on the NEXT day.
+    """
     common_idx = data.index.intersection(signals.index)
-    prices = data.loc[common_idx, 'close']
-    sigs = signals.loc[common_idx]
+    df = data.loc[common_idx].copy()
+    df['signal'] = signals.loc[common_idx]
     
     capital = initial_capital
     position = 0
@@ -653,30 +671,60 @@ def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float 
     trades = []
     equity_curve = []
     
-    for i, (date, price) in enumerate(prices.items()):
-        signal = sigs.iloc[i]
+    # Pre-calculate next day low for limit checks
+    if limit_pct > 0:
+        df['next_low'] = df['low'].shift(-1)
+    
+    for i in range(len(df)):
+        date = df.index[i]
+        row = df.iloc[i]
+        price = row['close']
+        signal = row['signal']
         
         # Track equity
         current_equity = shares * price if position == 1 else capital
         equity_curve.append({'date': date, 'equity': current_equity, 'price': price})
         
         if signal == 1 and position == 0:  # BUY
-            shares = capital / price
-            entry_capital = capital
-            position = 1
-            trades.append({
-                'type': 'BUY',
-                'entry_date': date,
-                'entry_price': price,
-                'shares': shares,
-                'entry_capital': entry_capital
-            })
+            entry_price = price
+            filled = True
+            fill_date = date
+            
+            if limit_pct > 0:
+                # Limit Logic: Try to fill next day
+                # Note: Since we are iterating, 'next_low' is the Low of i+1 (tomorrow)
+                # If we are at the last day, we can't fill tomorrow
+                if i < len(df) - 1:
+                    limit_price = price * (1 - limit_pct)
+                    next_low = row['next_low']
+                    
+                    if next_low <= limit_price:
+                        # Filled!
+                        entry_price = limit_price
+                        # We fill "tomorrow", but for simplicity in the log we keep signal date
+                        # or we could shift. Let's keep signal date but adjust price.
+                        filled = True
+                    else:
+                        filled = False # Missed trade
+                else:
+                    filled = False
+            
+            if filled:
+                shares = capital / entry_price
+                entry_capital = capital
+                position = 1
+                trades.append({
+                    'type': 'BUY',
+                    'entry_date': fill_date,
+                    'entry_price': entry_price,
+                    'shares': shares,
+                    'entry_capital': entry_capital
+                })
             
         elif signal == -1 and position == 1:  # SELL
             exit_value = shares * price
             profit = exit_value - trades[-1]['entry_capital']
             profit_pct = profit / trades[-1]['entry_capital'] * 100
-            
             trades[-1].update({
                 'exit_date': date,
                 'exit_price': price,
@@ -685,19 +733,19 @@ def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float 
                 'profit_pct': profit_pct,
                 'status': 'closed'
             })
-            
             capital = exit_value
             position = 0
             shares = 0
     
     # Handle open position
     if position == 1:
-        final_price = prices.iloc[-1]
+        final_price = df['close'].iloc[-1]
         exit_value = shares * final_price
         profit = exit_value - trades[-1]['entry_capital']
         profit_pct = profit / trades[-1]['entry_capital'] * 100
+        
         trades[-1].update({
-            'exit_date': prices.index[-1],
+            'exit_date': df.index[-1],
             'exit_price': final_price,
             'exit_value': exit_value,
             'profit': profit,
@@ -705,33 +753,33 @@ def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float 
             'status': 'open'
         })
         capital = exit_value
-    
+        
     # Calculate metrics
-    closed_trades = [t for t in trades if t.get('status') == 'closed']
-    winning_trades = [t for t in closed_trades if t.get('profit', 0) > 0]
-    
     total_return = (capital - initial_capital) / initial_capital * 100
-    win_rate = len(winning_trades) / len(closed_trades) * 100 if closed_trades else 0
     
-    # Buy and hold comparison
-    buy_hold_return = (prices.iloc[-1] - prices.iloc[0]) / prices.iloc[0] * 100
-    
-    # Max drawdown
+    if trades:
+        profits = [t.get('profit_pct', 0) for t in trades]
+        avg_trade_return = sum(profits) / len(profits)
+    else:
+        avg_trade_return = 0
+        
+    # Create equity curve df
     equity_df = pd.DataFrame(equity_curve)
-    equity_df['peak'] = equity_df['equity'].cummax()
-    equity_df['drawdown'] = (equity_df['equity'] - equity_df['peak']) / equity_df['peak'] * 100
-    max_drawdown = equity_df['drawdown'].min()
+    
+    # Calculate Buy & Hold
+    initial_close = df['close'].iloc[0]
+    final_close = df['close'].iloc[-1]
+    bh_return = (final_close - initial_close) / initial_close * 100
     
     return {
+        'total_return': total_return,
+        'final_capital': capital,
+        'num_trades': len(trades),
+        'avg_trade_return': avg_trade_return,
         'trades': trades,
         'equity_curve': equity_df,
-        'total_return': total_return,
-        'buy_hold_return': buy_hold_return,
-        'win_rate': win_rate,
-        'num_trades': len(closed_trades),
-        'max_drawdown': max_drawdown,
-        'final_equity': capital,
-        'initial_capital': initial_capital,
+        'buy_hold_return': bh_return,
+        'initial_capital': initial_capital
     }
 
 
@@ -1162,6 +1210,10 @@ with tab2:
     # Show selected backtest mode info
     st.info(f"📅 **Backtest Mode:** {backtest_mode}")
     
+    # Execution Settings
+    limit_entry_pct = st.slider("Entry Limit Offset %", 0.0, 3.0, 0.0, 0.1, 
+                               help="Try to buy lower than signal price (e.g. 1.0% lower). 0 = Market Order.") / 100
+    
     if st.button("📊 Generate Signals & Backtest", type="primary", use_container_width=True):
         with st.spinner("Loading model and generating signals..."):
             # Load model
@@ -1262,7 +1314,7 @@ with tab2:
                 composite_indicator = composite_indicator.loc[signals.index]
             
             # Run backtest
-            backtest = run_backtest(data, signals)
+            backtest = run_backtest(data, signals, limit_pct=limit_entry_pct)
             st.session_state.v2_backtest = backtest
             
             # Calculate theoretical maximum for this period
