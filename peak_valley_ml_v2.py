@@ -203,7 +203,8 @@ def generate_features(data: pd.DataFrame) -> pd.DataFrame:
 def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series, 
                             model_type: str = 'xgboost', use_smote: bool = True,
                             n_trials: int = 20, progress_callback=None,
-                            optimize_metric: str = 'f1_weighted', n_cv_splits: int = 5):
+                            optimize_metric: str = 'f1_weighted', n_cv_splits: int = 5,
+                            class_weight_ratio: float = 1.0):
     """
     Train model with Optuna optimization and SMOTE balancing.
     Uses proper time series cross-validation (no future data leakage).
@@ -211,10 +212,12 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
     Args:
         optimize_metric: 'f1_weighted', 'accuracy', or 'f1_macro'
         n_cv_splits: Number of TimeSeriesSplit folds (default 5)
+        class_weight_ratio: Multiplier for BUY/SELL class weights (default 1.0)
     """
     from sklearn.model_selection import cross_val_score, TimeSeriesSplit
     from sklearn.preprocessing import StandardScaler, LabelEncoder
     from sklearn.metrics import accuracy_score, f1_score, classification_report
+    from sklearn.utils.class_weight import compute_sample_weight
     import optuna
     
     # Console output header
@@ -264,6 +267,25 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
         y_train_encoded = y_train_balanced
         y_test_encoded = y_test.values
     
+    # Calculate sample weights if ratio > 1.0
+    sample_weights = None
+    if class_weight_ratio > 1.0:
+        # Identify classes: 0=HOLD, -1=SELL, 1=BUY
+        # If label encoded, map accordingly
+        if label_encoder:
+            # Map original labels to encoded
+            hold_val = label_encoder.transform([0])[0]
+            buy_val = label_encoder.transform([1])[0]
+            sell_val = label_encoder.transform([-1])[0]
+        else:
+            hold_val, buy_val, sell_val = 0, 1, -1
+            
+        weights = np.ones(len(y_train_encoded))
+        weights[y_train_encoded == buy_val] = class_weight_ratio
+        weights[y_train_encoded == sell_val] = class_weight_ratio
+        sample_weights = weights
+        print(f"⚖️  Applied class weights: BUY/SELL={class_weight_ratio}x, HOLD=1.0x")
+    
     print(f"\n🎯 Optimization target: {optimize_metric}")
     print(f"📊 Time Series CV: {n_cv_splits} folds (forward-chaining, no look-ahead)")
     print("-"*70)
@@ -306,13 +328,28 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
                 'random_state': 42,
                 'n_jobs': 1  # Single thread per model (parallelism at trial level)
             }
+            
+            # For Random Forest, we can use class_weight param directly
+            if class_weight_ratio > 1.0:
+                # Map: 0=HOLD, 1=BUY, -1=SELL (if not encoded)
+                # If encoded, we need to know the integer mapping.
+                # Let's assume balanced/encoded labels.
+                # Easier to rely on sample_weight in fit_params for consistency with XGBoost
+                pass
+                
             model = RandomForestClassifier(**params)
+        
+        # Prepare fit params for sample weights
+        fit_params = {}
+        if sample_weights is not None:
+            fit_params['sample_weight'] = sample_weights
         
         # Time Series Cross-Validation (forward-chaining)
         # n_jobs=1 here since we parallelize at trial level
         tscv = TimeSeriesSplit(n_splits=n_cv_splits)
         scores = cross_val_score(model, X_train_balanced, y_train_encoded, 
-                                cv=tscv, scoring=optimize_metric, n_jobs=1)
+                                cv=tscv, scoring=optimize_metric, n_jobs=1,
+                                fit_params=fit_params)
         
         mean_score = scores.mean()
         std_score = scores.std()
@@ -372,7 +409,11 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
         best_params.update({'random_state': 42, 'n_jobs': -1})
         model = RandomForestClassifier(**best_params)
     
-    model.fit(X_train_balanced, y_train_encoded)
+    # Apply sample weights if available
+    if sample_weights is not None:
+        model.fit(X_train_balanced, y_train_encoded, sample_weight=sample_weights)
+    else:
+        model.fit(X_train_balanced, y_train_encoded)
     
     # Predictions on held-out test set
     y_pred = model.predict(X_test_scaled)
@@ -468,31 +509,78 @@ def load_model(filepath: str) -> dict:
     return joblib.load(filepath)
 
 
-def generate_signals(model_data: dict, features: pd.DataFrame) -> pd.Series:
-    """Generate trading signals using the model"""
-    # Match features
-    required = model_data['feature_names']
-    available = [f for f in required if f in features.columns]
+def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float = 0.5) -> tuple[pd.Series, pd.DataFrame]:
+    """
+    Generate signals using the trained model with custom threshold.
+    Returns: (signals, probabilities)
+    """
+    model = model_data['model']
+    scaler = model_data['scaler']
+    label_encoder = model_data['label_encoder']
+    feature_names = model_data['feature_names']
     
-    if len(available) < len(required) * 0.8:
-        raise ValueError(f"Feature mismatch: need {len(required)}, have {len(available)}")
+    # Align features
+    common_features = [f for f in feature_names if f in features.columns]
+    if len(common_features) < len(feature_names):
+        st.warning(f"Missing {len(feature_names) - len(common_features)} features in current data")
     
-    # Fill missing features with 0
-    X = features.reindex(columns=required, fill_value=0)
+    X = features[feature_names]
     
     # Scale
-    X_scaled = model_data['scaler'].transform(X)
+    X_scaled = scaler.transform(X)
     
-    # Predict
-    raw_pred = model_data['model'].predict(X_scaled)
+    # Get probabilities
+    probs = model.predict_proba(X_scaled)
     
-    # Decode
-    if model_data.get('label_encoder'):
-        predictions = model_data['label_encoder'].inverse_transform(raw_pred)
+    # Determine classes based on threshold
+    # Default classes: 0, 1, 2 (mapped from -1, 0, 1 usually)
+    # We need to know which column corresponds to which class
+    classes = model.classes_
+    
+    # Map encoded classes back to -1, 0, 1
+    if label_encoder:
+        original_classes = label_encoder.inverse_transform(classes)
     else:
-        predictions = raw_pred
+        original_classes = classes
+        
+    # Find column indices for each class
+    try:
+        buy_idx = np.where(original_classes == 1)[0][0]
+        sell_idx = np.where(original_classes == -1)[0][0]
+        hold_idx = np.where(original_classes == 0)[0][0]
+    except IndexError:
+        # Fallback if some classes are missing (unlikely with proper training)
+        return pd.Series(0, index=features.index), pd.DataFrame(probs, index=features.index, columns=original_classes)
     
-    return pd.Series(predictions, index=features.index, name='signal')
+    # Apply threshold logic
+    # If prob(BUY) > threshold -> BUY
+    # If prob(SELL) > threshold -> SELL
+    # Else -> HOLD
+    
+    signals = np.zeros(len(X))
+    
+    # Vectorized threshold application
+    buy_mask = probs[:, buy_idx] > threshold
+    sell_mask = probs[:, sell_idx] > threshold
+    
+    # Conflict resolution: if both > threshold, pick higher prob
+    conflict_mask = buy_mask & sell_mask
+    if conflict_mask.any():
+        buy_higher = probs[:, buy_idx] > probs[:, sell_idx]
+        buy_mask[conflict_mask] = buy_higher[conflict_mask]
+        sell_mask[conflict_mask] = ~buy_higher[conflict_mask]
+        
+    signals[buy_mask] = 1
+    signals[sell_mask] = -1
+    
+    # Create DataFrame for probabilities
+    prob_df = pd.DataFrame(probs, index=features.index, columns=[f"prob_{c}" for c in original_classes])
+    
+    # Add confidence score (prob of predicted class)
+    prob_df['confidence'] = probs.max(axis=1)
+    prob_df['predicted_signal'] = signals
+    
+    return pd.Series(signals, index=features.index), prob_df
 
 
 def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float = 100000) -> dict:
@@ -697,6 +785,14 @@ with st.sidebar:
     n_cv_splits = st.slider("CV Folds", 3, 10, 5, 
                            help="Number of TimeSeriesSplit folds for cross-validation")
     
+    # Advanced Model Config
+    with st.expander("⚙️ Advanced Model Config"):
+        st.caption("Fine-tune how aggressive the model is")
+        class_weight_ratio = st.slider("Class Weight Ratio", 1.0, 10.0, 1.0, 0.5,
+                                      help="Higher = penalize missing BUY/SELL signals more heavily. 1.0 = Equal weights.")
+        decision_threshold = st.slider("Decision Threshold", 0.3, 0.9, 0.5, 0.05,
+                                      help="Lower = more aggressive signals. Higher = higher confidence required.")
+    
     detection_order = st.slider("Peak/Valley Sensitivity", 3, 10, 5,
                                help="Lower = more sensitive")
     
@@ -806,9 +902,10 @@ with tab1:
         model_data = train_model_with_optuna(
             features, labels, model_type, use_smote,
             n_trials=n_trials if use_optuna else 1,
-            progress_callback=update_progress if use_optuna else None,
+            progress_callback=None, # Console only now
             optimize_metric=optimize_metric,
-            n_cv_splits=n_cv_splits
+            n_cv_splits=n_cv_splits,
+            class_weight_ratio=class_weight_ratio
         )
         
         st.session_state.v2_model = model_data
@@ -900,16 +997,66 @@ with tab2:
             # Generate features
             features = generate_features(data)
             
-            # Generate signals
-            signals = generate_signals(model_data, features)
+            # Generate signals with custom threshold
+            signals, prob_df = generate_signals(model_data, features, threshold=decision_threshold)
+            
+            # Calculate Composite Technical Indicator (Average of normalized oscillators)
+            # Use features already generated
+            oscillators = pd.DataFrame(index=features.index)
+            
+            # RSI (normalized to -1 to 1)
+            if 'rsi_14' in features.columns:
+                oscillators['rsi_norm'] = (features['rsi_14'] - 50) / 50
+            
+            # Williams %R (already -100 to 0, normalize to -1 to 1)
+            if 'willr_14' in features.columns:
+                oscillators['willr_norm'] = (features['willr_14'] + 50) / 50
+            
+            # CCI (normalize by dividing by 100, clip to -1 to 1)
+            if 'cci_14' in features.columns:
+                oscillators['cci_norm'] = (features['cci_14'] / 100).clip(-1, 1)
+            
+            # ROC (normalize, soft clip)
+            if 'roc_10' in features.columns:
+                oscillators['roc_norm'] = (features['roc_10'] / 5).clip(-1, 1)
+                
+            # Calculate composite
+            if not oscillators.empty:
+                composite_indicator = oscillators.mean(axis=1)
+            else:
+                composite_indicator = pd.Series(0, index=features.index)
+            
+            # Store composite and confidence in session state for plotting
+            st.session_state.v2_composite = composite_indicator
+            st.session_state.v2_probs = prob_df
+            
+            # Save detailed analysis output
+            analysis_dir = "analysis"
+            os.makedirs(analysis_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # Save signals and probs
+            analysis_df = pd.concat([
+                data[['open', 'high', 'low', 'close', 'volume']],
+                signals.rename('signal'),
+                prob_df,
+                composite_indicator.rename('composite_indicator')
+            ], axis=1)
+            
+            analysis_path = os.path.join(analysis_dir, f"analysis_{ticker}_{timestamp}.csv")
+            analysis_df.to_csv(analysis_path)
             
             # For "Recent Days" mode, trim to exact days requested
             if backtest_mode == "Recent Days":
                 signals = signals.iloc[-prod_days:]
                 data = data.loc[signals.index]
+                prob_df = prob_df.loc[signals.index]
+                composite_indicator = composite_indicator.loc[signals.index]
             else:
                 # Align data with signals (features drop some rows due to NaN)
                 data = data.loc[signals.index]
+                prob_df = prob_df.loc[signals.index]
+                composite_indicator = composite_indicator.loc[signals.index]
             
             # Run backtest
             backtest = run_backtest(data, signals)
@@ -1102,10 +1249,10 @@ with tab2:
         recent_trades = [t for t in backtest['trades'] 
                         if t['entry_date'] >= recent_data.index[0]]
         
-        # Create recent chart
-        fig2 = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                            vertical_spacing=0.05, row_heights=[0.75, 0.25],
-                            subplot_titles=('Recent Price Action & Signals', 'Recent Equity'))
+        # Create recent chart with 3 subplots (Price, Equity, Technicals)
+        fig2 = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                            vertical_spacing=0.05, row_heights=[0.6, 0.2, 0.2],
+                            subplot_titles=('Recent Price Action & Signals', 'Recent Equity', 'Technicals (Confidence & Composite)'))
         
         # Candlestick for recent period
         fig2.add_trace(go.Candlestick(
@@ -1208,15 +1355,55 @@ with tab2:
                 line=dict(color='gray', width=1, dash='dash')
             ), row=2, col=1)
         
+        # ROW 3: TECHNICALS
+        # 1. Model Confidence (Blue)
+        # Use prob of predicted class * signal sign (-1 or 1)
+        recent_probs = prob_df[prob_df.index >= recent_data.index[0]]
+        recent_composite = composite_indicator[composite_indicator.index >= recent_data.index[0]]
+        
+        if not recent_probs.empty:
+            # Confidence signal: +confidence for BUY, -confidence for SELL, 0 for HOLD
+            conf_signal = recent_probs['predicted_signal'] * recent_probs['confidence']
+            
+            # Plot confidence line
+            fig2.add_trace(go.Scatter(
+                x=recent_probs.index,
+                y=conf_signal,
+                mode='lines',
+                name='Model Confidence',
+                line=dict(color='blue', width=2),
+                fill='tozeroy',
+                fillcolor='rgba(0,0,255,0.1)'
+            ), row=3, col=1)
+        
+        # 2. Composite Indicator (Orange)
+        if not recent_composite.empty:
+            fig2.add_trace(go.Scatter(
+                x=recent_composite.index,
+                y=recent_composite,
+                mode='lines',
+                name='Composite Tech',
+                line=dict(color='orange', width=1, dash='dot')
+            ), row=3, col=1)
+        
+        # Add threshold lines
+        fig2.add_shape(type="line", x0=recent_data.index[0], x1=recent_data.index[-1], y0=0, y1=0,
+                      line=dict(color="gray", width=1, dash="dot"), row=3, col=1)
+        fig2.add_shape(type="line", x0=recent_data.index[0], x1=recent_data.index[-1], y0=decision_threshold, y1=decision_threshold,
+                      line=dict(color="green", width=1, dash="dot"), row=3, col=1)
+        fig2.add_shape(type="line", x0=recent_data.index[0], x1=recent_data.index[-1], y0=-decision_threshold, y1=-decision_threshold,
+                      line=dict(color="red", width=1, dash="dot"), row=3, col=1)
+        
         fig2.update_layout(
             title=f"Last {len(recent_data)} Trading Days - {model_ticker}",
-            height=600,
+            height=900,
             xaxis_rangeslider_visible=False,
             showlegend=True,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1)
         )
         fig2.update_yaxes(title_text="Price", row=1, col=1)
         fig2.update_yaxes(title_text="Equity ($)", row=2, col=1)
+        fig2.update_yaxes(title_text="Signal", row=3, col=1, range=[-1.1, 1.1])
         
         st.plotly_chart(fig2, use_container_width=True)
         
