@@ -175,17 +175,36 @@ def generate_features(data: pd.DataFrame) -> pd.DataFrame:
     df['volume_sma_20'] = ta.sma(df['volume'], length=20)
     df['volume_ratio'] = df['volume'] / df['volume_sma_20']
     
+    # ==============================================================================
+    # NEW: Composite Oscillator & ROC
+    # ==============================================================================
+    # Normalize key oscillators to -1 to 1 range
+    rsi_norm = (df['rsi_14'] - 50) / 50
+    willr_norm = (df['willr_14'] + 50) / 50
+    cci_norm = (df['cci_14'] / 100).clip(-1, 1)
+    roc_norm = (df['roc_10'] / 5).clip(-1, 1)
+    
+    # Calculate composite (average of available normalized oscillators)
+    df['composite_oscillator'] = (rsi_norm + willr_norm + cci_norm + roc_norm) / 4
+    
+    # Calculate ROC of the composite oscillator (how fast is momentum changing?)
+    df['composite_roc_5'] = df['composite_oscillator'].diff(5)
+    df['composite_roc_10'] = df['composite_oscillator'].diff(10)
+    
     # Lagged features
     for lag in [1, 2, 3, 5]:
         df[f'returns_lag_{lag}'] = df['returns'].shift(lag)
         df[f'rsi_14_lag_{lag}'] = df['rsi_14'].shift(lag)
         df[f'close_lag_{lag}'] = df['close'].pct_change(lag)
+        df[f'composite_lag_{lag}'] = df['composite_oscillator'].shift(lag)
     
     # Rolling statistics
     for window in [5, 10, 20]:
         df[f'returns_mean_{window}'] = df['returns'].rolling(window).mean()
         df[f'returns_std_{window}'] = df['returns'].rolling(window).std()
         df[f'rsi_mean_{window}'] = df['rsi_14'].rolling(window).mean()
+        df[f'composite_mean_{window}'] = df['composite_oscillator'].rolling(window).mean()
+        df[f'composite_std_{window}'] = df['composite_oscillator'].rolling(window).std()
     
     # Drop NaN and select numeric features
     df = df.dropna()
@@ -755,6 +774,110 @@ def calculate_theoretical_return(data: pd.DataFrame, peak_dates: list, valley_da
         'avg_trade_return': avg_trade_return,
         'trades': trades
     }
+
+
+def run_comprehensive_analysis(analysis_dir: str = "analysis") -> str:
+    """
+    Run deep analysis on the latest output file.
+    Returns the report as a string.
+    """
+    if not os.path.exists(analysis_dir):
+        return "No analysis directory found."
+    
+    # Find latest file
+    files = [f for f in os.listdir(analysis_dir) if f.endswith('.csv')]
+    if not files:
+        return "No analysis files found."
+    
+    latest_file = sorted(files)[-1]
+    filepath = os.path.join(analysis_dir, latest_file)
+    
+    try:
+        df = pd.read_csv(filepath, index_col=0, parse_dates=True)
+    except Exception as e:
+        return f"Error reading file: {e}"
+    
+    report = []
+    report.append("="*60)
+    report.append(f"🔍 COMPREHENSIVE ANALYSIS REPORT")
+    report.append(f"File: {latest_file}")
+    report.append(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    report.append("="*60)
+    
+    # 1. Signal Distribution
+    report.append("\n📊 SIGNAL DISTRIBUTION")
+    sig_counts = df['signal'].value_counts()
+    total_sigs = len(df)
+    for sig, count in sig_counts.items():
+        label = "BUY (1)" if sig == 1 else "SELL (-1)" if sig == -1 else "HOLD (0)"
+        report.append(f"   {label}: {count} ({count/total_sigs*100:.1f}%)")
+    
+    # 2. Confidence Analysis
+    if 'confidence' in df.columns:
+        report.append("\n🧠 MODEL CONFIDENCE")
+        avg_conf = df['confidence'].mean()
+        report.append(f"   Average Confidence: {avg_conf:.1%}")
+        
+        # Confidence by signal type
+        for sig in [1, -1, 0]:
+            mask = df['signal'] == sig
+            if mask.any():
+                sig_conf = df.loc[mask, 'confidence'].mean()
+                label = "BUY" if sig == 1 else "SELL" if sig == -1 else "HOLD"
+                report.append(f"   Avg {label} Confidence: {sig_conf:.1%}")
+    
+    # 3. Signal Quality (vs Future Returns)
+    report.append("\n🎯 SIGNAL QUALITY (Forward Returns)")
+    
+    # Calculate forward returns if not present (simple close-to-close)
+    for period in [1, 3, 5, 10]:
+        df[f'fwd_ret_{period}d'] = df['close'].shift(-period) / df['close'] - 1
+    
+    for sig in [1, -1]:
+        mask = df['signal'] == sig
+        if not mask.any():
+            continue
+            
+        label = "BUY" if sig == 1 else "SELL"
+        report.append(f"\n   {label} Signals ({mask.sum()}):")
+        
+        for period in [1, 3, 5, 10]:
+            avg_ret = df.loc[mask, f'fwd_ret_{period}d'].mean() * 100
+            win_rate = (df.loc[mask, f'fwd_ret_{period}d'] > 0).mean() * 100 if sig == 1 else (df.loc[mask, f'fwd_ret_{period}d'] < 0).mean() * 100
+            report.append(f"      {period}d Forward Return: {avg_ret:+.2f}% | Win Rate: {win_rate:.1f}%")
+    
+    # 4. Missed Opportunities (Big Moves not captured)
+    report.append("\n📉 MISSED OPPORTUNITIES")
+    # Find days with > 3% move where signal was HOLD
+    big_move_mask = (df['close'].pct_change().abs() > 0.03) & (df['signal'] == 0)
+    missed_days = big_move_mask.sum()
+    report.append(f"   Big moves (>3%) missed: {missed_days}")
+    
+    if missed_days > 0:
+        report.append("   Top 3 Missed Days:")
+        missed = df[big_move_mask].copy()
+        missed['abs_ret'] = missed['close'].pct_change().abs()
+        top_missed = missed.sort_values('abs_ret', ascending=False).head(3)
+        for date, row in top_missed.iterrows():
+            pct = row['close'] / df['close'].shift(1).loc[date] - 1
+            report.append(f"      {date.strftime('%Y-%m-%d')}: {pct*100:+.1f}% (Conf: {row.get('confidence', 0):.1%})")
+    
+    # 5. Composite Indicator Correlation
+    if 'composite_indicator' in df.columns:
+        report.append("\n🔗 COMPOSITE INDICATOR CORRELATION")
+        corr = df['composite_indicator'].corr(df['close'].pct_change())
+        report.append(f"   Correlation with Price Returns: {corr:+.3f}")
+        
+        # Avg composite value per signal
+        report.append("   Avg Composite Value per Signal:")
+        for sig in [1, -1, 0]:
+            mask = df['signal'] == sig
+            if mask.any():
+                avg_val = df.loc[mask, 'composite_indicator'].mean()
+                label = "BUY" if sig == 1 else "SELL" if sig == -1 else "HOLD"
+                report.append(f"      {label}: {avg_val:+.3f}")
+
+    return "\n".join(report)
 
 
 # =============================================================================
@@ -1471,6 +1594,25 @@ with tab3:
         st.stop()
     
     selected_analysis_model = st.selectbox("Select Model to Analyze", model_options, key="analysis_model_select")
+    
+    # Deep Analysis Button
+    st.markdown("---")
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        if st.button("🔬 Run Deep Analysis", type="primary", use_container_width=True):
+            with st.spinner("Analyzing latest results..."):
+                report = run_comprehensive_analysis()
+                st.session_state.v2_analysis_report = report
+    with col2:
+        if 'v2_analysis_report' in st.session_state:
+            st.download_button("📥 Download Report", 
+                             st.session_state.v2_analysis_report, 
+                             file_name=f"analysis_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+    
+    if 'v2_analysis_report' in st.session_state:
+        with st.expander("📄 Comprehensive Analysis Report", expanded=True):
+            st.text(st.session_state.v2_analysis_report)
+    st.markdown("---")
     
     # Load the selected model data
     if selected_analysis_model == "📍 Current Session Model":
