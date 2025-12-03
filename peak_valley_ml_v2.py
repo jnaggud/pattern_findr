@@ -268,11 +268,14 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
     print(f"📊 Time Series CV: {n_cv_splits} folds (forward-chaining, no look-ahead)")
     print("-"*70)
     
-    # Track best trial for console output
+    # Thread-safe tracking for parallel execution
+    import threading
+    lock = threading.Lock()
     best_score_so_far = [0.0]
     best_trial_num = [0]
+    completed_trials = [0]
     
-    # Optuna optimization with console logging
+    # Optuna optimization with console logging (thread-safe)
     def objective(trial):
         if model_type == 'xgboost':
             from xgboost import XGBClassifier
@@ -288,7 +291,8 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
                 'random_state': 42,
                 'use_label_encoder': False,
                 'eval_metric': 'mlogloss',
-                'verbosity': 0
+                'verbosity': 0,
+                'n_jobs': 1  # Single thread per model (parallelism at trial level)
             }
             model = XGBClassifier(**params)
         else:
@@ -300,45 +304,55 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
                 'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 10),
                 'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2', None]),
                 'random_state': 42,
-                'n_jobs': -1
+                'n_jobs': 1  # Single thread per model (parallelism at trial level)
             }
             model = RandomForestClassifier(**params)
         
         # Time Series Cross-Validation (forward-chaining)
-        # This ensures we never train on future data
+        # n_jobs=1 here since we parallelize at trial level
         tscv = TimeSeriesSplit(n_splits=n_cv_splits)
         scores = cross_val_score(model, X_train_balanced, y_train_encoded, 
-                                cv=tscv, scoring=optimize_metric, n_jobs=-1)
+                                cv=tscv, scoring=optimize_metric, n_jobs=1)
         
         mean_score = scores.mean()
         std_score = scores.std()
         
-        # Console output for each trial
-        trial_num = trial.number + 1
-        is_best = mean_score > best_score_so_far[0]
-        if is_best:
-            best_score_so_far[0] = mean_score
-            best_trial_num[0] = trial_num
-            marker = "⭐ NEW BEST"
-        else:
-            marker = ""
-        
-        print(f"Trial {trial_num:3d}/{n_trials} | CV Score: {mean_score:.4f} (±{std_score:.4f}) | Best: {best_score_so_far[0]:.4f} {marker}")
+        # Thread-safe console output
+        with lock:
+            completed_trials[0] += 1
+            trial_num = completed_trials[0]
+            is_best = mean_score > best_score_so_far[0]
+            if is_best:
+                best_score_so_far[0] = mean_score
+                best_trial_num[0] = trial.number + 1
+                marker = "⭐ NEW BEST"
+            else:
+                marker = ""
+            
+            print(f"Trial {trial_num:3d}/{n_trials} | CV Score: {mean_score:.4f} (±{std_score:.4f}) | Best: {best_score_so_far[0]:.4f} {marker}")
         
         return mean_score
     
     # Callback for UI progress
     def optuna_callback(study, trial):
         if progress_callback:
-            progress_callback(trial.number + 1, n_trials)
+            # Use len(study.trials) for thread-safe count
+            progress_callback(len(study.trials), n_trials)
     
-    # Run optimization
+    # Determine number of parallel jobs (all cores except 1)
+    import multiprocessing
+    n_cores = multiprocessing.cpu_count()
+    n_jobs_optuna = max(1, n_cores - 1)  # Leave 1 core free for system
+    
+    # Run optimization with parallel trials
     print(f"\n🔍 Starting Optuna optimization ({n_trials} trials)...")
+    print(f"🖥️  Using {n_jobs_optuna} parallel workers (of {n_cores} cores)")
     print("-"*70)
     
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False, callbacks=[optuna_callback])
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False, 
+                  callbacks=[optuna_callback], n_jobs=n_jobs_optuna)
     
     best_params = study.best_params
     
