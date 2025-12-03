@@ -117,7 +117,11 @@ def generate_features(data: pd.DataFrame) -> pd.DataFrame:
     for period in [5, 10, 20, 50]:
         df[f'sma_{period}'] = ta.sma(df['close'], length=period)
         df[f'ema_{period}'] = ta.ema(df['close'], length=period)
-        df[f'close_to_sma{period}'] = df['close'] / df[f'sma_{period}'] - 1
+        
+        # OPTIMIZATION: Remove short-term mean reversion to force trend learning
+        # We skip 5 and 10 to stop the model from overfitting to noise
+        if period >= 20:
+            df[f'close_to_sma{period}'] = df['close'] / df[f'sma_{period}'] - 1
     
     # Momentum indicators
     df['rsi_14'] = ta.rsi(df['close'], length=14)
