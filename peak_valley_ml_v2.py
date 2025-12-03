@@ -191,6 +191,28 @@ def generate_features(data: pd.DataFrame) -> pd.DataFrame:
     df['composite_roc_5'] = df['composite_oscillator'].diff(5)
     df['composite_roc_10'] = df['composite_oscillator'].diff(10)
     
+    # ==============================================================================
+    # NEW: Breakout & Trend Features (Catch "Black Swans")
+    # ==============================================================================
+    # Long-term momentum
+    df['roc_50'] = ta.roc(df['close'], length=50)
+    
+    # Distance from SMA50 (Trend Strength)
+    if 'sma_50' in df.columns:
+        df['dist_sma50'] = (df['close'] - df['sma_50']) / df['sma_50']
+    
+    # Breakout Signal: Close > 20-day High (Donchian Channel Breakout)
+    # Shift 1 to compare Today's Close vs Previous 20 days High
+    df['high_20d'] = df['high'].rolling(20).max().shift(1)
+    df['breakout_20d'] = (df['close'] > df['high_20d']).astype(int)
+    
+    # ADX Trend Strength
+    # pandas_ta returns columns like ADX_14, DMP_14, DMN_14
+    # We concatenated them earlier, so check columns
+    adx_col = [c for c in df.columns if c.startswith('ADX_')]
+    if adx_col:
+        df['adx_trend'] = (df[adx_col[0]] > 25).astype(int)
+    
     # Lagged features
     for lag in [1, 2, 3, 5]:
         df[f'returns_lag_{lag}'] = df['returns'].shift(lag)
@@ -358,20 +380,37 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
                 
             model = RandomForestClassifier(**params)
         
-        # Prepare fit params for sample weights
-        fit_params = {}
-        if sample_weights is not None:
-            fit_params['sample_weight'] = sample_weights
-        
         # Time Series Cross-Validation (forward-chaining)
-        # n_jobs=1 here since we parallelize at trial level
+        # Manual loop to handle sample_weights correctly and avoid sklearn version issues
         tscv = TimeSeriesSplit(n_splits=n_cv_splits)
-        scores = cross_val_score(model, X_train_balanced, y_train_encoded, 
-                                cv=tscv, scoring=optimize_metric, n_jobs=1,
-                                fit_params=fit_params)
+        scores = []
         
-        mean_score = scores.mean()
-        std_score = scores.std()
+        for train_index, val_index in tscv.split(X_train_balanced):
+            X_tr, X_val = X_train_balanced[train_index], X_train_balanced[val_index]
+            y_tr, y_val = y_train_encoded[train_index], y_train_encoded[val_index]
+            
+            # Split weights if they exist
+            if sample_weights is not None:
+                w_tr = sample_weights[train_index]
+                model.fit(X_tr, y_tr, sample_weight=w_tr)
+            else:
+                model.fit(X_tr, y_tr)
+            
+            y_pred = model.predict(X_val)
+            
+            if optimize_metric == 'f1_weighted':
+                score = f1_score(y_val, y_pred, average='weighted')
+            elif optimize_metric == 'accuracy':
+                score = accuracy_score(y_val, y_pred)
+            elif optimize_metric == 'f1_macro':
+                score = f1_score(y_val, y_pred, average='macro')
+            else:
+                score = f1_score(y_val, y_pred, average='weighted') # Default
+                
+            scores.append(score)
+        
+        mean_score = np.mean(scores)
+        std_score = np.std(scores)
         
         # Thread-safe console output
         with lock:
