@@ -924,47 +924,117 @@ with tab2:
 with tab3:
     st.header("Model Analysis")
     
-    if not st.session_state.v2_trained or st.session_state.v2_model is None:
-        st.info("👈 Train a model first to see analysis")
+    # Model selection - current session or saved models
+    model_dir = "saved_models_v2"
+    saved_models = []
+    if os.path.exists(model_dir):
+        saved_models = sorted([f for f in os.listdir(model_dir) if f.endswith('.joblib')], reverse=True)
+    
+    # Build selection options
+    model_options = []
+    if st.session_state.v2_trained and st.session_state.v2_model is not None:
+        model_options.append("📍 Current Session Model")
+    model_options.extend([f"💾 {f}" for f in saved_models])
+    
+    if not model_options:
+        st.info("👈 Train a model or load a saved model to see analysis")
         st.stop()
     
-    model_data = st.session_state.v2_model
+    selected_analysis_model = st.selectbox("Select Model to Analyze", model_options, key="analysis_model_select")
+    
+    # Load the selected model data
+    if selected_analysis_model == "📍 Current Session Model":
+        model_data = st.session_state.v2_model
+        model_source = "Current Session"
+    else:
+        # Load from file
+        model_filename = selected_analysis_model.replace("💾 ", "")
+        model_path = os.path.join(model_dir, model_filename)
+        loaded_model = load_model(model_path)
+        
+        # Convert loaded model format to analysis format
+        model_data = {
+            'model': loaded_model['model'],
+            'scaler': loaded_model['scaler'],
+            'label_encoder': loaded_model.get('label_encoder'),
+            'feature_names': loaded_model['feature_names'],
+            'model_type': loaded_model['model_type'],
+            'best_params': loaded_model.get('best_params', {}),
+            'accuracy': loaded_model.get('metrics', {}).get('accuracy', 0),
+            'f1_score': loaded_model.get('metrics', {}).get('f1_score', 0),
+            'cv_score': loaded_model.get('metrics', {}).get('cv_score', 0),
+            'train_size': 0,  # Not stored in saved model
+            'test_size': 0,
+            'label_distribution': {},
+            'split_date': None,
+            'use_smote': True,  # Assume true for saved models
+            'feature_importance': None,
+        }
+        
+        # Try to get feature importance from loaded model
+        if hasattr(loaded_model['model'], 'feature_importances_'):
+            model_data['feature_importance'] = pd.DataFrame({
+                'feature': loaded_model['feature_names'],
+                'importance': loaded_model['model'].feature_importances_
+            }).sort_values('importance', ascending=False)
+        
+        model_source = model_filename
+    
+    st.success(f"📊 Analyzing: **{model_source}**")
     
     # Model metrics
     st.subheader("📊 Model Performance")
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("Accuracy", f"{model_data['accuracy']:.1%}")
+        acc = model_data.get('accuracy', 0)
+        st.metric("Accuracy", f"{acc:.1%}" if acc else "N/A")
     with col2:
-        st.metric("F1 Score", f"{model_data['f1_score']:.1%}")
+        f1 = model_data.get('f1_score', 0)
+        st.metric("F1 Score", f"{f1:.1%}" if f1 else "N/A")
     with col3:
-        st.metric("CV Score", f"{model_data['cv_score']:.1%}")
+        cv = model_data.get('cv_score', 0)
+        st.metric("CV Score", f"{cv:.1%}" if cv else "N/A")
     with col4:
-        st.metric("Train/Test", f"{model_data['train_size']}/{model_data['test_size']}")
+        train = model_data.get('train_size', 0)
+        test = model_data.get('test_size', 0)
+        st.metric("Train/Test", f"{train}/{test}" if train else "N/A")
     
-    # Label distribution
-    st.subheader("📈 Label Distribution")
-    dist = model_data['label_distribution']
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("BUY (1)", dist.get(1, 0))
-    with col2:
-        st.metric("HOLD (0)", dist.get(0, 0))
-    with col3:
-        st.metric("SELL (-1)", dist.get(-1, 0))
+    # Label distribution (only for current session)
+    dist = model_data.get('label_distribution', {})
+    if dist:
+        st.subheader("📈 Label Distribution")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("BUY (1)", dist.get(1, 0))
+        with col2:
+            st.metric("HOLD (0)", dist.get(0, 0))
+        with col3:
+            st.metric("SELL (-1)", dist.get(-1, 0))
     
     # Training settings
-    st.subheader("⚙️ Training Configuration")
+    st.subheader("⚙️ Model Configuration")
     col1, col2 = st.columns(2)
     with col1:
-        st.info(f"**Model Type:** {model_data['model_type']}")
-        st.info(f"**SMOTE:** {'Enabled' if model_data['use_smote'] else 'Disabled'}")
+        st.info(f"**Model Type:** {model_data.get('model_type', 'Unknown')}")
+        st.info(f"**SMOTE:** {'Enabled' if model_data.get('use_smote') else 'Disabled'}")
     with col2:
-        st.info(f"**Features:** {len(model_data['feature_names'])}")
-        st.info(f"**Split Date:** {model_data['split_date'].strftime('%Y-%m-%d')}")
+        st.info(f"**Features:** {len(model_data.get('feature_names', []))}")
+        split_date = model_data.get('split_date')
+        st.info(f"**Split Date:** {split_date.strftime('%Y-%m-%d') if split_date else 'N/A'}")
+    
+    # Feature list
+    with st.expander("📋 All Features Used"):
+        feature_names = model_data.get('feature_names', [])
+        if feature_names:
+            # Display in columns
+            cols = st.columns(3)
+            for i, feat in enumerate(feature_names):
+                cols[i % 3].write(f"• {feat}")
+        else:
+            st.write("No feature list available")
     
     # Feature importance
-    if model_data['feature_importance'] is not None:
+    if model_data.get('feature_importance') is not None:
         st.subheader("🎯 Top 20 Features")
         
         importance_df = model_data['feature_importance'].head(20)
@@ -977,5 +1047,18 @@ with tab3:
         st.plotly_chart(fig, use_container_width=True)
     
     # Best parameters
-    st.subheader("🔧 Optimized Hyperparameters")
-    st.json(model_data['best_params'])
+    best_params = model_data.get('best_params', {})
+    if best_params:
+        st.subheader("🔧 Optimized Hyperparameters")
+        st.json(best_params)
+    
+    # Model metadata (for saved models)
+    if selected_analysis_model != "📍 Current Session Model":
+        st.subheader("📁 Model Metadata")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.info(f"**Ticker:** {loaded_model.get('ticker', 'Unknown')}")
+            st.info(f"**Saved:** {loaded_model.get('timestamp', 'Unknown')}")
+        with col2:
+            notes = loaded_model.get('notes', '')
+            st.info(f"**Notes:** {notes if notes else 'None'}")
