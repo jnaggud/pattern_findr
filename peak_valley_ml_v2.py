@@ -757,14 +757,26 @@ def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float 
     # Calculate metrics
     total_return = (capital - initial_capital) / initial_capital * 100
     
+    trades_count = len(trades)
+    win_rate = 0
     if trades:
         profits = [t.get('profit_pct', 0) for t in trades]
+        wins = [p for p in profits if p > 0]
+        win_rate = len(wins) / len(profits) * 100
         avg_trade_return = sum(profits) / len(profits)
     else:
         avg_trade_return = 0
         
     # Create equity curve df
     equity_df = pd.DataFrame(equity_curve)
+    
+    # Calculate Max Drawdown
+    if not equity_df.empty:
+        equity_df['peak'] = equity_df['equity'].cummax()
+        equity_df['drawdown'] = (equity_df['equity'] - equity_df['peak']) / equity_df['peak'] * 100
+        max_drawdown = equity_df['drawdown'].min()
+    else:
+        max_drawdown = 0
     
     # Calculate Buy & Hold
     initial_close = df['close'].iloc[0]
@@ -774,7 +786,10 @@ def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float 
     return {
         'total_return': total_return,
         'final_capital': capital,
-        'num_trades': len(trades),
+        'final_equity': capital, # Alias for UI
+        'num_trades': trades_count,
+        'win_rate': win_rate,
+        'max_drawdown': max_drawdown,
         'avg_trade_return': avg_trade_return,
         'trades': trades,
         'equity_curve': equity_df,
