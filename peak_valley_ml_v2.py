@@ -202,38 +202,56 @@ def generate_features(data: pd.DataFrame) -> pd.DataFrame:
 
 def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series, 
                             model_type: str = 'xgboost', use_smote: bool = True,
-                            n_trials: int = 20, progress_callback=None):
+                            n_trials: int = 20, progress_callback=None,
+                            optimize_metric: str = 'f1_weighted', n_cv_splits: int = 5):
     """
     Train model with Optuna optimization and SMOTE balancing.
+    Uses proper time series cross-validation (no future data leakage).
+    
+    Args:
+        optimize_metric: 'f1_weighted', 'accuracy', or 'f1_macro'
+        n_cv_splits: Number of TimeSeriesSplit folds (default 5)
     """
     from sklearn.model_selection import cross_val_score, TimeSeriesSplit
     from sklearn.preprocessing import StandardScaler, LabelEncoder
     from sklearn.metrics import accuracy_score, f1_score, classification_report
     import optuna
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    
+    # Console output header
+    print("\n" + "="*70)
+    print(f"🚀 TRAINING {model_type.upper()} MODEL")
+    print("="*70)
     
     # Align data
     common_idx = features.index.intersection(labels.index)
     X = features.loc[common_idx]
     y = labels.loc[common_idx]
     
-    # Time-based split
+    print(f"📊 Dataset: {len(X)} samples, {len(X.columns)} features")
+    print(f"📈 Label distribution: {dict(y.value_counts())}")
+    
+    # Time-based split (80/20) - CRITICAL: no shuffling for time series
     split_idx = int(len(X) * 0.8)
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+    
+    print(f"📅 Train period: {X_train.index[0].strftime('%Y-%m-%d')} to {X_train.index[-1].strftime('%Y-%m-%d')} ({len(X_train)} samples)")
+    print(f"📅 Test period:  {X_test.index[0].strftime('%Y-%m-%d')} to {X_test.index[-1].strftime('%Y-%m-%d')} ({len(X_test)} samples)")
     
     # Scale features
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
     
-    # SMOTE balancing
+    # SMOTE balancing (applied to training data only)
     if use_smote:
         from imblearn.over_sampling import SMOTE
         smote = SMOTE(random_state=42)
         X_train_balanced, y_train_balanced = smote.fit_resample(X_train_scaled, y_train)
+        print(f"⚖️  SMOTE: {len(X_train_scaled)} → {len(X_train_balanced)} samples (balanced)")
     else:
         X_train_balanced, y_train_balanced = X_train_scaled, y_train.values
+        print(f"⚖️  SMOTE: Disabled")
     
     # Label encoding for XGBoost
     label_encoder = None
@@ -241,11 +259,20 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
         label_encoder = LabelEncoder()
         y_train_encoded = label_encoder.fit_transform(y_train_balanced)
         y_test_encoded = label_encoder.transform(y_test)
+        print(f"🏷️  Label encoding: {dict(zip(label_encoder.classes_, range(len(label_encoder.classes_))))}")
     else:
         y_train_encoded = y_train_balanced
         y_test_encoded = y_test.values
     
-    # Optuna optimization
+    print(f"\n🎯 Optimization target: {optimize_metric}")
+    print(f"📊 Time Series CV: {n_cv_splits} folds (forward-chaining, no look-ahead)")
+    print("-"*70)
+    
+    # Track best trial for console output
+    best_score_so_far = [0.0]
+    best_trial_num = [0]
+    
+    # Optuna optimization with console logging
     def objective(trial):
         if model_type == 'xgboost':
             from xgboost import XGBClassifier
@@ -277,20 +304,51 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
             }
             model = RandomForestClassifier(**params)
         
-        # Time series CV
-        tscv = TimeSeriesSplit(n_splits=3)
+        # Time Series Cross-Validation (forward-chaining)
+        # This ensures we never train on future data
+        tscv = TimeSeriesSplit(n_splits=n_cv_splits)
         scores = cross_val_score(model, X_train_balanced, y_train_encoded, 
-                                cv=tscv, scoring='f1_weighted', n_jobs=-1)
-        return scores.mean()
+                                cv=tscv, scoring=optimize_metric, n_jobs=-1)
+        
+        mean_score = scores.mean()
+        std_score = scores.std()
+        
+        # Console output for each trial
+        trial_num = trial.number + 1
+        is_best = mean_score > best_score_so_far[0]
+        if is_best:
+            best_score_so_far[0] = mean_score
+            best_trial_num[0] = trial_num
+            marker = "⭐ NEW BEST"
+        else:
+            marker = ""
+        
+        print(f"Trial {trial_num:3d}/{n_trials} | CV Score: {mean_score:.4f} (±{std_score:.4f}) | Best: {best_score_so_far[0]:.4f} {marker}")
+        
+        return mean_score
+    
+    # Callback for UI progress
+    def optuna_callback(study, trial):
+        if progress_callback:
+            progress_callback(trial.number + 1, n_trials)
     
     # Run optimization
+    print(f"\n🔍 Starting Optuna optimization ({n_trials} trials)...")
+    print("-"*70)
+    
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False,
-                  callbacks=[lambda study, trial: progress_callback(trial.number + 1, n_trials) if progress_callback else None])
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False, callbacks=[optuna_callback])
     
     best_params = study.best_params
     
+    print("-"*70)
+    print(f"✅ Optimization complete! Best trial: #{best_trial_num[0]} with CV score: {study.best_value:.4f}")
+    print(f"📋 Best parameters: {best_params}")
+    
     # Train final model with best params
+    print(f"\n🏋️ Training final model with best parameters...")
+    
     if model_type == 'xgboost':
         from xgboost import XGBClassifier
         best_params.update({'random_state': 42, 'use_label_encoder': False, 
@@ -303,7 +361,7 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
     
     model.fit(X_train_balanced, y_train_encoded)
     
-    # Predictions
+    # Predictions on held-out test set
     y_pred = model.predict(X_test_scaled)
     
     # Decode predictions
@@ -314,9 +372,25 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
         y_pred_decoded = y_pred
         y_test_decoded = y_test.values
     
-    # Metrics
+    # Final metrics on TEST set (out-of-sample)
     accuracy = accuracy_score(y_test_decoded, y_pred_decoded)
     f1 = f1_score(y_test_decoded, y_pred_decoded, average='weighted')
+    f1_macro = f1_score(y_test_decoded, y_pred_decoded, average='macro')
+    
+    # Print final results
+    print("\n" + "="*70)
+    print("📊 FINAL MODEL PERFORMANCE (Out-of-Sample Test Set)")
+    print("="*70)
+    print(f"   Accuracy:     {accuracy:.4f} ({accuracy*100:.1f}%)")
+    print(f"   F1 Weighted:  {f1:.4f} ({f1*100:.1f}%)")
+    print(f"   F1 Macro:     {f1_macro:.4f} ({f1_macro*100:.1f}%)")
+    print(f"   CV Score:     {study.best_value:.4f} ({study.best_value*100:.1f}%)")
+    print("="*70)
+    
+    # Classification report
+    print("\n📋 Classification Report (Test Set):")
+    print(classification_report(y_test_decoded, y_pred_decoded, 
+                               target_names=['SELL (-1)', 'HOLD (0)', 'BUY (1)']))
     
     # Feature importance
     if hasattr(model, 'feature_importances_'):
@@ -553,6 +627,15 @@ with st.sidebar:
     use_smote = st.checkbox("Use SMOTE Balancing", value=True)
     use_optuna = st.checkbox("Use Optuna Optimization", value=True)
     n_trials = st.slider("Optuna Trials", 10, 100, 30) if use_optuna else 10
+    
+    # Optimization metric selection
+    optimize_metric = st.selectbox("Optimize For", 
+        ['f1_weighted', 'accuracy', 'f1_macro'],
+        help="f1_weighted: Best for imbalanced classes, accuracy: Overall correctness, f1_macro: Equal weight to all classes")
+    
+    n_cv_splits = st.slider("CV Folds", 3, 10, 5, 
+                           help="Number of TimeSeriesSplit folds for cross-validation")
+    
     detection_order = st.slider("Peak/Valley Sensitivity", 3, 10, 5,
                                help="Lower = more sensitive")
     
@@ -638,6 +721,7 @@ with tab1:
         
         # Train model
         progress.progress(40, text=f"Training {model_type} with {'Optuna' if use_optuna else 'defaults'}...")
+        st.info(f"🎯 Optimizing for: **{optimize_metric}** | CV Folds: **{n_cv_splits}** (TimeSeriesSplit)")
         
         def update_progress(current, total):
             pct = 40 + int(50 * current / total)
@@ -646,7 +730,9 @@ with tab1:
         model_data = train_model_with_optuna(
             features, labels, model_type, use_smote,
             n_trials=n_trials if use_optuna else 1,
-            progress_callback=update_progress if use_optuna else None
+            progress_callback=update_progress if use_optuna else None,
+            optimize_metric=optimize_metric,
+            n_cv_splits=n_cv_splits
         )
         
         st.session_state.v2_model = model_data
