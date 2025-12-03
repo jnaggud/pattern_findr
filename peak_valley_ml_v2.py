@@ -557,8 +557,24 @@ with st.sidebar:
                                help="Lower = more sensitive")
     
     st.markdown("---")
-    st.subheader("📊 Production")
-    prod_days = st.slider("Backtest Days", 30, 365, 180)
+    st.subheader("📊 Backtest Period")
+    backtest_mode = st.selectbox("Backtest Mode", 
+        ["Full Training Period", "Test Period Only", "Recent Days", "Custom Date Range"],
+        help="Select which period to backtest over")
+    
+    # Default values
+    prod_days = 180
+    custom_start = datetime.now() - timedelta(days=365)
+    custom_end = datetime.now()
+    
+    if backtest_mode == "Recent Days":
+        prod_days = st.slider("Days", 30, 365, 180)
+    elif backtest_mode == "Custom Date Range":
+        col1, col2 = st.columns(2)
+        with col1:
+            custom_start = st.date_input("Start Date", value=datetime.now() - timedelta(days=365))
+        with col2:
+            custom_end = st.date_input("End Date", value=datetime.now())
 
 # Main tabs
 tab1, tab2, tab3 = st.tabs(["🎯 Train Model", "🚀 Production", "📊 Analysis"])
@@ -681,18 +697,40 @@ with tab2:
     selected_model = st.selectbox("Select Model", model_files)
     model_path = os.path.join(model_dir, selected_model)
     
+    # Show selected backtest mode info
+    st.info(f"📅 **Backtest Mode:** {backtest_mode}")
+    
     if st.button("📊 Generate Signals & Backtest", type="primary", use_container_width=True):
         with st.spinner("Loading model and generating signals..."):
             # Load model
             model_data = load_model(model_path)
             model_ticker = model_data.get('ticker', ticker)
             
-            # Load production data
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=prod_days + 100)
-            
+            # Determine date range based on backtest mode
             import yfinance as yf
-            data = yf.Ticker(model_ticker).history(start=start_date, end=end_date)
+            
+            if backtest_mode == "Full Training Period":
+                # Use the same period as training (e.g., 5y)
+                data = yf.Ticker(model_ticker).history(period=period)
+                period_label = f"Full {period} Training Period"
+                
+            elif backtest_mode == "Test Period Only":
+                # Load full data, then use only the test portion (last 20%)
+                data = yf.Ticker(model_ticker).history(period=period)
+                split_idx = int(len(data) * 0.8)
+                data = data.iloc[split_idx:]
+                period_label = "Test Period (Last 20%)"
+                
+            elif backtest_mode == "Recent Days":
+                end_date = datetime.now()
+                start_date = end_date - timedelta(days=prod_days + 100)
+                data = yf.Ticker(model_ticker).history(start=start_date, end=end_date)
+                period_label = f"Recent {prod_days} Days"
+                
+            else:  # Custom Date Range
+                data = yf.Ticker(model_ticker).history(start=custom_start, end=custom_end)
+                period_label = f"Custom: {custom_start} to {custom_end}"
+            
             data.index = pd.to_datetime(data.index).tz_localize(None)
             data.columns = [c.lower() for c in data.columns]
             data = data[['open', 'high', 'low', 'close', 'volume']]
@@ -703,13 +741,26 @@ with tab2:
             # Generate signals
             signals = generate_signals(model_data, features)
             
-            # Trim to production period
-            signals = signals.iloc[-prod_days:]
-            data = data.loc[signals.index]
+            # For "Recent Days" mode, trim to exact days requested
+            if backtest_mode == "Recent Days":
+                signals = signals.iloc[-prod_days:]
+                data = data.loc[signals.index]
+            else:
+                # Align data with signals (features drop some rows due to NaN)
+                data = data.loc[signals.index]
             
             # Run backtest
             backtest = run_backtest(data, signals)
             st.session_state.v2_backtest = backtest
+            
+            # Store period info for display
+            backtest['period_label'] = period_label
+            backtest['start_date'] = data.index[0]
+            backtest['end_date'] = data.index[-1]
+            backtest['total_days'] = len(data)
+        
+        # Period info
+        st.success(f"📅 **{backtest['period_label']}** | {backtest['start_date'].strftime('%Y-%m-%d')} to {backtest['end_date'].strftime('%Y-%m-%d')} ({backtest['total_days']} trading days)")
         
         # Performance metrics
         st.subheader("📈 Performance Summary")
@@ -725,7 +776,7 @@ with tab2:
         with col4:
             st.metric("Max Drawdown", f"{backtest['max_drawdown']:.1f}%")
         
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("Trades", backtest['num_trades'])
         with col2:
@@ -733,6 +784,12 @@ with tab2:
         with col3:
             signal_counts = signals.value_counts()
             st.metric("Signals", f"{signal_counts.get(1, 0)} BUY / {signal_counts.get(-1, 0)} SELL")
+        with col4:
+            # Annualized return
+            years = backtest['total_days'] / 252
+            if years > 0:
+                annualized = ((1 + backtest['total_return']/100) ** (1/years) - 1) * 100
+                st.metric("Annualized Return", f"{annualized:.1f}%")
         
         # Candlestick chart with signals
         st.subheader("📊 Price Chart with Signals")
