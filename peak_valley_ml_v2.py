@@ -1524,6 +1524,7 @@ with tab2:
         
         # Candlestick chart with signals
         st.subheader("📊 Price Chart with Signals")
+        st.info("ℹ️ **Chart Legend**: Triangles are **Signals** (Limit Orders placed). Blue Dots are **Trades** (Limit Orders filled). If you see a Triangle but no Blue Dot, the price didn't reach your limit entry.")
         
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                            vertical_spacing=0.05, row_heights=[0.7, 0.3],
@@ -1552,7 +1553,7 @@ with tab2:
                 mode='markers',
                 marker=dict(symbol='triangle-up', size=15, color='lime', 
                            line=dict(width=2, color='darkgreen')),
-                name='BUY Signal'
+                name='BUY Signal (Intent)'
             ), row=1, col=1)
         
         # Sell signals
@@ -1566,10 +1567,11 @@ with tab2:
                 mode='markers',
                 marker=dict(symbol='triangle-down', size=15, color='red',
                            line=dict(width=2, color='darkred')),
-                name='SELL Signal'
+                name='SELL Signal (Intent)'
             ), row=1, col=1)
         
         # Trade markers (actual executions)
+        first_trade = True
         for trade in backtest['trades']:
             # Entry
             fig.add_trace(go.Scatter(
@@ -1578,8 +1580,8 @@ with tab2:
                 mode='markers',
                 marker=dict(symbol='circle', size=12, color='blue',
                            line=dict(width=2, color='white')),
-                name='Entry',
-                showlegend=False
+                name='Trade Entry (Filled)',
+                showlegend=first_trade
             ), row=1, col=1)
             
             # Exit
@@ -1591,9 +1593,11 @@ with tab2:
                     mode='markers',
                     marker=dict(symbol='x', size=12, color=color,
                                line=dict(width=2, color='white')),
-                    name='Exit',
-                    showlegend=False
+                    name='Trade Exit',
+                    showlegend=first_trade
                 ), row=1, col=1)
+            
+            first_trade = False
         
         # Equity curve
         equity_df = backtest['equity_curve']
