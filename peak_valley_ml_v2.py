@@ -646,6 +646,30 @@ def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float 
         buy_idx = np.where(original_classes == 1)[0][0]
         sell_idx = np.where(original_classes == -1)[0][0]
         hold_idx = np.where(original_classes == 0)[0][0]
+        
+        # ==========================================================================
+        # CONFIDENCE BOOSTING (Hybrid Rule-Based + ML)
+        # Boost confidence if Composite Indicator is extreme to capture "missed" turns
+        # ==========================================================================
+        if 'composite_oscillator' in features.columns:
+            # Get composite values (aligned with X)
+            comp_vals = features['composite_oscillator'].values
+            
+            # Boost BUY prob if Oversold (< -0.6)
+            # We add 0.10 to probability (clamped at 1.0)
+            oversold_mask = comp_vals < -0.6
+            if oversold_mask.any():
+                probs[oversold_mask, buy_idx] = np.minimum(probs[oversold_mask, buy_idx] + 0.10, 1.0)
+                # Decrease HOLD prob to compensate (normalization not strictly required for threshold check but good for correctness)
+                probs[oversold_mask, hold_idx] = np.maximum(probs[oversold_mask, hold_idx] - 0.10, 0.0)
+            
+            # Boost SELL prob if Overbought (> 0.6)
+            overbought_mask = comp_vals > 0.6
+            if overbought_mask.any():
+                probs[overbought_mask, sell_idx] = np.minimum(probs[overbought_mask, sell_idx] + 0.10, 1.0)
+                probs[overbought_mask, hold_idx] = np.maximum(probs[overbought_mask, hold_idx] - 0.10, 0.0)
+        # ==========================================================================
+        
     except IndexError:
         # Fallback if some classes are missing (unlikely with proper training)
         return pd.Series(0, index=features.index), pd.DataFrame(probs, index=features.index, columns=original_classes)
