@@ -110,8 +110,9 @@ def generate_features(data: pd.DataFrame) -> pd.DataFrame:
     df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
     df['volatility_10'] = df['returns'].rolling(10).std()
     df['volatility_20'] = df['returns'].rolling(20).std()
-    df['high_low_range'] = (df['high'] - df['low']) / df['close']
-    df['close_open_range'] = (df['close'] - df['open']) / df['open']
+    # OPTIMIZATION: Removed intraday range features to prevent "candle shape" overfitting
+    # df['high_low_range'] = (df['high'] - df['low']) / df['close'] 
+    # df['close_open_range'] = (df['close'] - df['open']) / df['open']
     
     # Moving averages
     for period in [5, 10, 20, 50]:
@@ -150,6 +151,10 @@ def generate_features(data: pd.DataFrame) -> pd.DataFrame:
     adx = ta.adx(df['high'], df['low'], df['close'])
     if adx is not None:
         df = pd.concat([df, adx], axis=1)
+        # Calculate ADX slope to find ACCELERATING trends
+        adx_col = [c for c in df.columns if c.startswith('ADX_')]
+        if adx_col:
+            df['adx_slope'] = df[adx_col[0]].diff(3)
     
     # ATR
     df['atr_14'] = ta.atr(df['high'], df['low'], df['close'], length=14)
