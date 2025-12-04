@@ -720,7 +720,8 @@ def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float 
     return pd.Series(signals, index=features.index), prob_df
 
 
-def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float = 100000, limit_pct: float = 0.0) -> dict:
+def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float = 100000, 
+                 limit_pct: float = 0.0, stop_loss_pct: float = 0.0, take_profit_pct: float = 0.0) -> dict:
     """
     Run backtest with detailed trade tracking.
     If limit_pct > 0, attempts to enter at Close * (1 - limit_pct) on the NEXT day.
@@ -732,6 +733,8 @@ def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float 
     capital = initial_capital
     position = 0
     shares = 0
+    entry_price = 0
+    entry_capital = 0
     trades = []
     equity_curve = []
     
@@ -745,6 +748,64 @@ def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float 
         price = row['close']
         signal = row['signal']
         
+        # Check SL/TP if in position
+        if position == 1:
+            # STOP LOSS
+            if stop_loss_pct > 0:
+                sl_price = entry_price * (1 - stop_loss_pct)
+                # Use Low for SL check
+                if row['low'] <= sl_price:
+                    # Trigger SL
+                    exit_price = sl_price
+                    capital = shares * exit_price
+                    profit = capital - entry_capital
+                    profit_pct = (exit_price - entry_price) / entry_price * 100
+                    
+                    trades[-1].update({
+                        'exit_date': date,
+                        'exit_price': exit_price,
+                        'exit_value': capital,
+                        'profit': profit,
+                        'profit_pct': profit_pct,
+                        'status': 'closed',
+                        'reason': 'Stop Loss'
+                    })
+                    position = 0
+                    shares = 0
+                    entry_price = 0
+                    
+                    # Record equity after exit and continue
+                    equity_curve.append({'date': date, 'equity': capital, 'price': price})
+                    continue
+
+            # TAKE PROFIT
+            if take_profit_pct > 0:
+                tp_price = entry_price * (1 + take_profit_pct)
+                # Use High for TP check
+                if row['high'] >= tp_price:
+                    # Trigger TP
+                    exit_price = tp_price
+                    capital = shares * exit_price
+                    profit = capital - entry_capital
+                    profit_pct = (exit_price - entry_price) / entry_price * 100
+                    
+                    trades[-1].update({
+                        'exit_date': date,
+                        'exit_price': exit_price,
+                        'exit_value': capital,
+                        'profit': profit,
+                        'profit_pct': profit_pct,
+                        'status': 'closed',
+                        'reason': 'Take Profit'
+                    })
+                    position = 0
+                    shares = 0
+                    entry_price = 0
+                    
+                    # Record equity after exit and continue
+                    equity_curve.append({'date': date, 'equity': capital, 'price': price})
+                    continue
+
         # Track equity
         current_equity = shares * price if position == 1 else capital
         equity_curve.append({'date': date, 'equity': current_equity, 'price': price})
@@ -1325,6 +1386,12 @@ with tab2:
         use_trend_filter = st.checkbox("✅ Use Trend Filtering", value=False, 
                                       help="Allow ALL Buys. Block SELLs in Bull Market unless Overbought (>0.6).")
     
+    col3, col4 = st.columns(2)
+    with col3:
+        stop_loss_pct = st.slider("Stop Loss %", 0.0, 20.0, 0.0, 0.5, help="Exit trade if price drops X%. 0 = No Stop.") / 100
+    with col4:
+        take_profit_pct = st.slider("Take Profit %", 0.0, 50.0, 0.0, 1.0, help="Exit trade if price rises X%. 0 = No Target.") / 100
+    
     if st.button("📊 Generate Signals & Backtest", type="primary", use_container_width=True):
         with st.spinner("Loading model and generating signals..."):
             # Load model
@@ -1455,7 +1522,8 @@ with tab2:
                 composite_indicator = composite_indicator.loc[signals.index]
             
             # Run backtest
-            backtest = run_backtest(data, signals, limit_pct=limit_entry_pct)
+            backtest = run_backtest(data, signals, limit_pct=limit_entry_pct, 
+                                   stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct)
             st.session_state.v2_backtest = backtest
             
             # Calculate theoretical maximum for this period
