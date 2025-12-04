@@ -1278,8 +1278,13 @@ with tab2:
     st.info(f"📅 **Backtest Mode:** {backtest_mode}")
     
     # Execution Settings
-    limit_entry_pct = st.slider("Entry Limit Offset %", 0.0, 3.0, 0.0, 0.1, 
-                               help="Try to buy lower than signal price (e.g. 1.0% lower). 0 = Market Order.") / 100
+    col1, col2 = st.columns(2)
+    with col1:
+        limit_entry_pct = st.slider("Entry Limit Offset %", 0.0, 3.0, 0.0, 0.1, 
+                                   help="Try to buy lower than signal price (e.g. 1.0% lower). 0 = Market Order.") / 100
+    with col2:
+        use_trend_filter = st.checkbox("✅ Use Trend Filtering", value=False, 
+                                      help="Only BUY in Bull Market (Price > SMA200) or Extreme Oversold. Only SELL in Bear Market.")
     
     if st.button("📊 Generate Signals & Backtest", type="primary", use_container_width=True):
         with st.spinner("Loading model and generating signals..."):
@@ -1347,6 +1352,39 @@ with tab2:
                 composite_indicator = oscillators.mean(axis=1)
             else:
                 composite_indicator = pd.Series(0, index=features.index)
+            
+            # APPLY TREND FILTER (If Enabled)
+            if use_trend_filter:
+                # Calculate SMA200 on the FULL data
+                sma200 = data['close'].rolling(200).mean()
+                is_bull = data['close'] > sma200
+                
+                # Filter signals based on regime
+                filtered_signals = signals.copy()
+                
+                # Vectorized masking for speed
+                # Align indices first
+                common_idx = signals.index.intersection(is_bull.index).intersection(composite_indicator.index)
+                
+                if not common_idx.empty:
+                    # Create masks
+                    bull_mask = is_bull.loc[common_idx]
+                    bear_mask = ~bull_mask
+                    comp_oversold = composite_indicator.loc[common_idx] < -0.6
+                    
+                    # Filter BUYs (1): Allowed if Bull OR Oversold
+                    # If Bear AND Not Oversold -> Filter out
+                    # mask to zero out: (Signal=1) & (Bear) & (Not Oversold)
+                    buy_filter_mask = (signals.loc[common_idx] == 1) & bear_mask & (~comp_oversold)
+                    filtered_signals.loc[buy_filter_mask[buy_filter_mask].index] = 0
+                    
+                    # Filter SELLs (-1): Allowed only if Bear
+                    # If Bull -> Filter out
+                    # mask to zero out: (Signal=-1) & (Bull)
+                    sell_filter_mask = (signals.loc[common_idx] == -1) & bull_mask
+                    filtered_signals.loc[sell_filter_mask[sell_filter_mask].index] = 0
+                    
+                signals = filtered_signals
             
             # Store composite and confidence in session state for plotting
             st.session_state.v2_composite = composite_indicator
