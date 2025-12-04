@@ -218,10 +218,26 @@ def generate_features(data: pd.DataFrame) -> pd.DataFrame:
         df['adx_trend'] = (df[adx_col[0]] > 25).astype(int)
     
     # Lagged features
+    # OPTIMIZATION: Removed 'close_lag' to prevent overfitting to simple price drops (mean reversion).
+    # Added composite_slope to detect when the indicator turns up/down.
+    df['composite_slope'] = df['composite_oscillator'].diff(1)
+    
+    # EXPLICIT COMPOSITE SIGNALS (User Observation: Low = Bottom, High = Top)
+    df['comp_oversold'] = (df['composite_oscillator'] < -0.6).astype(int)
+    df['comp_overbought'] = (df['composite_oscillator'] > 0.6).astype(int)
+    
+    # Crossing signals (leaving the extreme zone)
+    df['comp_cross_low'] = ((df['composite_oscillator'].shift(1) < -0.6) & (df['composite_oscillator'] > -0.6)).astype(int)
+    df['comp_cross_high'] = ((df['composite_oscillator'].shift(1) > 0.6) & (df['composite_oscillator'] < 0.6)).astype(int)
+    
+    # Turning points (Extreme value + Change in direction)
+    df['comp_bottom_turn'] = (df['comp_oversold'] & (df['composite_slope'] > 0)).astype(int)
+    df['comp_top_turn'] = (df['comp_overbought'] & (df['composite_slope'] < 0)).astype(int)
+    
     for lag in [1, 2, 3, 5]:
         df[f'returns_lag_{lag}'] = df['returns'].shift(lag)
         df[f'rsi_14_lag_{lag}'] = df['rsi_14'].shift(lag)
-        df[f'close_lag_{lag}'] = df['close'].pct_change(lag)
+        # df[f'close_lag_{lag}'] = df['close'].pct_change(lag) # REMOVED
         df[f'composite_lag_{lag}'] = df['composite_oscillator'].shift(lag)
     
     # Rolling statistics
@@ -1023,6 +1039,33 @@ def run_comprehensive_analysis(analysis_dir: str = "analysis") -> str:
             for bucket, row in grouped.iterrows():
                 if row['count'] > 0:
                     report.append(f"   {bucket}: {int(row['count'])} trades | Avg 5d Ret: {row['mean']*100:+.2f}%")
+
+    # 8. Composite Indicator Analysis (Validation of User Hypothesis)
+    if 'composite_indicator' in df.columns:
+        report.append("\n🧬 COMPOSITE INDICATOR EFFICIENCY (Manual Strategy Proxy)")
+        report.append("   Hypothesis: Low Composite (< -0.6) = Bottom, High (> 0.6) = Top")
+        
+        # Create bins
+        try:
+            # pd.cut might fail if data is weird, wrap in try
+            df['comp_bin'] = pd.cut(df['composite_indicator'], bins=[-1.5, -0.6, -0.2, 0.2, 0.6, 1.5], 
+                                  labels=["Oversold (<-0.6)", "Bearish", "Neutral", "Bullish", "Overbought (>0.6)"])
+            
+            grouped = df.groupby('comp_bin')['fwd_ret_5d'].agg(['count', 'mean'])
+            
+            for interval, row in grouped.iterrows():
+                if row['count'] > 0:
+                    report.append(f"   {interval}: {int(row['count']):4d} days | Avg 5d Ret: {row['mean']*100:+.2f}%")
+                    
+            # Check win rate for Oversold
+            low_comp = df[df['composite_indicator'] < -0.6]
+            if not low_comp.empty:
+                win_rate = (low_comp['fwd_ret_5d'] > 0).mean()
+                report.append(f"\n   OVERSOLD SIGNAL QUALITY (Comp < -0.6):")
+                report.append(f"   Win Rate (5d > 0): {win_rate*100:.1f}%")
+                
+        except Exception as e:
+            report.append(f"   Could not calculate composite stats: {str(e)}")
 
     return "\n".join(report)
 
