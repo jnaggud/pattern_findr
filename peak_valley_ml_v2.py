@@ -663,8 +663,23 @@ def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float 
                 # Decrease HOLD prob to compensate (normalization not strictly required for threshold check but good for correctness)
                 probs[oversold_mask, hold_idx] = np.maximum(probs[oversold_mask, hold_idx] - 0.10, 0.0)
             
-            # Boost SELL prob if Overbought (> 0.6)
-            overbought_mask = comp_vals > 0.6
+            # Boost SELL prob if Overbought
+            # DYNAMIC THRESHOLD: In a downtrend (Price < SMA50), tops happen at lower oscillator values.
+            # If dist_sma50 is negative, use 0.4 threshold. Otherwise use 0.6.
+            
+            sell_threshold = 0.6
+            if 'dist_sma50' in features.columns:
+                # Create array of thresholds
+                # If dist_sma50 < 0, threshold is 0.4, else 0.6
+                dists = features['dist_sma50'].values
+                sell_thresholds = np.where(dists < 0, 0.4, 0.6)
+                
+                # Create mask where Comp > Threshold
+                overbought_mask = comp_vals > sell_thresholds
+            else:
+                # Fallback
+                overbought_mask = comp_vals > 0.6
+            
             if overbought_mask.any():
                 probs[overbought_mask, sell_idx] = np.minimum(probs[overbought_mask, sell_idx] + 0.10, 1.0)
                 probs[overbought_mask, hold_idx] = np.maximum(probs[overbought_mask, hold_idx] - 0.10, 0.0)
