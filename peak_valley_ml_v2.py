@@ -1284,7 +1284,7 @@ with tab2:
                                    help="Try to buy lower than signal price (e.g. 1.0% lower). 0 = Market Order.") / 100
     with col2:
         use_trend_filter = st.checkbox("✅ Use Trend Filtering", value=False, 
-                                      help="Only BUY in Bull Market (Price > SMA200) or Extreme Oversold. Only SELL in Bear Market.")
+                                      help="Allow ALL Buys. Block SELLs in Bull Market unless Overbought (>0.6).")
     
     if st.button("📊 Generate Signals & Backtest", type="primary", use_container_width=True):
         with st.spinner("Loading model and generating signals..."):
@@ -1370,18 +1370,15 @@ with tab2:
                     # Create masks
                     bull_mask = is_bull.loc[common_idx]
                     bear_mask = ~bull_mask
-                    comp_oversold = composite_indicator.loc[common_idx] < -0.6
+                    comp_overbought = composite_indicator.loc[common_idx] > 0.6
                     
-                    # Filter BUYs (1): Allowed if Bull OR Oversold
-                    # If Bear AND Not Oversold -> Filter out
-                    # mask to zero out: (Signal=1) & (Bear) & (Not Oversold)
-                    buy_filter_mask = (signals.loc[common_idx] == 1) & bear_mask & (~comp_oversold)
-                    filtered_signals.loc[buy_filter_mask[buy_filter_mask].index] = 0
+                    # Filter BUYs (1): ALWAYS ALLOWED
+                    # Analysis showed the model is excellent at buying dips even in Bear markets (+3.58% return)
+                    # So we removed the restriction on Buys.
                     
-                    # Filter SELLs (-1): Allowed only if Bear
-                    # If Bull -> Filter out
-                    # mask to zero out: (Signal=-1) & (Bull)
-                    sell_filter_mask = (signals.loc[common_idx] == -1) & bull_mask
+                    # Filter SELLs (-1): Allowed if Bear OR (Bull AND Extreme Overbought)
+                    # If Bull AND Not Overbought -> Filter out (Don't short the trend unless it's a top)
+                    sell_filter_mask = (signals.loc[common_idx] == -1) & bull_mask & (~comp_overbought)
                     filtered_signals.loc[sell_filter_mask[sell_filter_mask].index] = 0
                     
                 signals = filtered_signals
