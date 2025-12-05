@@ -970,6 +970,108 @@ def calculate_theoretical_return(data: pd.DataFrame, peak_dates: list, valley_da
     }
 
 
+def analyze_slope_signals(file_path: str):
+    """
+    Analyze Slope Turn Signals from a saved analysis CSV.
+    Generates a comprehensive report.
+    """
+    try:
+        df = pd.read_csv(file_path, index_col=0, parse_dates=True)
+        
+        if 'composite_indicator' not in df.columns:
+            st.error("Composite Indicator not found in analysis file.")
+            return
+        
+        # 1. Calculations
+        df['composite_slope'] = df['composite_indicator'].diff()
+        slope = df['composite_slope'].values
+        slope_prev = np.roll(slope, 1)
+        slope_prev[0] = 0
+        
+        turn_up = (slope_prev < 0) & (slope > 0)
+        turn_down = (slope_prev > 0) & (slope < 0)
+        
+        # Trend
+        df['sma_200'] = df['close'].rolling(200).mean()
+        df['trend'] = np.where(df['close'] > df['sma_200'], 'BULL', 'BEAR')
+        
+        # Returns (1d, 3d, 5d, 10d)
+        for d in [1, 3, 5, 10]:
+            df[f'ret_{d}d'] = df['close'].pct_change(d).shift(-d) * 100
+            
+        buys = df[turn_up].copy()
+        sells = df[turn_down].copy()
+        
+        # --- GENERATE REPORT ---
+        report = []
+        report.append("============================================================")
+        report.append("📉 SLOPE SIGNAL DEEP DIVE REPORT")
+        report.append("============================================================")
+        report.append(f"Total Potential BUYS: {len(buys)}")
+        report.append(f"Total Potential SELLS: {len(sells)}")
+        report.append("")
+        
+        # 1. COMPOSITE ZONE ANALYSIS
+        report.append(" 1. PERFORMANCE BY COMPOSITE ZONE (5-Day Return)")
+        bins = [-1.0, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        buys['comp_bin'] = pd.cut(buys['composite_indicator'], bins=bins)
+        sells['comp_bin'] = pd.cut(sells['composite_indicator'], bins=bins)
+        
+        report.append("\n BUY SIGNALS:")
+        b_grp = buys.groupby('comp_bin')[['ret_5d']].agg(['count', 'mean', lambda x: (x>0).mean()*100])
+        b_grp.columns = ['Count', 'Avg Return %', 'Win Rate %']
+        report.append(b_grp.to_string())
+        
+        report.append("\n SELL SIGNALS:")
+        s_grp = sells.groupby('comp_bin')[['ret_5d']].agg(['count', 'mean', lambda x: (x<0).mean()*100])
+        s_grp.columns = ['Count', 'Avg Return %', 'Win Rate %']
+        report.append(s_grp.to_string())
+        
+        # 2. TREND REGIME ANALYSIS
+        report.append("\n 2. TREND REGIME ANALYSIS (Bull vs Bear)")
+        report.append("\n BUYS:")
+        trend_buy = buys.groupby('trend')[['ret_5d']].agg(['count', 'mean', lambda x: (x>0).mean()*100])
+        trend_buy.columns = ['Count', 'Avg Return %', 'Win Rate %']
+        report.append(trend_buy.to_string())
+        
+        report.append("\n SELLS:")
+        trend_sell = sells.groupby('trend')[['ret_5d']].agg(['count', 'mean', lambda x: (x<0).mean()*100])
+        trend_sell.columns = ['Count', 'Avg Return %', 'Win Rate %']
+        report.append(trend_sell.to_string())
+        
+        # 3. BEST FILTER SUGGESTION
+        report.append("\n 3. OPTIMAL FILTER SUGGESTION")
+        # Find best threshold for Buys (highest return with decent count)
+        best_buy_thresh = -1.0
+        best_buy_ret = -999
+        for t in [-0.8, -0.6, -0.4, -0.2, 0.0]:
+             subset = buys[buys['composite_indicator'] < t]
+             if len(subset) > 10:
+                 ret = subset['ret_5d'].mean()
+                 if ret > best_buy_ret:
+                     best_buy_ret = ret
+                     best_buy_thresh = t
+        
+        report.append(f"Suggested BUY Threshold: Composite < {best_buy_thresh}")
+        report.append(f"   -> Avg 5d Return: {best_buy_ret:.2f}%")
+        
+        report_text = "\n".join(report)
+        
+        # Display
+        st.text_area("📋 Copy-Paste Analysis Report", report_text, height=400)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("🟢 BUY Zones")
+            st.dataframe(b_grp.style.background_gradient(cmap='RdYlGn', subset=['Win Rate %']), use_container_width=True)
+        with col2:
+             st.subheader("🔴 SELL Zones")
+             st.dataframe(s_grp.style.background_gradient(cmap='RdYlGn', subset=['Win Rate %']), use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+
 def run_comprehensive_analysis(analysis_dir: str = "analysis") -> str:
     """
     Run deep analysis on the latest output file.
@@ -2060,69 +2162,3 @@ with tab3:
             st.info("No analysis files found. Run a backtest in Production tab first.")
     else:
         st.info("No analysis directory found.")
-
-def analyze_slope_signals(file_path: str):
-    """
-    Analyze Slope Turn Signals from a saved analysis CSV.
-    """
-    try:
-        df = pd.read_csv(file_path, index_col=0, parse_dates=True)
-        
-        # Need 'composite_indicator'
-        if 'composite_indicator' not in df.columns:
-            st.error("Composite Indicator not found in analysis file.")
-            return
-        
-        # Calculate slope
-        df['composite_slope'] = df['composite_indicator'].diff()
-        
-        slope = df['composite_slope'].values
-        # Identify Slope Turns (using same logic as backtest)
-        slope_prev = np.roll(slope, 1)
-        slope_prev[0] = 0
-        
-        turn_up = (slope_prev < 0) & (slope > 0)
-        turn_down = (slope_prev > 0) & (slope < 0)
-        
-        # Calculate Forward Returns (5d)
-        # Use 'close'
-        df['ret_5d'] = df['close'].pct_change(5).shift(-5) * 100
-        
-        # Analyze Buys
-        buys = df[turn_up].copy()
-        sells = df[turn_down].copy()
-        
-        st.success(f"Found **{len(buys)}** Potential Slope Buys and **{len(sells)}** Potential Slope Sells in the data.")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("🟢 BUY Signal Quality")
-            # Bin the Composite Value
-            bins = [-1.0, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
-            buys['comp_bin'] = pd.cut(buys['composite_indicator'], bins=bins)
-            
-            buy_metrics = pd.DataFrame({
-                'Win Rate (%)': buys.groupby('comp_bin')['ret_5d'].apply(lambda x: (x > 0).mean() * 100),
-                'Avg 5d Ret (%)': buys.groupby('comp_bin')['ret_5d'].mean(),
-                'Count': buys.groupby('comp_bin')['ret_5d'].count()
-            })
-            st.dataframe(buy_metrics.style.background_gradient(cmap='RdYlGn', subset=['Win Rate (%)', 'Avg 5d Ret (%)']), use_container_width=True)
-            
-        with col2:
-            st.subheader("🔴 SELL Signal Quality")
-            # Bin for sells
-            sells['comp_bin'] = pd.cut(sells['composite_indicator'], bins=bins)
-            
-            # For Sells, Win Rate is return < 0
-            sell_metrics = pd.DataFrame({
-                'Win Rate (%)': sells.groupby('comp_bin')['ret_5d'].apply(lambda x: (x < 0).mean() * 100),
-                'Avg 5d Ret (%)': sells.groupby('comp_bin')['ret_5d'].mean() * -1, # Inverse return for shorts
-                'Count': sells.groupby('comp_bin')['ret_5d'].count()
-            })
-            st.dataframe(sell_metrics.style.background_gradient(cmap='RdYlGn', subset=['Win Rate (%)', 'Avg 5d Ret (%)']), use_container_width=True)
-
-        st.info("💡 **Recommendation**: Choose a threshold where Win Rate is consistently high (e.g., > 60%). For Buys, this is likely **Composite < -0.6**. For Sells, **Composite > 0.6**.")
-
-    except Exception as e:
-        st.error(f"Error analyzing file: {e}")
-        st.exception(e)
