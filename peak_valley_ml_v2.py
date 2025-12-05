@@ -610,7 +610,9 @@ def load_model(filepath: str) -> dict:
 def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float = 0.5, 
                      use_slope_signals: bool = False,
                      slope_buy_thresh: float = 0.0,
-                     slope_sell_thresh: float = 0.0) -> tuple[pd.Series, pd.DataFrame]:
+                     slope_sell_thresh: float = 0.0,
+                     use_ml_confirm: bool = False,
+                     ml_confirm_thresh: float = 0.3) -> tuple[pd.Series, pd.DataFrame]:
     """
     Generate signals using the trained model with custom threshold.
     Returns: (signals, probabilities)
@@ -706,6 +708,12 @@ def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float 
             # Turn Down: Prev > 0 AND Curr < 0 AND Comp > Threshold
             turn_down_mask = (slope_prev > 0) & (slope < 0) & (comp_vals > slope_sell_thresh)
             
+            # ML Confirmation Filter
+            if use_ml_confirm:
+                # Require ML Model to agree (Prob > 0.3 or custom)
+                turn_up_mask = turn_up_mask & (probs[:, buy_idx] > ml_confirm_thresh)
+                turn_down_mask = turn_down_mask & (probs[:, sell_idx] > ml_confirm_thresh)
+
             if turn_up_mask.any():
                 # Force Buy
                 probs[turn_up_mask, buy_idx] = 1.0
@@ -979,7 +987,7 @@ def calculate_theoretical_return(data: pd.DataFrame, peak_dates: list, valley_da
 def analyze_slope_signals(file_path: str):
     """
     Analyze Slope Turn Signals from a saved analysis CSV.
-    Generates a comprehensive report including multi-timeframe return matrix.
+    Generates a comprehensive report including multi-timeframe return matrix, histograms, and scatter plots.
     """
     try:
         df = pd.read_csv(file_path, index_col=0, parse_dates=True)
@@ -990,6 +998,9 @@ def analyze_slope_signals(file_path: str):
         
         # 1. Calculations
         df['composite_slope'] = df['composite_indicator'].diff()
+        # Rate of Change of Slope (Acceleration)
+        df['slope_roc'] = df['composite_slope'].diff()
+        
         slope = df['composite_slope'].values
         slope_prev = np.roll(slope, 1)
         slope_prev[0] = 0
@@ -1008,7 +1019,7 @@ def analyze_slope_signals(file_path: str):
         # --- GENERATE REPORT ---
         report = []
         report.append("============================================================")
-        report.append("📉 SLOPE SIGNAL DEEP DIVE REPORT (ENHANCED)")
+        report.append("📉 SLOPE SIGNAL DEEP DIVE REPORT (ENHANCED V3)")
         report.append("============================================================")
         report.append(f"Total Potential BUYS: {len(buys)}")
         report.append(f"Total Potential SELLS: {len(sells)}")
@@ -1019,10 +1030,8 @@ def analyze_slope_signals(file_path: str):
         # Bins of 0.1
         bins = np.arange(-1.0, 1.1, 0.1)
         buys['comp_bin'] = pd.cut(buys['composite_indicator'], bins=bins)
-        sells['comp_bin'] = pd.cut(sells['composite_indicator'], bins=bins)
         
         # Pivot table for Buys
-        # Index: Bin, Columns: Horizon
         buy_matrix = buys.groupby('comp_bin')[[f'ret_{d}d' for d in horizons]].mean()
         buy_counts = buys.groupby('comp_bin')['ret_5d'].count()
         buy_matrix.insert(0, 'Count', buy_counts)
@@ -1030,61 +1039,52 @@ def analyze_slope_signals(file_path: str):
         report.append("\n🟢 BUY SIGNAL RETURNS BY HORIZON:")
         report.append(buy_matrix.to_string())
         
-        # 2. WIN RATE MATRIX
-        report.append("\n🎯 2. BUY SIGNAL WIN RATE (%) MATRIX")
-        buy_wr_matrix = buys.groupby('comp_bin')[[f'ret_{d}d' for d in horizons]].apply(lambda x: (x>0).mean()*100)
-        report.append(buy_wr_matrix.to_string())
-
-        # 3. TREND REGIME ANALYSIS
-        report.append("\n📈 3. TREND REGIME ANALYSIS (Bull vs Bear)")
-        df['sma_200'] = df['close'].rolling(200).mean()
-        df['trend'] = np.where(df['close'] > df['sma_200'], 'BULL', 'BEAR')
-        
-        # Re-slice with trend
-        buys['trend'] = df.loc[buys.index, 'trend']
-        trend_buy = buys.groupby('trend')[['ret_5d', 'ret_10d', 'ret_20d']].mean()
-        trend_buy_count = buys.groupby('trend')['ret_5d'].count()
-        trend_buy.insert(0, 'Count', trend_buy_count)
-        
-        report.append("\n🟢 BUYS (Avg Return %):")
-        report.append(trend_buy.to_string())
-        
-        # 4. OPTIMAL FILTER SUGGESTION
-        report.append("\n💡 4. OPTIMAL FILTER SUGGESTION")
-        # Scan thresholds for best Risk/Reward (5d)
-        best_thresh = -1.0
-        best_score = -999
-        
-        # Simple score: Avg Return * Win Rate (Expected Value proxy)
-        # Iterate through possible thresholds
-        for t in np.arange(-0.9, 0.1, 0.1):
-             subset = buys[buys['composite_indicator'] < t]
-             if len(subset) > 20: # Minimum sample size
-                 ret = subset['ret_5d'].mean()
-                 wr = (subset['ret_5d'] > 0).mean()
-                 score = ret * wr
-                 if score > best_score:
-                     best_score = score
-                     best_thresh = t
-        
-        subset_opt = buys[buys['composite_indicator'] < best_thresh]
-        report.append(f"Suggested BUY Threshold: Composite < {best_thresh:.1f}")
-        report.append(f"   -> Count: {len(subset_opt)}")
-        report.append(f"   -> Avg 5d Return: {subset_opt['ret_5d'].mean():.2f}%")
-        report.append(f"   -> Win Rate (5d): {(subset_opt['ret_5d']>0).mean()*100:.1f}%")
-        
         report_text = "\n".join(report)
         
-        # Display
-        st.text_area("📋 Copy-Paste Analysis Report", report_text, height=500)
+        # Display Report Text
+        st.text_area("📋 Copy-Paste Analysis Report", report_text, height=400)
         
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("🟢 BUY Returns Matrix")
-            st.dataframe(buy_matrix.style.background_gradient(cmap='RdYlGn', subset=[f'ret_{d}d' for d in horizons]), use_container_width=True)
-        with col2:
-             st.subheader("� BUY Win Rate Matrix")
-             st.dataframe(buy_wr_matrix.style.background_gradient(cmap='RdYlGn'), use_container_width=True)
+        # --- VISUALIZATIONS ---
+        import plotly.express as px
+        
+        st.subheader("📊 Signal Analysis Plots")
+        
+        tab_v1, tab_v2, tab_v3 = st.tabs(["Scatter Analysis", "Histograms", "ROC Analysis"])
+        
+        with tab_v1:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**Buy Signals: Composite Value vs 5d Return**")
+                fig1 = px.scatter(buys, x='composite_indicator', y='ret_5d', 
+                                 color='ret_5d', color_continuous_scale='RdYlGn',
+                                 hover_data=['close'])
+                fig1.add_hline(y=0, line_dash="dash", line_color="gray")
+                st.plotly_chart(fig1, use_container_width=True)
+                
+            with col2:
+                st.markdown("**Buy Signals: Slope Magnitude vs 5d Return**")
+                # Slope Magnitude (how sharp was the turn?)
+                # Actually composite_slope is the change.
+                fig2 = px.scatter(buys, x='composite_slope', y='ret_5d',
+                                 color='ret_5d', color_continuous_scale='RdYlGn')
+                fig2.add_hline(y=0, line_dash="dash", line_color="gray")
+                st.plotly_chart(fig2, use_container_width=True)
+                
+        with tab_v2:
+            st.markdown("**Distribution of 5-Day Returns (Buy Signals)**")
+            fig3 = px.histogram(buys, x='ret_5d', nbins=50, 
+                               color_discrete_sequence=['green'])
+            fig3.add_vline(x=0, line_dash="dash", line_color="red")
+            st.plotly_chart(fig3, use_container_width=True)
+            
+        with tab_v3:
+            st.markdown("**Rate of Change Analysis**")
+            # Is acceleration relevant?
+            # Plot Acceleration vs Return
+            fig4 = px.scatter(buys, x='slope_roc', y='ret_5d', 
+                             title="Slope Acceleration vs 5d Return",
+                             color='ret_5d', color_continuous_scale='RdYlGn')
+            st.plotly_chart(fig4, use_container_width=True)
 
     except Exception as e:
         st.error(f"Error: {e}")
@@ -1477,12 +1477,19 @@ with tab2:
         
         slope_buy_thresh = 0.0
         slope_sell_thresh = 0.0
+        use_ml_confirm = False
+        ml_confirm_thresh = 0.3
+        
         if use_slope_signals:
             col_s1, col_s2 = st.columns(2)
             with col_s1:
                 slope_buy_thresh = st.slider("Buy Thresh (Comp < X)", -1.0, 0.0, -0.5, 0.1, key="s_buy")
             with col_s2:
                 slope_sell_thresh = st.slider("Sell Thresh (Comp > X)", 0.0, 1.0, 0.5, 0.1, key="s_sell")
+            
+            use_ml_confirm = st.checkbox("🧠 Use ML Confirmation", value=False, help="Only take Slope Signal if ML Probability > Threshold")
+            if use_ml_confirm:
+                ml_confirm_thresh = st.slider("ML Confirm Prob", 0.1, 0.9, 0.3, 0.05)
     
     if st.button("📊 Generate Signals & Backtest", type="primary", use_container_width=True):
         with st.spinner("Loading model and generating signals..."):
@@ -1526,7 +1533,9 @@ with tab2:
             signals, prob_df = generate_signals(model_data, features, threshold=decision_threshold, 
                                               use_slope_signals=use_slope_signals,
                                               slope_buy_thresh=slope_buy_thresh,
-                                              slope_sell_thresh=slope_sell_thresh)
+                                              slope_sell_thresh=slope_sell_thresh,
+                                              use_ml_confirm=use_ml_confirm,
+                                              ml_confirm_thresh=ml_confirm_thresh)
             
             # Calculate Composite Technical Indicator (Average of normalized oscillators)
             # Use features already generated
