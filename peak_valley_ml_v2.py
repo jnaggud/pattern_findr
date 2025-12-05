@@ -2041,3 +2041,88 @@ with tab3:
         with col2:
             notes = loaded_model.get('notes', '')
             st.info(f"**Notes:** {notes if notes else 'None'}")
+
+    # ==========================================================================
+    # SLOPE SIGNAL ANALYSIS (New Section)
+    # ==========================================================================
+    st.markdown("---")
+    st.subheader("📉 Slope Signal Analysis (Deep Dive)")
+    st.caption("Analyze the quality of 'Slope Turn Signals' to find the best filter threshold.")
+    
+    analysis_dir = "analysis"
+    if os.path.exists(analysis_dir):
+        analysis_files = sorted([f for f in os.listdir(analysis_dir) if f.startswith("analysis_")], reverse=True)
+        if analysis_files:
+            latest_file = analysis_files[0]
+            if st.button(f"🔬 Analyze Slope Signals from {latest_file}"):
+                analyze_slope_signals(os.path.join(analysis_dir, latest_file))
+        else:
+            st.info("No analysis files found. Run a backtest in Production tab first.")
+    else:
+        st.info("No analysis directory found.")
+
+def analyze_slope_signals(file_path: str):
+    """
+    Analyze Slope Turn Signals from a saved analysis CSV.
+    """
+    try:
+        df = pd.read_csv(file_path, index_col=0, parse_dates=True)
+        
+        # Need 'composite_indicator'
+        if 'composite_indicator' not in df.columns:
+            st.error("Composite Indicator not found in analysis file.")
+            return
+        
+        # Calculate slope
+        df['composite_slope'] = df['composite_indicator'].diff()
+        
+        slope = df['composite_slope'].values
+        # Identify Slope Turns (using same logic as backtest)
+        slope_prev = np.roll(slope, 1)
+        slope_prev[0] = 0
+        
+        turn_up = (slope_prev < 0) & (slope > 0)
+        turn_down = (slope_prev > 0) & (slope < 0)
+        
+        # Calculate Forward Returns (5d)
+        # Use 'close'
+        df['ret_5d'] = df['close'].pct_change(5).shift(-5) * 100
+        
+        # Analyze Buys
+        buys = df[turn_up].copy()
+        sells = df[turn_down].copy()
+        
+        st.success(f"Found **{len(buys)}** Potential Slope Buys and **{len(sells)}** Potential Slope Sells in the data.")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("🟢 BUY Signal Quality")
+            # Bin the Composite Value
+            bins = [-1.0, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+            buys['comp_bin'] = pd.cut(buys['composite_indicator'], bins=bins)
+            
+            buy_metrics = pd.DataFrame({
+                'Win Rate (%)': buys.groupby('comp_bin')['ret_5d'].apply(lambda x: (x > 0).mean() * 100),
+                'Avg 5d Ret (%)': buys.groupby('comp_bin')['ret_5d'].mean(),
+                'Count': buys.groupby('comp_bin')['ret_5d'].count()
+            })
+            st.dataframe(buy_metrics.style.background_gradient(cmap='RdYlGn', subset=['Win Rate (%)', 'Avg 5d Ret (%)']), use_container_width=True)
+            
+        with col2:
+            st.subheader("🔴 SELL Signal Quality")
+            # Bin for sells
+            sells['comp_bin'] = pd.cut(sells['composite_indicator'], bins=bins)
+            
+            # For Sells, Win Rate is return < 0
+            sell_metrics = pd.DataFrame({
+                'Win Rate (%)': sells.groupby('comp_bin')['ret_5d'].apply(lambda x: (x < 0).mean() * 100),
+                'Avg 5d Ret (%)': sells.groupby('comp_bin')['ret_5d'].mean() * -1, # Inverse return for shorts
+                'Count': sells.groupby('comp_bin')['ret_5d'].count()
+            })
+            st.dataframe(sell_metrics.style.background_gradient(cmap='RdYlGn', subset=['Win Rate (%)', 'Avg 5d Ret (%)']), use_container_width=True)
+
+        st.info("💡 **Recommendation**: Choose a threshold where Win Rate is consistently high (e.g., > 60%). For Buys, this is likely **Composite < -0.6**. For Sells, **Composite > 0.6**.")
+
+    except Exception as e:
+        st.error(f"Error analyzing file: {e}")
+        st.exception(e)
