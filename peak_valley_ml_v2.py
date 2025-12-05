@@ -607,7 +607,7 @@ def load_model(filepath: str) -> dict:
     return joblib.load(filepath)
 
 
-def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float = 0.5) -> tuple[pd.Series, pd.DataFrame]:
+def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float = 0.5, use_slope_signals: bool = False) -> tuple[pd.Series, pd.DataFrame]:
     """
     Generate signals using the trained model with custom threshold.
     Returns: (signals, probabilities)
@@ -683,6 +683,34 @@ def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float 
             if overbought_mask.any():
                 probs[overbought_mask, sell_idx] = np.minimum(probs[overbought_mask, sell_idx] + 0.10, 1.0)
                 probs[overbought_mask, hold_idx] = np.maximum(probs[overbought_mask, hold_idx] - 0.10, 0.0)
+        
+        # ==========================================================================
+        # SLOPE TURN SIGNALS (User Request)
+        # Buy on Slope Turn Up (- to +), Sell on Slope Turn Down (+ to -)
+        # ==========================================================================
+        if use_slope_signals and 'composite_slope' in features.columns:
+            slope = features['composite_slope'].values
+            # Shifted slope (prev value)
+            slope_prev = np.roll(slope, 1)
+            slope_prev[0] = 0 # Handle boundary
+            
+            # Turn Up: Prev < 0 AND Curr > 0
+            turn_up_mask = (slope_prev < 0) & (slope > 0)
+            
+            # Turn Down: Prev > 0 AND Curr < 0
+            turn_down_mask = (slope_prev > 0) & (slope < 0)
+            
+            if turn_up_mask.any():
+                # Force Buy
+                probs[turn_up_mask, buy_idx] = 1.0
+                probs[turn_up_mask, hold_idx] = 0.0
+                probs[turn_up_mask, sell_idx] = 0.0
+                
+            if turn_down_mask.any():
+                # Force Sell
+                probs[turn_down_mask, sell_idx] = 1.0
+                probs[turn_down_mask, hold_idx] = 0.0
+                probs[turn_down_mask, buy_idx] = 0.0
         # ==========================================================================
         
     except IndexError:
@@ -720,9 +748,7 @@ def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float 
     return pd.Series(signals, index=features.index), prob_df
 
 
-def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float = 100000, 
-                 limit_pct: float = 0.0, stop_loss_pct: float = 0.0, take_profit_pct: float = 0.0,
-                 composite_data: pd.Series = None) -> dict:
+def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float = 100000, limit_pct: float = 0.0) -> dict:
     """
     Run backtest with detailed trade tracking.
     If limit_pct > 0, attempts to enter at Close * (1 - limit_pct) on the NEXT day.
@@ -731,15 +757,9 @@ def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float 
     df = data.loc[common_idx].copy()
     df['signal'] = signals.loc[common_idx]
     
-    if composite_data is not None:
-        # Align composite data
-        composite_data = composite_data.reindex(df.index)
-    
     capital = initial_capital
     position = 0
     shares = 0
-    entry_price = 0
-    entry_capital = 0
     trades = []
     equity_curve = []
     
@@ -753,92 +773,6 @@ def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float 
         price = row['close']
         signal = row['signal']
         
-        # Check SL/TP if in position
-        if position == 1:
-            # STOP LOSS
-            if stop_loss_pct > 0:
-                sl_price = entry_price * (1 - stop_loss_pct)
-                # Use Low for SL check
-                if row['low'] <= sl_price:
-                    # Trigger SL
-                    exit_price = sl_price
-                    capital = shares * exit_price
-                    profit = capital - entry_capital
-                    profit_pct = (exit_price - entry_price) / entry_price * 100
-                    
-                    trades[-1].update({
-                        'exit_date': date,
-                        'exit_price': exit_price,
-                        'exit_value': capital,
-                        'profit': profit,
-                        'profit_pct': profit_pct,
-                        'status': 'closed',
-                        'reason': 'Stop Loss'
-                    })
-                    position = 0
-                    shares = 0
-                    entry_price = 0
-                    
-                    # Record equity after exit and continue
-                    equity_curve.append({'date': date, 'equity': capital, 'price': price})
-                    continue
-
-            # TAKE PROFIT
-            if take_profit_pct > 0:
-                tp_price = entry_price * (1 + take_profit_pct)
-                # Use High for TP check
-                if row['high'] >= tp_price:
-                    # Trigger TP
-                    exit_price = tp_price
-                    capital = shares * exit_price
-                    profit = capital - entry_capital
-                    profit_pct = (exit_price - entry_price) / entry_price * 100
-                    
-                    trades[-1].update({
-                        'exit_date': date,
-                        'exit_price': exit_price,
-                        'exit_value': capital,
-                        'profit': profit,
-                        'profit_pct': profit_pct,
-                        'status': 'closed',
-                        'reason': 'Take Profit'
-                    })
-                    position = 0
-                    shares = 0
-                    entry_price = 0
-                    
-                    # Record equity after exit and continue
-                    equity_curve.append({'date': date, 'equity': capital, 'price': price})
-                    continue
-
-            # DYNAMIC TAKE PROFIT (Composite Extreme)
-            # Force exit if Composite > 0.8 (extreme euphoria) regardless of fixed target
-            if composite_data is not None:
-                comp_val = composite_data.iloc[i]
-                if not pd.isna(comp_val) and comp_val > 0.8:
-                    # Trigger Dynamic TP
-                    exit_price = price # Close at current bar Close
-                    capital = shares * exit_price
-                    profit = capital - entry_capital
-                    profit_pct = (exit_price - entry_price) / entry_price * 100
-                    
-                    trades[-1].update({
-                        'exit_date': date,
-                        'exit_price': exit_price,
-                        'exit_value': capital,
-                        'profit': profit,
-                        'profit_pct': profit_pct,
-                        'status': 'closed',
-                        'reason': 'Dynamic TP (Comp > 0.8)'
-                    })
-                    position = 0
-                    shares = 0
-                    entry_price = 0
-                    
-                    # Record equity after exit and continue
-                    equity_curve.append({'date': date, 'equity': capital, 'price': price})
-                    continue
-
         # Track equity
         current_equity = shares * price if position == 1 else capital
         equity_curve.append({'date': date, 'equity': current_equity, 'price': price})
@@ -1419,12 +1353,6 @@ with tab2:
         use_trend_filter = st.checkbox("✅ Use Trend Filtering", value=False, 
                                       help="Allow ALL Buys. Block SELLs in Bull Market unless Overbought (>0.6).")
     
-    col3, col4 = st.columns(2)
-    with col3:
-        stop_loss_pct = st.slider("Stop Loss %", 0.0, 20.0, 5.0, 0.5, help="Exit trade if price drops X%. 0 = No Stop.") / 100
-    with col4:
-        take_profit_pct = st.slider("Take Profit %", 0.0, 50.0, 0.0, 1.0, help="Fixed Target. Set to 0 to use Dynamic Exit (Sell Signals) only.") / 100
-    
     if st.button("📊 Generate Signals & Backtest", type="primary", use_container_width=True):
         with st.spinner("Loading model and generating signals..."):
             # Load model
@@ -1464,7 +1392,7 @@ with tab2:
             features = generate_features(data)
             
             # Generate signals with custom threshold
-            signals, prob_df = generate_signals(model_data, features, threshold=decision_threshold)
+            signals, prob_df = generate_signals(model_data, features, threshold=decision_threshold, use_slope_signals=use_slope_signals)
             
             # Calculate Composite Technical Indicator (Average of normalized oscillators)
             # Use features already generated
@@ -1555,9 +1483,7 @@ with tab2:
                 composite_indicator = composite_indicator.loc[signals.index]
             
             # Run backtest
-            backtest = run_backtest(data, signals, limit_pct=limit_entry_pct, 
-                                   stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct,
-                                   composite_data=composite_indicator)
+            backtest = run_backtest(data, signals, limit_pct=limit_entry_pct)
             st.session_state.v2_backtest = backtest
             
             # Calculate theoretical maximum for this period
