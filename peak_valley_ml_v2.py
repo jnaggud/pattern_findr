@@ -721,7 +721,8 @@ def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float 
 
 
 def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float = 100000, 
-                 limit_pct: float = 0.0, stop_loss_pct: float = 0.0, take_profit_pct: float = 0.0) -> dict:
+                 limit_pct: float = 0.0, stop_loss_pct: float = 0.0, take_profit_pct: float = 0.0,
+                 composite_data: pd.Series = None) -> dict:
     """
     Run backtest with detailed trade tracking.
     If limit_pct > 0, attempts to enter at Close * (1 - limit_pct) on the NEXT day.
@@ -729,6 +730,10 @@ def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float 
     common_idx = data.index.intersection(signals.index)
     df = data.loc[common_idx].copy()
     df['signal'] = signals.loc[common_idx]
+    
+    if composite_data is not None:
+        # Align composite data
+        composite_data = composite_data.reindex(df.index)
     
     capital = initial_capital
     position = 0
@@ -797,6 +802,34 @@ def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float 
                         'profit_pct': profit_pct,
                         'status': 'closed',
                         'reason': 'Take Profit'
+                    })
+                    position = 0
+                    shares = 0
+                    entry_price = 0
+                    
+                    # Record equity after exit and continue
+                    equity_curve.append({'date': date, 'equity': capital, 'price': price})
+                    continue
+
+            # DYNAMIC TAKE PROFIT (Composite Extreme)
+            # Force exit if Composite > 0.8 (extreme euphoria) regardless of fixed target
+            if composite_data is not None:
+                comp_val = composite_data.iloc[i]
+                if not pd.isna(comp_val) and comp_val > 0.8:
+                    # Trigger Dynamic TP
+                    exit_price = price # Close at current bar Close
+                    capital = shares * exit_price
+                    profit = capital - entry_capital
+                    profit_pct = (exit_price - entry_price) / entry_price * 100
+                    
+                    trades[-1].update({
+                        'exit_date': date,
+                        'exit_price': exit_price,
+                        'exit_value': capital,
+                        'profit': profit,
+                        'profit_pct': profit_pct,
+                        'status': 'closed',
+                        'reason': 'Dynamic TP (Comp > 0.8)'
                     })
                     position = 0
                     shares = 0
@@ -1388,9 +1421,9 @@ with tab2:
     
     col3, col4 = st.columns(2)
     with col3:
-        stop_loss_pct = st.slider("Stop Loss %", 0.0, 20.0, 0.0, 0.5, help="Exit trade if price drops X%. 0 = No Stop.") / 100
+        stop_loss_pct = st.slider("Stop Loss %", 0.0, 20.0, 5.0, 0.5, help="Exit trade if price drops X%. 0 = No Stop.") / 100
     with col4:
-        take_profit_pct = st.slider("Take Profit %", 0.0, 50.0, 0.0, 1.0, help="Exit trade if price rises X%. 0 = No Target.") / 100
+        take_profit_pct = st.slider("Take Profit %", 0.0, 50.0, 0.0, 1.0, help="Fixed Target. Set to 0 to use Dynamic Exit (Sell Signals) only.") / 100
     
     if st.button("📊 Generate Signals & Backtest", type="primary", use_container_width=True):
         with st.spinner("Loading model and generating signals..."):
@@ -1523,7 +1556,8 @@ with tab2:
             
             # Run backtest
             backtest = run_backtest(data, signals, limit_pct=limit_entry_pct, 
-                                   stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct)
+                                   stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct,
+                                   composite_data=composite_indicator)
             st.session_state.v2_backtest = backtest
             
             # Calculate theoretical maximum for this period
