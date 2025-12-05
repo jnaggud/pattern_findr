@@ -1352,6 +1352,8 @@ with tab2:
     with col2:
         use_trend_filter = st.checkbox("✅ Use Trend Filtering", value=False, 
                                       help="Allow ALL Buys. Block SELLs in Bull Market unless Overbought (>0.6).")
+        use_slope_signals = st.checkbox("✅ Use Slope Turn Signals", value=False, 
+                                      help="Force Buy on Composite Turn Up (Valley), Force Sell on Turn Down (Peak). Overrides ML.")
     
     if st.button("📊 Generate Signals & Backtest", type="primary", use_container_width=True):
         with st.spinner("Loading model and generating signals..."):
