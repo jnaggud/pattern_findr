@@ -1489,7 +1489,8 @@ with tab2:
             
             use_ml_confirm = st.checkbox("🧠 Use ML Confirmation", value=False, help="Only take Slope Signal if ML Probability > Threshold")
             if use_ml_confirm:
-                ml_confirm_thresh = st.slider("ML Confirm Prob", 0.1, 0.9, 0.3, 0.05)
+                ml_confirm_thresh = st.slider("ML Confirm Prob", 0.0, 0.5, 0.10, 0.01)
+                st.caption("ℹ️ **Tip:** ML Model usually predicts 'HOLD' with high confidence (~95%), leaving only ~2-5% for BUY/SELL. Set this **low** (e.g. 0.05 - 0.15) to catch subtle confirmations.")
     
     if st.button("📊 Generate Signals & Backtest", type="primary", use_container_width=True):
         with st.spinner("Loading model and generating signals..."):
@@ -2018,6 +2019,52 @@ with tab2:
             st.dataframe(trades_display, use_container_width=True)
         else:
             st.info("No trades executed in this period")
+            
+        # SAVE STRATEGY STATE BUTTON
+        st.divider()
+        if st.button("💾 Save Strategy State (Signals + Config)"):
+            import json
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_dir = "strategy_states"
+            os.makedirs(save_dir, exist_ok=True)
+            
+            # 1. Save Signals CSV
+            signals_path = os.path.join(save_dir, f"signals_{timestamp}.csv")
+            
+            # Reconstruct necessary data for CSV
+            output_df = pd.DataFrame(index=data.index)
+            output_df['close'] = data['close']
+            output_df['signal'] = signals
+            if 'composite_oscillator' in features.columns:
+                output_df['composite'] = features['composite_oscillator']
+                
+            # Add probabilities if available (need to match index)
+            # prob_df has same index as data?
+            if not prob_df.empty and len(prob_df) == len(data):
+                 # Find columns
+                 buy_col = [c for c in prob_df.columns if str(c) == '1']
+                 sell_col = [c for c in prob_df.columns if str(c) == '-1']
+                 if buy_col: output_df['ml_buy_prob'] = prob_df[buy_col[0]]
+                 if sell_col: output_df['ml_sell_prob'] = prob_df[sell_col[0]]
+            
+            output_df.to_csv(signals_path)
+            
+            # 2. Save Config JSON
+            config = {
+                'model_path': model_path,
+                'slope_buy_thresh': slope_buy_thresh,
+                'slope_sell_thresh': slope_sell_thresh,
+                'use_ml_confirm': use_ml_confirm,
+                'ml_confirm_thresh': ml_confirm_thresh,
+                'win_rate': backtest['win_rate'],
+                'total_return': backtest['total_return']
+            }
+            config_path = os.path.join(save_dir, f"config_{timestamp}.json")
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=4)
+                
+            st.success(f"Strategy State Saved to {save_dir}/")
 
 # =============================================================================
 # TAB 3: ANALYSIS
