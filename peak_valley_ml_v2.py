@@ -612,7 +612,9 @@ def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float 
                      slope_buy_thresh: float = 0.0,
                      slope_sell_thresh: float = 0.0,
                      use_ml_confirm: bool = False,
-                     ml_confirm_thresh: float = 0.3) -> tuple[pd.Series, pd.DataFrame]:
+                     ml_confirm_thresh: float = 0.3,
+                     slope_roc_thresh: float = 0.0,
+                     use_mom_zone: bool = False) -> tuple[pd.Series, pd.DataFrame]:
     """
     Generate signals using the trained model with custom threshold.
     Returns: (signals, probabilities)
@@ -692,7 +694,7 @@ def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float 
         # ==========================================================================
         # SLOPE TURN SIGNALS (User Request)
         # Buy on Slope Turn Up (- to +), Sell on Slope Turn Down (+ to -)
-        # With Threshold Filtering (e.g. only buy if Comp < -0.5)
+        # With Threshold Filtering + Acceleration + Momentum Zone
         # ==========================================================================
         if use_slope_signals and 'composite_slope' in features.columns:
             slope = features['composite_slope'].values
@@ -702,8 +704,23 @@ def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float 
             slope_prev = np.roll(slope, 1)
             slope_prev[0] = 0 # Handle boundary
             
-            # Turn Up: Prev < 0 AND Curr > 0 AND Comp < Threshold
-            turn_up_mask = (slope_prev < 0) & (slope > 0) & (comp_vals < slope_buy_thresh)
+            # Acceleration (ROC of Slope)
+            slope_roc = np.diff(slope, prepend=0)
+            
+            # Buy Logic
+            # 1. Deep Value Zone
+            cond_deep = (comp_vals < slope_buy_thresh)
+            
+            # 2. Momentum Zone (0.2 - 0.3) - The "Rocket Ship" signal
+            cond_mom = ((comp_vals > 0.2) & (comp_vals < 0.3)) if use_mom_zone else False
+            
+            valid_buy_zone = cond_deep | cond_mom
+            
+            # 3. Acceleration Filter (Avoid lazy turns)
+            valid_accel = (slope_roc > slope_roc_thresh)
+            
+            # Turn Up: Prev < 0 AND Curr > 0 AND Valid Zone AND Valid Accel
+            turn_up_mask = (slope_prev < 0) & (slope > 0) & valid_buy_zone & valid_accel
             
             # Turn Down: Prev > 0 AND Curr < 0 AND Comp > Threshold
             turn_down_mask = (slope_prev > 0) & (slope < 0) & (comp_vals > slope_sell_thresh)
@@ -1479,6 +1496,8 @@ with tab2:
         slope_sell_thresh = 0.0
         use_ml_confirm = False
         ml_confirm_thresh = 0.3
+        slope_roc_thresh = 0.0
+        use_mom_zone = False
         
         if use_slope_signals:
             col_s1, col_s2 = st.columns(2)
@@ -1486,6 +1505,9 @@ with tab2:
                 slope_buy_thresh = st.slider("Buy Thresh (Comp < X)", -1.0, 0.0, -0.5, 0.1, key="s_buy")
             with col_s2:
                 slope_sell_thresh = st.slider("Sell Thresh (Comp > X)", 0.0, 1.0, 0.5, 0.1, key="s_sell")
+            
+            use_mom_zone = st.checkbox("🚀 Allow Momentum Zone (0.2 - 0.3)", value=False, help="Buy high-probability breakouts even if not Oversold.")
+            slope_roc_thresh = st.slider("Min Slope Accel (ROC)", 0.0, 0.5, 0.0, 0.05, help="Filter out lazy turns. Winners usually have acceleration > 0.2.")
             
             use_ml_confirm = st.checkbox("🧠 Use ML Confirmation", value=False, help="Only take Slope Signal if ML Probability > Threshold")
             if use_ml_confirm:
@@ -1536,7 +1558,9 @@ with tab2:
                                               slope_buy_thresh=slope_buy_thresh,
                                               slope_sell_thresh=slope_sell_thresh,
                                               use_ml_confirm=use_ml_confirm,
-                                              ml_confirm_thresh=ml_confirm_thresh)
+                                              ml_confirm_thresh=ml_confirm_thresh,
+                                              slope_roc_thresh=slope_roc_thresh,
+                                              use_mom_zone=use_mom_zone)
             
             # Calculate Composite Technical Indicator (Average of normalized oscillators)
             # Use features already generated
