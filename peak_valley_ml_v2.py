@@ -285,25 +285,21 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
                             model_type: str = 'xgboost', use_smote: bool = True,
                             n_trials: int = 20, progress_callback=None,
                             optimize_metric: str = 'f1_weighted', n_cv_splits: int = 5,
-                            class_weight_ratio: float = 1.0):
+                            class_weight_ratio: float = 1.0, optimize_training_params: bool = False):
     """
-    Train model with Optuna optimization and SMOTE balancing.
-    Uses proper time series cross-validation (no future data leakage).
-    
-    Args:
-        optimize_metric: 'f1_weighted', 'accuracy', or 'f1_macro'
-        n_cv_splits: Number of TimeSeriesSplit folds (default 5)
-        class_weight_ratio: Multiplier for BUY/SELL class weights (default 1.0)
+    Train model with Optuna optimization.
+    Supports optimizing Class Weights and SMOTE if optimize_training_params=True.
     """
     from sklearn.model_selection import cross_val_score, TimeSeriesSplit
     from sklearn.preprocessing import StandardScaler, LabelEncoder
     from sklearn.metrics import accuracy_score, f1_score, classification_report
     from sklearn.utils.class_weight import compute_sample_weight
+    from imblearn.over_sampling import SMOTE
     import optuna
     
     # Console output header
     print("\n" + "="*70)
-    print(f"🚀 TRAINING {model_type.upper()} MODEL")
+    print(f"🚀 TRAINING {model_type.upper()} MODEL (Optuna)")
     print("="*70)
     
     # Align data
@@ -311,75 +307,79 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
     X = features.loc[common_idx]
     y = labels.loc[common_idx]
     
-    print(f"📊 Dataset: {len(X)} samples, {len(X.columns)} features")
-    print(f"📈 Label distribution: {dict(y.value_counts())}")
-    
-    # Time-based split (80/20) - CRITICAL: no shuffling for time series
+    # Time-based split (80/20)
     split_idx = int(len(X) * 0.8)
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
-    
-    print(f"📅 Train period: {X_train.index[0].strftime('%Y-%m-%d')} to {X_train.index[-1].strftime('%Y-%m-%d')} ({len(X_train)} samples)")
-    print(f"📅 Test period:  {X_test.index[0].strftime('%Y-%m-%d')} to {X_test.index[-1].strftime('%Y-%m-%d')} ({len(X_test)} samples)")
     
     # Scale features
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
     
-    # SMOTE balancing (applied to training data only)
-    if use_smote:
-        from imblearn.over_sampling import SMOTE
-        smote = SMOTE(random_state=42)
-        X_train_balanced, y_train_balanced = smote.fit_resample(X_train_scaled, y_train)
-        print(f"⚖️  SMOTE: {len(X_train_scaled)} → {len(X_train_balanced)} samples (balanced)")
-    else:
-        X_train_balanced, y_train_balanced = X_train_scaled, y_train.values
-        print(f"⚖️  SMOTE: Disabled")
+    # Pre-compute Datasets (for speed)
+    # 1. Raw
+    data_raw = (X_train_scaled, y_train.values)
     
-    # Label encoding for XGBoost
+    # 2. SMOTE (Calculate once if possible, or just instantiate object)
+    # If we optimize SMOTE, we need to have the SMOTE data ready.
+    print("⏳ Pre-computing SMOTE dataset...")
+    smote = SMOTE(random_state=42)
+    X_train_smote, y_train_smote = smote.fit_resample(X_train_scaled, y_train)
+    data_smote = (X_train_smote, y_train_smote)
+    print(f"   Raw: {len(X_train_scaled)} | SMOTE: {len(X_train_smote)}")
+    
+    # Label Encoding
     label_encoder = None
     if model_type == 'xgboost':
         label_encoder = LabelEncoder()
-        y_train_encoded = label_encoder.fit_transform(y_train_balanced)
-        y_test_encoded = label_encoder.transform(y_test)
-        print(f"🏷️  Label encoding: {dict(zip(label_encoder.classes_, range(len(label_encoder.classes_))))}")
-    else:
-        y_train_encoded = y_train_balanced
-        y_test_encoded = y_test.values
+        # Fit on full labels to ensure all classes covered
+        label_encoder.fit(y) 
     
-    # Calculate sample weights if ratio > 1.0
-    sample_weights = None
-    if class_weight_ratio > 1.0:
-        # Identify classes: 0=HOLD, -1=SELL, 1=BUY
-        # If label encoded, map accordingly
+    # Helper to get encoded y
+    def get_encoded_y(y_in):
         if label_encoder:
-            # Map original labels to encoded
-            hold_val = label_encoder.transform([0])[0]
+            return label_encoder.transform(y_in)
+        return y_in
+        
+    # Helper to get weights
+    def get_weights(y_in, ratio):
+        if ratio <= 1.0: return None
+        if label_encoder:
             buy_val = label_encoder.transform([1])[0]
             sell_val = label_encoder.transform([-1])[0]
         else:
-            hold_val, buy_val, sell_val = 0, 1, -1
+            buy_val, sell_val = 1, -1
             
-        weights = np.ones(len(y_train_encoded))
-        weights[y_train_encoded == buy_val] = class_weight_ratio
-        weights[y_train_encoded == sell_val] = class_weight_ratio
-        sample_weights = weights
-        print(f"⚖️  Applied class weights: BUY/SELL={class_weight_ratio}x, HOLD=1.0x")
-    
-    print(f"\n🎯 Optimization target: {optimize_metric}")
-    print(f"📊 Time Series CV: {n_cv_splits} folds (forward-chaining, no look-ahead)")
-    print("-"*70)
-    
-    # Thread-safe tracking for parallel execution
+        w = np.ones(len(y_in))
+        w[y_in == buy_val] = ratio
+        w[y_in == sell_val] = ratio
+        return w
+
+    # Thread-safe tracking
     import threading
     lock = threading.Lock()
     best_score_so_far = [0.0]
-    best_trial_num = [0]
     completed_trials = [0]
+    best_trial_num = [0]
     
-    # Optuna optimization with console logging (thread-safe)
     def objective(trial):
+        # 1. Suggest Data & Config
+        if optimize_training_params:
+            use_smote_trial = trial.suggest_categorical('use_smote', [True, False])
+            cw_ratio_trial = trial.suggest_float('class_weight_ratio', 1.0, 10.0, step=0.5)
+        else:
+            use_smote_trial = use_smote
+            cw_ratio_trial = class_weight_ratio
+            
+        # Select Data
+        X_t, y_t_raw = data_smote if use_smote_trial else data_raw
+        y_t = get_encoded_y(y_t_raw)
+        
+        # Calculate Weights
+        sample_weights_t = get_weights(y_t, cw_ratio_trial)
+        
+        # 2. Suggest Hyperparams
         if model_type == 'xgboost':
             from xgboost import XGBClassifier
             params = {
@@ -395,78 +395,66 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
                 'use_label_encoder': False,
                 'eval_metric': 'mlogloss',
                 'verbosity': 0,
-                'n_jobs': 1  # Single thread per model (parallelism at trial level)
+                'n_jobs': 1
             }
             model = XGBClassifier(**params)
         else:
             from sklearn.ensemble import RandomForestClassifier
             params = {
                 'n_estimators': trial.suggest_int('n_estimators', 50, 300),
-                'max_depth': trial.suggest_int('max_depth', 5, 20),
-                'min_samples_split': trial.suggest_int('min_samples_split', 2, 20),
+                'max_depth': trial.suggest_int('max_depth', 3, 20),
+                'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
                 'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 10),
-                'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2', None]),
                 'random_state': 42,
-                'n_jobs': 1  # Single thread per model (parallelism at trial level)
+                'n_jobs': 1
             }
-            
-            # For Random Forest, we can use class_weight param directly
-            if class_weight_ratio > 1.0:
-                # Map: 0=HOLD, 1=BUY, -1=SELL (if not encoded)
-                # If encoded, we need to know the integer mapping.
-                # Let's assume balanced/encoded labels.
-                # Easier to rely on sample_weight in fit_params for consistency with XGBoost
-                pass
-                
             model = RandomForestClassifier(**params)
-        
-        # Time Series Cross-Validation (forward-chaining)
-        # Manual loop to handle sample_weights correctly and avoid sklearn version issues
+            
+        # 3. Cross-Validation
         tscv = TimeSeriesSplit(n_splits=n_cv_splits)
         scores = []
         
-        for train_index, val_index in tscv.split(X_train_balanced):
-            X_tr, X_val = X_train_balanced[train_index], X_train_balanced[val_index]
-            y_tr, y_val = y_train_encoded[train_index], y_train_encoded[val_index]
+        # We need to handle weights in CV. 
+        # Sklearn cross_val_score supports fit_params but manual loop is clearer for weights.
+        # Actually, sample_weight must be aligned with split.
+        
+        for train_idx, val_idx in tscv.split(X_t):
+            X_fold_train, X_fold_val = X_t[train_idx], X_t[val_idx]
+            y_fold_train, y_fold_val = y_t[train_idx], y_t[val_idx]
             
-            # Split weights if they exist
-            if sample_weights is not None:
-                w_tr = sample_weights[train_index]
-                model.fit(X_tr, y_tr, sample_weight=w_tr)
-            else:
-                model.fit(X_tr, y_tr)
+            w_fold_train = sample_weights_t[train_idx] if sample_weights_t is not None else None
             
-            y_pred = model.predict(X_val)
+            model.fit(X_fold_train, y_fold_train, sample_weight=w_fold_train)
+            y_pred = model.predict(X_fold_val)
             
             if optimize_metric == 'f1_weighted':
-                score = f1_score(y_val, y_pred, average='weighted')
-            elif optimize_metric == 'accuracy':
-                score = accuracy_score(y_val, y_pred)
+                score = f1_score(y_fold_val, y_pred, average='weighted')
             elif optimize_metric == 'f1_macro':
-                score = f1_score(y_val, y_pred, average='macro')
+                score = f1_score(y_fold_val, y_pred, average='macro')
             else:
-                score = f1_score(y_val, y_pred, average='weighted') # Default
-                
+                score = accuracy_score(y_fold_val, y_pred)
             scores.append(score)
+            
+        avg_score = np.mean(scores)
         
-        mean_score = np.mean(scores)
-        std_score = np.std(scores)
-        
-        # Thread-safe console output
+        # Logging
         with lock:
             completed_trials[0] += 1
-            trial_num = completed_trials[0]
-            is_best = mean_score > best_score_so_far[0]
-            if is_best:
-                best_score_so_far[0] = mean_score
-                best_trial_num[0] = trial.number + 1
-                marker = "⭐ NEW BEST"
-            else:
-                marker = ""
+            is_best = False
+            if avg_score > best_score_so_far[0]:
+                best_score_so_far[0] = avg_score
+                best_trial_num[0] = trial.number
+                is_best = True
             
-            print(f"Trial {trial_num:3d}/{n_trials} | CV Score: {mean_score:.4f} (±{std_score:.4f}) | Best: {best_score_so_far[0]:.4f} {marker}")
-        
-        return mean_score
+            if is_best:
+                print(f"⭐ New Best (Trial {trial.number}): {avg_score:.4f} | SMOTE={use_smote_trial}, CW={cw_ratio_trial:.1f}")
+            else:
+                print(f"   Trial {trial.number}: {avg_score:.4f} | SMOTE={use_smote_trial}, CW={cw_ratio_trial:.1f}")
+            
+            if progress_callback:
+                progress_callback(completed_trials[0])
+                
+        return avg_score
     
     # Determine number of parallel jobs (all cores except 1)
     import multiprocessing
@@ -488,14 +476,19 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
     if progress_callback:
         progress_callback(n_trials, n_trials)
     
-    best_params = study.best_params
+    best_params = study.best_params.copy()
     
     print("-"*70)
     print(f"✅ Optimization complete! Best trial: #{best_trial_num[0]} with CV score: {study.best_value:.4f}")
     print(f"📋 Best parameters: {best_params}")
     
+    # Extract Training Config from best_params
+    final_use_smote = best_params.pop('use_smote', use_smote)
+    final_cw_ratio = best_params.pop('class_weight_ratio', class_weight_ratio)
+    
     # Train final model with best params
     print(f"\n🏋️ Training final model with best parameters...")
+    print(f"   SMOTE: {final_use_smote} | Class Weight: {final_cw_ratio:.2f}x")
     
     if model_type == 'xgboost':
         from xgboost import XGBClassifier
@@ -507,11 +500,15 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
         best_params.update({'random_state': 42, 'n_jobs': -1})
         model = RandomForestClassifier(**best_params)
     
-    # Apply sample weights if available
-    if sample_weights is not None:
-        model.fit(X_train_balanced, y_train_encoded, sample_weight=sample_weights)
-    else:
-        model.fit(X_train_balanced, y_train_encoded)
+    # Prepare Final Training Data
+    X_final, y_final_raw = data_smote if final_use_smote else data_raw
+    y_final = get_encoded_y(y_final_raw)
+    
+    # Prepare Final Weights
+    final_weights = get_weights(y_final, final_cw_ratio)
+    
+    # Fit
+    model.fit(X_final, y_final, sample_weight=final_weights)
     
     # Predictions on held-out test set
     y_pred = model.predict(X_test_scaled)
@@ -614,11 +611,17 @@ def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float 
                      use_ml_confirm: bool = False,
                      ml_confirm_thresh: float = 0.3,
                      slope_roc_thresh: float = 0.0,
-                     use_mom_zone: bool = False) -> tuple[pd.Series, pd.DataFrame]:
+                     use_mom_zone: bool = False,
+                     buy_threshold: float = None,
+                     sell_threshold: float = None) -> tuple[pd.Series, pd.DataFrame]:
     """
-    Generate signals using the trained model with custom threshold.
+    Generate signals using the trained model with custom thresholds.
     Returns: (signals, probabilities)
     """
+    # Handle legacy single threshold arg
+    if buy_threshold is None: buy_threshold = threshold
+    if sell_threshold is None: sell_threshold = threshold
+
     model = model_data['model']
     scaler = model_data['scaler']
     label_encoder = model_data['label_encoder']
@@ -637,68 +640,44 @@ def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float 
     # Get probabilities
     probs = model.predict_proba(X_scaled)
     
-    # Determine classes based on threshold
-    # Default classes: 0, 1, 2 (mapped from -1, 0, 1 usually)
-    # We need to know which column corresponds to which class
-    classes = model.classes_
+    # Get class indices
+    classes = label_encoder.classes_
+    original_classes = label_encoder.inverse_transform(range(len(classes)))
     
-    # Map encoded classes back to -1, 0, 1
-    if label_encoder:
-        original_classes = label_encoder.inverse_transform(classes)
-    else:
-        original_classes = classes
-        
-    # Find column indices for each class
+    # Map classes to indices (1: Buy, -1: Sell, 0: Hold)
     try:
         buy_idx = np.where(original_classes == 1)[0][0]
         sell_idx = np.where(original_classes == -1)[0][0]
         hold_idx = np.where(original_classes == 0)[0][0]
         
         # ==========================================================================
-        # CONFIDENCE BOOSTING (Hybrid Rule-Based + ML)
-        # Boost confidence if Composite Indicator is extreme to capture "missed" turns
+        # LOGIC ENHANCEMENT: SLOPE SIGNALS & ML CONFIRMATION
         # ==========================================================================
-        if 'composite_oscillator' in features.columns:
-            # Get composite values (aligned with X)
-            comp_vals = features['composite_oscillator'].values
+        if use_slope_signals:
+            # Calculate Composite Indicator on the fly (if not passed)
+            # We need the same logic as in the main app.
+            # Since we don't have the composite passed in, we reconstruct it from features.
+            # This ensures consistency.
             
-            # Boost BUY prob if Oversold (< -0.6)
-            # We add 0.10 to probability (clamped at 1.0)
-            oversold_mask = comp_vals < -0.6
-            if oversold_mask.any():
-                probs[oversold_mask, buy_idx] = np.minimum(probs[oversold_mask, buy_idx] + 0.10, 1.0)
-                # Decrease HOLD prob to compensate (normalization not strictly required for threshold check but good for correctness)
-                probs[oversold_mask, hold_idx] = np.maximum(probs[oversold_mask, hold_idx] - 0.10, 0.0)
+            # Helper to safely get feature
+            def get_f(name):
+                return features[name] if name in features.columns else pd.Series(0, index=features.index)
             
-            # Boost SELL prob if Overbought
-            # DYNAMIC THRESHOLD: In a downtrend (Price < SMA50), tops happen at lower oscillator values.
-            # If dist_sma50 is negative, use 0.4 threshold. Otherwise use 0.6.
+            # Reconstruct Composite (Norm RSI, Norm WillR, Norm CCI, Norm ROC)
+            # RSI (0-100) -> (-1 to 1)
+            rsi_norm = (get_f('rsi_14') - 50) / 50
+            # WillR (-100 to 0) -> (-1 to 1)
+            willr_norm = (get_f('willr_14') + 50) / 50
+            # CCI (approx -100 to 100) -> (-1 to 1)
+            cci_norm = (get_f('cci_14') / 100).clip(-1, 1)
+            # ROC (approx -5 to 5) -> (-1 to 1)
+            roc_norm = (get_f('roc_10') / 5).clip(-1, 1)
             
-            sell_threshold = 0.6
-            if 'dist_sma50' in features.columns:
-                # Create array of thresholds
-                # If dist_sma50 < 0, threshold is 0.4, else 0.6
-                dists = features['dist_sma50'].values
-                sell_thresholds = np.where(dists < 0, 0.4, 0.6)
-                
-                # Create mask where Comp > Threshold
-                overbought_mask = comp_vals > sell_thresholds
-            else:
-                # Fallback
-                overbought_mask = comp_vals > 0.6
+            # Composite
+            comp_vals = (rsi_norm + willr_norm + cci_norm + roc_norm) / 4
             
-            if overbought_mask.any():
-                probs[overbought_mask, sell_idx] = np.minimum(probs[overbought_mask, sell_idx] + 0.10, 1.0)
-                probs[overbought_mask, hold_idx] = np.maximum(probs[overbought_mask, hold_idx] - 0.10, 0.0)
-        
-        # ==========================================================================
-        # SLOPE TURN SIGNALS (User Request)
-        # Buy on Slope Turn Up (- to +), Sell on Slope Turn Down (+ to -)
-        # With Threshold Filtering + Acceleration + Momentum Zone
-        # ==========================================================================
-        if use_slope_signals and 'composite_slope' in features.columns:
-            slope = features['composite_slope'].values
-            comp_vals = features['composite_oscillator'].values
+            # Slope
+            slope = np.gradient(comp_vals)
             
             # Shifted slope (prev value)
             slope_prev = np.roll(slope, 1)
@@ -749,23 +728,23 @@ def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float 
         return pd.Series(0, index=features.index), pd.DataFrame(probs, index=features.index, columns=original_classes)
     
     # Apply threshold logic
-    # If prob(BUY) > threshold -> BUY
-    # If prob(SELL) > threshold -> SELL
+    # If prob(BUY) > buy_threshold -> BUY
+    # If prob(SELL) > sell_threshold -> SELL
     # Else -> HOLD
     
-    signals = np.zeros(len(X))
+    signals = np.zeros(len(X), dtype=int)
     
-    # Vectorized threshold application
-    buy_mask = probs[:, buy_idx] > threshold
-    sell_mask = probs[:, sell_idx] > threshold
+    # Vectorized signal generation
+    buy_mask = probs[:, buy_idx] > buy_threshold
+    sell_mask = probs[:, sell_idx] > sell_threshold
     
-    # Conflict resolution: if both > threshold, pick higher prob
+    # Conflict resolution: If both > threshold, take higher probability
     conflict_mask = buy_mask & sell_mask
     if conflict_mask.any():
-        buy_higher = probs[:, buy_idx] > probs[:, sell_idx]
-        buy_mask[conflict_mask] = buy_higher[conflict_mask]
-        sell_mask[conflict_mask] = ~buy_higher[conflict_mask]
-        
+        buy_higher = probs[conflict_mask, buy_idx] > probs[conflict_mask, sell_idx]
+        buy_mask[conflict_mask] = buy_higher
+        sell_mask[conflict_mask] = ~buy_higher
+    
     signals[buy_mask] = 1
     signals[sell_mask] = -1
     
@@ -779,10 +758,120 @@ def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float 
     return pd.Series(signals, index=features.index), prob_df
 
 
-def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float = 100000, limit_pct: float = 0.0) -> dict:
+def optimize_strategy(data, model_data, features, n_trials=100, progress_callback=None):
+    """
+    Optimize Strategy Sliders using Optuna (Fast Post-Processing).
+    Does NOT re-train the model. Optimizes filters only.
+    """
+    import optuna
+    # Suppress console output to avoid confusion with model training
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    
+    print("--- STARTING STRATEGY OPTIMIZATION ---")
+    
+    def objective(trial):
+        # Update progress if callback provided
+        if progress_callback:
+            progress_callback(trial.number, n_trials)
+
+        # Suggest parameters (Strategy Sliders)
+        s_buy = trial.suggest_float('slope_buy_thresh', -1.0, 0.0, step=0.1)
+        s_sell = trial.suggest_float('slope_sell_thresh', 0.0, 1.0, step=0.1)
+        roc_thresh = trial.suggest_float('slope_roc_thresh', 0.0, 0.5, step=0.05)
+        mom_zone = trial.suggest_categorical('use_mom_zone', [True, False])
+        
+        # Trend Filter
+        use_trend = trial.suggest_categorical('use_trend_filter', [True, False])
+        
+        # Volatility Filter (ADX)
+        use_adx = trial.suggest_categorical('use_adx_filter', [True, False])
+        adx_thresh = trial.suggest_int('adx_threshold', 15, 30)
+        
+        # ML Thresholds (Instead of fixed 0.5)
+        # Allow asymmetry (e.g. easy entry, strict exit or vice versa)
+        ml_buy = trial.suggest_float('ml_buy_threshold', 0.2, 0.8, step=0.05)
+        ml_sell = trial.suggest_float('ml_sell_threshold', 0.2, 0.8, step=0.05)
+        
+        # ML Confirmation params (for slope signals)
+        use_ml = trial.suggest_categorical('use_ml_confirm', [True, False])
+        ml_conf_thresh = trial.suggest_float('ml_confirm_thresh', 0.0, 0.5, step=0.05)
+        
+        # Generate signals
+        signals, _ = generate_signals(
+            model_data, features,
+            use_slope_signals=True,
+            slope_buy_thresh=s_buy,
+            slope_sell_thresh=s_sell,
+            use_ml_confirm=use_ml,
+            ml_confirm_thresh=ml_conf_thresh,
+            slope_roc_thresh=roc_thresh,
+            use_mom_zone=mom_zone,
+            buy_threshold=ml_buy,
+            sell_threshold=ml_sell
+        )
+        
+        # Apply Trend Filter (if selected)
+        if use_trend:
+            # Calculate SMA200 (using full available data to be safe)
+            aligned_data = data.loc[signals.index]
+            if len(aligned_data) > 200:
+                sma200 = aligned_data['close'].rolling(200).mean()
+                is_bull = aligned_data['close'] > sma200
+                
+                bull_mask = is_bull
+                # Filter SELLs (-1) in Bull Market
+                # Keep BUYs (1)
+                sell_mask = (signals == -1) & bull_mask
+                signals.loc[sell_mask] = 0
+                
+        # Apply Volatility Filter (ADX) (if selected)
+        if use_adx:
+            adx_cols = [c for c in features.columns if c.startswith('ADX_')]
+            if adx_cols:
+                # Get ADX values and align
+                adx_vals = features[adx_cols[0]].loc[signals.index]
+                
+                # Identify "Chop" zones (ADX < Threshold)
+                chop_mask = adx_vals < adx_thresh
+                
+                # Block ALL new signals in chop
+                # (We set signal to 0, which means HOLD)
+                signals.loc[chop_mask] = 0
+        
+        # Run Backtest
+        # Pure Signal-Based: No SL/TP overrides
+        res = run_backtest(data, signals, verbose=False)
+        
+        ret = res['total_return']
+        
+        # Console progress (optional, can be spammy)
+        # print(f"Trial {trial.number}: {ret:.2f}%")
+        
+        # Objective: Maximize Total Return
+        # Penalize very few trades
+        if res['num_trades'] < 5: 
+            return -100.0 
+            
+        return ret
+
+    study = optuna.create_study(direction='maximize')
+    
+    # Use all cores except 1
+    import os
+    n_jobs = max(1, os.cpu_count() - 1)
+    if progress_callback:
+        n_jobs = 1 # Must be single-threaded to update Streamlit UI safely
+        
+    study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs)
+    
+    return study.best_params, study.best_value
+
+
+def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float = 100000, limit_pct: float = 0.0, stop_loss_pct: float = 0.0, take_profit_pct: float = 0.0, verbose: bool = True) -> dict:
     """
     Run backtest with detailed trade tracking.
     If limit_pct > 0, attempts to enter at Close * (1 - limit_pct) on the NEXT day.
+    Supports Stop Loss and Take Profit (pct as decimal, e.g. 0.05 for 5%).
     """
     common_idx = data.index.intersection(signals.index)
     df = data.loc[common_idx].copy()
@@ -804,6 +893,66 @@ def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float 
         price = row['close']
         signal = row['signal']
         
+        # Check Stop Loss / Take Profit for EXISTING positions
+        if position == 1 and trades:
+            entry_price = trades[-1]['entry_price']
+            
+            # Stop Loss Logic
+            if stop_loss_pct > 0:
+                sl_price = entry_price * (1 - stop_loss_pct)
+                if row['low'] <= sl_price:
+                    # SL Triggered
+                    exit_price = sl_price
+                    if row['open'] < sl_price: exit_price = row['open'] # Gap down
+                    
+                    exit_value = shares * exit_price
+                    profit = exit_value - trades[-1]['entry_capital']
+                    profit_pct = profit / trades[-1]['entry_capital'] * 100
+                    
+                    trades[-1].update({
+                        'exit_date': date,
+                        'exit_price': exit_price,
+                        'exit_value': exit_value,
+                        'profit': profit,
+                        'profit_pct': profit_pct,
+                        'status': 'closed (SL)'
+                    })
+                    capital = exit_value
+                    position = 0
+                    shares = 0
+                    
+                    # Track equity after close
+                    equity_curve.append({'date': date, 'equity': capital, 'price': price})
+                    continue # Trade closed, skip to next bar
+
+            # Take Profit Logic
+            if take_profit_pct > 0 and position == 1:
+                tp_price = entry_price * (1 + take_profit_pct)
+                if row['high'] >= tp_price:
+                    # TP Triggered
+                    exit_price = tp_price
+                    if row['open'] > tp_price: exit_price = row['open'] # Gap up
+                    
+                    exit_value = shares * exit_price
+                    profit = exit_value - trades[-1]['entry_capital']
+                    profit_pct = profit / trades[-1]['entry_capital'] * 100
+                    
+                    trades[-1].update({
+                        'exit_date': date,
+                        'exit_price': exit_price,
+                        'exit_value': exit_value,
+                        'profit': profit,
+                        'profit_pct': profit_pct,
+                        'status': 'closed (TP)'
+                    })
+                    capital = exit_value
+                    position = 0
+                    shares = 0
+                    
+                    # Track equity after close
+                    equity_curve.append({'date': date, 'equity': capital, 'price': price})
+                    continue # Trade closed, skip to next bar
+
         # Track equity
         current_equity = shares * price if position == 1 else capital
         equity_curve.append({'date': date, 'equity': current_equity, 'price': price})
@@ -813,7 +962,7 @@ def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float 
             filled = True
             fill_date = date
             
-            if limit_pct > 0:
+            if limit_pct > 0.001:  # Treat < 0.1% as Market Order (0.0) to avoid float errors
                 # Limit Logic: Try to fill next day
                 # Note: Since we are iterating, 'next_low' is the Low of i+1 (tomorrow)
                 # If we are at the last day, we can't fill tomorrow
@@ -1297,7 +1446,7 @@ with st.sidebar:
     model_type = st.selectbox("Model Type", ['xgboost', 'random_forest'])
     use_smote = st.checkbox("Use SMOTE Balancing", value=True)
     use_optuna = st.checkbox("Use Optuna Optimization", value=True)
-    n_trials = st.slider("Optuna Trials", 10, 100, 30) if use_optuna else 10
+    n_trials = st.slider("Optuna Trials", 10, 5000, 30) if use_optuna else 10
     
     # Optimization metric selection
     optimize_metric = st.selectbox("Optimize For", 
@@ -1427,7 +1576,8 @@ with tab1:
             progress_callback=None, # Console only now
             optimize_metric=optimize_metric,
             n_cv_splits=n_cv_splits,
-            class_weight_ratio=class_weight_ratio
+            class_weight_ratio=class_weight_ratio,
+            optimize_training_params=use_optuna
         )
         
         st.session_state.v2_model = model_data
@@ -1482,14 +1632,33 @@ with tab2:
     st.info(f"📅 **Backtest Mode:** {backtest_mode}")
     
     # Execution Settings
+    st.markdown("### ⚙️ Signal Filters & Sensitivity")
     col1, col2 = st.columns(2)
+    
     with col1:
-        limit_entry_pct = st.slider("Entry Limit Offset %", 0.0, 3.0, 0.0, 0.1, 
-                                   help="Try to buy lower than signal price (e.g. 1.0% lower). 0 = Market Order.") / 100
+        st.markdown("**1. Market Filters**")
+        use_trend_filter = st.checkbox("✅ Use Trend Filter (SMA200)", value=False, key="s_trend",
+                                      help="Block SELLS in Bull Market. Forces trend following.")
+        
+        use_adx_filter = st.checkbox("✅ Use Volatility Filter (ADX)", value=False, key="s_adx_bool",
+                                    help="Block ALL TRADES in Choppy/Sideways Market (Low ADX).")
+        
+        adx_threshold = 20
+        if use_adx_filter:
+             adx_threshold = st.slider("Min ADX Threshold", 10, 40, 20, 1, key="s_adx_thresh")
+             
+        limit_entry_pct = st.slider("Entry Limit Offset %", 0.0, 3.0, 0.0, 0.1, key="s_limit",
+                                   help="Try to buy lower than signal price. 0 = Market Order.") / 100
+
     with col2:
-        use_trend_filter = st.checkbox("✅ Use Trend Filtering", value=False, 
-                                      help="Allow ALL Buys. Block SELLs in Bull Market unless Overbought (>0.6).")
-        use_slope_signals = st.checkbox("✅ Use Slope Turn Signals", value=False, 
+        st.markdown("**2. AI Confidence**")
+        # ML Thresholds
+        ml_buy_thresh = st.slider("ML Buy Confidence", 0.2, 0.95, 0.5, 0.05, key="s_ml_buy", help="Minimum Probability to Trigger BUY")
+        ml_sell_thresh = st.slider("ML Sell Confidence", 0.2, 0.95, 0.5, 0.05, key="s_ml_sell", help="Minimum Probability to Trigger SELL")
+
+    # Slope Signals (Advanced/Legacy)
+    with st.expander("Advanced: Composite Slope Signals"):
+        use_slope_signals = st.checkbox("Enable Slope Turn Signals", value=False, key="s_slope_bool",
                                       help="Force Buy on Composite Turn Up (Valley), Force Sell on Turn Down (Peak). Overrides ML.")
         
         slope_buy_thresh = 0.0
@@ -1506,14 +1675,93 @@ with tab2:
             with col_s2:
                 slope_sell_thresh = st.slider("Sell Thresh (Comp > X)", 0.0, 1.0, 0.5, 0.1, key="s_sell")
             
-            use_mom_zone = st.checkbox("🚀 Allow Momentum Zone (0.2 - 0.3)", value=False, help="Buy high-probability breakouts even if not Oversold.")
-            slope_roc_thresh = st.slider("Min Slope Accel (ROC)", 0.0, 0.5, 0.0, 0.05, help="Filter out lazy turns. Winners usually have acceleration > 0.2.")
+            use_mom_zone = st.checkbox("🚀 Allow Momentum Zone (0.2 - 0.3)", value=False, key="s_mom", help="Buy high-probability breakouts.")
+            slope_roc_thresh = st.slider("Min Slope Accel (ROC)", 0.0, 0.5, 0.0, 0.05, key="s_roc", help="Filter out lazy turns.")
             
-            use_ml_confirm = st.checkbox("🧠 Use ML Confirmation", value=False, help="Only take Slope Signal if ML Probability > Threshold")
+            use_ml_confirm = st.checkbox("🧠 Use ML Confirmation", value=False, key="s_ml_conf_bool", help="Only take Slope Signal if ML Probability > Threshold")
             if use_ml_confirm:
-                ml_confirm_thresh = st.slider("ML Confirm Prob", 0.0, 0.5, 0.10, 0.01)
-                st.caption("ℹ️ **Tip:** ML Model usually predicts 'HOLD' with high confidence (~95%), leaving only ~2-5% for BUY/SELL. Set this **low** (e.g. 0.05 - 0.15) to catch subtle confirmations.")
+                ml_confirm_thresh = st.slider("ML Confirm Prob", 0.0, 0.5, 0.10, 0.01, key="s_ml_conf_thresh")
     
+    # Strategy Auto-Tuner
+    with st.expander("🤖 Auto-Tune Strategy Parameters"):
+        st.info("Find the optimal slider settings (Buy/Sell Thresholds, Momentum, ML Confirm) for the selected period.")
+        tune_trials = st.slider("Optimization Trials", 10, 5000, 30)
+        if st.button("Start Optimization"):
+            # Progress bar
+            prog_bar = st.progress(0, text="Initializing optimization...")
+            
+            def update_prog(current, total):
+                pct = min(100, int(100 * current / total))
+                prog_bar.progress(pct, text=f"Strategy Optimization: Trial {current}/{total}")
+
+            with st.spinner("Optimizing strategy parameters..."):
+                # Load model
+                model_data = load_model(model_path)
+                model_ticker = model_data.get('ticker', ticker)
+                
+                import yfinance as yf
+                
+                # Determine date range
+                if backtest_mode == "Full Training Period":
+                    data_opt = yf.Ticker(model_ticker).history(period=period)
+                elif backtest_mode == "Test Period Only":
+                    data_opt = yf.Ticker(model_ticker).history(period=period)
+                    split_idx = int(len(data_opt) * 0.8)
+                    data_opt = data_opt.iloc[split_idx:]
+                elif backtest_mode == "Recent Days":
+                    end_date = datetime.now()
+                    start_date = end_date - timedelta(days=prod_days + 100)
+                    data_opt = yf.Ticker(model_ticker).history(start=start_date, end=end_date)
+                else:
+                    data_opt = yf.Ticker(model_ticker).history(start=custom_start, end=custom_end)
+                
+                data_opt.index = pd.to_datetime(data_opt.index).tz_localize(None)
+                data_opt.columns = [c.lower() for c in data_opt.columns]
+                data_opt = data_opt[['open', 'high', 'low', 'close', 'volume']]
+                
+                # Generate Features
+                features_opt = generate_features(data_opt)
+                
+                # Optimize
+                best_params, best_return = optimize_strategy(data_opt, model_data, features_opt, n_trials=tune_trials, progress_callback=update_prog)
+                
+                # Complete progress
+                prog_bar.progress(100, text="Optimization Complete!")
+                
+                # Store in session state
+                st.session_state.v2_opt_params = best_params
+                st.session_state.v2_opt_return = best_return
+        
+        # Display results (Persistent)
+        if 'v2_opt_params' in st.session_state:
+            st.success(f"✅ Optimization Complete! Best Return: {st.session_state.v2_opt_return:,.2f}%")
+            st.markdown("### 🏆 Recommended Settings")
+            st.json(st.session_state.v2_opt_params)
+            
+            # Callback to update state before rerun
+            def apply_callback():
+                params = st.session_state.v2_opt_params
+                
+                # Update Session State Keys
+                if 'use_trend_filter' in params: st.session_state.s_trend = params['use_trend_filter']
+                if 'use_adx_filter' in params: st.session_state.s_adx_bool = params['use_adx_filter']
+                if 'adx_threshold' in params: st.session_state.s_adx_thresh = int(params['adx_threshold'])
+                
+                if 'ml_buy_threshold' in params: st.session_state.s_ml_buy = float(params['ml_buy_threshold'])
+                if 'ml_sell_threshold' in params: st.session_state.s_ml_sell = float(params['ml_sell_threshold'])
+                
+                # Force Slope Signals ON (since optimization uses them)
+                st.session_state.s_slope_bool = True
+                
+                if 'slope_buy_thresh' in params: st.session_state.s_buy = float(params['slope_buy_thresh'])
+                if 'slope_sell_thresh' in params: st.session_state.s_sell = float(params['slope_sell_thresh'])
+                if 'slope_roc_thresh' in params: st.session_state.s_roc = float(params['slope_roc_thresh'])
+                if 'use_mom_zone' in params: st.session_state.s_mom = params['use_mom_zone']
+                if 'use_ml_confirm' in params: st.session_state.s_ml_conf_bool = params['use_ml_confirm']
+                if 'ml_confirm_thresh' in params: st.session_state.s_ml_conf_thresh = float(params['ml_confirm_thresh'])
+            
+            st.button("✅ Apply Best Settings to Sliders", on_click=apply_callback)
+
     if st.button("📊 Generate Signals & Backtest", type="primary", use_container_width=True):
         with st.spinner("Loading model and generating signals..."):
             # Load model
@@ -1553,7 +1801,9 @@ with tab2:
             features = generate_features(data)
             
             # Generate signals with custom threshold
-            signals, prob_df = generate_signals(model_data, features, threshold=decision_threshold, 
+            signals, prob_df = generate_signals(model_data, features, 
+                                              buy_threshold=ml_buy_thresh,
+                                              sell_threshold=ml_sell_thresh,
                                               use_slope_signals=use_slope_signals,
                                               slope_buy_thresh=slope_buy_thresh,
                                               slope_sell_thresh=slope_sell_thresh,
@@ -1561,6 +1811,14 @@ with tab2:
                                               ml_confirm_thresh=ml_confirm_thresh,
                                               slope_roc_thresh=slope_roc_thresh,
                                               use_mom_zone=use_mom_zone)
+                                              
+            # Apply Volatility Filter (ADX)
+            if use_adx_filter:
+                adx_cols = [c for c in features.columns if c.startswith('ADX_')]
+                if adx_cols:
+                    adx_vals = features[adx_cols[0]].loc[signals.index]
+                    chop_mask = adx_vals < adx_threshold
+                    signals.loc[chop_mask] = 0
             
             # Calculate Composite Technical Indicator (Average of normalized oscillators)
             # Use features already generated
@@ -1674,6 +1932,42 @@ with tab2:
             backtest['start_date'] = data.index[0]
             backtest['end_date'] = data.index[-1]
             backtest['total_days'] = len(data)
+            
+            # Save results to session state for persistence
+            st.session_state.v2_results = {
+                'data': data,
+                'signals': signals,
+                'backtest': backtest,
+                'features': features,
+                'prob_df': prob_df,
+                'composite_indicator': composite_indicator,
+                'model_ticker': model_ticker,
+                'model_path': model_path,
+                'config': {
+                    'limit_entry_pct': limit_entry_pct,
+                    'slope_buy_thresh': slope_buy_thresh,
+                    'slope_sell_thresh': slope_sell_thresh,
+                    'use_ml_confirm': use_ml_confirm,
+                    'ml_confirm_thresh': ml_confirm_thresh,
+                    'use_trend_filter': use_trend_filter,
+                    'use_adx_filter': use_adx_filter,
+                    'adx_threshold': adx_threshold,
+                    'ml_buy_thresh': ml_buy_thresh,
+                    'ml_sell_thresh': ml_sell_thresh
+                }
+            }
+        
+    # Persistent Display Block
+    if 'v2_results' in st.session_state:
+        res = st.session_state.v2_results
+        data = res['data']
+        signals = res['signals']
+        backtest = res['backtest']
+        features = res['features']
+        prob_df = res['prob_df']
+        composite_indicator = res['composite_indicator']
+        model_ticker = res['model_ticker']
+        model_path = res['model_path']
         
         # Period info
         st.success(f"📅 **{backtest['period_label']}** | {backtest['start_date'].strftime('%Y-%m-%d')} to {backtest['end_date'].strftime('%Y-%m-%d')} ({backtest['total_days']} trading days)")
