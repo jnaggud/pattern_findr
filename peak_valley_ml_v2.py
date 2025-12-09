@@ -19,6 +19,31 @@ ARCHITECTURE:
 import streamlit as st
 import pandas as pd
 import numpy as np
+import joblib
+import os
+import json
+from datetime import datetime
+from data_manager import DataManager, StrategyFileManager
+from ml_utils import (
+    load_price_data, 
+    detect_peaks_valleys, 
+    generate_features, 
+    calculate_theoretical_return,
+    save_model,
+    load_model,
+    generate_signals,
+    train_meta_model,
+    apply_meta_filter,
+    train_regressor
+)
+
+# Import Polygon Manager
+try:
+    from polygon_manager import PolygonManager
+except ImportError:
+    PolygonManager = None
+
+import numpy as np
 import os
 import joblib
 from datetime import datetime, timedelta
@@ -53,232 +78,11 @@ def init_session_state():
 init_session_state()
 
 # =============================================================================
-# CORE FUNCTIONS
+# CORE FUNCTIONS MOVED TO ML_UTILS.PY
 # =============================================================================
-
-def load_price_data(ticker: str, period: str) -> pd.DataFrame:
-    """Load OHLCV data from yfinance"""
-    import yfinance as yf
-    data = yf.Ticker(ticker).history(period=period)
-    data.index = pd.to_datetime(data.index).tz_localize(None)
-    data.columns = [c.lower() for c in data.columns]
-    return data[['open', 'high', 'low', 'close', 'volume']]
+# Functions imported above.
 
 
-def detect_peaks_valleys(data: pd.DataFrame, order: int = 5) -> tuple:
-    """
-    Detect peaks and valleys with PREDICTIVE labeling.
-    Returns labels and detection info.
-    """
-    from scipy.signal import argrelextrema
-    
-    highs = data['high'].values
-    lows = data['low'].values
-    
-    peak_indices = argrelextrema(highs, np.greater, order=order)[0]
-    valley_indices = argrelextrema(lows, np.less, order=order)[0]
-    
-    # Create labels - signal 1 day BEFORE event
-    labels = pd.Series(0, index=data.index, name='label')
-    
-    for idx in valley_indices:
-        if idx > 0:
-            labels.iloc[idx - 1] = 1  # BUY before valley
-    
-    for idx in peak_indices:
-        if idx > 0:
-            labels.iloc[idx - 1] = -1  # SELL before peak
-    
-    info = {
-        'num_peaks': len(peak_indices),
-        'num_valleys': len(valley_indices),
-        'peak_dates': data.index[peak_indices].tolist(),
-        'valley_dates': data.index[valley_indices].tolist(),
-    }
-    
-    return labels, info
-
-
-def generate_features(data: pd.DataFrame) -> pd.DataFrame:
-    """Generate comprehensive technical indicator features"""
-    import pandas_ta as ta
-    
-    df = data.copy()
-    
-    # Price features
-    df['returns'] = df['close'].pct_change()
-    df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
-    df['volatility_10'] = df['returns'].rolling(10).std()
-    df['volatility_20'] = df['returns'].rolling(20).std()
-    # OPTIMIZATION: Removed intraday range features to prevent "candle shape" overfitting
-    # df['high_low_range'] = (df['high'] - df['low']) / df['close'] 
-    # df['close_open_range'] = (df['close'] - df['open']) / df['open']
-    
-    # Moving averages
-    for period in [5, 10, 20, 50]:
-        df[f'sma_{period}'] = ta.sma(df['close'], length=period)
-        df[f'ema_{period}'] = ta.ema(df['close'], length=period)
-        
-        # OPTIMIZATION: Remove short-term mean reversion to force trend learning
-        # We skip 5 and 10 to stop the model from overfitting to noise
-        if period >= 20:
-            df[f'close_to_sma{period}'] = df['close'] / df[f'sma_{period}'] - 1
-    
-    # Momentum indicators
-    df['rsi_14'] = ta.rsi(df['close'], length=14)
-    df['rsi_7'] = ta.rsi(df['close'], length=7)
-    df['rsi_21'] = ta.rsi(df['close'], length=21)
-    
-    # MACD
-    macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
-    if macd is not None:
-        df = pd.concat([df, macd], axis=1)
-    
-    # Bollinger Bands
-    bbands = ta.bbands(df['close'], length=20, std=2)
-    if bbands is not None:
-        df = pd.concat([df, bbands], axis=1)
-        # BB position
-        if 'BBU_20_2.0' in df.columns and 'BBL_20_2.0' in df.columns:
-            df['bb_position'] = (df['close'] - df['BBL_20_2.0']) / (df['BBU_20_2.0'] - df['BBL_20_2.0'])
-    
-    # Stochastic
-    stoch = ta.stoch(df['high'], df['low'], df['close'])
-    if stoch is not None:
-        df = pd.concat([df, stoch], axis=1)
-    
-    # ADX
-    adx = ta.adx(df['high'], df['low'], df['close'])
-    if adx is not None:
-        df = pd.concat([df, adx], axis=1)
-        # Calculate ADX slope to find ACCELERATING trends
-        adx_col = [c for c in df.columns if c.startswith('ADX_')]
-        if adx_col:
-            df['adx_slope'] = df[adx_col[0]].diff(3)
-    
-    # ATR
-    df['atr_14'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-    df['atr_pct'] = df['atr_14'] / df['close'] * 100
-    
-    # Williams %R
-    df['willr_14'] = ta.willr(df['high'], df['low'], df['close'], length=14)
-    
-    # CCI
-    df['cci_14'] = ta.cci(df['high'], df['low'], df['close'], length=14)
-    df['cci_20'] = ta.cci(df['high'], df['low'], df['close'], length=20)
-    
-    # ROC
-    df['roc_5'] = ta.roc(df['close'], length=5)
-    df['roc_10'] = ta.roc(df['close'], length=10)
-    df['roc_20'] = ta.roc(df['close'], length=20)
-    
-    # MFI
-    df['mfi_14'] = ta.mfi(df['high'], df['low'], df['close'], df['volume'], length=14)
-    
-    # OBV
-    df['obv'] = ta.obv(df['close'], df['volume'])
-    df['obv_sma'] = ta.sma(df['obv'], length=20)
-    
-    # Volume features
-    df['volume_sma_10'] = ta.sma(df['volume'], length=10)
-    df['volume_sma_20'] = ta.sma(df['volume'], length=20)
-    df['volume_ratio'] = df['volume'] / df['volume_sma_20']
-    
-    # ==============================================================================
-    # NEW: Composite Oscillator & ROC
-    # ==============================================================================
-    # Normalize key oscillators to -1 to 1 range
-    rsi_norm = (df['rsi_14'] - 50) / 50
-    willr_norm = (df['willr_14'] + 50) / 50
-    cci_norm = (df['cci_14'] / 100).clip(-1, 1)
-    roc_norm = (df['roc_10'] / 5).clip(-1, 1)
-    
-    # Calculate composite (average of available normalized oscillators)
-    df['composite_oscillator'] = (rsi_norm + willr_norm + cci_norm + roc_norm) / 4
-    
-    # Calculate ROC of the composite oscillator (how fast is momentum changing?)
-    df['composite_roc_5'] = df['composite_oscillator'].diff(5)
-    df['composite_roc_10'] = df['composite_oscillator'].diff(10)
-    
-    # ==============================================================================
-    # NEW: Breakout & Trend Features (Catch "Black Swans")
-    # ==============================================================================
-    # Long-term momentum
-    df['roc_50'] = ta.roc(df['close'], length=50)
-    
-    # Distance from SMA50 (Trend Strength)
-    if 'sma_50' in df.columns:
-        df['dist_sma50'] = (df['close'] - df['sma_50']) / df['sma_50']
-    
-    # Breakout Signal: Close > 20-day High (Donchian Channel Breakout)
-    # Shift 1 to compare Today's Close vs Previous 20 days High
-    df['high_20d'] = df['high'].rolling(20).max().shift(1)
-    df['breakout_20d'] = (df['close'] > df['high_20d']).astype(int)
-    
-    # ADX Trend Strength
-    # pandas_ta returns columns like ADX_14, DMP_14, DMN_14
-    # We concatenated them earlier, so check columns
-    adx_col = [c for c in df.columns if c.startswith('ADX_')]
-    if adx_col:
-        df['adx_trend'] = (df[adx_col[0]] > 25).astype(int)
-    
-    # Lagged features
-    # OPTIMIZATION: Removed 'close_lag' to prevent overfitting to simple price drops (mean reversion).
-    # Added composite_slope to detect when the indicator turns up/down.
-    df['composite_slope'] = df['composite_oscillator'].diff(1)
-    
-    # EXPLICIT COMPOSITE SIGNALS (User Observation: Low = Bottom, High = Top)
-    df['comp_oversold'] = (df['composite_oscillator'] < -0.6).astype(int)
-    df['comp_overbought'] = (df['composite_oscillator'] > 0.6).astype(int)
-    
-    # Crossing signals (leaving the extreme zone)
-    df['comp_cross_low'] = ((df['composite_oscillator'].shift(1) < -0.6) & (df['composite_oscillator'] > -0.6)).astype(int)
-    df['comp_cross_high'] = ((df['composite_oscillator'].shift(1) > 0.6) & (df['composite_oscillator'] < 0.6)).astype(int)
-    
-    # Turning points (Extreme value + Change in direction)
-    df['comp_bottom_turn'] = (df['comp_oversold'] & (df['composite_slope'] > 0)).astype(int)
-    df['comp_top_turn'] = (df['comp_overbought'] & (df['composite_slope'] < 0)).astype(int)
-    
-    for lag in [1, 2, 3, 5]:
-        df[f'returns_lag_{lag}'] = df['returns'].shift(lag)
-        df[f'rsi_14_lag_{lag}'] = df['rsi_14'].shift(lag)
-        # df[f'close_lag_{lag}'] = df['close'].pct_change(lag) # REMOVED
-        df[f'composite_lag_{lag}'] = df['composite_oscillator'].shift(lag)
-    
-    # Rolling statistics
-    for window in [5, 10, 20]:
-        df[f'returns_mean_{window}'] = df['returns'].rolling(window).mean()
-        df[f'returns_std_{window}'] = df['returns'].rolling(window).std()
-        df[f'rsi_mean_{window}'] = df['rsi_14'].rolling(window).mean()
-        df[f'composite_mean_{window}'] = df['composite_oscillator'].rolling(window).mean()
-        df[f'composite_std_{window}'] = df['composite_oscillator'].rolling(window).std()
-    
-    # ==============================================================================
-    # NEW: Interaction Features (Trend * Momentum)
-    # ==============================================================================
-    # Combine Trend Strength (dist_sma50) with Momentum (rsi)
-    if 'dist_sma50' in df.columns and 'rsi_14' in df.columns:
-        df['trend_momentum'] = df['dist_sma50'] * (df['rsi_14'] - 50)
-        
-    # Combine Volatility with Breakout
-    if 'volatility_20' in df.columns and 'breakout_20d' in df.columns:
-        df['vol_breakout'] = df['volatility_20'] * df['breakout_20d']
-        
-    # Relative Volume * Price Change (Volume Force)
-    if 'volume_ratio' in df.columns:
-        df['volume_force'] = df['volume_ratio'] * df['returns']
-
-    # Drop NaN and select numeric features
-    df = df.dropna()
-    
-    exclude_cols = ['open', 'high', 'low', 'close', 'volume', 'dividends', 'stock splits']
-    feature_cols = [c for c in df.columns if c not in exclude_cols]
-    features = df[feature_cols].select_dtypes(include=[np.number])
-    
-    # Remove constant columns
-    features = features.loc[:, features.std() > 0]
-    
-    return features
 
 
 def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series, 
@@ -292,7 +96,7 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
     """
     from sklearn.model_selection import cross_val_score, TimeSeriesSplit
     from sklearn.preprocessing import StandardScaler, LabelEncoder
-    from sklearn.metrics import accuracy_score, f1_score, classification_report
+    from sklearn.metrics import accuracy_score, f1_score, classification_report, recall_score
     from sklearn.utils.class_weight import compute_sample_weight
     from imblearn.over_sampling import SMOTE
     import optuna
@@ -431,6 +235,20 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
                 score = f1_score(y_fold_val, y_pred, average='weighted')
             elif optimize_metric == 'f1_macro':
                 score = f1_score(y_fold_val, y_pred, average='macro')
+            elif optimize_metric == 'recall':
+                # Optimize for BUY Recall (Class 1)
+                pos_label = 1
+                if label_encoder:
+                    try: pos_label = label_encoder.transform([1])[0]
+                    except: pos_label = None
+                
+                if pos_label is not None:
+                    # Calculate recall for specific label
+                    # average=None returns array of recall for each class in labels
+                    recalls = recall_score(y_fold_val, y_pred, average=None, labels=[pos_label], zero_division=0)
+                    score = recalls[0] if len(recalls) > 0 else 0.0
+                else:
+                    score = 0.0
             else:
                 score = accuracy_score(y_fold_val, y_pred)
             scores.append(score)
@@ -569,193 +387,8 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
     }
 
 
-def save_model(model_data: dict, ticker: str, notes: str = "") -> str:
-    """Save model with all required data"""
-    save_dir = "saved_models_v2"
-    os.makedirs(save_dir, exist_ok=True)
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{model_data['model_type']}_{ticker}_{timestamp}.joblib"
-    filepath = os.path.join(save_dir, filename)
-    
-    payload = {
-        'model': model_data['model'],
-        'scaler': model_data['scaler'],
-        'label_encoder': model_data['label_encoder'],
-        'feature_names': model_data['feature_names'],
-        'model_type': model_data['model_type'],
-        'best_params': model_data['best_params'],
-        'ticker': ticker,
-        'timestamp': timestamp,
-        'notes': notes,
-        'metrics': {
-            'accuracy': model_data['accuracy'],
-            'f1_score': model_data['f1_score'],
-            'cv_score': model_data['cv_score'],
-        }
-    }
-    
-    joblib.dump(payload, filepath)
-    return filepath
 
 
-def load_model(filepath: str) -> dict:
-    """Load a saved model"""
-    return joblib.load(filepath)
-
-
-def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float = 0.5, 
-                     use_slope_signals: bool = False,
-                     slope_buy_thresh: float = 0.0,
-                     slope_sell_thresh: float = 0.0,
-                     use_ml_confirm: bool = False,
-                     ml_confirm_thresh: float = 0.3,
-                     slope_roc_thresh: float = 0.0,
-                     use_mom_zone: bool = False,
-                     buy_threshold: float = None,
-                     sell_threshold: float = None) -> tuple[pd.Series, pd.DataFrame]:
-    """
-    Generate signals using the trained model with custom thresholds.
-    Returns: (signals, probabilities)
-    """
-    # Handle legacy single threshold arg
-    if buy_threshold is None: buy_threshold = threshold
-    if sell_threshold is None: sell_threshold = threshold
-
-    model = model_data['model']
-    scaler = model_data['scaler']
-    label_encoder = model_data['label_encoder']
-    feature_names = model_data['feature_names']
-    
-    # Align features
-    common_features = [f for f in feature_names if f in features.columns]
-    if len(common_features) < len(feature_names):
-        st.warning(f"Missing {len(feature_names) - len(common_features)} features in current data")
-    
-    X = features[feature_names]
-    
-    # Scale
-    X_scaled = scaler.transform(X)
-    
-    # Get probabilities
-    probs = model.predict_proba(X_scaled)
-    
-    # Get class indices
-    classes = label_encoder.classes_
-    original_classes = label_encoder.inverse_transform(range(len(classes)))
-    
-    # Map classes to indices (1: Buy, -1: Sell, 0: Hold)
-    try:
-        buy_idx = np.where(original_classes == 1)[0][0]
-        sell_idx = np.where(original_classes == -1)[0][0]
-        hold_idx = np.where(original_classes == 0)[0][0]
-        
-        # ==========================================================================
-        # LOGIC ENHANCEMENT: SLOPE SIGNALS & ML CONFIRMATION
-        # ==========================================================================
-        if use_slope_signals:
-            # Calculate Composite Indicator on the fly (if not passed)
-            # We need the same logic as in the main app.
-            # Since we don't have the composite passed in, we reconstruct it from features.
-            # This ensures consistency.
-            
-            # Helper to safely get feature
-            def get_f(name):
-                return features[name] if name in features.columns else pd.Series(0, index=features.index)
-            
-            # Reconstruct Composite (Norm RSI, Norm WillR, Norm CCI, Norm ROC)
-            # RSI (0-100) -> (-1 to 1)
-            rsi_norm = (get_f('rsi_14') - 50) / 50
-            # WillR (-100 to 0) -> (-1 to 1)
-            willr_norm = (get_f('willr_14') + 50) / 50
-            # CCI (approx -100 to 100) -> (-1 to 1)
-            cci_norm = (get_f('cci_14') / 100).clip(-1, 1)
-            # ROC (approx -5 to 5) -> (-1 to 1)
-            roc_norm = (get_f('roc_10') / 5).clip(-1, 1)
-            
-            # Composite
-            comp_vals = (rsi_norm + willr_norm + cci_norm + roc_norm) / 4
-            
-            # Slope
-            slope = np.gradient(comp_vals)
-            
-            # Shifted slope (prev value)
-            slope_prev = np.roll(slope, 1)
-            slope_prev[0] = 0 # Handle boundary
-            
-            # Acceleration (ROC of Slope)
-            slope_roc = np.diff(slope, prepend=0)
-            
-            # Buy Logic
-            # 1. Deep Value Zone
-            cond_deep = (comp_vals < slope_buy_thresh)
-            
-            # 2. Momentum Zone (0.2 - 0.3) - The "Rocket Ship" signal
-            cond_mom = ((comp_vals > 0.2) & (comp_vals < 0.3)) if use_mom_zone else False
-            
-            valid_buy_zone = cond_deep | cond_mom
-            
-            # 3. Acceleration Filter (Avoid lazy turns)
-            valid_accel = (slope_roc > slope_roc_thresh)
-            
-            # Turn Up: Prev < 0 AND Curr > 0 AND Valid Zone AND Valid Accel
-            turn_up_mask = (slope_prev < 0) & (slope > 0) & valid_buy_zone & valid_accel
-            
-            # Turn Down: Prev > 0 AND Curr < 0 AND Comp > Threshold
-            turn_down_mask = (slope_prev > 0) & (slope < 0) & (comp_vals > slope_sell_thresh)
-            
-            # ML Confirmation Filter
-            if use_ml_confirm:
-                # Require ML Model to agree (Prob > 0.3 or custom)
-                turn_up_mask = turn_up_mask & (probs[:, buy_idx] > ml_confirm_thresh)
-                turn_down_mask = turn_down_mask & (probs[:, sell_idx] > ml_confirm_thresh)
-
-            if turn_up_mask.any():
-                # Force Buy
-                probs[turn_up_mask, buy_idx] = 1.0
-                probs[turn_up_mask, hold_idx] = 0.0
-                probs[turn_up_mask, sell_idx] = 0.0
-                
-            if turn_down_mask.any():
-                # Force Sell
-                probs[turn_down_mask, sell_idx] = 1.0
-                probs[turn_down_mask, hold_idx] = 0.0
-                probs[turn_down_mask, buy_idx] = 0.0
-        # ==========================================================================
-        
-    except IndexError:
-        # Fallback if some classes are missing (unlikely with proper training)
-        return pd.Series(0, index=features.index), pd.DataFrame(probs, index=features.index, columns=original_classes)
-    
-    # Apply threshold logic
-    # If prob(BUY) > buy_threshold -> BUY
-    # If prob(SELL) > sell_threshold -> SELL
-    # Else -> HOLD
-    
-    signals = np.zeros(len(X), dtype=int)
-    
-    # Vectorized signal generation
-    buy_mask = probs[:, buy_idx] > buy_threshold
-    sell_mask = probs[:, sell_idx] > sell_threshold
-    
-    # Conflict resolution: If both > threshold, take higher probability
-    conflict_mask = buy_mask & sell_mask
-    if conflict_mask.any():
-        buy_higher = probs[conflict_mask, buy_idx] > probs[conflict_mask, sell_idx]
-        buy_mask[conflict_mask] = buy_higher
-        sell_mask[conflict_mask] = ~buy_higher
-    
-    signals[buy_mask] = 1
-    signals[sell_mask] = -1
-    
-    # Create DataFrame for probabilities
-    prob_df = pd.DataFrame(probs, index=features.index, columns=[f"prob_{c}" for c in original_classes])
-    
-    # Add confidence score (prob of predicted class)
-    prob_df['confidence'] = probs.max(axis=1)
-    prob_df['predicted_signal'] = signals
-    
-    return pd.Series(signals, index=features.index), prob_df
 
 
 def optimize_strategy(data, model_data, features, n_trials=100, progress_callback=None):
@@ -1070,84 +703,7 @@ def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float 
     }
 
 
-def calculate_theoretical_return(data: pd.DataFrame, peak_dates: list, valley_dates: list, 
-                                  initial_capital: float = 100000) -> dict:
-    """
-    Calculate theoretical perfect trading return - buying at every valley and selling at every peak.
-    
-    Returns dict with:
-        - total_return: Percentage return from perfect trading
-        - num_trades: Number of completed round-trip trades
-        - avg_trade_return: Average return per trade
-        - trades: List of individual trade details
-    """
-    # Create events list with buy at valleys, sell at peaks
-    events = []
-    for d in valley_dates:
-        if d in data.index:
-            events.append(('buy', d, data.loc[d, 'close']))
-    for d in peak_dates:
-        if d in data.index:
-            events.append(('sell', d, data.loc[d, 'close']))
-    
-    # Sort by date
-    events.sort(key=lambda x: x[1])
-    
-    capital = initial_capital
-    position = 0
-    shares = 0
-    entry_price = 0
-    entry_date = None
-    trades = []
-    
-    for action, date, price in events:
-        if action == 'buy' and position == 0:
-            # Enter long position at valley
-            shares = capital / price
-            entry_price = price
-            entry_date = date
-            position = 1
-            
-        elif action == 'sell' and position == 1:
-            # Exit at peak
-            exit_value = shares * price
-            trade_return = (price - entry_price) / entry_price * 100
-            trades.append({
-                'entry_date': entry_date,
-                'entry_price': entry_price,
-                'exit_date': date,
-                'exit_price': price,
-                'return_pct': trade_return
-            })
-            capital = exit_value
-            position = 0
-            shares = 0
-    
-    # Close any open position at last price
-    if position == 1:
-        final_price = data['close'].iloc[-1]
-        exit_value = shares * final_price
-        trade_return = (final_price - entry_price) / entry_price * 100
-        trades.append({
-            'entry_date': entry_date,
-            'entry_price': entry_price,
-            'exit_date': data.index[-1],
-            'exit_price': final_price,
-            'return_pct': trade_return,
-            'status': 'open'
-        })
-        capital = exit_value
-    
-    total_return = (capital - initial_capital) / initial_capital * 100
-    avg_trade_return = np.mean([t['return_pct'] for t in trades]) if trades else 0
-    
-    return {
-        'total_return': total_return,
-        'final_capital': capital,
-        'num_trades': len(trades),
-        'avg_trade_return': avg_trade_return,
-        'trades': trades
-    }
+
 
 
 def analyze_slope_signals(file_path: str):
@@ -1432,6 +988,18 @@ def run_comprehensive_analysis(analysis_dir: str = "analysis") -> str:
 # STREAMLIT UI
 # =============================================================================
 
+import pandas as pd
+import numpy as np
+import os
+import joblib
+from datetime import datetime, timedelta
+import threading
+
+try:
+    from dl_feature_extractor import DLFeatureExtractor
+except ImportError:
+    DLFeatureExtractor = None
+
 st.title("📈 Peak/Valley ML v2 - Enhanced")
 st.caption("Clean architecture with SMOTE, Optuna, and comprehensive analysis")
 
@@ -1439,7 +1007,40 @@ st.caption("Clean architecture with SMOTE, Optuna, and comprehensive analysis")
 with st.sidebar:
     st.header("⚙️ Settings")
     ticker = st.text_input("Ticker Symbol", value=st.session_state.v2_ticker)
-    period = st.selectbox("Training Period", ['1y', '2y', '3y', '5y'], index=3)
+    
+    # Load API Key from user_settings.json (Primary) or strategy_config.json (Fallback)
+    if 'polygon_api_key_input' not in st.session_state:
+        st.session_state.polygon_api_key_input = ""
+        
+        # Try user_settings.json
+        if os.path.exists("user_settings.json"):
+            try:
+                import json
+                with open("user_settings.json", "r") as f:
+                    u_conf = json.load(f)
+                    if u_conf.get("polygon_api_key"):
+                        st.session_state.polygon_api_key_input = u_conf.get("polygon_api_key")
+            except: pass
+            
+        # Fallback to strategy_config.json
+        elif os.path.exists("strategy_config.json"):
+            try:
+                import json
+                with open("strategy_config.json", "r") as f:
+                    saved_conf = json.load(f)
+                    if saved_conf.get("polygon_api_key"):
+                        st.session_state.polygon_api_key_input = saved_conf.get("polygon_api_key")
+            except: pass
+
+    polygon_api_key = st.text_input("🔑 Polygon.io API Key (Optional)", type="password", help="Enable to compare Polygon vs Yahoo Data.", key="polygon_api_key_input")
+    period = st.selectbox("Training Period", ['1mo', '3mo', '6mo', '1y', '2y', '3y', '5y'], index=6)
+    interval = st.selectbox("Interval", ['1d', '60m', '30m', '15m', '5m'], index=0, help="Bar size. Intraday (min/hour) has limited history (e.g. 1m=7d, 1h=730d).")
+    
+    if st.button("💾 Save Sidebar Settings"):
+        import json
+        with open("user_settings.json", "w") as f:
+            json.dump({"polygon_api_key": polygon_api_key, "ticker": ticker}, f)
+        st.success("Settings Saved!")
     
     st.markdown("---")
     st.subheader("🎯 Training Options")
@@ -1450,8 +1051,8 @@ with st.sidebar:
     
     # Optimization metric selection
     optimize_metric = st.selectbox("Optimize For", 
-        ['f1_weighted', 'accuracy', 'f1_macro'],
-        help="f1_weighted: Best for imbalanced classes, accuracy: Overall correctness, f1_macro: Equal weight to all classes")
+        ['f1_weighted', 'recall', 'accuracy', 'f1_macro'],
+        help="recall: Maximize finding ALL Buy signals (good for not missing moves). f1_weighted: Balanced approach.")
     
     n_cv_splits = st.slider("CV Folds", 3, 10, 5, 
                            help="Number of TimeSeriesSplit folds for cross-validation")
@@ -1488,7 +1089,7 @@ with st.sidebar:
             custom_end = st.date_input("End Date", value=datetime.now())
 
 # Main tabs
-tab1, tab2, tab3 = st.tabs(["🎯 Train Model", "🚀 Production", "📊 Analysis"])
+tab1, tab2, tab3, tab4 = st.tabs(["🎯 Train Model", "🚀 Production", "📊 Analysis", "🧪 Alpha Lab"])
 
 # =============================================================================
 # TAB 1: TRAINING
@@ -1504,109 +1105,124 @@ with tab1:
     with col3:
         st.info(f"**Model:** {model_type}")
     
+    use_dl_features = st.checkbox("🧠 Use Deep Learning Features (CNN/LSTM)", value=False, 
+                                 help="Train a Multi-Scale CNN Autoencoder to extract latent pattern features. Slower but captures complex shapes.")
+
     if st.button("🚀 Train Model", type="primary", use_container_width=True):
         progress = st.progress(0, text="Starting...")
         
-        # Load data
-        progress.progress(10, text="Loading price data...")
-        data = load_price_data(ticker, period)
-        st.session_state.v2_data = data
-        st.session_state.v2_ticker = ticker
+        try:
+            # 1. Load data
+            progress.progress(10, text="Loading price data...")
+            data = load_price_data(ticker, period, interval=interval)
+            st.session_state.v2_data = data
+            st.session_state.v2_ticker = ticker
+            
+            # 2. Detect peaks/valleys
+            progress.progress(20, text="Detecting peaks and valleys...")
+            labels, detection_info = detect_peaks_valleys(data, order=detection_order)
+            st.session_state.v2_labels = labels
+            st.session_state.v2_detection_info = detection_info
+            
+            # 3. Calculate theoretical return
+            theoretical = calculate_theoretical_return(data, detection_info['peak_dates'], 
+                                                       detection_info['valley_dates'])
+            st.session_state.v2_theoretical = theoretical
+            
+            # 4. Generate features
+            progress.progress(30, text="Generating features...")
+            dl_config = None
+            if use_dl_features:
+                os.makedirs("saved_models_v2", exist_ok=True)
+                dl_config = {'train': True, 'model_path': f"saved_models_v2/dl_{ticker}.h5"}
+                
+            features = generate_features(data, dl_config=dl_config)
+            st.session_state.v2_features = features
+            
+            # 5. Train model
+            progress.progress(40, text=f"Training {model_type} with {'Optuna' if use_optuna else 'defaults'}...")
+            
+            model_data = train_model_with_optuna(
+                features, labels, model_type, use_smote,
+                n_trials=n_trials if use_optuna else 1,
+                progress_callback=None,
+                optimize_metric=optimize_metric,
+                n_cv_splits=n_cv_splits,
+                class_weight_ratio=class_weight_ratio,
+                optimize_training_params=use_optuna
+            )
+            
+            model_data['use_dl'] = use_dl_features
+            
+            # 6. Quick Evaluation Backtest (Test Set)
+            try:
+                split_idx = int(len(features) * 0.8)
+                test_features = features.iloc[split_idx:]
+                test_data = data.loc[test_features.index]
+                q_sigs, _ = generate_signals(model_data, test_features, threshold=decision_threshold)
+                q_bt = run_backtest(test_data, q_sigs, verbose=False)
+                model_data['total_return'] = q_bt['total_return']
+            except Exception as e:
+                print(f"Warning: Quick backtest failed: {e}")
+            
+            st.session_state.v2_model = model_data
+            
+            # 7. Save Model
+            progress.progress(95, text="Saving model...")
+            filepath = save_model(model_data, ticker)
+            st.session_state.v2_model_path = filepath
+            
+            st.session_state.v2_trained = True
+            progress.progress(100, text="Complete!")
+            st.rerun()
+            
+        except Exception as e:
+            st.error(f"Training Failed: {e}")
+            
+    # PERSISTENT DISPLAY BLOCK
+    if st.session_state.get('v2_trained'):
+        # Retrieve State
+        data = st.session_state.v2_data
+        detection_info = st.session_state.v2_detection_info
+        theoretical = st.session_state.v2_theoretical
+        features = st.session_state.v2_features
+        labels = st.session_state.v2_labels
+        model_data = st.session_state.v2_model
         
-        # Detect peaks/valleys
-        progress.progress(20, text="Detecting peaks and valleys...")
-        labels, detection_info = detect_peaks_valleys(data, order=detection_order)
-        st.session_state.v2_labels = labels
+        st.success(f"✅ Model Trained & Saved: `{st.session_state.get('v2_model_path', '')}`")
         
+        # Display Stats
         col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Data Points", len(data))
-        with col2:
-            st.metric("Peaks Detected", detection_info['num_peaks'])
-        with col3:
-            st.metric("Valleys Detected", detection_info['num_valleys'])
+        with col1: st.metric("Data Points", len(data))
+        with col2: st.metric("Peaks Detected", detection_info['num_peaks'])
+        with col3: st.metric("Valleys Detected", detection_info['num_valleys'])
         
-        # Calculate theoretical return (perfect trading at every peak/valley)
-        theoretical = calculate_theoretical_return(data, detection_info['peak_dates'], 
-                                                   detection_info['valley_dates'])
-        st.session_state.v2_theoretical = theoretical  # Store for efficiency calculation
-        
-        # Display theoretical performance
-        st.markdown("### 🎯 Theoretical Maximum (Perfect Trading)")
-        st.caption("*Compounded returns from buying at every valley and selling at every peak with 100% capital*")
+        st.markdown("### 🎯 Theoretical Maximum")
         col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Perfect Return", f"{theoretical['total_return']:,.1f}%")
-        with col2:
-            st.metric("Perfect Trades", theoretical['num_trades'])
-        with col3:
-            st.metric("Avg Trade Return", f"{theoretical['avg_trade_return']:.1f}%")
+        with col1: st.metric("Perfect Return", f"{theoretical['total_return']:,.1f}%")
+        with col2: st.metric("Perfect Trades", theoretical['num_trades'])
+        with col3: st.metric("Avg Trade Return", f"{theoretical['avg_trade_return']:.1f}%")
         with col4:
-            # Buy and hold for comparison
             bh_return = (data['close'].iloc[-1] - data['close'].iloc[0]) / data['close'].iloc[0] * 100
             st.metric("Buy & Hold", f"{bh_return:.1f}%")
-        
-        # Generate features
-        progress.progress(30, text="Generating features...")
-        features = generate_features(data)
-        st.session_state.v2_features = features
+            
         st.info(f"Generated **{len(features.columns)}** features")
         
-        # Label distribution
         label_counts = labels.value_counts()
         col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("BUY Labels", label_counts.get(1, 0))
-        with col2:
-            st.metric("HOLD Labels", label_counts.get(0, 0))
-        with col3:
-            st.metric("SELL Labels", label_counts.get(-1, 0))
+        with col1: st.metric("BUY Labels", label_counts.get(1, 0))
+        with col2: st.metric("HOLD Labels", label_counts.get(0, 0))
+        with col3: st.metric("SELL Labels", label_counts.get(-1, 0))
         
-        # Train model
-        progress.progress(40, text=f"Training {model_type} with {'Optuna' if use_optuna else 'defaults'}...")
-        st.info(f"🎯 Optimizing for: **{optimize_metric}** | CV Folds: **{n_cv_splits}** (TimeSeriesSplit)")
-        
-        def update_progress(current, total):
-            pct = 40 + int(50 * current / total)
-            progress.progress(pct, text=f"Optuna trial {current}/{total}...")
-        
-        model_data = train_model_with_optuna(
-            features, labels, model_type, use_smote,
-            n_trials=n_trials if use_optuna else 1,
-            progress_callback=None, # Console only now
-            optimize_metric=optimize_metric,
-            n_cv_splits=n_cv_splits,
-            class_weight_ratio=class_weight_ratio,
-            optimize_training_params=use_optuna
-        )
-        
-        st.session_state.v2_model = model_data
-        st.session_state.v2_trained = True
-        
-        # Show results
-        progress.progress(95, text="Saving model...")
-        
+        st.markdown("### 📊 Model Performance")
         col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Accuracy", f"{model_data['accuracy']:.1%}")
-        with col2:
-            st.metric("F1 Score", f"{model_data['f1_score']:.1%}")
-        with col3:
-            st.metric("CV Score", f"{model_data['cv_score']:.1%}")
-        with col4:
-            st.metric("Features", len(model_data['feature_names']))
+        with col1: st.metric("Accuracy", f"{model_data['accuracy']:.1%}")
+        with col2: st.metric("F1 Score", f"{model_data['f1_score']:.1%}")
+        with col3: st.metric("CV Score", f"{model_data['cv_score']:.1%}")
+        with col4: st.metric("Features", len(model_data['feature_names']))
         
-        # Best params
         with st.expander("🔧 Best Hyperparameters"):
             st.json(model_data['best_params'])
-        
-        # Save model
-        filepath = save_model(model_data, ticker)
-        st.session_state.v2_model_path = filepath
-        
-        progress.progress(100, text="Complete!")
-        st.success(f"✅ Model saved: `{filepath}`")
-        st.balloons()
 
 # =============================================================================
 # TAB 2: PRODUCTION
@@ -1703,24 +1319,33 @@ with tab2:
                 
                 # Determine date range
                 if backtest_mode == "Full Training Period":
-                    data_opt = yf.Ticker(model_ticker).history(period=period)
+                    data_opt = yf.Ticker(model_ticker).history(period=period, interval=interval)
                 elif backtest_mode == "Test Period Only":
-                    data_opt = yf.Ticker(model_ticker).history(period=period)
+                    data_opt = yf.Ticker(model_ticker).history(period=period, interval=interval)
                     split_idx = int(len(data_opt) * 0.8)
                     data_opt = data_opt.iloc[split_idx:]
                 elif backtest_mode == "Recent Days":
                     end_date = datetime.now()
                     start_date = end_date - timedelta(days=prod_days + 100)
-                    data_opt = yf.Ticker(model_ticker).history(start=start_date, end=end_date)
+                    data_opt = yf.Ticker(model_ticker).history(start=start_date, end=end_date, interval=interval)
                 else:
-                    data_opt = yf.Ticker(model_ticker).history(start=custom_start, end=custom_end)
+                    data_opt = yf.Ticker(model_ticker).history(start=custom_start, end=custom_end, interval=interval)
                 
                 data_opt.index = pd.to_datetime(data_opt.index).tz_localize(None)
                 data_opt.columns = [c.lower() for c in data_opt.columns]
                 data_opt = data_opt[['open', 'high', 'low', 'close', 'volume']]
                 
+                # Check if model uses DL
+                use_dl = model_data.get('use_dl', False)
+                # Fallback: If metadata missing, check feature names
+                if not use_dl and 'feature_names' in model_data:
+                    if any('DL_pred_' in f for f in model_data['feature_names']):
+                        use_dl = True
+                
+                dl_config = {'train': False, 'model_path': f"saved_models_v2/dl_{model_ticker}.h5"} if use_dl else None
+                
                 # Generate Features
-                features_opt = generate_features(data_opt)
+                features_opt = generate_features(data_opt, dl_config=dl_config)
                 
                 # Optimize
                 best_params, best_return = optimize_strategy(data_opt, model_data, features_opt, n_trials=tune_trials, progress_callback=update_prog)
@@ -1762,6 +1387,131 @@ with tab2:
             
             st.button("✅ Apply Best Settings to Sliders", on_click=apply_callback)
 
+
+    # Meta-Model Filter Control
+    st.markdown("### 🧠 Meta-Model Filter (Experimental)")
+    use_meta = st.checkbox("Enable Meta-Model Filter", help="Filters out low-probability trades using a secondary model.")
+    meta_threshold = 0.5
+    
+    if use_meta:
+        meta_threshold = st.slider("Meta-Model Threshold", 0.1, 0.9, 0.5, 0.05, help="Lower = More Trades (Less Strict). Higher = Fewer Trades (More Strict).")
+        
+        if 'v2_meta_model' not in st.session_state:
+            st.warning("Meta-Model not trained yet.")
+            if st.button(f"Train Meta-Model (Uses {period} Data)"):
+                with st.spinner("Training Meta-Model..."):
+                    # Load data for training
+                    import yfinance as yf
+                    # Use the selected period from sidebar
+                    mm_data = yf.Ticker(ticker).history(period=period, interval=interval) 
+                    mm_data.index = pd.to_datetime(mm_data.index).tz_localize(None)
+                    mm_data.columns = [c.lower() for c in mm_data.columns]
+                    
+                    # Generate features
+                    # Load base model to get config
+                    base_model = load_model(model_path)
+                    
+                    # Check DL
+                    mm_dl_config = None
+                    if base_model.get('use_dl', False):
+                        mm_dl_config = {'train': False, 'model_path': f"saved_models_v2/dl_{ticker}.h5"}
+                        
+                    mm_features = generate_features(mm_data, dl_config=mm_dl_config)
+                    
+                    # CRITICAL: Re-attach CLOSE price for OOF Target Generation
+                    # generate_features drops raw prices, but we need 'close' to calc returns
+                    mm_features['close'] = mm_data.loc[mm_features.index]['close']
+                    
+                    # Train
+                    mm_result = train_meta_model(base_model, mm_features, labels=None) # labels not needed for simulated training
+                    
+                    if mm_result['status'] == 'success':
+                        st.session_state.v2_meta_model = mm_result
+                        st.success(f"Meta-Model Trained! Precision Score: {mm_result['score']:.2f}")
+                        st.rerun()
+                    else:
+                        st.error(f"Training Failed: {mm_result.get('reason')}")
+        else:
+            st.success(f"Meta-Model Active (Score: {st.session_state.v2_meta_model.get('score', 0):.2f})")
+            if st.button("Reset Meta-Model"):
+                del st.session_state.v2_meta_model
+                st.rerun()
+
+    with st.expander("🚀 Strategy Bundling & Live Setup", expanded=False):
+        st.info("Package your entire strategy (Base Model, DL, Meta, Alpha, Config) into a versioned bundle.")
+        
+        strat_name = st.text_input("Strategy Name (Optional)", value=f"{ticker}_Strategy")
+        
+        if st.button("📦 Bundle & Save Strategy"):
+            # Check Meta Model Export
+            meta_path = None
+            if use_meta and 'v2_meta_model' in st.session_state:
+                 meta_path = f"saved_models_v2/meta_model_{ticker}_latest.joblib"
+                 joblib.dump(st.session_state.v2_meta_model, meta_path)
+            
+            # 1. Gather Active Models
+            active_models = {}
+            active_models['base'] = model_path
+            
+            # DL Check
+            dl_path = f"saved_models_v2/dl_{ticker}.h5"
+            if os.path.exists(dl_path):
+                active_models['dl'] = dl_path
+            
+            # Meta Check
+            if meta_path:
+                active_models['meta'] = meta_path
+            
+            # Alpha Check
+            alpha_path_disk = f"saved_models_v2/alpha_regressors_{ticker}.joblib"
+            if os.path.exists(alpha_path_disk):
+                active_models['alpha'] = alpha_path_disk
+                
+            # 2. Config Dictionary
+            config = {
+                "ticker": ticker,
+                "interval": interval,
+                "polygon_api_key": polygon_api_key,
+                "model_path": model_path,
+                "buy_threshold": ml_buy_thresh,
+                "sell_threshold": ml_sell_thresh,
+                "use_trend_filter": use_trend_filter,
+                "use_adx_filter": use_adx_filter,
+                "adx_threshold": adx_threshold,
+                "limit_entry_pct": limit_entry_pct,
+                "use_slope_signals": use_slope_signals,
+                "slope_buy_thresh": slope_buy_thresh,
+                "slope_sell_thresh": slope_sell_thresh,
+                "slope_roc_thresh": slope_roc_thresh,
+                "use_mom_zone": use_mom_zone,
+                "use_ml_confirm": use_ml_confirm,
+                "ml_confirm_thresh": ml_confirm_thresh,
+                "use_meta_filter": use_meta,
+                "meta_threshold": meta_threshold,
+                # "meta_model_path": handled by bundle
+                "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            # 3. Create Bundle
+            sfm = StrategyFileManager()
+            bundle_path = sfm.save_strategy_bundle(strat_name, config, active_models)
+            
+            # 4. Update Root Config
+            folder_name = os.path.basename(bundle_path)
+            root_config = config.copy()
+            
+            # Point to the bundled files
+            if 'base' in active_models: root_config['model_path'] = f"strategies/{folder_name}/{os.path.basename(active_models['base'])}"
+            if 'dl' in active_models: root_config['dl_model_path'] = f"strategies/{folder_name}/{os.path.basename(active_models['dl'])}"
+            if 'meta' in active_models: root_config['meta_model_path'] = f"strategies/{folder_name}/{os.path.basename(active_models['meta'])}"
+            if 'alpha' in active_models: root_config['alpha_model_path'] = f"strategies/{folder_name}/{os.path.basename(active_models['alpha'])}"
+            
+            with open("strategy_config.json", "w") as f:
+                json.dump(root_config, f, indent=4)
+                
+            st.success(f"✅ Strategy Bundled to: {bundle_path}")
+            st.success("✅ Live Trader Config Updated to use this bundle!")
+
     if st.button("📊 Generate Signals & Backtest", type="primary", use_container_width=True):
         with st.spinner("Loading model and generating signals..."):
             # Load model
@@ -1773,12 +1523,12 @@ with tab2:
             
             if backtest_mode == "Full Training Period":
                 # Use the same period as training (e.g., 5y)
-                data = yf.Ticker(model_ticker).history(period=period)
+                data = yf.Ticker(model_ticker).history(period=period, interval=interval)
                 period_label = f"Full {period} Training Period"
                 
             elif backtest_mode == "Test Period Only":
                 # Load full data, then use only the test portion (last 20%)
-                data = yf.Ticker(model_ticker).history(period=period)
+                data = yf.Ticker(model_ticker).history(period=period, interval=interval)
                 split_idx = int(len(data) * 0.8)
                 data = data.iloc[split_idx:]
                 period_label = "Test Period (Last 20%)"
@@ -1786,19 +1536,28 @@ with tab2:
             elif backtest_mode == "Recent Days":
                 end_date = datetime.now()
                 start_date = end_date - timedelta(days=prod_days + 100)
-                data = yf.Ticker(model_ticker).history(start=start_date, end=end_date)
-                period_label = f"Recent {prod_days} Days"
+                data = yf.Ticker(model_ticker).history(start=start_date, end=end_date, interval=interval)
+                period_label = f"Last {prod_days} Days"
                 
-            else:  # Custom Date Range
-                data = yf.Ticker(model_ticker).history(start=custom_start, end=custom_end)
-                period_label = f"Custom: {custom_start} to {custom_end}"
+            else:
+                data = yf.Ticker(model_ticker).history(start=custom_start, end=custom_end, interval=interval)
+                period_label = f"{custom_start} to {custom_end}"
             
             data.index = pd.to_datetime(data.index).tz_localize(None)
             data.columns = [c.lower() for c in data.columns]
             data = data[['open', 'high', 'low', 'close', 'volume']]
             
+            # Check if model uses DL
+            use_dl = model_data.get('use_dl', False)
+            # Fallback
+            if not use_dl and 'feature_names' in model_data:
+                if any('DL_pred_' in f for f in model_data['feature_names']):
+                    use_dl = True
+            
+            dl_config = {'train': False, 'model_path': f"saved_models_v2/dl_{model_ticker}.h5"} if use_dl else None
+            
             # Generate features
-            features = generate_features(data)
+            features = generate_features(data, dl_config=dl_config)
             
             # Generate signals with custom threshold
             signals, prob_df = generate_signals(model_data, features, 
@@ -1876,6 +1635,14 @@ with tab2:
                     
                 signals = filtered_signals
             
+            # Store raw for comparison
+            signals_raw = signals.copy()
+            
+            # APPLY META FILTER (If Enabled)
+            if use_meta and 'v2_meta_model' in st.session_state:
+                signals = apply_meta_filter(st.session_state.v2_meta_model, signals, prob_df, features, threshold=meta_threshold)
+                st.caption(f"✨ Meta-Filter Applied (Thresh: {meta_threshold}). Active signals reduced to: {(signals!=0).sum()}")
+            
             # Store composite and confidence in session state for plotting
             st.session_state.v2_composite = composite_indicator
             st.session_state.v2_probs = prob_df
@@ -1885,13 +1652,16 @@ with tab2:
             os.makedirs(analysis_dir, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             
-            # Save signals and probs
+            # Save signals, probs, and ALL features
             analysis_df = pd.concat([
                 data[['open', 'high', 'low', 'close', 'volume']],
                 signals.rename('signal'),
                 prob_df,
-                composite_indicator.rename('composite_indicator')
+                features # Include all technical indicators and features
             ], axis=1)
+            
+            # Remove duplicate columns (e.g. if 'close' is in features too)
+            analysis_df = analysis_df.loc[:, ~analysis_df.columns.duplicated()]
             
             analysis_path = os.path.join(analysis_dir, f"analysis_{ticker}_{timestamp}.csv")
             analysis_df.to_csv(analysis_path)
@@ -1937,6 +1707,7 @@ with tab2:
             st.session_state.v2_results = {
                 'data': data,
                 'signals': signals,
+                'signals_raw': signals_raw,
                 'backtest': backtest,
                 'features': features,
                 'prob_df': prob_df,
@@ -1962,6 +1733,7 @@ with tab2:
         res = st.session_state.v2_results
         data = res['data']
         signals = res['signals']
+        signals_raw = res.get('signals_raw', signals)
         backtest = res['backtest']
         features = res['features']
         prob_df = res['prob_df']
@@ -2032,6 +1804,30 @@ with tab2:
             decreasing_line_color='red'
         ), row=1, col=1)
         
+        # Rejected Signals (Meta-Model Filtered)
+        if not signals_raw.equals(signals):
+            # Rejected Buys
+            rej_buy_mask = (signals_raw == 1) & (signals != 1)
+            if rej_buy_mask.any():
+                rej_dates = signals_raw[rej_buy_mask].index
+                rej_prices = data.loc[rej_dates, 'low'] * 0.98
+                fig.add_trace(go.Scatter(
+                    x=rej_dates, y=rej_prices, mode='markers',
+                    marker=dict(symbol='triangle-up-open', size=12, color='gray', line=dict(width=2)),
+                    name='Rejected BUY (Meta)', opacity=0.7
+                ), row=1, col=1)
+
+            # Rejected Sells
+            rej_sell_mask = (signals_raw == -1) & (signals != -1)
+            if rej_sell_mask.any():
+                rej_dates = signals_raw[rej_sell_mask].index
+                rej_prices = data.loc[rej_dates, 'high'] * 1.02
+                fig.add_trace(go.Scatter(
+                    x=rej_dates, y=rej_prices, mode='markers',
+                    marker=dict(symbol='triangle-down-open', size=12, color='gray', line=dict(width=2)),
+                    name='Rejected SELL (Meta)', opacity=0.7
+                ), row=1, col=1)
+
         # Buy signals
         buy_mask = signals == 1
         if buy_mask.any():
@@ -2297,6 +2093,84 @@ with tab2:
         
         st.plotly_chart(fig2, use_container_width=True)
         
+        # Meta-Model Analysis Chart (Rejected Trades)
+        if use_meta and 'signals_raw' in locals():
+            st.markdown("### 🧠 Meta-Model Decisions")
+            
+            # Filter to recent period
+            rec_sig_raw = signals_raw[signals_raw.index >= recent_data.index[0]]
+            # recent_signals is already the filtered version
+            
+            rej_buys = (rec_sig_raw == 1) & (recent_signals == 0)
+            rej_sells = (rec_sig_raw == -1) & (recent_signals == 0)
+            
+            total_rej = rej_buys.sum() + rej_sells.sum()
+            
+            if total_rej > 0:
+                st.caption(f"The Meta-Model rejected **{total_rej}** signals in this period.")
+                fig_rej = go.Figure()
+                
+                # Price
+                fig_rej.add_trace(go.Candlestick(
+                    x=recent_data.index, open=recent_data['open'], high=recent_data['high'],
+                    low=recent_data['low'], close=recent_data['close'], name='Price'
+                ))
+                
+                # --- ACCEPTED SIGNALS (Green/Red Triangles) ---
+                recent_buy_mask = recent_signals == 1
+                recent_sell_mask = recent_signals == -1
+                
+                if recent_buy_mask.any():
+                    recent_buy_dates = recent_signals[recent_buy_mask].index
+                    recent_buy_prices = recent_data.loc[recent_buy_dates, 'low'] * 0.98
+                    fig_rej.add_trace(go.Scatter(
+                        x=recent_buy_dates, y=recent_buy_prices, mode='markers',
+                        marker=dict(symbol='triangle-up', size=14, color='lime', line=dict(width=2, color='darkgreen')),
+                        name='Accepted BUY'
+                    ))
+                
+                if recent_sell_mask.any():
+                    recent_sell_dates = recent_signals[recent_sell_mask].index
+                    recent_sell_prices = recent_data.loc[recent_sell_dates, 'high'] * 1.02
+                    fig_rej.add_trace(go.Scatter(
+                        x=recent_sell_dates, y=recent_sell_prices, mode='markers',
+                        marker=dict(symbol='triangle-down', size=14, color='red', line=dict(width=2, color='darkred')),
+                        name='Accepted SELL'
+                    ))
+                    
+                # --- TRADES (Entries/Exits) ---
+                for trade in recent_trades:
+                    fig_rej.add_trace(go.Scatter(
+                        x=[trade['entry_date']], y=[trade['entry_price']], mode='markers+text',
+                        marker=dict(symbol='circle', size=10, color='blue', line=dict(width=1, color='white')),
+                        text=['▶'], textposition='middle left', name='Entry', showlegend=False
+                    ))
+                    if 'exit_date' in trade and trade['exit_date'] >= recent_data.index[0]:
+                        profit_color = 'green' if trade.get('profit', 0) > 0 else 'red'
+                        fig_rej.add_trace(go.Scatter(
+                            x=[trade['exit_date']], y=[trade['exit_price']], mode='markers',
+                            marker=dict(symbol='x', size=10, color=profit_color, line=dict(width=2, color='white')),
+                            name='Exit', showlegend=False
+                        ))
+                
+                # --- REJECTED SIGNALS (Red/Orange Xs) ---
+                if rej_buys.sum() > 0:
+                    fig_rej.add_trace(go.Scatter(
+                        x=recent_data.loc[rej_buys].index, y=recent_data.loc[rej_buys]['low']*0.98,
+                        mode='markers', marker=dict(symbol='x-thin', size=12, color='red', line_width=3), 
+                        name='Rejected Buy'
+                    ))
+                
+                if rej_sells.sum() > 0:
+                    fig_rej.add_trace(go.Scatter(
+                        x=recent_data.loc[rej_sells].index, y=recent_data.loc[rej_sells]['high']*1.02,
+                        mode='markers', marker=dict(symbol='x-thin', size=12, color='orange', line_width=3), 
+                        name='Rejected Sell'
+                    ))
+                    
+                fig_rej.update_layout(title="Meta-Model Impact: Accepted vs Rejected", height=500, template="plotly_dark", xaxis_rangeslider_visible=False)
+                st.plotly_chart(fig_rej, use_container_width=True)
+        
         # Recent period stats
         if len(recent_trades) > 0:
             recent_profits = [t.get('profit', 0) for t in recent_trades if 'profit' in t]
@@ -2337,7 +2211,123 @@ with tab2:
             st.dataframe(trades_display, use_container_width=True)
         else:
             st.info("No trades executed in this period")
+
+        # ==========================================================================
+        # 💎 Polygon.io Comparison (High Fidelity Data)
+        # ==========================================================================
+        # 1. Calculation (Only runs when Generating Signals)
+        # Relaxed check: If dl_config is missing, assume None (No DL)
+        if polygon_api_key and PolygonManager:
+            # Ensure we are in a generation context (model_data exists)
+            if 'model_data' in locals():
+                dl_config = locals().get('dl_config', None)
+                
+                with st.spinner("Fetching Polygon Data (180 Days) & Re-Calculating..."):
+                    poly_mgr = PolygonManager(polygon_api_key)
+                    
+                    # Exact 180 Day Window
+                    poly_end = datetime.now().strftime("%Y-%m-%d")
+                    poly_start = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+                    
+                    poly_data = poly_mgr.get_price_data(ticker, start_date=poly_start, end_date=poly_end, limit=50000)
+                    
+                    if not poly_data.empty:
+                        # Generate Features
+                        poly_features = generate_features(poly_data, dl_config=dl_config)
+                        
+                        # Generate Signals
+                        poly_signals, poly_probs = generate_signals(
+                            model_data, poly_features, 
+                            threshold=decision_threshold,
+                            use_slope_signals=use_slope_signals,
+                            slope_buy_thresh=slope_buy_thresh,
+                            slope_sell_thresh=slope_sell_thresh,
+                            use_ml_confirm=use_ml_confirm,
+                            ml_confirm_thresh=ml_confirm_thresh,
+                            slope_roc_thresh=slope_roc_thresh,
+                            use_mom_zone=use_mom_zone,
+                            buy_threshold=ml_buy_thresh,
+                            sell_threshold=ml_sell_thresh
+                        )
+                        
+                        # Backtest
+                        poly_backtest = run_backtest(poly_data, poly_signals, limit_pct=limit_entry_pct)
+                        
+                        # Save to Session State for Persistence
+                        st.session_state.v2_polygon_results = {
+                            'data': poly_data,
+                            'signals': poly_signals,
+                            'backtest': poly_backtest,
+                            'ticker': ticker
+                        }
+                    else:
+                        if 'v2_polygon_results' in st.session_state:
+                            del st.session_state.v2_polygon_results
+                        st.warning("Could not fetch data from Polygon. Check your API Key and Ticker.")
+
+        # 2. Display (Runs on every render if results exist)
+        if 'v2_polygon_results' in st.session_state:
+            p_res = st.session_state.v2_polygon_results
+            poly_data = p_res['data']
+            poly_signals = p_res['signals']
+            poly_backtest = p_res['backtest']
             
+            st.markdown("---")
+            st.header("💎 Polygon.io Comparison")
+            st.caption("Comparing 'What Would Have Happened' with High-Fidelity Polygon Data vs Yahoo Data (Last 180 Days)")
+
+            # Metrics
+            col_p1, col_p2, col_p3 = st.columns(3)
+            
+            # Get Standard Return for Delta (from session state or local)
+            std_return = backtest['total_return'] if 'backtest' in locals() else st.session_state.get('v2_backtest', {}).get('total_return', 0.0)
+            
+            with col_p1:
+                st.metric("Polygon Total Return", f"{poly_backtest['total_return']:.1f}%", 
+                          delta=f"{poly_backtest['total_return'] - std_return:.1f}% vs Standard")
+            with col_p2:
+                st.metric("Polygon Win Rate", f"{poly_backtest['win_rate']:.1f}%")
+            with col_p3:
+                st.metric("Polygon Trades", poly_backtest['num_trades'])
+
+            # Duplicate Chart (Simplified Plotly)
+            fig_p = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
+            
+            # Candles
+            fig_p.add_trace(go.Candlestick(
+                x=poly_data.index, open=poly_data['open'], high=poly_data['high'],
+                low=poly_data['low'], close=poly_data['close'], name='Polygon Price'
+            ), row=1, col=1)
+            
+            # Buy Signals
+            p_buys = poly_signals[poly_signals == 1]
+            if not p_buys.empty:
+                fig_p.add_trace(go.Scatter(
+                    x=p_buys.index, y=poly_data.loc[p_buys.index, 'low']*0.98,
+                    mode='markers', marker=dict(symbol='triangle-up', size=12, color='lime'),
+                    name='Buy Signal'
+                ), row=1, col=1)
+
+            # Sell Signals
+            p_sells = poly_signals[poly_signals == -1]
+            if not p_sells.empty:
+                fig_p.add_trace(go.Scatter(
+                    x=p_sells.index, y=poly_data.loc[p_sells.index, 'high']*1.02,
+                    mode='markers', marker=dict(symbol='triangle-down', size=12, color='red'),
+                    name='Sell Signal'
+                ), row=1, col=1)
+                
+            # Equity Curve
+            fig_p.add_trace(go.Scatter(
+                x=poly_backtest['equity_curve'].index, y=poly_backtest['equity_curve']['equity'],
+                line=dict(color='cyan', width=2), name='Equity', fill='tozeroy'
+            ), row=2, col=1)
+            
+            fig_p.update_layout(title=f"Polygon Data Analysis ({p_res['ticker']}) - High Fidelity", height=600, template="plotly_dark")
+            fig_p.update_yaxes(title_text="Price", row=1, col=1)
+            fig_p.update_yaxes(title_text="Equity ($)", row=2, col=1)
+            st.plotly_chart(fig_p, use_container_width=True)
+
         # SAVE STRATEGY STATE BUTTON
         st.divider()
         if st.button("💾 Save Strategy State (Signals + Config)"):
@@ -2566,3 +2556,309 @@ with tab3:
             st.info("No analysis files found. Run a backtest in Production tab first.")
     else:
         st.info("No analysis directory found.")
+
+# =============================================================================
+# TAB 4: ALPHA LAB
+# =============================================================================
+with tab4:
+    st.header("🧪 Alpha Lab: Execution Optimization")
+    st.info("Improve your entries by predicting intraday Highs/Lows and using Limit Orders instead of Market Orders.")
+    
+    # 1. Select Base Model
+    model_dir = "saved_models_v2"
+    if os.path.exists(model_dir):
+        model_files = sorted([f for f in os.listdir(model_dir) if f.endswith('.joblib') and 'meta' not in f], reverse=True)
+        alpha_model = st.selectbox("Select Directional Model", model_files, key="alpha_model_select")
+    else:
+        st.warning("No models found.")
+        st.stop()
+        
+    alpha_model_path = os.path.join(model_dir, alpha_model)
+    
+    # 2. Train Range Predictor
+    st.markdown("### 1. Range Predictor (Daily High/Low)")
+    st.caption("Train a Regression Model to predict how far the price will move from the Open.")
+    
+    if st.button("🧠 Train Range Predictor"):
+        # Progress Bar Setup
+        prog_bar = st.progress(0, text="Initializing...")
+        status_text = st.empty()
+        
+        try:
+            # Load Daily Data for Regression
+            status_text.text("Loading Daily Data for Regression...")
+            prog_bar.progress(5, text="Loading Data...")
+            
+            import yfinance as yf
+            # We use Daily data for this because we predict Daily High/Low
+            reg_data = yf.Ticker(ticker).history(period=period, interval='1d') 
+            reg_data.index = pd.to_datetime(reg_data.index).tz_localize(None)
+            reg_data.columns = [c.lower() for c in reg_data.columns]
+            
+            # Generate Features
+            status_text.text("Generating Technical Features (Daily)...")
+            prog_bar.progress(15, text="Generating Features...")
+            reg_features = generate_features(reg_data)
+            
+            # Targets
+            # High Target: % move from Open to High
+            target_high = (reg_data['high'] - reg_data['open']) / reg_data['open']
+            # Low Target: % move from Open to Low
+            target_low = (reg_data['low'] - reg_data['open']) / reg_data['open']
+            
+            # Align
+            common = reg_features.index.intersection(target_high.index)
+            reg_features = reg_features.loc[common]
+            target_high = target_high.loc[common]
+            target_low = target_low.loc[common]
+            
+            # Train High Predictor
+            status_text.text("Optimizing High Predictor (XGBoost Regressor)...")
+            def update_high(current, total):
+                # 20% to 55%
+                pct = 20 + int(35 * (current + 1) / total)
+                prog_bar.progress(pct, text=f"Optimizing High Predictor: Trial {current+1}/{total}")
+                
+            res_high = train_regressor(reg_features, target_high, progress_callback=update_high)
+            
+            # Train Low Predictor
+            status_text.text("Optimizing Low Predictor (XGBoost Regressor)...")
+            def update_low(current, total):
+                # 55% to 90%
+                pct = 55 + int(35 * (current + 1) / total)
+                prog_bar.progress(pct, text=f"Optimizing Low Predictor: Trial {current+1}/{total}")
+                
+            res_low = train_regressor(reg_features, target_low, progress_callback=update_low)
+            
+            prog_bar.progress(100, text="Training Complete!")
+            status_text.success("✅ Training Complete!")
+            
+            st.session_state.alpha_regressors = {
+                'high': res_high,
+                'low': res_low,
+                'data': reg_data
+            }
+            
+            # Save to disk
+            alpha_path = f"saved_models_v2/alpha_regressors_{ticker}.joblib"
+            joblib.dump(st.session_state.alpha_regressors, alpha_path)
+            st.info(f"💾 Alpha Models saved to {alpha_path}")
+            
+            st.success(f"✅ Regressors Trained! Low RMSE: {res_low['rmse']:.4f}, High RMSE: {res_high['rmse']:.4f}")
+            
+        except Exception as e:
+            st.error(f"Error during training: {e}")
+            
+    if 'alpha_regressors' in st.session_state:
+        regs = st.session_state.alpha_regressors
+        
+        # Visualization
+        st.markdown("#### Predicted vs Actual Range (Last 50 Days)")
+        
+        # Predict on recent data
+        data = regs['data']
+        features = generate_features(data)
+        
+        # Load models
+        model_h = regs['high']['model']
+        model_l = regs['low']['model']
+        
+        # Predict
+        pred_h = model_h.predict(features)
+        pred_l = model_l.predict(features)
+        
+        # Create DF
+        df_res = pd.DataFrame({
+            'Actual High': (data['high'] - data['open']) / data['open'],
+            'Actual Low': (data['low'] - data['open']) / data['open'],
+            'Pred High': pred_h,
+            'Pred Low': pred_l
+        }, index=features.index)
+        
+        # Plot
+        st.line_chart(df_res.iloc[-50:][['Actual Low', 'Pred Low']])
+        
+        # Execution Simulation
+        st.markdown("### 2. Sniper Strategy Simulation (Entry & Exit)")
+        st.caption("Strategy: Buy Limit @ Predicted Low. Sell Limit @ Predicted High. Exit at Close if Target not hit.")
+        
+        if st.button("⚔️ Run Strategy Simulation"):
+            # Load Base Model Signals
+            base_model = load_model(alpha_model_path)
+            # Generate signals on this data
+            sigs, _ = generate_signals(base_model, features)
+            
+            # Filter for BUYS
+            buy_days = sigs[sigs == 1].index
+            
+            results = []
+            
+            for date in buy_days:
+                if date not in df_res.index: continue
+                
+                row = data.loc[date]
+                preds = df_res.loc[date]
+                
+                # Standard: Buy at Open, Sell at Close
+                entry_std = row['open']
+                exit_std = row['close']
+                ret_std = (exit_std - entry_std) / entry_std
+                
+                # Sniper Strategy
+                # 1. Place Buy Limit at Predicted Low
+                buy_limit = row['open'] * (1 + preds['Pred Low'])
+                # 2. Place Sell Limit at Predicted High
+                sell_limit = row['open'] * (1 + preds['Pred High'])
+                
+                # Check Entry Fill
+                if row['low'] <= buy_limit:
+                    entry_sniper = buy_limit
+                    status = 'FILLED_ENTRY'
+                    
+                    # Check Exit Fill (Target)
+                    # Note: With daily data, we assume High > Sell_Limit is a fill.
+                    # Risk: High might have happened BEFORE Low. 
+                    # Mitigation: We are conservative.
+                    if row['high'] >= sell_limit:
+                        exit_sniper = sell_limit
+                        status = 'TARGET_HIT 🎯'
+                    else:
+                        # Exit at Close
+                        exit_sniper = row['close']
+                        status = 'CLOSE_EXIT'
+                        
+                    ret_sniper = (exit_sniper - entry_sniper) / entry_sniper
+                else:
+                    # Missed Entry
+                    entry_sniper = row['close'] # No trade
+                    status = 'MISSED'
+                    ret_sniper = 0.0
+                
+                results.append({
+                    'date': date,
+                    'std_return': ret_std,
+                    'sniper_return': ret_sniper,
+                    'status': status,
+                    'buy_limit': buy_limit,
+                    'sell_limit': sell_limit
+                })
+                
+            res_df = pd.DataFrame(results)
+            if not res_df.empty:
+                st.metric("Total Trades", len(res_df))
+                
+                fill_rate = (res_df['status'] != 'MISSED').mean()
+                target_rate = (res_df['status'] == 'TARGET_HIT 🎯').mean()
+                
+                c1, c2 = st.columns(2)
+                c1.metric("Entry Fill Rate", f"{fill_rate:.1%}")
+                c2.metric("Target Hit Rate", f"{target_rate:.1%}")
+                
+                tot_std = res_df['std_return'].sum() * 100
+                tot_snip = res_df['sniper_return'].sum() * 100
+                
+                col1, col2 = st.columns(2)
+                col1.metric("Standard Return", f"{tot_std:.1f}%")
+                col2.metric("Sniper Strategy Return", f"{tot_snip:.1f}%", delta=f"{tot_snip - tot_std:.1f}%")
+                
+                st.dataframe(res_df)
+                
+                # --- VISUALIZATION ---
+                st.subheader("📊 Sniper Strategy Simulation Chart")
+                
+                # Use the full range of the prediction dataframe (df_res) for context
+                # This ensures we show candles even on days without trades
+                if not df_res.empty:
+                    sim_start = df_res.index[0]
+                    sim_end = df_res.index[-1]
+                    sim_data = data.loc[sim_start:sim_end]
+                else:
+                    sim_data = data.iloc[-50:] # Fallback
+                
+                fig_sim = go.Figure()
+                
+                # 1. Candlestick
+                fig_sim.add_trace(go.Candlestick(
+                    x=sim_data.index,
+                    open=sim_data['open'], high=sim_data['high'],
+                    low=sim_data['low'], close=sim_data['close'],
+                    name='Price'
+                ))
+                
+                # 2. Entries (Filled)
+                filled_mask = res_df['status'] != 'MISSED'
+                if filled_mask.any():
+                    filled_df = res_df[filled_mask]
+                    fig_sim.add_trace(go.Scatter(
+                        x=filled_df['date'], y=filled_df['buy_limit'],
+                        mode='markers', marker=dict(symbol='triangle-up', size=10, color='lime'),
+                        name='Limit Entry Filled'
+                    ))
+                    
+                # 3. Exits (Target Hit)
+                target_mask = res_df['status'] == 'TARGET_HIT 🎯'
+                if target_mask.any():
+                    target_df = res_df[target_mask]
+                    fig_sim.add_trace(go.Scatter(
+                        x=target_df['date'], y=target_df['sell_limit'],
+                        mode='markers', marker=dict(symbol='star', size=12, color='gold', line=dict(width=1, color='black')),
+                        name='Target Hit'
+                    ))
+                    
+                # 4. Exits (Close)
+                close_mask = res_df['status'] == 'CLOSE_EXIT'
+                if close_mask.any():
+                    close_df = res_df[close_mask]
+                    close_prices = sim_data.loc[close_df['date']]['close']
+                    fig_sim.add_trace(go.Scatter(
+                        x=close_df['date'], y=close_prices,
+                        mode='markers', marker=dict(symbol='x', size=8, color='orange'),
+                        name='Close Exit'
+                    ))
+
+                fig_sim.update_layout(height=600, template="plotly_dark", title="Sniper Strategy Execution", xaxis_rangeslider_visible=False)
+                st.plotly_chart(fig_sim, use_container_width=True)
+
+        # Real-Time Signals
+        st.markdown("### 3. 🔮 Real-Time Signals (Next Session)")
+        st.info("Use these levels for your Limit Orders in the next trading session.")
+        
+        # Get latest data point
+        last_date = data.index[-1]
+        last_row = data.iloc[-1]
+        last_preds = df_res.loc[last_date] # Predictions for the last known day
+        
+        # We need predictions for TOMORROW (or Today if live).
+        # The regression model uses LAGGED features. So inputting today's features predicts TODAY's range.
+        # So we actually need to look at the prediction for the LATEST row.
+        
+        # Base Signal
+        base_model = load_model(alpha_model_path)
+        # We need to run inference on the last row
+        last_feat = features.iloc[[-1]] # Keep as DF
+        last_sig, _ = generate_signals(base_model, last_feat)
+        signal_val = last_sig.iloc[0]
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if signal_val == 1:
+                st.success("## 🟢 BUY Signal")
+            elif signal_val == -1:
+                st.error("## 🔴 SELL Signal")
+            else:
+                st.warning("## ⚪ HOLD")
+                
+        with col2:
+            st.metric("📅 Date", last_date.strftime('%Y-%m-%d'))
+            st.metric("Open Price", f"${last_row['open']:,.2f}")
+            
+        with col3:
+            # Calculate Limits
+            buy_limit = last_row['open'] * (1 + last_preds['Pred Low'])
+            sell_limit = last_row['open'] * (1 + last_preds['Pred High'])
+            
+            st.metric("📉 Buy Limit Order", f"${buy_limit:,.2f}", delta=f"{last_preds['Pred Low']*100:.2f}% from Open")
+            st.metric("📈 Sell Limit Order", f"${sell_limit:,.2f}", delta=f"{last_preds['Pred High']*100:.2f}% from Open")
+            
+        st.caption("Note: These limits are calculated relative to the Open price. If trading tomorrow, update 'Open Price' with tomorrow's open.")

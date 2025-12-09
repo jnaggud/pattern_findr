@@ -1,0 +1,9 @@
+{
+    "model_path": "saved_models_v2/xgboost_BTC-USD_20251206_154136.joblib",
+    "slope_buy_thresh": -0.7,
+    "slope_sell_thresh": 0.7000000000000001,
+    "use_ml_confirm": true,
+    "ml_confirm_thresh": 0.1,
+    "win_rate": 80.0,
+    "total_return": 107.89390976850426
+}
