@@ -1,0 +1,442 @@
+[
+  {
+    "rank": 1,
+    "total_return": 1.4464929827316662,
+    "sharpe_ratio": 0.4032029566416941,
+    "win_rate": 0.72,
+    "num_trades": 125,
+    "profit_factor": 2.2059004905551993,
+    "max_drawdown": 0.1288877008675597,
+    "avg_trade": 0.007556888552822904,
+    "rules": "LONG: ['composite_momentum_slope_slope_cross_up'] | EXIT: ['zscore_20_slope_5_cross_up']",
+    "config": {
+      "entry_long": [
+        "composite_momentum_slope_slope_cross_up"
+      ],
+      "exit_long": [
+        "zscore_20_slope_5_cross_up"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  },
+  {
+    "rank": 2,
+    "total_return": 1.4052564344139784,
+    "sharpe_ratio": 0.6173313679953876,
+    "win_rate": 0.7272727272727273,
+    "num_trades": 110,
+    "profit_factor": 2.8609591089140576,
+    "max_drawdown": 0.07830641166104053,
+    "avg_trade": 0.008212411832093444,
+    "rules": "LONG: ['uo_slope_3_cross_up'] | EXIT: ['mfi_14_slope_3_cross_up']",
+    "config": {
+      "entry_long": [
+        "uo_slope_3_cross_up"
+      ],
+      "exit_long": [
+        "mfi_14_slope_3_cross_up"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  },
+  {
+    "rank": 3,
+    "total_return": 1.3511005655259165,
+    "sharpe_ratio": 0.42207828846387907,
+    "win_rate": 0.6454545454545455,
+    "num_trades": 110,
+    "profit_factor": 2.2028990174483853,
+    "max_drawdown": 0.2070302133588157,
+    "avg_trade": 0.008400876385720046,
+    "rules": "LONG: ['obv_slope_slope_cross_up'] | EXIT: ['mfi_14_slope_5_cross_down']",
+    "config": {
+      "entry_long": [
+        "obv_slope_slope_cross_up"
+      ],
+      "exit_long": [
+        "mfi_14_slope_5_cross_down"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  },
+  {
+    "rank": 4,
+    "total_return": 1.2293005204950387,
+    "sharpe_ratio": 0.38299590703665765,
+    "win_rate": 0.6396396396396397,
+    "num_trades": 111,
+    "profit_factor": 1.9967025463779633,
+    "max_drawdown": 0.18913658169071648,
+    "avg_trade": 0.007627643809334998,
+    "rules": "LONG: ['obv_slope_slope_cross_up'] | EXIT: ['adx_14_slope_1_cross_up']",
+    "config": {
+      "entry_long": [
+        "obv_slope_slope_cross_up"
+      ],
+      "exit_long": [
+        "adx_14_slope_1_cross_up"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  },
+  {
+    "rank": 5,
+    "total_return": 1.2282427240154055,
+    "sharpe_ratio": 0.258416875724595,
+    "win_rate": 0.6410256410256411,
+    "num_trades": 195,
+    "profit_factor": 1.909282897351277,
+    "max_drawdown": 0.10363398329904752,
+    "avg_trade": 0.004344392511132532,
+    "rules": "LONG: ['macd_12_26_slope_slope_cross_up'] | EXIT: ['ao_slope_slope_cross_up']",
+    "config": {
+      "entry_long": [
+        "macd_12_26_slope_slope_cross_up"
+      ],
+      "exit_long": [
+        "ao_slope_slope_cross_up"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  },
+  {
+    "rank": 6,
+    "total_return": 1.191829566762107,
+    "sharpe_ratio": 0.3354134714909168,
+    "win_rate": 0.6621621621621622,
+    "num_trades": 148,
+    "profit_factor": 2.171618666219215,
+    "max_drawdown": 0.12649147297899796,
+    "avg_trade": 0.005548505477351321,
+    "rules": "LONG: ['stoch_k_14_slope_slope_cross_up'] | EXIT: ['rsi_14_slope_3_cross_up']",
+    "config": {
+      "entry_long": [
+        "stoch_k_14_slope_slope_cross_up"
+      ],
+      "exit_long": [
+        "rsi_14_slope_3_cross_up"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  },
+  {
+    "rank": 7,
+    "total_return": 1.14390072727257,
+    "sharpe_ratio": 0.31271587807304746,
+    "win_rate": 0.6357142857142857,
+    "num_trades": 140,
+    "profit_factor": 1.8987314782800246,
+    "max_drawdown": 0.22368032177851782,
+    "avg_trade": 0.005900532555854781,
+    "rules": "LONG: ['obv_slope_slope_cross_up'] | EXIT: ['mfi_14_slope_3_cross_down']",
+    "config": {
+      "entry_long": [
+        "obv_slope_slope_cross_up"
+      ],
+      "exit_long": [
+        "mfi_14_slope_3_cross_down"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  },
+  {
+    "rank": 8,
+    "total_return": 1.1367943723683873,
+    "sharpe_ratio": 0.4369873865533806,
+    "win_rate": 0.7227722772277227,
+    "num_trades": 101,
+    "profit_factor": 2.0610648034675747,
+    "max_drawdown": 0.14991404428301477,
+    "avg_trade": 0.007982211211128623,
+    "rules": "LONG: ['uo_slope_norm_cross_up'] | EXIT: ['mfi_14_slope_5_cross_up']",
+    "config": {
+      "entry_long": [
+        "uo_slope_norm_cross_up"
+      ],
+      "exit_long": [
+        "mfi_14_slope_5_cross_up"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  },
+  {
+    "rank": 9,
+    "total_return": 1.1362622119141068,
+    "sharpe_ratio": 0.25927981477585405,
+    "win_rate": 0.6844919786096256,
+    "num_trades": 187,
+    "profit_factor": 1.8756691836563377,
+    "max_drawdown": 0.1133348233454781,
+    "avg_trade": 0.0042478322173809795,
+    "rules": "LONG: ['composite_momentum_slope_slope_cross_up'] | EXIT: ['willr_14_slope_3_cross_up']",
+    "config": {
+      "entry_long": [
+        "composite_momentum_slope_slope_cross_up"
+      ],
+      "exit_long": [
+        "willr_14_slope_3_cross_up"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  },
+  {
+    "rank": 10,
+    "total_return": 1.1157960781029097,
+    "sharpe_ratio": 0.34934812509644153,
+    "win_rate": 0.6788321167883211,
+    "num_trades": 137,
+    "profit_factor": 2.179769342644687,
+    "max_drawdown": 0.12265657597719214,
+    "avg_trade": 0.005733021500359513,
+    "rules": "LONG: ['stoch_k_14_slope_slope_cross_up'] | EXIT: ['price_slope_pct_3_cross_up']",
+    "config": {
+      "entry_long": [
+        "stoch_k_14_slope_slope_cross_up"
+      ],
+      "exit_long": [
+        "price_slope_pct_3_cross_up"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  },
+  {
+    "rank": 11,
+    "total_return": 1.102592099797098,
+    "sharpe_ratio": 0.1915348379815079,
+    "win_rate": 0.6173913043478261,
+    "num_trades": 230,
+    "profit_factor": 1.7314857549566143,
+    "max_drawdown": 0.16158418047278167,
+    "avg_trade": 0.0034535493084939953,
+    "rules": "LONG: ['composite_momentum_slope_1_cross_up'] | EXIT: ['uo_slope_norm_cross_up']",
+    "config": {
+      "entry_long": [
+        "composite_momentum_slope_1_cross_up"
+      ],
+      "exit_long": [
+        "uo_slope_norm_cross_up"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  },
+  {
+    "rank": 12,
+    "total_return": 1.0901401371938761,
+    "sharpe_ratio": 0.33534512489749635,
+    "win_rate": 0.6594202898550725,
+    "num_trades": 138,
+    "profit_factor": 2.0411526134634226,
+    "max_drawdown": 0.11414041727326461,
+    "avg_trade": 0.005611628304826463,
+    "rules": "LONG: ['uo_slope_1_cross_up'] | EXIT: ['price_slope_pct_3_cross_up']",
+    "config": {
+      "entry_long": [
+        "uo_slope_1_cross_up"
+      ],
+      "exit_long": [
+        "price_slope_pct_3_cross_up"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  },
+  {
+    "rank": 13,
+    "total_return": 1.0845594475242035,
+    "sharpe_ratio": 0.3745885154178887,
+    "win_rate": 0.6330275229357798,
+    "num_trades": 109,
+    "profit_factor": 1.9862672573810143,
+    "max_drawdown": 0.1659244466001691,
+    "avg_trade": 0.007208183622598132,
+    "rules": "LONG: ['composite_momentum_slope_slope_cross_up'] | EXIT: ['adx_14_slope_1_cross_up']",
+    "config": {
+      "entry_long": [
+        "composite_momentum_slope_slope_cross_up"
+      ],
+      "exit_long": [
+        "adx_14_slope_1_cross_up"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  },
+  {
+    "rank": 14,
+    "total_return": 1.0796084878034895,
+    "sharpe_ratio": 0.3055535314562041,
+    "win_rate": 0.6490066225165563,
+    "num_trades": 151,
+    "profit_factor": 1.9590937796092684,
+    "max_drawdown": 0.11609493773913018,
+    "avg_trade": 0.0050930473986091655,
+    "rules": "LONG: ['obv_slope_slope_cross_up'] | EXIT: ['price_slope_pct_3_cross_up']",
+    "config": {
+      "entry_long": [
+        "obv_slope_slope_cross_up"
+      ],
+      "exit_long": [
+        "price_slope_pct_3_cross_up"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  },
+  {
+    "rank": 15,
+    "total_return": 1.070835306350017,
+    "sharpe_ratio": 0.4371693466211028,
+    "win_rate": 0.7326732673267327,
+    "num_trades": 101,
+    "profit_factor": 2.0698711266858583,
+    "max_drawdown": 0.16503680950041086,
+    "avg_trade": 0.007633213878957919,
+    "rules": "LONG: ['rsi_14_slope_1_cross_up'] | EXIT: ['mfi_14_slope_5_cross_up']",
+    "config": {
+      "entry_long": [
+        "rsi_14_slope_1_cross_up"
+      ],
+      "exit_long": [
+        "mfi_14_slope_5_cross_up"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  },
+  {
+    "rank": 16,
+    "total_return": 1.0600276735015366,
+    "sharpe_ratio": 0.8948627528959715,
+    "win_rate": 0.7647058823529411,
+    "num_trades": 68,
+    "profit_factor": 3.737398600795127,
+    "max_drawdown": 0.050817422747095435,
+    "avg_trade": 0.0109576078034937,
+    "rules": "LONG: ['cci_20_slope_5_cross_up'] | EXIT: ['mfi_14_slope_5_cross_up']",
+    "config": {
+      "entry_long": [
+        "cci_20_slope_5_cross_up"
+      ],
+      "exit_long": [
+        "mfi_14_slope_5_cross_up"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  },
+  {
+    "rank": 17,
+    "total_return": 1.0588337526964902,
+    "sharpe_ratio": 0.34070660305932093,
+    "win_rate": 0.7142857142857143,
+    "num_trades": 126,
+    "profit_factor": 2.0478442533309678,
+    "max_drawdown": 0.1369207311752582,
+    "avg_trade": 0.006064471748843809,
+    "rules": "LONG: ['mfi_14_slope_slope_cross_up'] | EXIT: ['macd_12_26_slope_norm_cross_up']",
+    "config": {
+      "entry_long": [
+        "mfi_14_slope_slope_cross_up"
+      ],
+      "exit_long": [
+        "macd_12_26_slope_norm_cross_up"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  },
+  {
+    "rank": 18,
+    "total_return": 1.0502196188020656,
+    "sharpe_ratio": 0.3485573811732488,
+    "win_rate": 0.6833333333333333,
+    "num_trades": 120,
+    "profit_factor": 2.1184029056076743,
+    "max_drawdown": 0.11456018377639449,
+    "avg_trade": 0.006342903547837579,
+    "rules": "LONG: ['obv_slope_norm_cross_up'] | EXIT: ['macd_12_26_slope_norm_cross_up']",
+    "config": {
+      "entry_long": [
+        "obv_slope_norm_cross_up"
+      ],
+      "exit_long": [
+        "macd_12_26_slope_norm_cross_up"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  },
+  {
+    "rank": 19,
+    "total_return": 1.0498169591086786,
+    "sharpe_ratio": 0.3474049560133488,
+    "win_rate": 0.6594202898550725,
+    "num_trades": 138,
+    "profit_factor": 2.143045884566386,
+    "max_drawdown": 0.08047382197379578,
+    "avg_trade": 0.005437606543266737,
+    "rules": "LONG: ['zscore_20_slope_norm_cross_up'] | EXIT: ['price_slope_3_cross_up']",
+    "config": {
+      "entry_long": [
+        "zscore_20_slope_norm_cross_up"
+      ],
+      "exit_long": [
+        "price_slope_3_cross_up"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  },
+  {
+    "rank": 20,
+    "total_return": 1.047317444919717,
+    "sharpe_ratio": 0.3508384058233426,
+    "win_rate": 0.625,
+    "num_trades": 112,
+    "profit_factor": 1.9253619645644053,
+    "max_drawdown": 0.14599324345680476,
+    "avg_trade": 0.006866319524343287,
+    "rules": "LONG: ['zscore_20_slope_slope_cross_up'] | EXIT: ['adx_14_slope_norm_cross_up']",
+    "config": {
+      "entry_long": [
+        "zscore_20_slope_slope_cross_up"
+      ],
+      "exit_long": [
+        "adx_14_slope_norm_cross_up"
+      ],
+      "entry_short": null,
+      "exit_short": null,
+      "filters": null
+    }
+  }
+]

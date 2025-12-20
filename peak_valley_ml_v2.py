@@ -34,8 +34,15 @@ from ml_utils import (
     generate_signals,
     train_meta_model,
     apply_meta_filter,
-    train_regressor
+    train_regressor,
+    optimize_full_strategy
 )
+
+# Try to import Conformal Wrapper
+try:
+    from conformal_utils import ConformalPredictionWrapper
+except ImportError:
+    ConformalPredictionWrapper = None
 
 # Import Polygon Manager
 try:
@@ -74,6 +81,19 @@ def init_session_state():
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+    
+    # Load persisted optimization results from file if not in session state
+    if 'v2_last_optimization' not in st.session_state:
+        import json
+        opt_cache_path = os.path.join("saved_models_v2", "last_optimization.json")
+        if os.path.exists(opt_cache_path):
+            try:
+                with open(opt_cache_path, 'r') as f:
+                    st.session_state.v2_last_optimization = json.load(f)
+            except Exception:
+                st.session_state.v2_last_optimization = None
+        else:
+            st.session_state.v2_last_optimization = None
 
 init_session_state()
 
@@ -387,119 +407,6 @@ def train_model_with_optuna(features: pd.DataFrame, labels: pd.Series,
     }
 
 
-
-
-
-
-def optimize_strategy(data, model_data, features, n_trials=100, progress_callback=None):
-    """
-    Optimize Strategy Sliders using Optuna (Fast Post-Processing).
-    Does NOT re-train the model. Optimizes filters only.
-    """
-    import optuna
-    # Suppress console output to avoid confusion with model training
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-    
-    print("--- STARTING STRATEGY OPTIMIZATION ---")
-    
-    def objective(trial):
-        # Update progress if callback provided
-        if progress_callback:
-            progress_callback(trial.number, n_trials)
-
-        # Suggest parameters (Strategy Sliders)
-        s_buy = trial.suggest_float('slope_buy_thresh', -1.0, 0.0, step=0.1)
-        s_sell = trial.suggest_float('slope_sell_thresh', 0.0, 1.0, step=0.1)
-        roc_thresh = trial.suggest_float('slope_roc_thresh', 0.0, 0.5, step=0.05)
-        mom_zone = trial.suggest_categorical('use_mom_zone', [True, False])
-        
-        # Trend Filter
-        use_trend = trial.suggest_categorical('use_trend_filter', [True, False])
-        
-        # Volatility Filter (ADX)
-        use_adx = trial.suggest_categorical('use_adx_filter', [True, False])
-        adx_thresh = trial.suggest_int('adx_threshold', 15, 30)
-        
-        # ML Thresholds (Instead of fixed 0.5)
-        # Allow asymmetry (e.g. easy entry, strict exit or vice versa)
-        ml_buy = trial.suggest_float('ml_buy_threshold', 0.2, 0.8, step=0.05)
-        ml_sell = trial.suggest_float('ml_sell_threshold', 0.2, 0.8, step=0.05)
-        
-        # ML Confirmation params (for slope signals)
-        use_ml = trial.suggest_categorical('use_ml_confirm', [True, False])
-        ml_conf_thresh = trial.suggest_float('ml_confirm_thresh', 0.0, 0.5, step=0.05)
-        
-        # Generate signals
-        signals, _ = generate_signals(
-            model_data, features,
-            use_slope_signals=True,
-            slope_buy_thresh=s_buy,
-            slope_sell_thresh=s_sell,
-            use_ml_confirm=use_ml,
-            ml_confirm_thresh=ml_conf_thresh,
-            slope_roc_thresh=roc_thresh,
-            use_mom_zone=mom_zone,
-            buy_threshold=ml_buy,
-            sell_threshold=ml_sell
-        )
-        
-        # Apply Trend Filter (if selected)
-        if use_trend:
-            # Calculate SMA200 (using full available data to be safe)
-            aligned_data = data.loc[signals.index]
-            if len(aligned_data) > 200:
-                sma200 = aligned_data['close'].rolling(200).mean()
-                is_bull = aligned_data['close'] > sma200
-                
-                bull_mask = is_bull
-                # Filter SELLs (-1) in Bull Market
-                # Keep BUYs (1)
-                sell_mask = (signals == -1) & bull_mask
-                signals.loc[sell_mask] = 0
-                
-        # Apply Volatility Filter (ADX) (if selected)
-        if use_adx:
-            adx_cols = [c for c in features.columns if c.startswith('ADX_')]
-            if adx_cols:
-                # Get ADX values and align
-                adx_vals = features[adx_cols[0]].loc[signals.index]
-                
-                # Identify "Chop" zones (ADX < Threshold)
-                chop_mask = adx_vals < adx_thresh
-                
-                # Block ALL new signals in chop
-                # (We set signal to 0, which means HOLD)
-                signals.loc[chop_mask] = 0
-        
-        # Run Backtest
-        # Pure Signal-Based: No SL/TP overrides
-        res = run_backtest(data, signals, verbose=False)
-        
-        ret = res['total_return']
-        
-        # Console progress (optional, can be spammy)
-        # print(f"Trial {trial.number}: {ret:.2f}%")
-        
-        # Objective: Maximize Total Return
-        # Penalize very few trades
-        if res['num_trades'] < 5: 
-            return -100.0 
-            
-        return ret
-
-    study = optuna.create_study(direction='maximize')
-    
-    # Use all cores except 1
-    import os
-    n_jobs = max(1, os.cpu_count() - 1)
-    if progress_callback:
-        n_jobs = 1 # Must be single-threaded to update Streamlit UI safely
-        
-    study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs)
-    
-    return study.best_params, study.best_value
-
-
 def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float = 100000, limit_pct: float = 0.0, stop_loss_pct: float = 0.0, take_profit_pct: float = 0.0, verbose: bool = True) -> dict:
     """
     Run backtest with detailed trade tracking.
@@ -703,6 +610,115 @@ def run_backtest(data: pd.DataFrame, signals: pd.Series, initial_capital: float 
     }
 
 
+
+
+def optimize_strategy(data, model_data, features, n_trials=100, progress_callback=None):
+    """
+    Optimize Strategy Sliders using Optuna (Fast Post-Processing).
+    Does NOT re-train the model. Optimizes filters only.
+    """
+    import optuna
+    # Suppress console output to avoid confusion with model training
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    
+    print("--- STARTING STRATEGY OPTIMIZATION ---")
+    
+    def objective(trial):
+        # Update progress if callback provided
+        if progress_callback:
+            progress_callback(trial.number, n_trials)
+
+        # Suggest parameters (Strategy Sliders)
+        s_buy = trial.suggest_float('slope_buy_thresh', -1.0, 0.0, step=0.1)
+        s_sell = trial.suggest_float('slope_sell_thresh', 0.0, 1.0, step=0.1)
+        roc_thresh = trial.suggest_float('slope_roc_thresh', 0.0, 0.5, step=0.05)
+        mom_zone = trial.suggest_categorical('use_mom_zone', [True, False])
+        
+        # Trend Filter
+        use_trend = trial.suggest_categorical('use_trend_filter', [True, False])
+        
+        # Volatility Filter (ADX)
+        use_adx = trial.suggest_categorical('use_adx_filter', [True, False])
+        adx_thresh = trial.suggest_int('adx_threshold', 15, 30)
+        
+        # ML Thresholds (Instead of fixed 0.5)
+        # Allow asymmetry (e.g. easy entry, strict exit or vice versa)
+        ml_buy = trial.suggest_float('ml_buy_threshold', 0.2, 0.8, step=0.05)
+        ml_sell = trial.suggest_float('ml_sell_threshold', 0.2, 0.8, step=0.05)
+        
+        # ML Confirmation params (for slope signals)
+        use_ml = trial.suggest_categorical('use_ml_confirm', [True, False])
+        ml_conf_thresh = trial.suggest_float('ml_confirm_thresh', 0.0, 0.5, step=0.05)
+        
+        # Generate signals
+        signals, _ = generate_signals(
+            model_data, features,
+            use_slope_signals=True,
+            slope_buy_thresh=s_buy,
+            slope_sell_thresh=s_sell,
+            use_ml_confirm=use_ml,
+            ml_confirm_thresh=ml_conf_thresh,
+            slope_roc_thresh=roc_thresh,
+            use_mom_zone=mom_zone,
+            buy_threshold=ml_buy,
+            sell_threshold=ml_sell
+        )
+        
+        # Apply Trend Filter (if selected)
+        if use_trend:
+            # Calculate SMA200 (using full available data to be safe)
+            aligned_data = data.loc[signals.index]
+            if len(aligned_data) > 200:
+                sma200 = aligned_data['close'].rolling(200).mean()
+                is_bull = aligned_data['close'] > sma200
+                
+                bull_mask = is_bull
+                # Filter SELLs (-1) in Bull Market
+                # Keep BUYs (1)
+                sell_mask = (signals == -1) & bull_mask
+                signals.loc[sell_mask] = 0
+                
+        # Apply Volatility Filter (ADX) (if selected)
+        if use_adx:
+            adx_cols = [c for c in features.columns if c.startswith('ADX_')]
+            if adx_cols:
+                # Get ADX values and align
+                adx_vals = features[adx_cols[0]].loc[signals.index]
+                
+                # Identify "Chop" zones (ADX < Threshold)
+                chop_mask = adx_vals < adx_thresh
+                
+                # Block ALL new signals in chop
+                # (We set signal to 0, which means HOLD)
+                signals.loc[chop_mask] = 0
+        
+        # Run Backtest
+        # Pure Signal-Based: No SL/TP overrides
+        res = run_backtest(data, signals, verbose=False)
+        
+        ret = res['total_return']
+        
+        # Console progress (optional, can be spammy)
+        # print(f"Trial {trial.number}: {ret:.2f}%")
+        
+        # Objective: Maximize Total Return
+        # Penalize very few trades
+        if res['num_trades'] < 5: 
+            return -100.0 
+            
+        return ret
+
+    study = optuna.create_study(direction='maximize')
+    
+    # Use all cores except 1
+    import os
+    n_jobs = max(1, os.cpu_count() - 1)
+    if progress_callback:
+        n_jobs = 1 # Must be single-threaded to update Streamlit UI safely
+        
+    study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs)
+    
+    return study.best_params, study.best_value
 
 
 
@@ -1064,6 +1080,8 @@ with st.sidebar:
                                       help="Higher = penalize missing BUY/SELL signals more heavily. 1.0 = Equal weights.")
         decision_threshold = st.slider("Decision Threshold", 0.3, 0.9, 0.5, 0.05,
                                       help="Lower = more aggressive signals. Higher = higher confidence required.")
+        use_regime_detection = st.checkbox("🧠 Use Market Regime Detection", value=True, 
+                                          help="Detects Bull/Bear/Sideways markets using Gaussian Mixture Models.")
     
     detection_order = st.slider("Peak/Valley Sensitivity", 3, 10, 5,
                                help="Lower = more sensitive")
@@ -1088,8 +1106,552 @@ with st.sidebar:
         with col2:
             custom_end = st.date_input("End Date", value=datetime.now())
 
+# -----------------------------------------------------------------------------
+# GLOBAL DATA LOADING
+# -----------------------------------------------------------------------------
+@st.cache_data(ttl=300)
+def load_global_data(t, p, i, poly_key):
+    if poly_key and PolygonManager:
+         try:
+             pm = PolygonManager(poly_key)
+             df = pm.get_historical_data(t, period=p, interval=i)
+             if not df.empty: return df
+         except: pass
+    return load_price_data(t, p, i)
+
+data = load_global_data(ticker, period, interval, polygon_api_key if polygon_api_key else None)
+features = pd.DataFrame()
+
+if not data.empty:
+    # Generate base features globally
+    features = generate_features(data, use_regime=use_regime_detection)
+else:
+    st.error(f"No data found for {ticker}")
+
 # Main tabs
-tab1, tab2, tab3, tab4 = st.tabs(["🎯 Train Model", "🚀 Production", "📊 Analysis", "🧪 Alpha Lab"])
+tab_optimized, tab_simple, tab_opt, tab1, tab2, tab3, tab4 = st.tabs(["🔬 Optimized", "⚡ Simple", "🧪 Master Opt.", "🎯 Manual Train", "🚀 Production", "📊 Analysis", "🧪 Alpha Lab"])
+
+# =============================================================================
+# TAB OPTIMIZED: OPTIMIZED STRATEGY (Optuna + Proper Train/Test)
+# =============================================================================
+with tab_optimized:
+    try:
+        from optimized_strategy import render_optimized_strategy_page
+        render_optimized_strategy_page(data, features)
+    except ImportError as e:
+        st.error(f"Optimized Strategy module not available: {e}")
+    except Exception as e:
+        st.error(f"Error loading Optimized Strategy: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+
+# =============================================================================
+# TAB SIMPLE: SIMPLE STRATEGY (Rule-Based + ML Enhancement)
+# =============================================================================
+with tab_simple:
+    st.header("⚡ Simple Strategy")
+    st.info("**Rule-based signals with ML enhancement** • Proven to work • No overfitting • Regime-aware")
+    
+    # Import the simple strategy module
+    try:
+        from simple_strategy import (
+            generate_rule_signals, 
+            generate_hybrid_signals,
+            walk_forward_backtest,
+            analyze_signal_quality,
+            calculate_efficiency
+        )
+        SIMPLE_AVAILABLE = True
+    except ImportError as e:
+        SIMPLE_AVAILABLE = False
+        st.error(f"Simple Strategy module not available: {e}")
+    
+    if SIMPLE_AVAILABLE and not data.empty:
+        # Configuration columns
+        col_cfg1, col_cfg2, col_cfg3 = st.columns(3)
+        
+        with col_cfg1:
+            st.subheader("📈 BUY Conditions")
+            simple_buy_rsi = st.slider("RSI Oversold Threshold", 20, 45, 35, key="simple_buy_rsi",
+                                       help="Buy when RSI drops below this level")
+            simple_buy_comp = st.slider("Composite Oversold", -0.8, 0.0, -0.3, 0.1, key="simple_buy_comp",
+                                        help="Buy when composite oscillator drops below this")
+            simple_require_multi = st.checkbox("Require 2+ oversold indicators", value=True, key="simple_multi",
+                                               help="More conservative: requires multiple confirmations")
+        
+        with col_cfg2:
+            st.subheader("📉 SELL Conditions")
+            simple_sell_rsi = st.slider("RSI Overbought Threshold", 60, 85, 70, key="simple_sell_rsi",
+                                        help="Sell when RSI rises above this level")
+            simple_sell_comp = st.slider("Composite Overbought", 0.2, 0.8, 0.5, 0.1, key="simple_sell_comp",
+                                         help="Sell when composite oscillator rises above this")
+            simple_regime_aware = st.checkbox("Only sell in Bear markets", value=True, key="simple_regime",
+                                              help="In bull markets, only sell on extreme overbought (recommended)")
+        
+        with col_cfg3:
+            st.subheader("🎛️ Strategy Mode")
+            simple_mode = st.radio("Signal Generation", 
+                                   ["Rule-Based (Recommended)", "Hybrid (Rules + ML)"],
+                                   key="simple_mode",
+                                   help="Rule-based uses proven indicators. Hybrid adds ML confirmation.")
+            
+            if "Hybrid" in simple_mode:
+                simple_ml_confirm = st.slider("ML Confirmation Threshold", 0.1, 0.7, 0.3, 0.1, key="simple_ml_conf",
+                                              help="Minimum ML confidence to confirm rule-based signal")
+            else:
+                simple_ml_confirm = 0.3
+        
+        # Build config
+        simple_config = {
+            'buy_rsi_thresh': simple_buy_rsi,
+            'buy_composite_thresh': simple_buy_comp,
+            'sell_rsi_thresh': simple_sell_rsi,
+            'sell_composite_thresh': simple_sell_comp,
+            'require_multiple_oversold': simple_require_multi,
+            'regime_aware': simple_regime_aware,
+            'ml_buy_confirm': simple_ml_confirm,
+            'ml_sell_confirm': simple_ml_confirm,
+        }
+        
+        # Run button
+        if st.button("🚀 Generate Signals & Backtest", type="primary", key="simple_run"):
+            with st.spinner("Generating signals..."):
+                # Generate signals
+                simple_signals = generate_rule_signals(data, features, simple_config)
+                
+                # Signal summary
+                buy_count = (simple_signals == 1).sum()
+                sell_count = (simple_signals == -1).sum()
+                
+                st.success(f"✅ Generated {buy_count} BUY and {sell_count} SELL signals")
+            
+            # Signal Quality Analysis
+            with st.spinner("Analyzing signal quality..."):
+                quality = analyze_signal_quality(data, simple_signals)
+            
+            st.markdown("---")
+            st.subheader("🎯 Signal Quality (Forward Returns)")
+            
+            col_q1, col_q2 = st.columns(2)
+            
+            with col_q1:
+                st.markdown("**BUY Signals**")
+                if quality['buy_stats']:
+                    bs = quality['buy_stats']
+                    st.metric("5-Day Avg Return", f"{bs['5d_return']:.2f}%")
+                    st.metric("5-Day Win Rate", f"{bs['5d_win_rate']:.1f}%")
+                    st.caption(f"1d: {bs['1d_return']:.2f}% | 3d: {bs['3d_return']:.2f}% | 10d: {bs['10d_return']:.2f}%")
+                else:
+                    st.warning("No BUY signals generated")
+            
+            with col_q2:
+                st.markdown("**SELL Signals**")
+                if quality['sell_stats']:
+                    ss = quality['sell_stats']
+                    st.metric("5-Day Avg Return", f"{ss['5d_return']:.2f}%")
+                    st.metric("5-Day Win Rate", f"{ss['5d_win_rate']:.1f}%")
+                    st.caption(f"1d: {ss['1d_return']:.2f}% | 3d: {ss['3d_return']:.2f}% | 10d: {ss['10d_return']:.2f}%")
+                else:
+                    st.warning("No SELL signals generated")
+            
+            # Run Backtest
+            with st.spinner("Running walk-forward backtest..."):
+                simple_backtest = walk_forward_backtest(data, simple_signals)
+            
+            st.markdown("---")
+            st.subheader("📈 Backtest Results")
+            
+            col_b1, col_b2, col_b3, col_b4, col_b5 = st.columns(5)
+            
+            col_b1.metric("Strategy Return", f"{simple_backtest['total_return']:.1f}%",
+                         f"{simple_backtest['alpha']:+.1f}% vs B&H")
+            col_b2.metric("Buy & Hold", f"{simple_backtest['buy_hold_return']:.1f}%")
+            col_b3.metric("Win Rate", f"{simple_backtest['win_rate']:.1f}%")
+            col_b4.metric("Max Drawdown", f"{simple_backtest['max_drawdown']:.1f}%")
+            col_b5.metric("Trades", simple_backtest['num_trades'])
+            
+            # Efficiency
+            efficiency = calculate_efficiency(data, simple_signals)
+            st.metric("⚡ Efficiency", f"{efficiency['efficiency']:.1f}%",
+                     help=f"Capturing {efficiency['efficiency']:.1f}% of theoretical maximum ({efficiency['theoretical_max']:.0f}%)")
+            
+            # Chart
+            st.subheader("📉 Price Chart with Signals")
+            
+            fig_simple = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                               vertical_spacing=0.05, row_heights=[0.7, 0.3])
+            
+            # Candlestick
+            fig_simple.add_trace(go.Candlestick(
+                x=data.index,
+                open=data['open'],
+                high=data['high'],
+                low=data['low'],
+                close=data['close'],
+                name='Price',
+                increasing_line_color='green',
+                decreasing_line_color='red'
+            ), row=1, col=1)
+            
+            # BUY signals
+            buy_dates = simple_signals[simple_signals == 1].index
+            if len(buy_dates) > 0:
+                buy_prices = data.loc[buy_dates, 'low'] * 0.98
+                fig_simple.add_trace(go.Scatter(
+                    x=buy_dates, y=buy_prices, mode='markers',
+                    marker=dict(symbol='triangle-up', size=12, color='lime',
+                               line=dict(width=1, color='darkgreen')),
+                    name='BUY Signal'
+                ), row=1, col=1)
+            
+            # SELL signals
+            sell_dates = simple_signals[simple_signals == -1].index
+            if len(sell_dates) > 0:
+                sell_prices = data.loc[sell_dates, 'high'] * 1.02
+                fig_simple.add_trace(go.Scatter(
+                    x=sell_dates, y=sell_prices, mode='markers',
+                    marker=dict(symbol='triangle-down', size=12, color='red',
+                               line=dict(width=1, color='darkred')),
+                    name='SELL Signal'
+                ), row=1, col=1)
+            
+            # Equity curve
+            if len(simple_backtest['equity_curve']) > 0:
+                eq = simple_backtest['equity_curve']
+                fig_simple.add_trace(go.Scatter(
+                    x=eq['date'], y=eq['equity'],
+                    mode='lines', name='Strategy Equity',
+                    line=dict(color='cyan', width=2)
+                ), row=2, col=1)
+                
+                # Buy & Hold line
+                bh_equity = 100000 * (data['close'] / data['close'].iloc[0])
+                fig_simple.add_trace(go.Scatter(
+                    x=data.index, y=bh_equity,
+                    mode='lines', name='Buy & Hold',
+                    line=dict(color='gray', width=1, dash='dash')
+                ), row=2, col=1)
+            
+            fig_simple.update_layout(
+                height=700,
+                template='plotly_dark',
+                xaxis_rangeslider_visible=False,
+                showlegend=True,
+                title=f"Simple Strategy - {ticker}"
+            )
+            fig_simple.update_yaxes(title_text="Price", row=1, col=1)
+            fig_simple.update_yaxes(title_text="Equity ($)", row=2, col=1)
+            
+            st.plotly_chart(fig_simple, use_container_width=True)
+            
+            # Trade List
+            with st.expander("📋 Trade Details"):
+                if simple_backtest['trades']:
+                    trades_df = pd.DataFrame(simple_backtest['trades'])
+                    st.dataframe(trades_df, use_container_width=True)
+                else:
+                    st.write("No trades executed")
+            
+            # Save to session state
+            st.session_state['simple_signals'] = simple_signals
+            st.session_state['simple_backtest'] = simple_backtest
+            st.session_state['simple_config'] = simple_config
+        
+        # Show comparison with current ML model if available
+        if 'v2_backtest' in st.session_state and st.session_state.v2_backtest is not None:
+            st.markdown("---")
+            st.subheader("📊 Comparison: Simple vs ML Model")
+            
+            ml_bt = st.session_state.v2_backtest
+            
+            col_cmp1, col_cmp2 = st.columns(2)
+            
+            with col_cmp1:
+                st.markdown("**Current ML Model**")
+                if isinstance(ml_bt, dict):
+                    st.write(f"Return: {ml_bt.get('total_return', 0):.1f}%")
+                    st.write(f"Trades: {ml_bt.get('num_trades', 0)}")
+                    st.write(f"Win Rate: {ml_bt.get('win_rate', 0):.1f}%")
+                else:
+                    st.write("ML backtest data not available")
+            
+            with col_cmp2:
+                st.markdown("**Simple Strategy**")
+                if 'simple_backtest' in st.session_state and st.session_state.simple_backtest is not None:
+                    sbt = st.session_state.simple_backtest
+                    st.write(f"Return: {sbt['total_return']:.1f}%")
+                    st.write(f"Trades: {sbt['num_trades']}")
+                    st.write(f"Win Rate: {sbt['win_rate']:.1f}%")
+                else:
+                    st.write("Run Simple Strategy first")
+
+# =============================================================================
+# TAB OPT: MASTER OPTIMIZATION
+# =============================================================================
+with tab_opt:
+    st.header("🧪 Master Strategy Optimization")
+    st.info("Automated Strategy Finder: Optimizes Model + Signals + Filters in one go.")
+    
+    col_opt1, col_opt2 = st.columns([1, 2])
+    
+    with col_opt1:
+        st.subheader("Settings")
+        n_trials_opt = st.slider("Optimization Trials", 10, 5000, 100, help="More trials = Better results but slower.")
+        
+        with st.expander("📋 Optimization Scope (What Gets Tuned)", expanded=True):
+            st.markdown("#### 🤖 XGBoost Model Hyperparameters (9 params)")
+            st.markdown("""
+            | Parameter | Range | Description |
+            |-----------|-------|-------------|
+            | `n_estimators` | 50 - 2000 | Number of boosting rounds |
+            | `max_depth` | 2 - 15 | Tree depth (complexity) |
+            | `learning_rate` | 0.001 - 0.5 | Step size (log scale) |
+            | `subsample` | 0.5 - 1.0 | Row sampling ratio |
+            | `colsample_bytree` | 0.5 - 1.0 | Feature sampling ratio |
+            | `gamma` | 0 - 5 | Min loss reduction for split |
+            | `min_child_weight` | 1 - 10 | Min samples per leaf |
+            | `reg_alpha` | 0.001 - 10 | L1 regularization (log) |
+            | `reg_lambda` | 0.001 - 10 | L2 regularization (log) |
+            """)
+            
+            st.markdown("#### 🎛️ Training Settings (5 params)")
+            st.markdown("""
+            | Parameter | Range | Description |
+            |-----------|-------|-------------|
+            | `peak_valley_order` | 3 - 10 | Peak/Valley detection sensitivity |
+            | `class_weight_ratio` | 1.0 - 5.0 | Penalize missing BUY/SELL |
+            | `decision_threshold` | 0.3 - 0.7 | Confidence required for signals |
+            | `use_smote` | True/False | SMOTE class balancing |
+            | `use_regime_detection` | True/False | Market regime features |
+            """)
+            
+            st.markdown("#### 📊 ML Signal Thresholds (2 params)")
+            st.markdown("""
+            | Parameter | Range | Description |
+            |-----------|-------|-------------|
+            | `ml_buy_thresh` | 0.20 - 0.90 | ML confidence for BUY |
+            | `ml_sell_thresh` | 0.20 - 0.90 | ML confidence for SELL |
+            """)
+            
+            st.markdown("#### 📈 Slope/Composite Signals (5 params)")
+            st.markdown("""
+            | Parameter | Range | Description |
+            |-----------|-------|-------------|
+            | `use_slope_signals` | True/False | Enable slope-based signals |
+            | `slope_buy` | -0.9 to -0.1 | Composite buy trigger |
+            | `slope_sell` | 0.1 - 0.9 | Composite sell trigger |
+            | `slope_roc_thresh` | 0.0 - 0.3 | Min slope acceleration |
+            | `use_mom_zone` | True/False | Allow momentum zone buys |
+            """)
+            
+            st.markdown("#### 🧠 ML Confirmation (2 params)")
+            st.markdown("""
+            | Parameter | Range | Description |
+            |-----------|-------|-------------|
+            | `use_ml_confirm` | True/False | Require ML confirmation |
+            | `ml_confirm_thresh` | 0.10 - 0.50 | ML prob threshold |
+            """)
+            
+            st.markdown("#### 🛡️ Market Filters (3 params)")
+            st.markdown("""
+            | Parameter | Range | Description |
+            |-----------|-------|-------------|
+            | `use_adx_filter` | True/False | Block signals in chop |
+            | `adx_threshold` | 15 - 35 | Min ADX for trending |
+            | `use_trend_filter` | True/False | Only long in uptrend |
+            """)
+            
+            st.success("**Total: 27 parameters optimized simultaneously!**")
+            
+            st.markdown("#### ⚠️ Fixed Parameters (Not Optimized)")
+            st.markdown("""
+            - Conformal Prediction alpha (set in Production tab)
+            - Stop Loss / Take Profit levels
+            - Deep Learning feature extraction settings
+            """)
+        
+        # Display last optimization results if available (persisted in session state)
+        if 'v2_last_optimization' in st.session_state and st.session_state.v2_last_optimization:
+            st.divider()
+            st.subheader("📊 Last Optimization Results")
+            last_opt = st.session_state.v2_last_optimization
+            
+            st.metric("Best Return", f"{last_opt.get('best_return', 0):.2%}")
+            st.caption(f"Optimized at: {last_opt.get('timestamp', 'Unknown')}")
+            
+            # Display full model filename
+            model_path = last_opt.get('model_path', '')
+            if model_path:
+                model_filename = os.path.basename(model_path)
+                st.info(f"**Model:** `{model_filename}`")
+                st.code(model_path, language=None)
+            
+            with st.expander("View Best Parameters", expanded=False):
+                st.json(last_opt.get('best_params', {}))
+            
+            if st.button("🔄 Clear Saved Results"):
+                del st.session_state.v2_last_optimization
+                st.rerun()
+        
+    with col_opt2:
+        if st.button("🚀 Run Full Strategy Optimization", type="primary", use_container_width=True):
+             progress_bar = st.progress(0)
+             status_text = st.empty()
+             
+             try:
+                 # 1. Prepare Data
+                 status_text.text("Preparing Data & Features...")
+                 
+                 # Recalculate labels with current sensitivity
+                 labels, info = detect_peaks_valleys(data, order=detection_order)
+                 
+                 # Robust Alignment
+                 common_idx = data.index.intersection(features.index).intersection(labels.index)
+                 
+                 # Align Features
+                 f_aligned = features.loc[common_idx]
+                 l_aligned = labels.loc[common_idx]
+                 d_aligned = data.loc[common_idx]
+                 
+                 # Drop NaN (Important for ML)
+                 valid_mask = f_aligned.notna().all(axis=1) & l_aligned.notna()
+                 valid_idx = f_aligned.index[valid_mask]
+                 
+                 X_opt = f_aligned.loc[valid_idx]
+                 y_opt = l_aligned.loc[valid_idx]
+                 d_opt = d_aligned.loc[valid_idx]
+                 
+                 if len(X_opt) < 100:
+                     st.error("Not enough valid data points for optimization. Try a longer period.")
+                     st.stop()
+                 
+                 # 2. Run Optimization
+                 status_text.text(f"Running Optuna Study ({n_trials_opt} trials)...")
+                 
+                 def prog_cb(i, n):
+                     progress_bar.progress(i / n)
+                     status_text.text(f"Optimization Progress: Trial {i}/{n}")
+                     
+                 best_params = optimize_full_strategy(d_opt, X_opt, y_opt, n_trials=n_trials_opt, progress_callback=prog_cb, raw_data=data)
+                 
+                 progress_bar.progress(1.0)
+                 status_text.text("Optimization Complete!")
+                 
+                 # 3. Save & Apply
+                 st.success("✅ Best Strategy Found!")
+                 st.json(best_params)
+                 
+                 # Train Final Model with Best Params
+                 status_text.text("Training Final Model...")
+                 model_params = {k:v for k,v in best_params.items() if k in ['n_estimators', 'max_depth', 'learning_rate', 'subsample', 'colsample_bytree', 'n_jobs']}
+                 
+                 # Prepare Labels for XGBoost (Must be 0, 1, 2...)
+                 from sklearn.preprocessing import LabelEncoder, StandardScaler
+                 le = LabelEncoder()
+                 y_opt_encoded = le.fit_transform(y_opt)
+                 
+                 # Add Scaling (Required by downstream app logic)
+                 scaler = StandardScaler()
+                 X_opt_scaled = scaler.fit_transform(X_opt)
+                 
+                 model_params['objective'] = 'multi:softprob'
+                 model_params['num_class'] = len(le.classes_)
+                 
+                 import xgboost as xgb
+                 final_model = xgb.XGBClassifier(**model_params)
+                 final_model.fit(X_opt_scaled, y_opt_encoded)
+                 
+                 # Save
+                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                 model_filename = f"xgboost_{ticker}_{timestamp}_OPTIMIZED.joblib"
+                 save_path = os.path.join("saved_models_v2", model_filename)
+                 
+                 # Metadata
+                 meta = {
+                    'model': final_model,
+                    'scaler': scaler,
+                    'label_encoder': le,
+                    'feature_names': X_opt.columns.tolist(),
+                    'ticker': ticker,
+                    'best_params': best_params, # Contains thresholds too!
+                    'model_type': 'xgboost',
+                    'detection_order': detection_order,
+                    'label_classes': le.classes_ 
+                 }
+                 
+                 # Also calculate performance metrics for display
+                 from sklearn.metrics import accuracy_score, f1_score
+                 y_pred = final_model.predict(X_opt_scaled)
+                 meta['accuracy'] = accuracy_score(y_opt_encoded, y_pred)
+                 meta['f1_score'] = f1_score(y_opt_encoded, y_pred, average='weighted')
+                 meta['cv_score'] = best_params.get('best_value', 0.0) # We don't have this easily, skip or approx
+                 
+                 joblib.dump(meta, save_path)
+                 
+                 # Calculate Theoretical Stats for UI
+                 theoretical_for_period = calculate_theoretical_return(
+                    data, info['peak_dates'], info['valley_dates']
+                 )
+                 
+                 # Update Session State FULLY
+                 st.session_state.v2_model_path = save_path
+                 st.session_state.v2_model = meta
+                 st.session_state.v2_data = data
+                 st.session_state.v2_features = features
+                 st.session_state.v2_labels = labels
+                 st.session_state.v2_detection_info = info
+                 st.session_state.v2_theoretical = theoretical_for_period
+                 st.session_state.v2_trained = True
+                 
+                 # Update Sidebar Thresholds in Session State (Apply Callbacks)
+                 if 'slope_buy' in best_params: st.session_state.s_buy = float(best_params['slope_buy'])
+                 if 'slope_sell' in best_params: st.session_state.s_sell = float(best_params['slope_sell'])
+                 if 'ml_confirm' in best_params: 
+                     conf = float(best_params['ml_confirm'])
+                     
+                     # 1. Update Session State Variables
+                     st.session_state.s_ml_conf_thresh = conf
+                     st.session_state.s_buy = float(best_params.get('slope_buy', -0.5))
+                     st.session_state.s_sell = float(best_params.get('slope_sell', 0.5))
+                     
+                     # 2. CRITICAL: Update the Primary ML Thresholds (used by UI Backtest)
+                     st.session_state.s_ml_buy = conf
+                     st.session_state.s_ml_sell = conf
+                     
+                     # 3. Update Widget Keys directly (to force Sidebar update)
+                     st.session_state["s_ml_buy"] = conf
+                     st.session_state["s_ml_sell"] = conf
+                     st.session_state["decision_threshold_slider"] = conf # Legacy
+                 
+                 # Save optimization results to session state for persistence across tab navigation
+                 st.session_state.v2_last_optimization = {
+                     'best_params': best_params,
+                     'best_return': best_params.get('best_value', 0.0) if isinstance(best_params, dict) else 0.0,
+                     'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                     'model_path': save_path,
+                     'model_filename': model_filename,
+                     'ticker': ticker,
+                     'n_trials': n_trials_opt
+                 }
+                 
+                 # PERSIST to file so it survives browser refresh
+                 import json
+                 opt_cache_path = os.path.join("saved_models_v2", "last_optimization.json")
+                 try:
+                     with open(opt_cache_path, 'w') as f:
+                         json.dump(st.session_state.v2_last_optimization, f, indent=2)
+                 except Exception as e:
+                     print(f"Warning: Could not save optimization cache: {e}")
+                 
+                 st.success(f"💾 Optimized Model Saved: `{model_filename}`")
+                 st.success(f"✅ Thresholds updated to {best_params.get('ml_confirm', 0.5):.2f}. Go to 'Production' to Bundle!")
+                 st.info(f"📁 Full path: `{save_path}`")
+                 st.balloons()
+                 
+                 # NOTE: Removed st.rerun() - session state is saved, user can manually refresh if needed
+                 
+             except Exception as e:
+                 st.error(f"Optimization Failed: {e}")
 
 # =============================================================================
 # TAB 1: TRAINING
@@ -1136,7 +1698,7 @@ with tab1:
                 os.makedirs("saved_models_v2", exist_ok=True)
                 dl_config = {'train': True, 'model_path': f"saved_models_v2/dl_{ticker}.h5"}
                 
-            features = generate_features(data, dl_config=dl_config)
+            features = generate_features(data, dl_config=dl_config, use_regime=use_regime_detection)
             st.session_state.v2_features = features
             
             # 5. Train model
@@ -1230,22 +1792,136 @@ with tab1:
 with tab2:
     st.header("Production Trading")
     
-    # Model selection
+    # 1. Select Base Model
     model_dir = "saved_models_v2"
+    strategies_dir = "strategies"
+    
+    # Force refresh button for model list
+    col_refresh, col_spacer = st.columns([1, 4])
+    with col_refresh:
+        if st.button("🔄 Refresh Models", help="Refresh the model list to see newly trained models"):
+            st.rerun()
+    
+    # Collect Raw Models (re-scan directory each time)
+    raw_models = []
     if os.path.exists(model_dir):
-        model_files = sorted([f for f in os.listdir(model_dir) if f.endswith('.joblib')], reverse=True)
-    else:
-        model_files = []
+        raw_models = sorted([f"raw/{f}" for f in os.listdir(model_dir) if f.endswith('.joblib')], reverse=True)
+        
+    # Collect Bundles
+    bundles = []
+    if os.path.exists(strategies_dir):
+        # List directories in strategies/
+        bundles = sorted([f"bundle/{d}" for d in os.listdir(strategies_dir) if os.path.isdir(os.path.join(strategies_dir, d))], reverse=True)
     
-    if not model_files:
-        st.warning("⚠️ No trained models found. Please train a model first.")
+    all_options = bundles + raw_models
+    
+    if not all_options:
+        st.warning("⚠️ No models or bundles found.")
         st.stop()
+        
+    selected_option = st.selectbox("Select Strategy / Model", all_options)
     
-    selected_model = st.selectbox("Select Model", model_files)
-    model_path = os.path.join(model_dir, selected_model)
+    # Resolve Path
+    if selected_option.startswith("bundle/"):
+        bundle_name = selected_option.replace("bundle/", "")
+        # Find the model file inside the bundle
+        bundle_path = os.path.join(strategies_dir, bundle_name)
+        # Look for .joblib in bundle
+        model_files = [f for f in os.listdir(bundle_path) if f.endswith('.joblib') and 'alpha' not in f]
+        if model_files:
+            model_path = os.path.join(bundle_path, model_files[0])
+        else:
+            st.error(f"No model found in bundle {bundle_name}")
+            st.stop()
+    else:
+        # Raw model
+        model_name = selected_option.replace("raw/", "")
+        model_path = os.path.join(model_dir, model_name)
     
     # Show selected backtest mode info
     st.info(f"📅 **Backtest Mode:** {backtest_mode}")
+    
+    # =========================================================================
+    # APPLY MASTER OPT PARAMS BUTTON (Prominent Location)
+    # =========================================================================
+    if 'v2_last_optimization' in st.session_state and st.session_state.v2_last_optimization:
+        last_opt = st.session_state.v2_last_optimization
+        with st.container():
+            col_opt_a, col_opt_b = st.columns([3, 1])
+            with col_opt_a:
+                st.success(f"📊 **Master Opt Available:** {last_opt.get('timestamp', 'Unknown')} | Best Return: {last_opt.get('best_return', 0):.2%} | Model: `{last_opt.get('model_filename', 'N/A')}`")
+            with col_opt_b:
+                if st.button("⚡ Apply All Params", type="primary", use_container_width=True, help="Apply ALL best parameters found in Master Optimization"):
+                    params = last_opt.get('best_params', {})
+                    applied_count = 0
+                    
+                    # ML THRESHOLDS
+                    if 'ml_buy_thresh' in params:
+                        st.session_state.s_ml_buy = float(params['ml_buy_thresh'])
+                        applied_count += 1
+                    if 'ml_sell_thresh' in params:
+                        st.session_state.s_ml_sell = float(params['ml_sell_thresh'])
+                        applied_count += 1
+                    
+                    # SLOPE SIGNALS
+                    if 'use_slope_signals' in params:
+                        st.session_state.s_slope_bool = params['use_slope_signals']
+                        applied_count += 1
+                    if 'slope_buy' in params:
+                        st.session_state.s_buy = float(params['slope_buy'])
+                        applied_count += 1
+                    if 'slope_sell' in params:
+                        st.session_state.s_sell = float(params['slope_sell'])
+                        applied_count += 1
+                    if 'slope_roc_thresh' in params:
+                        st.session_state.s_roc = float(params['slope_roc_thresh'])
+                        applied_count += 1
+                    if 'use_mom_zone' in params:
+                        st.session_state.s_mom = params['use_mom_zone']
+                        applied_count += 1
+                    
+                    # ML CONFIRMATION
+                    if 'use_ml_confirm' in params:
+                        st.session_state.s_ml_conf_bool = params['use_ml_confirm']
+                        applied_count += 1
+                    if 'ml_confirm_thresh' in params:
+                        st.session_state.s_ml_conf_thresh = float(params['ml_confirm_thresh'])
+                        applied_count += 1
+                    
+                    # MARKET FILTERS
+                    if 'use_adx_filter' in params:
+                        st.session_state.s_adx_bool = params['use_adx_filter']
+                        applied_count += 1
+                    if 'adx_threshold' in params:
+                        st.session_state.s_adx_thresh = int(params['adx_threshold'])
+                        applied_count += 1
+                    if 'use_trend_filter' in params:
+                        st.session_state.s_trend_bool = params['use_trend_filter']
+                        applied_count += 1
+                    
+                    # TRAINING SETTINGS
+                    if 'peak_valley_order' in params:
+                        st.session_state.s_pv_order = int(params['peak_valley_order'])
+                        applied_count += 1
+                    if 'use_smote' in params:
+                        st.session_state.s_use_smote = params['use_smote']
+                        applied_count += 1
+                    if 'use_regime_detection' in params:
+                        st.session_state.s_use_regime = params['use_regime_detection']
+                        applied_count += 1
+                    
+                    # CONFORMAL PREDICTION
+                    if 'use_conformal' in params:
+                        st.session_state.s_cp_bool = params['use_conformal']
+                        applied_count += 1
+                    if 'cp_alpha' in params:
+                        st.session_state.s_cp_alpha = float(params['cp_alpha'])
+                        applied_count += 1
+                    
+                    st.success(f"✅ Applied {applied_count} optimized parameters!")
+                    st.rerun()
+    else:
+        st.warning("💡 **Tip:** Run Master Optimization first to get optimized parameters, then click 'Apply All Params' here.")
     
     # Execution Settings
     st.markdown("### ⚙️ Signal Filters & Sensitivity")
@@ -1253,15 +1929,24 @@ with tab2:
     
     with col1:
         st.markdown("**1. Market Filters**")
+        
         use_trend_filter = st.checkbox("✅ Use Trend Filter (SMA200)", value=False, key="s_trend",
-                                      help="Block SELLS in Bull Market. Forces trend following.")
+                                      help="Block SELLS in Bull Market unless extremely overbought.")
         
         use_adx_filter = st.checkbox("✅ Use Volatility Filter (ADX)", value=False, key="s_adx_bool",
                                     help="Block ALL TRADES in Choppy/Sideways Market (Low ADX).")
         
+        use_conformal = st.checkbox("🔬 Use Conformal Prediction (Uncertainty)", value=False, key="s_cp_bool",
+                                   help="Rigorous mathematical filter. Blocks trades if the model is 'Uncertain' (Set Size > 1).")
+        
         adx_threshold = 20
         if use_adx_filter:
              adx_threshold = st.slider("Min ADX Threshold", 10, 40, 20, 1, key="s_adx_thresh")
+             
+        cp_alpha = 0.1
+        if use_conformal:
+            cp_alpha = st.slider("Significance Level (Alpha)", 0.01, 0.20, 0.10, 0.01, key="s_cp_alpha",
+                                help="0.10 = 90% Confidence. Lower = Stricter.")
              
         limit_entry_pct = st.slider("Entry Limit Offset %", 0.0, 3.0, 0.0, 0.1, key="s_limit",
                                    help="Try to buy lower than signal price. 0 = Market Order.") / 100
@@ -1416,7 +2101,7 @@ with tab2:
                     if base_model.get('use_dl', False):
                         mm_dl_config = {'train': False, 'model_path': f"saved_models_v2/dl_{ticker}.h5"}
                         
-                    mm_features = generate_features(mm_data, dl_config=mm_dl_config)
+                    mm_features = generate_features(mm_data, dl_config=mm_dl_config, use_regime=use_regime_detection)
                     
                     # CRITICAL: Re-attach CLOSE price for OOF Target Generation
                     # generate_features drops raw prices, but we need 'close' to calc returns
@@ -1488,6 +2173,9 @@ with tab2:
                 "ml_confirm_thresh": ml_confirm_thresh,
                 "use_meta_filter": use_meta,
                 "meta_threshold": meta_threshold,
+                "use_regime_detection": use_regime_detection,
+                "use_conformal": use_conformal,
+                "cp_alpha": cp_alpha,
                 # "meta_model_path": handled by bundle
                 "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
@@ -1557,7 +2245,7 @@ with tab2:
             dl_config = {'train': False, 'model_path': f"saved_models_v2/dl_{model_ticker}.h5"} if use_dl else None
             
             # Generate features
-            features = generate_features(data, dl_config=dl_config)
+            features = generate_features(data, dl_config=dl_config, use_regime=use_regime_detection)
             
             # Generate signals with custom threshold
             signals, prob_df = generate_signals(model_data, features, 
@@ -1642,7 +2330,65 @@ with tab2:
             if use_meta and 'v2_meta_model' in st.session_state:
                 signals = apply_meta_filter(st.session_state.v2_meta_model, signals, prob_df, features, threshold=meta_threshold)
                 st.caption(f"✨ Meta-Filter Applied (Thresh: {meta_threshold}). Active signals reduced to: {(signals!=0).sum()}")
+
+            # COMPUTE CONFORMAL PREDICTION CONFIDENCE (Always, for hover display)
+            # Store conformal info for chart hover even if filtering is disabled
+            cp_confidence = pd.Series(index=signals.index, dtype=float)
+            cp_set_size = pd.Series(index=signals.index, dtype=int)
+            cp_confidence[:] = np.nan
+            cp_set_size[:] = 0
             
+            if ConformalPredictionWrapper:
+                try:
+                    with st.spinner(f"🔬 Computing Conformal Prediction Confidence..."):
+                        base_estimator = model_data['model']
+                        cp = ConformalPredictionWrapper(base_estimator, method="score", cv=5)
+                        
+                        # Calibrate
+                        cal_labels, _ = detect_peaks_valleys(data, order=detection_order)
+                        common_idx = features.index.intersection(cal_labels.index)
+                        X_cal = features.loc[common_idx]
+                        y_cal = cal_labels.loc[common_idx]
+                        
+                        valid_mask = X_cal.notna().all(axis=1) & y_cal.notna()
+                        X_cal = X_cal[valid_mask]
+                        y_cal = y_cal[valid_mask]
+                        
+                        if not X_cal.empty:
+                            cp.fit(X_cal, y_cal)
+                            
+                            # Get prediction sets for ALL signal points
+                            X_pred = features.loc[signals.index].fillna(0)
+                            _, y_pis = cp.predict(X_pred, alpha=cp_alpha)
+                            
+                            # Compute set sizes and confidence for each signal
+                            classes = cp.mapie.classes_
+                            class_map = {c: i for i, c in enumerate(classes)}
+                            
+                            for i, (idx, sig) in enumerate(signals.items()):
+                                set_size = int(np.sum(y_pis[i]))
+                                cp_set_size.at[idx] = set_size
+                                
+                                # Confidence = 1 if set size is 1 and correct class in set
+                                # Otherwise compute as inverse of set size
+                                if set_size == 1:
+                                    cp_confidence.at[idx] = 1.0 - cp_alpha  # e.g., 90% for alpha=0.1
+                                elif set_size > 1:
+                                    cp_confidence.at[idx] = (1.0 - cp_alpha) / set_size  # Diluted confidence
+                                else:
+                                    cp_confidence.at[idx] = 0.0  # Empty set = no confidence
+                            
+                            # APPLY FILTER if enabled
+                            if use_conformal:
+                                signals = cp.filter_signals(signals, X_pred, alpha=cp_alpha)
+                                st.caption(f"🔬 Conformal Filter Applied (Alpha: {cp_alpha}). Active signals reduced to: {(signals!=0).sum()}")
+                except Exception as e:
+                    st.warning(f"Conformal prediction failed: {e}")
+            
+            # Store for chart hover
+            st.session_state.v2_cp_confidence = cp_confidence
+            st.session_state.v2_cp_set_size = cp_set_size
+
             # Store composite and confidence in session state for plotting
             st.session_state.v2_composite = composite_indicator
             st.session_state.v2_probs = prob_df
@@ -1828,18 +2574,45 @@ with tab2:
                     name='Rejected SELL (Meta)', opacity=0.7
                 ), row=1, col=1)
 
+        # Get conformal prediction data for hover
+        cp_conf = st.session_state.get('v2_cp_confidence', pd.Series(dtype=float))
+        cp_sets = st.session_state.get('v2_cp_set_size', pd.Series(dtype=int))
+        prob_df_hover = st.session_state.get('v2_probs', pd.DataFrame())
+        
         # Buy signals
         buy_mask = signals == 1
         if buy_mask.any():
             buy_dates = signals[buy_mask].index
             buy_prices = data.loc[buy_dates, 'low'] * 0.98
+            
+            # Build hover text with ML confidence and conformal prediction
+            hover_texts = []
+            for dt in buy_dates:
+                price = data.loc[dt, 'close']
+                ml_conf = prob_df_hover.loc[dt, 'prob_buy'] * 100 if dt in prob_df_hover.index and 'prob_buy' in prob_df_hover.columns else 0
+                cp_c = cp_conf.get(dt, np.nan) * 100 if dt in cp_conf.index else np.nan
+                cp_s = cp_sets.get(dt, 0) if dt in cp_sets.index else 0
+                
+                hover = f"<b>BUY SIGNAL</b><br>"
+                hover += f"Date: {dt.strftime('%Y-%m-%d')}<br>"
+                hover += f"Price: ${price:,.2f}<br>"
+                hover += f"ML Confidence: {ml_conf:.1f}%<br>"
+                if not np.isnan(cp_c):
+                    hover += f"<b>Conformal Conf: {cp_c:.1f}%</b><br>"
+                    hover += f"Prediction Set Size: {cp_s}"
+                else:
+                    hover += "Conformal: N/A"
+                hover_texts.append(hover)
+            
             fig.add_trace(go.Scatter(
                 x=buy_dates,
                 y=buy_prices,
                 mode='markers',
                 marker=dict(symbol='triangle-up', size=15, color='lime', 
                            line=dict(width=2, color='darkgreen')),
-                name='BUY Signal (Intent)'
+                name='BUY Signal (Intent)',
+                hovertemplate='%{text}<extra></extra>',
+                text=hover_texts
             ), row=1, col=1)
         
         # Sell signals
@@ -1847,13 +2620,35 @@ with tab2:
         if sell_mask.any():
             sell_dates = signals[sell_mask].index
             sell_prices = data.loc[sell_dates, 'high'] * 1.02
+            
+            # Build hover text with ML confidence and conformal prediction
+            hover_texts = []
+            for dt in sell_dates:
+                price = data.loc[dt, 'close']
+                ml_conf = prob_df_hover.loc[dt, 'prob_sell'] * 100 if dt in prob_df_hover.index and 'prob_sell' in prob_df_hover.columns else 0
+                cp_c = cp_conf.get(dt, np.nan) * 100 if dt in cp_conf.index else np.nan
+                cp_s = cp_sets.get(dt, 0) if dt in cp_sets.index else 0
+                
+                hover = f"<b>SELL SIGNAL</b><br>"
+                hover += f"Date: {dt.strftime('%Y-%m-%d')}<br>"
+                hover += f"Price: ${price:,.2f}<br>"
+                hover += f"ML Confidence: {ml_conf:.1f}%<br>"
+                if not np.isnan(cp_c):
+                    hover += f"<b>Conformal Conf: {cp_c:.1f}%</b><br>"
+                    hover += f"Prediction Set Size: {cp_s}"
+                else:
+                    hover += "Conformal: N/A"
+                hover_texts.append(hover)
+            
             fig.add_trace(go.Scatter(
                 x=sell_dates,
                 y=sell_prices,
                 mode='markers',
                 marker=dict(symbol='triangle-down', size=15, color='red',
                            line=dict(width=2, color='darkred')),
-                name='SELL Signal (Intent)'
+                name='SELL Signal (Intent)',
+                hovertemplate='%{text}<extra></extra>',
+                text=hover_texts
             ), row=1, col=1)
         
         # Trade markers (actual executions)
@@ -1907,7 +2702,7 @@ with tab2:
         ), row=2, col=1)
         
         fig.update_layout(
-            title=f"{model_ticker} - ML Trading Signals ({selected_model})",
+            title=f"{model_ticker} - ML Trading Signals ({selected_option})",
             height=800,
             xaxis_rangeslider_visible=False,
             showlegend=True
@@ -2430,7 +3225,7 @@ with tab3:
         # Convert loaded model format to analysis format
         model_data = {
             'model': loaded_model['model'],
-            'scaler': loaded_model['scaler'],
+            'scaler': loaded_model.get('scaler'), # Safe get
             'label_encoder': loaded_model.get('label_encoder'),
             'feature_names': loaded_model['feature_names'],
             'model_type': loaded_model['model_type'],
@@ -2438,11 +3233,11 @@ with tab3:
             'accuracy': loaded_model.get('metrics', {}).get('accuracy', 0),
             'f1_score': loaded_model.get('metrics', {}).get('f1_score', 0),
             'cv_score': loaded_model.get('metrics', {}).get('cv_score', 0),
-            'train_size': 0,  # Not stored in saved model
+            'train_size': 0,
             'test_size': 0,
             'label_distribution': {},
             'split_date': None,
-            'use_smote': True,  # Assume true for saved models
+            'use_smote': True,
             'feature_importance': None,
         }
         
@@ -2539,6 +3334,108 @@ with tab3:
             st.info(f"**Notes:** {notes if notes else 'None'}")
 
     # ==========================================================================
+    # MARKET REGIME ANALYSIS (New Section)
+    # ==========================================================================
+    st.markdown("---")
+    st.subheader("🌍 Market Regime Analysis")
+    
+    if st.checkbox("Show Regime Analysis", value=False):
+        # 1. Get Data & Generate Regimes
+        # We need to regenerate features to get the latest regime classification
+        reg_data = st.session_state.get('v2_data')
+        if reg_data is not None:
+            with st.spinner("Classifying Market Regimes..."):
+                # Force regime generation
+                reg_features = generate_features(reg_data, use_regime=True)
+                
+                if 'regime' in reg_features.columns:
+                    # Plot Price with Regime Colors
+                    st.markdown("#### Market States (Bull / Bear / Chop)")
+                    
+                    # Create Plot
+                    fig_reg = go.Figure()
+                    
+                    # Price Line
+                    fig_reg.add_trace(go.Scatter(
+                        x=reg_data.index, y=reg_data['close'],
+                        mode='lines', name='Price', line=dict(color='black', width=1)
+                    ))
+                    
+                    # Use FIXED regime mapping from MarketRegimeDetector
+                    # 0 = Bull Trend, 1 = Sideways/Chop, 2 = Bear/Stress
+                    bull_label = 0
+                    chop_label = 1
+                    bear_label = 2
+                    
+                    colors = {
+                        bull_label: 'rgba(0, 255, 0, 0.2)',      # Green - Bull
+                        chop_label: 'rgba(128, 128, 128, 0.2)',  # Gray - Chop
+                        bear_label: 'rgba(255, 0, 0, 0.2)'       # Red - Bear
+                    }
+                    
+                    names = {
+                        bull_label: 'Bull Trend', 
+                        chop_label: 'Chop/Sideways', 
+                        bear_label: 'Bear/Stress'
+                    }
+                    
+                    # Add colored regions
+                    # We iterate through regime changes
+                    regime_changes = reg_features['regime'].diff().fillna(0) != 0
+                    segments = reg_features[regime_changes].index.tolist()
+                    segments.append(reg_features.index[-1]) # End
+                    
+                    # This is slow for many segments. Better to use Heatmap or Bar?
+                    # Let's use Scatter markers with fill? No.
+                    # Let's use VRects (Vertical Rectangles)
+                    
+                    # Optimized Segment Loop
+                    # (Simplified for performance: just last 365 days)
+                    recent_feat = reg_features.iloc[-365:]
+                    recent_data = reg_data.loc[recent_feat.index]
+                    
+                    # Re-plot for recent only
+                    fig_reg = go.Figure()
+                    fig_reg.add_trace(go.Scatter(
+                        x=recent_data.index, y=recent_data['close'],
+                        mode='lines', name='Price', line=dict(color='black', width=1.5)
+                    ))
+                    
+                    curr_reg = recent_feat['regime'].iloc[0]
+                    start_date = recent_feat.index[0]
+                    
+                    for date, row in recent_feat.iterrows():
+                        r = row['regime']
+                        if r != curr_reg:
+                            # End segment
+                            fig_reg.add_vrect(
+                                x0=start_date, x1=date,
+                                fillcolor=colors[curr_reg], opacity=1,
+                                layer="below", line_width=0,
+                                annotation_text=names[curr_reg] if (date - start_date).days > 30 else None,
+                                annotation_position="top left"
+                            )
+                            curr_reg = r
+                            start_date = date
+                            
+                    # Last segment
+                    fig_reg.add_vrect(
+                        x0=start_date, x1=recent_feat.index[-1],
+                        fillcolor=colors[curr_reg], opacity=1,
+                        layer="below", line_width=0
+                    )
+                    
+                    fig_reg.update_layout(title="Market Regimes (Last 365 Days)", height=500)
+                    st.plotly_chart(fig_reg, use_container_width=True)
+                    
+                    st.info(f"**Legend:** 🟢 {names[bull_label]} | 🔴 {names[bear_label]} | ⚪ {names[chop_label]}")
+                    
+                else:
+                    st.warning("Regime data not found in features. Ensure 'Use Market Regime Detection' is enabled.")
+        else:
+            st.info("Load data in Manual Train or Production first.")
+
+    # ==========================================================================
     # SLOPE SIGNAL ANALYSIS (New Section)
     # ==========================================================================
     st.markdown("---")
@@ -2566,14 +3463,42 @@ with tab4:
     
     # 1. Select Base Model
     model_dir = "saved_models_v2"
+    strategies_dir = "strategies"
+    
+    # Collect Raw Models
+    raw_models = []
     if os.path.exists(model_dir):
-        model_files = sorted([f for f in os.listdir(model_dir) if f.endswith('.joblib') and 'meta' not in f], reverse=True)
-        alpha_model = st.selectbox("Select Directional Model", model_files, key="alpha_model_select")
-    else:
-        st.warning("No models found.")
+        raw_models = sorted([f"raw/{f}" for f in os.listdir(model_dir) if f.endswith('.joblib') and 'meta' not in f], reverse=True)
+        
+    # Collect Bundles
+    bundles = []
+    if os.path.exists(strategies_dir):
+        # List directories in strategies/
+        bundles = sorted([f"bundle/{d}" for d in os.listdir(strategies_dir) if os.path.isdir(os.path.join(strategies_dir, d))], reverse=True)
+    
+    all_options = bundles + raw_models
+    
+    if not all_options:
+        st.warning("⚠️ No models or bundles found.")
         st.stop()
         
-    alpha_model_path = os.path.join(model_dir, alpha_model)
+    alpha_model_select = st.selectbox("Select Strategy / Model", all_options, key="alpha_model_select")
+    
+    # Resolve Path
+    if alpha_model_select.startswith("bundle/"):
+        bundle_name = alpha_model_select.replace("bundle/", "")
+        bundle_path = os.path.join(strategies_dir, bundle_name)
+        # Find model inside bundle
+        model_files = [f for f in os.listdir(bundle_path) if f.endswith('.joblib') and 'alpha' not in f]
+        if model_files:
+            alpha_model_path = os.path.join(bundle_path, model_files[0])
+        else:
+            st.error(f"No model found in bundle {bundle_name}")
+            st.stop()
+    else:
+        # Raw model
+        model_name = alpha_model_select.replace("raw/", "")
+        alpha_model_path = os.path.join(model_dir, model_name)
     
     # 2. Train Range Predictor
     st.markdown("### 1. Range Predictor (Daily High/Low)")

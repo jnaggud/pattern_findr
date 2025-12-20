@@ -1,0 +1,10 @@
+{
+  "best_params": null,
+  "best_score": -Infinity,
+  "top_10_results": [],
+  "summary": {
+    "total_tested": 6480,
+    "successful": 0,
+    "failed": 6480
+  }
+}

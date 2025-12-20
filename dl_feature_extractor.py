@@ -9,6 +9,7 @@ complex temporal patterns that classical models (RF, XGB) might miss.
 
 import os
 import logging
+import json
 
 # FORCE CPU to avoid "stream cannot wait for itself" Metal error on Mac
 # This must be set BEFORE importing tensorflow
@@ -47,6 +48,7 @@ class DLFeatureExtractor:
         self.scaler = MinMaxScaler()
         self.model = None
         self.encoder = None
+        self.feature_cols = None
         
     def _prepare_sequences(self, data):
         """
@@ -188,9 +190,19 @@ class DLFeatureExtractor:
         
         # 1. Select Features
         if feature_cols is None:
-            data = df.select_dtypes(include=[np.number]).copy()
-        else:
-            data = df[feature_cols].copy()
+            if self.feature_cols is not None:
+                feature_cols = self.feature_cols
+            else:
+                feature_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+
+        # Persist the feature list so training/inference stay compatible
+        if train:
+            self.feature_cols = list(feature_cols)
+        elif self.feature_cols is None:
+            self.feature_cols = list(feature_cols)
+
+        # Reindex to ensure stable dimensionality across runs
+        data = df.reindex(columns=self.feature_cols, fill_value=0).copy()
             
         # 2. STATIONARITY: Use Returns
         data_pct = data.pct_change().replace([np.inf, -np.inf], 0).fillna(0)
@@ -213,7 +225,7 @@ class DLFeatureExtractor:
         input_dim = X.shape[2]
         
         if train:
-            print(f"🧠 Training Multi-Task DL Model on {len(df)} samples...")
+            logging.getLogger(__name__).info(f"Training Multi-Task DL Model on {len(df)} samples...")
             self.model, self.encoder = self.build_forecasting_model(input_dim)
             
             es = EarlyStopping(monitor='loss', patience=3, restore_best_weights=True)
@@ -227,7 +239,7 @@ class DLFeatureExtractor:
                 verbose=verbose
             )
         else:
-            print(f"🔮 Generating DL Features (Inference Mode) on {len(df)} samples...")
+            logging.getLogger(__name__).info(f"Generating DL Features (Inference Mode) on {len(df)} samples...")
             if self.encoder is None:
                 raise ValueError("Model not trained or loaded! Call load_model() first.")
         
@@ -244,16 +256,22 @@ class DLFeatureExtractor:
         # Set first 'sequence_length' rows to 0
         embed_df.iloc[:self.sequence_length] = 0
         
-        print(f"   ✅ Generated {self.encoding_dim} Predictive DL features")
+        logging.getLogger(__name__).info(f"Generated {self.encoding_dim} Predictive DL features")
         return embed_df
 
     def save_model(self, filepath):
         """Save the trained encoder model to disk"""
         if self.encoder:
             self.encoder.save(filepath)
-            print(f"✅ DL Extractor saved to {filepath}")
+            try:
+                meta_path = filepath.replace('.h5', '_feature_cols.json')
+                with open(meta_path, 'w') as f:
+                    json.dump({'feature_cols': self.feature_cols or []}, f)
+            except Exception:
+                pass
+            logging.getLogger(__name__).info(f"DL Extractor saved to {filepath}")
         else:
-            print("⚠️ No encoder to save!")
+            logging.getLogger(__name__).warning("No encoder to save!")
 
     def load_model(self, filepath):
         """Load a trained encoder model from disk"""
@@ -261,10 +279,20 @@ class DLFeatureExtractor:
             # Allow loading models with lambda functions (safe for our own models)
             self.encoder = tf.keras.models.load_model(filepath, safe_mode=False)
             self.model = None # We don't need the full training model for inference
-            print(f"✅ DL Extractor loaded from {filepath}")
+            try:
+                meta_path = filepath.replace('.h5', '_feature_cols.json')
+                if os.path.exists(meta_path):
+                    with open(meta_path, 'r') as f:
+                        meta = json.load(f) or {}
+                    cols = meta.get('feature_cols')
+                    if isinstance(cols, list) and cols:
+                        self.feature_cols = cols
+            except Exception:
+                pass
+            logging.getLogger(__name__).info(f"DL Extractor loaded from {filepath}")
             return True
         except Exception as e:
-            print(f"❌ Failed to load DL Extractor: {e}")
+            logging.getLogger(__name__).warning(f"Failed to load DL Extractor: {e}")
             return False
 
 if __name__ == "__main__":

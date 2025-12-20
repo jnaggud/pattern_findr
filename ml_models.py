@@ -21,6 +21,9 @@ import warnings
 import os
 warnings.filterwarnings('ignore')
 
+# Global variable to hold data for Optuna parallel optimization
+_optuna_shared_data = {}
+
 # Try to import XGBoost and LightGBM (optional)
 try:
     import xgboost as xgb
@@ -41,7 +44,82 @@ try:
     OPTUNA_AVAILABLE = True
 except ImportError:
     OPTUNA_AVAILABLE = False
-    print("⚠️  Optuna not available. Install with: pip install optuna")
+    print("Optuna not available for hyperparameter optimization")
+
+def _optuna_objective(trial):
+    """Global objective function for Optuna that can be pickled for parallel execution"""
+    # Retrieve shared data
+    model_name = _optuna_shared_data['model_name']
+    X_train_balanced = _optuna_shared_data['X_train_balanced']
+    y_train_balanced = _optuna_shared_data['y_train_balanced']
+    cv_folds = _optuna_shared_data['cv_folds']
+    ml_models = _optuna_shared_data['ml_models']
+    class_weights = _optuna_shared_data.get('class_weights')
+    
+    # Suggest parameters
+    params = ml_models._suggest_parameters(trial, model_name)
+    # Force single-threaded execution for each trial to avoid oversubscription
+    # when running multiple trials in parallel
+    if model_name in ['random_forest', 'xgboost', 'lightgbm']:
+        params = {**params, 'n_jobs': 1}
+    
+    # Apply class weights if they were set
+    if hasattr(ml_models, 'class_weights') and ml_models.class_weights:
+        if model_name in ['random_forest', 'svm']:
+            # For RandomForest/SVM use class_weight
+            params['class_weight'] = ml_models.class_weights
+        # Note: XGBoost/LightGBM don't support class weights for multiclass
+        # We'll handle this through sample weights during training instead
+    
+    try:
+        # Create model with trial parameters
+        if model_name == 'random_forest':
+            model = ml_models.create_random_forest(**params)
+        elif model_name == 'xgboost':
+            model = ml_models.create_xgboost(**params)
+        elif model_name == 'lightgbm':
+            model = ml_models.create_lightgbm(**params)
+        elif model_name == 'svm':
+            model = ml_models.create_svm(**params)
+        else:
+            raise ValueError(f"Unknown model: {model_name}")
+        
+        # Prepare data (scaling if needed)
+        X_scaled = X_train_balanced
+        y_encoded = y_train_balanced
+        
+        if model_name in ['xgboost', 'lightgbm', 'svm']:
+            # Scale features
+            scaler = StandardScaler()
+            X_scaled = pd.DataFrame(
+                scaler.fit_transform(X_train_balanced),
+                columns=X_train_balanced.columns,
+                index=X_train_balanced.index
+            )
+        
+        if model_name in ['xgboost', 'lightgbm']:
+            # Encode labels
+            label_encoder = LabelEncoder()
+            y_encoded = pd.Series(
+                label_encoder.fit_transform(y_train_balanced),
+                index=y_train_balanced.index
+            )
+        
+        # Cross-validation with time series split
+        cv_scores = cross_val_score(
+            model, X_scaled, y_encoded,
+            cv=TimeSeriesSplit(n_splits=cv_folds),
+            scoring='f1_weighted',
+            n_jobs=1  # Keep individual model training single-threaded
+        )
+        
+        return cv_scores.mean()
+        
+    except Exception as e:
+        import traceback
+        print(f"Trial failed: {e}")
+        traceback.print_exc()
+        return 0.0
 
 class TradingMLModels:
     """
@@ -55,6 +133,7 @@ class TradingMLModels:
         self.training_history = {}
         self.best_model = None
         self.best_score = 0.0
+        self.class_weights = None  # Store class weights for optimization
         
     def prepare_data(self, features: pd.DataFrame, labels: pd.Series,
                     test_size: float = 0.2,
@@ -114,70 +193,90 @@ class TradingMLModels:
         return X_train, X_test, y_train, y_test
     
     def create_random_forest(self, **kwargs) -> RandomForestClassifier:
-        """Create Random Forest model with optimized parameters"""
+        """Create Random Forest model with optimized parameters to prevent overfitting"""
         default_params = {
             'n_estimators': 100,
-            'max_depth': 10,
-            'min_samples_split': 5,
-            'min_samples_leaf': 2,
+            'max_depth': 5,  # REDUCED from 10 to prevent overfitting
+            'min_samples_split': 20,  # INCREASED from 5 to force simpler splits
+            'min_samples_leaf': 10,  # INCREASED from 2 to prevent memorization
+            'max_features': 'sqrt',  # Limit features per tree to reduce overfitting
             'random_state': 42,
             'class_weight': 'balanced',  # Handle imbalanced classes
-            'n_jobs': -1
+            'n_jobs': -1,
+            'bootstrap': True  # Ensure bootstrap is enabled
         }
         default_params.update(kwargs)
         
         return RandomForestClassifier(**default_params)
     
     def create_xgboost(self, **kwargs) -> Any:
-        """Create XGBoost model if available"""
+        """Create XGBoost model with strong regularization to prevent overfitting"""
         if not XGBOOST_AVAILABLE:
             raise ImportError("XGBoost not available")
         
         default_params = {
             'n_estimators': 100,
-            'max_depth': 6,
-            'learning_rate': 0.1,
-            'subsample': 0.8,
-            'colsample_bytree': 0.8,
+            'max_depth': 3,  # REDUCED from 6 to prevent overfitting
+            'learning_rate': 0.05,  # REDUCED from 0.1 for more conservative updates
             'random_state': 42,
-            'eval_metric': 'mlogloss'
+            'objective': 'multi:softmax',
+            'num_class': 3,
+            'use_label_encoder': False,
+            'eval_metric': 'mlogloss',
+            # Strong regularization parameters
+            'reg_alpha': 1.0,  # L1 regularization
+            'reg_lambda': 3.0,  # L2 regularization
+            'gamma': 1.0,  # Minimum loss reduction for split
+            'min_child_weight': 5,  # Higher value = more conservative
+            'subsample': 0.8,  # Don't use all training data
+            'colsample_bytree': 0.8,  # Don't use all features
+            # Early stopping will be handled in train_model method
         }
         default_params.update(kwargs)
         
         return xgb.XGBClassifier(**default_params)
     
     def create_lightgbm(self, **kwargs) -> Any:
-        """Create LightGBM model if available"""
+        """Create LightGBM model with regularization to prevent overfitting"""
         if not LIGHTGBM_AVAILABLE:
             raise ImportError("LightGBM not available")
         
         default_params = {
             'n_estimators': 100,
-            'max_depth': 6,
-            'learning_rate': 0.1,
-            'subsample': 0.8,
-            'colsample_bytree': 0.8,
+            'max_depth': 5,  # LIMIT depth instead of -1
+            'num_leaves': 20,  # Limit complexity
+            'learning_rate': 0.05,  # REDUCED from 0.1
             'random_state': 42,
+            'objective': 'multiclass',
+            'num_class': 3,
+            'metric': 'multi_logloss',
             'verbose': -1,
-            'class_weight': 'balanced'
+            # Regularization parameters
+            'reg_alpha': 1.0,  # L1 regularization
+            'reg_lambda': 3.0,  # L2 regularization  
+            'min_child_samples': 20,  # Minimum data in leaf
+            'subsample': 0.8,  # Bagging fraction
+            'colsample_bytree': 0.8,  # Feature fraction
+            # Early stopping will be handled in train_model method
         }
         default_params.update(kwargs)
         
         return lgb.LGBMClassifier(**default_params)
     
-    def create_svm(self, **kwargs) -> SVC:
-        """Create SVM model with optimized parameters"""
+    def create_svm(self, **kwargs) -> Any:
+        """Create SVM model with regularization"""
         default_params = {
             'kernel': 'rbf',
-            'C': 1.0,
+            'C': 0.1,  # REDUCED from 1.0 for stronger regularization
             'gamma': 'scale',
+            'random_state': 42,
             'class_weight': 'balanced',
-            'probability': True,  # Enable probability predictions
-            'random_state': 42
+            'decision_function_shape': 'ovo',  # One-vs-one for multiclass
+            'max_iter': 1000  # Limit iterations
         }
         default_params.update(kwargs)
         
-        return SVC(**default_params)
+        return SVC(**default_params, probability=True)
     
     def balance_training_data(self, X_train: pd.DataFrame, y_train: pd.Series) -> Tuple[pd.DataFrame, pd.Series]:
         """
@@ -290,7 +389,40 @@ class TradingMLModels:
         
         # Train model
         try:
-            model.fit(X_train_scaled, y_train_encoded)
+            # Special handling for models that support early stopping
+            if model_name in ['xgboost', 'lightgbm']:
+                # Only use early stopping if we have enough data
+                if len(X_train_scaled) >= 50:  # Need at least 50 samples
+                    # Create validation set for early stopping
+                    val_size = max(10, int(0.2 * len(X_train_scaled)))  # At least 10 samples
+                    X_train_split = X_train_scaled.iloc[:-val_size]
+                    X_val_split = X_train_scaled.iloc[-val_size:]
+                    y_train_split = y_train_encoded.iloc[:-val_size]
+                    y_val_split = y_train_encoded.iloc[-val_size:]
+                    
+                    if model_name == 'xgboost':
+                        # XGBoost with early stopping
+                        model.fit(
+                            X_train_split, y_train_split,
+                            eval_set=[(X_val_split, y_val_split)],
+                            early_stopping_rounds=10,
+                            verbose=False
+                        )
+                    else:  # lightgbm
+                        # LightGBM with early stopping
+                        model.fit(
+                            X_train_split, y_train_split,
+                            eval_set=[(X_val_split, y_val_split)],
+                            eval_metric='multi_logloss',
+                            callbacks=[lgb.early_stopping(10), lgb.log_evaluation(0)]
+                        )
+                else:
+                    # Not enough data for validation split, train without early stopping
+                    print(f"   Warning: Not enough data for early stopping (only {len(X_train_scaled)} samples)")
+                    model.fit(X_train_scaled, y_train_encoded)
+            else:
+                # Other models (RandomForest, SVM)
+                model.fit(X_train_scaled, y_train_encoded)
             
             # Cross-validation score (use encoded labels for consistency)
             cv_scores = cross_val_score(
@@ -500,6 +632,12 @@ class TradingMLModels:
         
         model = self.models[model_name]
         
+        # Handle NaN values before prediction
+        if features.isnull().any().any():
+            print(f"Warning: Found {features.isnull().sum().sum()} NaN values in features")
+            # Fill NaN values with 0 (same as missing features)
+            features = features.fillna(0)
+        
         # Scale features if needed
         features_scaled = features
         if model_name in self.scalers:
@@ -528,7 +666,7 @@ class TradingMLModels:
         return predictions, probabilities
     
     def optimize_hyperparameters(self, model_name: str, X_train: pd.DataFrame, y_train: pd.Series,
-                                 n_trials: int = 100, cv_folds: int = 3) -> Dict:
+                                 n_trials: int = 100, cv_folds: int = 3, detection_params: Dict = None) -> Dict:
         """
         Optimize hyperparameters using Optuna
         
@@ -545,67 +683,43 @@ class TradingMLModels:
         if not OPTUNA_AVAILABLE:
             raise ImportError("Optuna not available. Install with: pip install optuna")
         
-        print(f"🔍 Optimizing {model_name} hyperparameters with {n_trials} trials...")
+        print(f"🔍 Optimizing {model_name} hyperparameters...")
         
-        # Balance training data first
+        # Balance classes before optimization
         X_train_balanced, y_train_balanced = self.balance_training_data(X_train, y_train)
         
-        # Define objective function for Optuna
-        def objective(trial):
-            params = self._suggest_parameters(trial, model_name)
-            
-            try:
-                # Create model with trial parameters
-                if model_name == 'random_forest':
-                    model = self.create_random_forest(**params)
-                elif model_name == 'xgboost':
-                    model = self.create_xgboost(**params)
-                elif model_name == 'lightgbm':
-                    model = self.create_lightgbm(**params)
-                elif model_name == 'svm':
-                    model = self.create_svm(**params)
-                else:
-                    raise ValueError(f"Unknown model: {model_name}")
-                
-                # Prepare data (scaling if needed)
-                X_scaled = X_train_balanced
-                y_encoded = y_train_balanced
-                
-                if model_name in ['xgboost', 'lightgbm', 'svm']:
-                    # Scale features
-                    scaler = StandardScaler()
-                    X_scaled = pd.DataFrame(
-                        scaler.fit_transform(X_train_balanced),
-                        columns=X_train_balanced.columns
-                    )
-                
-                if model_name in ['xgboost', 'lightgbm']:
-                    # Encode labels
-                    label_encoder = LabelEncoder()
-                    y_encoded = pd.Series(label_encoder.fit_transform(y_train_balanced))
-                
-                # Cross-validation with time series split
-                cv_scores = cross_val_score(
-                    model, X_scaled, y_encoded,
-                    cv=TimeSeriesSplit(n_splits=cv_folds),
-                    scoring='f1_weighted',
-                    n_jobs=-1
-                )
-                
-                return cv_scores.mean()
-                
-            except Exception as e:
-                print(f"Trial failed: {e}")
-                return 0.0
-        
-        # Create and run study
-        study = optuna.create_study(direction='maximize', 
-                                   sampler=optuna.samplers.TPESampler(seed=42))
+        # Prepare shared data for parallel execution
+        global _optuna_shared_data
+        _optuna_shared_data = {
+            'model_name': model_name,
+            'X_train_balanced': X_train_balanced,
+            'y_train_balanced': y_train_balanced,
+            'cv_folds': cv_folds,
+            'ml_models': self,
+            'class_weights': getattr(self, 'class_weights', None),
+            'detection_params': detection_params or {}
+        }
         
         # Suppress optuna logs
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+        # Create study
+        study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler())
+        
+        # Calculate optimal n_jobs
+        cpu_count = os.cpu_count() or 1
+        # Use all cores but leave one for system
+        n_jobs = max(1, cpu_count - 1)
+        # Don't use more workers than trials
+        n_jobs = min(n_jobs, n_trials)
+        
+        print(f"   Using {n_jobs} parallel workers on {cpu_count} CPU cores")
+        
+        # Run optimization with parallel trials
+        study.optimize(_optuna_objective, n_trials=n_trials, show_progress_bar=True, n_jobs=n_jobs)
+        
+        # Clear shared data
+        _optuna_shared_data.clear()
         
         # Results
         best_params = study.best_params
@@ -694,6 +808,13 @@ class TradingMLModels:
         best_params = optimization_result['best_params']
         
         # Step 2: Train final model with best parameters
+        # Apply class weights if they were set
+        if self.class_weights and model_name in ['random_forest', 'svm']:
+            # For RandomForest/SVM use class_weight
+            best_params['class_weight'] = self.class_weights
+        # Note: XGBoost/LightGBM don't support class weights for multiclass
+        # We'll handle this through sample weights during training instead
+        
         final_result = self.train_model(model_name, X_train, y_train, 
                                        model_params=best_params, use_scaling=True)
         

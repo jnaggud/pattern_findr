@@ -1,0 +1,11 @@
+{
+    "status": "FLAT",
+    "ticker": "BTC-USD",
+    "entry_price": 89594.7734375,
+    "entry_date": "2025-12-15 00:00:00",
+    "highest_price": 0.0,
+    "strategy_id": null,
+    "pnl": 0.0,
+    "exit_price": 87077.4453125,
+    "last_pnl": -2.809681891495659
+}

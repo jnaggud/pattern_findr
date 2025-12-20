@@ -5,6 +5,9 @@ import itertools
 from backtester import Backtester
 import joblib
 from joblib import Parallel, delayed
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Import signal optimization enhancements
 try:
@@ -16,56 +19,56 @@ try:
     SIGNAL_OPTIMIZATION_AVAILABLE = True
 except ImportError:
     SIGNAL_OPTIMIZATION_AVAILABLE = False
-    print("⚠️  Signal optimization module not available - using basic optimization")
+    logger.info("Signal optimization module not available - using basic optimization")
 
 # Import Enhancement #2: Position Sizing & Risk Management
 try:
     from enhanced_backtester import EnhancedBacktester, create_enhanced_backtester
     from position_sizing import PositionSizer, optimize_position_sizing_parameters
     POSITION_SIZING_AVAILABLE = True
-    print("✅ Enhancement #2: Position Sizing & Risk Management available")
+    logger.info("Enhancement #2: Position Sizing & Risk Management available")
 except ImportError as e:
     POSITION_SIZING_AVAILABLE = False
-    print(f"⚠️  Enhancement #2 not available: {e}")
+    logger.info(f"Enhancement #2 not available: {e}")
 except Exception as e:
     POSITION_SIZING_AVAILABLE = False
-    print(f"❌ Enhancement #2 import error: {e}")
+    logger.warning(f"Enhancement #2 import error: {e}")
 
 # Import Detailed Logging System
 try:
     from detailed_logger import create_comprehensive_strategy_log
     DETAILED_LOGGING_AVAILABLE = True
-    print("✅ Detailed CSV logging system available")
+    logger.info("Detailed CSV logging system available")
 except ImportError as e:
     DETAILED_LOGGING_AVAILABLE = False
-    print(f"⚠️  Detailed logging not available: {e}")
+    logger.info(f"Detailed logging not available: {e}")
 except Exception as e:
     DETAILED_LOGGING_AVAILABLE = False
-    print(f"❌ Detailed logging import error: {e}")
+    logger.warning(f"Detailed logging import error: {e}")
 
 # Import Enhancement #3: Market Regime Detection
 try:
     from market_regime_detector import MarketRegimeDetector, create_regime_aware_strategy_params
     MARKET_REGIME_AVAILABLE = True
-    print("✅ Enhancement #3: Market Regime Detection available")
+    logger.info("Enhancement #3: Market Regime Detection available")
 except ImportError as e:
     MARKET_REGIME_AVAILABLE = False
-    print(f"⚠️  Enhancement #3 not available: {e}")
+    logger.info(f"Enhancement #3 not available: {e}")
 except Exception as e:
     MARKET_REGIME_AVAILABLE = False
-    print(f"❌ Enhancement #3 import error: {e}")
+    logger.warning(f"Enhancement #3 import error: {e}")
 
 # Import Simple Regime Detection
 try:
     from simple_regime_detector import detect_market_regime, get_regime_parameters
     SIMPLE_REGIME_AVAILABLE = True
-    print("✅ Simple Regime Detection available")
+    logger.info("Simple Regime Detection available")
 except ImportError as e:
     SIMPLE_REGIME_AVAILABLE = False
-    print(f"⚠️  Simple Regime Detection not available: {e}")
+    logger.info(f"Simple Regime Detection not available: {e}")
 except Exception as e:
     SIMPLE_REGIME_AVAILABLE = False
-    print(f"❌ Simple Regime Detection import error: {e}")
+    logger.warning(f"Simple Regime Detection import error: {e}")
 
 def universal_strategy(data, params):
     """

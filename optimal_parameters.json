@@ -1,0 +1,12 @@
+{
+  "params": {
+    "window_size": 3,
+    "lead_time_days": 1,
+    "min_peak_height_pct": 3.0,
+    "class_weight_ratio": 15,
+    "detection_method": "predictive",
+    "model_type": "xgboost"
+  },
+  "score": 3893.6072896326036,
+  "timestamp": "2025-12-16 06:21:33"
+}

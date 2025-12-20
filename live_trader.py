@@ -16,6 +16,17 @@ from alert_system import AlertManager
 from polygon_manager import PolygonManager
 from ml_utils import generate_features, generate_signals, calculate_metrics_from_signals, apply_trend_filter, apply_meta_filter
 
+# Optional Imports
+try:
+    from conformal_utils import ConformalPredictionWrapper
+except ImportError:
+    ConformalPredictionWrapper = None
+
+try:
+    from regime_utils import MarketRegimeDetector
+except ImportError:
+    MarketRegimeDetector = None
+
 # Configuration
 CHECK_INTERVAL_SECONDS = 60 * 15 # 15 Minutes
 MODEL_PATH = "saved_models_v2/xgboost_BTC-USD_latest.joblib" # Placeholder
@@ -329,7 +340,7 @@ def main():
                 dl_path = config.get('dl_model_path', f"saved_models_v2/dl_{ticker}.h5")
                 dl_config = {'train': False, 'model_path': dl_path}
             
-            features = generate_features(df_window, dl_config=dl_config)
+            features = generate_features(df_window, dl_config=dl_config, use_regime=config.get('use_regime_detection', False))
             
             if features.empty:
                 print("⚠️ Feature generation returned empty. Skipping.")
@@ -357,7 +368,51 @@ def main():
             s_raw = signals.copy()
             if config.get('use_trend_filter', True):
                 s_raw = apply_trend_filter(s_raw, df_window, features)
+            
+            # Apply Conformal Prediction Filter (New)
+            if config.get('use_conformal', False) and ConformalPredictionWrapper:
+                cp_alpha = config.get('cp_alpha', 0.1)
+                print(f"🔬 Applying Conformal Filter (Alpha={cp_alpha})...")
                 
+                try:
+                    # We need the base estimator from model_data
+                    # model_data is a dict loaded from joblib
+                    base_model = model_data.get('model')
+                    if base_model:
+                        # Initialize Wrapper
+                        # We use cv=5 to calibrate on the historical window we have loaded
+                        cp = ConformalPredictionWrapper(base_model, method="score", cv=5)
+                        
+                        # Generate labels for calibration (peaks/valleys on window)
+                        from ml_utils import detect_peaks_valleys
+                        cal_labels, _ = detect_peaks_valleys(df_window, order=5) # Default order
+                        
+                        # Align
+                        common_idx = features.index.intersection(cal_labels.index)
+                        X_cal = features.loc[common_idx]
+                        y_cal = cal_labels.loc[common_idx]
+                        
+                        # Clean
+                        valid_mask = X_cal.notna().all(axis=1) & y_cal.notna()
+                        X_cal = X_cal[valid_mask]
+                        y_cal = y_cal[valid_mask]
+                        
+                        if len(X_cal) > 50: # Minimum data for calibration
+                            cp.fit(X_cal, y_cal)
+                            
+                            # Filter the signals
+                            # We only really care about filtering the *last* signal, but we filter all for consistency
+                            # Align X for prediction
+                            X_pred = features.loc[s_raw.index].fillna(0)
+                            s_raw = cp.filter_signals(s_raw, X_pred, alpha=cp_alpha)
+                            print(f"   ✅ CP Filter applied.")
+                        else:
+                            print("   ⚠️ Not enough data to calibrate CP. Skipping filter.")
+                    else:
+                        print("   ⚠️ Base model not found in model_data. Skipping CP.")
+                except Exception as e:
+                    print(f"   ❌ CP Filter Failed: {e}")
+
             # Apply Meta-Filter (Meta)
             s_meta = s_raw.copy()
             has_meta = config.get('use_meta_filter', False) and meta_model_data is not None
@@ -580,7 +635,7 @@ def main():
 
                 # Send Alert
                 alert_mgr.send_alert(
-                    title=f"🚀 BUY {ticker}",
+                    title=f"🚀 [ML] BUY {ticker}",
                     message=f"Entry Signal Detected @ ${last_close:,.2f}\nConfidence: {last_prob_buy:.1%}{warn_msg}",
                     data=df_window,
                     ticker=ticker,
@@ -627,7 +682,7 @@ def main():
                     fields.append({'name': 'Strategy Status', 'value': meta_status_msg, 'inline': False})
 
                 alert_mgr.send_alert(
-                    title=f"📉 SELL {ticker}",
+                    title=f"📉 [ML] SELL {ticker}",
                     message=f"Exit Signal Detected @ ${last_close:,.2f}\nProfit: {pnl_pct:+.2f}%",
                     data=df_window,
                     ticker=ticker,
@@ -667,7 +722,7 @@ def main():
                     state_mgr.save_state(state)
                     
                     alert_mgr.send_alert(
-                        title=f"🛡️ {exit_reason}: {ticker}",
+                        title=f"🛡️ [ML] {exit_reason}: {ticker}",
                         message=f"Exiting @ ${last_close:.2f}\nPnL: {current_pnl*100:+.2f}%",
                         data=df_window,
                         ticker=ticker,

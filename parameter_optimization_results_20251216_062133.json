@@ -1,0 +1,258 @@
+{
+  "best_params": {
+    "window_size": 3,
+    "lead_time_days": 1,
+    "min_peak_height_pct": 3.0,
+    "class_weight_ratio": 15,
+    "detection_method": "predictive",
+    "model_type": "xgboost"
+  },
+  "best_score": 3893.6072896326036,
+  "top_10_results": [
+    {
+      "params": {
+        "window_size": 3,
+        "lead_time_days": 1,
+        "min_peak_height_pct": 3.0,
+        "class_weight_ratio": 15,
+        "detection_method": "predictive",
+        "model_type": "xgboost"
+      },
+      "train_score": 0.9789431863329361,
+      "cv_score": 0.9602543720190778,
+      "test_trades": 3,
+      "test_return": 0.0592048059459102,
+      "test_win_rate": 1.0,
+      "test_sharpe": 191.65673643058122,
+      "test_max_drawdown": 0.01711596193063402,
+      "signal_distribution": {
+        "buy": 4,
+        "sell": 17,
+        "hold": 350
+      },
+      "optimization": {},
+      "composite_score": 3893.6072896326036
+    },
+    {
+      "params": {
+        "window_size": 3,
+        "lead_time_days": 1,
+        "min_peak_height_pct": 3.0,
+        "class_weight_ratio": 7,
+        "detection_method": "predictive",
+        "model_type": "xgboost"
+      },
+      "train_score": 0.9789431863329361,
+      "cv_score": 0.9602543720190778,
+      "test_trades": 3,
+      "test_return": 0.0592048059459102,
+      "test_win_rate": 1.0,
+      "test_sharpe": 191.65673643058122,
+      "test_max_drawdown": 0.01711596193063402,
+      "signal_distribution": {
+        "buy": 4,
+        "sell": 17,
+        "hold": 350
+      },
+      "optimization": {},
+      "composite_score": 3893.6072896326036
+    },
+    {
+      "params": {
+        "window_size": 3,
+        "lead_time_days": 1,
+        "min_peak_height_pct": 3.0,
+        "class_weight_ratio": 3,
+        "detection_method": "predictive",
+        "model_type": "xgboost"
+      },
+      "train_score": 0.9789431863329361,
+      "cv_score": 0.9602543720190778,
+      "test_trades": 3,
+      "test_return": 0.0592048059459102,
+      "test_win_rate": 1.0,
+      "test_sharpe": 191.65673643058122,
+      "test_max_drawdown": 0.01711596193063402,
+      "signal_distribution": {
+        "buy": 4,
+        "sell": 17,
+        "hold": 350
+      },
+      "optimization": {},
+      "composite_score": 3893.6072896326036
+    },
+    {
+      "params": {
+        "window_size": 3,
+        "lead_time_days": 1,
+        "min_peak_height_pct": 3.0,
+        "class_weight_ratio": 5,
+        "detection_method": "predictive",
+        "model_type": "xgboost"
+      },
+      "train_score": 0.9789431863329361,
+      "cv_score": 0.9602543720190778,
+      "test_trades": 3,
+      "test_return": 0.0592048059459102,
+      "test_win_rate": 1.0,
+      "test_sharpe": 191.65673643058122,
+      "test_max_drawdown": 0.01711596193063402,
+      "signal_distribution": {
+        "buy": 4,
+        "sell": 17,
+        "hold": 350
+      },
+      "optimization": {},
+      "composite_score": 3893.6072896326036
+    },
+    {
+      "params": {
+        "window_size": 3,
+        "lead_time_days": 1,
+        "min_peak_height_pct": 3.0,
+        "class_weight_ratio": 1,
+        "detection_method": "predictive",
+        "model_type": "xgboost"
+      },
+      "train_score": 0.9789431863329361,
+      "cv_score": 0.9602543720190778,
+      "test_trades": 3,
+      "test_return": 0.0592048059459102,
+      "test_win_rate": 1.0,
+      "test_sharpe": 191.65673643058122,
+      "test_max_drawdown": 0.01711596193063402,
+      "signal_distribution": {
+        "buy": 4,
+        "sell": 17,
+        "hold": 350
+      },
+      "optimization": {},
+      "composite_score": 3893.6072896326036
+    },
+    {
+      "params": {
+        "window_size": 3,
+        "lead_time_days": 1,
+        "min_peak_height_pct": 3.0,
+        "class_weight_ratio": 10,
+        "detection_method": "predictive",
+        "model_type": "xgboost"
+      },
+      "train_score": 0.9789431863329361,
+      "cv_score": 0.9602543720190778,
+      "test_trades": 3,
+      "test_return": 0.0592048059459102,
+      "test_win_rate": 1.0,
+      "test_sharpe": 191.65673643058122,
+      "test_max_drawdown": 0.01711596193063402,
+      "signal_distribution": {
+        "buy": 4,
+        "sell": 17,
+        "hold": 350
+      },
+      "optimization": {},
+      "composite_score": 3893.6072896326036
+    },
+    {
+      "params": {
+        "window_size": 5,
+        "lead_time_days": 0,
+        "min_peak_height_pct": 5.0,
+        "class_weight_ratio": 3,
+        "detection_method": "predictive",
+        "model_type": "xgboost"
+      },
+      "train_score": 0.9949729311678268,
+      "cv_score": 0.9829721362229101,
+      "test_trades": 2,
+      "test_return": 0.07346859071157567,
+      "test_win_rate": 1.0,
+      "test_sharpe": 181.17623543086887,
+      "test_max_drawdown": 0.032927105302055615,
+      "signal_distribution": {
+        "buy": 14,
+        "sell": 2,
+        "hold": 355
+      },
+      "optimization": {},
+      "composite_score": 3683.283714782228
+    },
+    {
+      "params": {
+        "window_size": 5,
+        "lead_time_days": 0,
+        "min_peak_height_pct": 5.0,
+        "class_weight_ratio": 5,
+        "detection_method": "predictive",
+        "model_type": "xgboost"
+      },
+      "train_score": 0.9949729311678268,
+      "cv_score": 0.9829721362229101,
+      "test_trades": 2,
+      "test_return": 0.07346859071157567,
+      "test_win_rate": 1.0,
+      "test_sharpe": 181.17623543086887,
+      "test_max_drawdown": 0.032927105302055615,
+      "signal_distribution": {
+        "buy": 14,
+        "sell": 2,
+        "hold": 355
+      },
+      "optimization": {},
+      "composite_score": 3683.283714782228
+    },
+    {
+      "params": {
+        "window_size": 5,
+        "lead_time_days": 0,
+        "min_peak_height_pct": 5.0,
+        "class_weight_ratio": 10,
+        "detection_method": "predictive",
+        "model_type": "xgboost"
+      },
+      "train_score": 0.9949729311678268,
+      "cv_score": 0.9829721362229101,
+      "test_trades": 2,
+      "test_return": 0.07346859071157567,
+      "test_win_rate": 1.0,
+      "test_sharpe": 181.17623543086887,
+      "test_max_drawdown": 0.032927105302055615,
+      "signal_distribution": {
+        "buy": 14,
+        "sell": 2,
+        "hold": 355
+      },
+      "optimization": {},
+      "composite_score": 3683.283714782228
+    },
+    {
+      "params": {
+        "window_size": 5,
+        "lead_time_days": 0,
+        "min_peak_height_pct": 5.0,
+        "class_weight_ratio": 15,
+        "detection_method": "predictive",
+        "model_type": "xgboost"
+      },
+      "train_score": 0.9949729311678268,
+      "cv_score": 0.9829721362229101,
+      "test_trades": 2,
+      "test_return": 0.07346859071157567,
+      "test_win_rate": 1.0,
+      "test_sharpe": 181.17623543086887,
+      "test_max_drawdown": 0.032927105302055615,
+      "signal_distribution": {
+        "buy": 14,
+        "sell": 2,
+        "hold": 355
+      },
+      "optimization": {},
+      "composite_score": 3683.283714782228
+    }
+  ],
+  "summary": {
+    "total_tested": 2160,
+    "successful": 2160,
+    "failed": 0
+  }
+}

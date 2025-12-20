@@ -7,6 +7,12 @@ from datetime import datetime
 from scipy.signal import argrelextrema
 import pandas_ta as ta
 
+# Import Regime Detector
+try:
+    from regime_utils import MarketRegimeDetector
+except ImportError:
+    MarketRegimeDetector = None
+
 # Try to import DL Feature Extractor
 try:
     from dl_feature_extractor import DLFeatureExtractor
@@ -185,12 +191,31 @@ def calculate_metrics_from_signals(data: pd.DataFrame, signals: pd.Series, initi
 # FEATURE ENGINEERING
 # =============================================================================
 
-def generate_features(data: pd.DataFrame, dl_config: dict = None) -> pd.DataFrame:
-    """Generate comprehensive technical indicator features"""
+def generate_features(data: pd.DataFrame, dl_config: dict = None, use_regime: bool = True) -> pd.DataFrame:
+    """
+    Generate comprehensive technical features.
+    """
     df = data.copy()
     
-    # Efficiency Ratio (Kaufman) - Dynamic Filter
-    # High ER = Strong Trend, Low ER = Choppy/Noise
+    # 0. Market Regime Detection (New)
+    if use_regime and MarketRegimeDetector:
+        try:
+            mrd = MarketRegimeDetector(n_components=3)
+            regime_series, regime_map = mrd.fit_predict(df)
+            
+            # Add Regime Label (Integer)
+            df['regime'] = regime_series
+            
+            # One-Hot Encode Regimes for ML
+            # 0: Bull/Neutral, 1: Sideways, 2: Stress (Map varies, but ML will learn it)
+            df['regime_0'] = (regime_series == 0).astype(int)
+            df['regime_1'] = (regime_series == 1).astype(int)
+            df['regime_2'] = (regime_series == 2).astype(int)
+            
+        except Exception as e:
+            print(f"⚠️ Regime Detection Failed: {e}", file=sys.stderr)
+            
+    # Efficiency Ratio (Kaufman)
     if 'close' in df.columns:
         try:
             df['efficiency_ratio'] = ta.er(df['close'], length=10)
@@ -449,7 +474,7 @@ def generate_signals(model_data: dict, features: pd.DataFrame, threshold: float 
                      slope_roc_thresh: float = 0.0,
                      use_mom_zone: bool = False,
                      buy_threshold: float = None,
-                     sell_threshold: float = None) -> tuple[pd.Series, pd.DataFrame]:
+                     sell_threshold: float = None):
     """
     Generate signals using the trained model with custom thresholds.
     Returns: (signals, probabilities)
@@ -964,3 +989,346 @@ def train_regressor(features: pd.DataFrame, target: pd.Series, n_trials: int = 2
         'r2': r2,
         'best_params': best_params
     }
+
+def optimize_full_strategy(data, features, labels, n_trials=50, progress_callback=None, n_jobs=-1, 
+                           raw_data=None):
+    """
+    Master Optimization: Optimizes ALL tunable parameters simultaneously.
+    
+    Optimizes:
+    - XGBoost Hyperparameters (9 params)
+    - Signal Thresholds (ML buy/sell, slope buy/sell)
+    - Market Filters (ADX, Trend)
+    - Advanced Settings (momentum zone, slope ROC, ML confirmation)
+    - Training Settings (class weight, SMOTE, optimize_for metric)
+    - Peak/Valley Sensitivity
+    - Use Regime Detection
+    
+    Objective: Maximize Total Return (Backtest) with risk-adjusted penalties
+    """
+    import optuna
+    import multiprocessing
+    from tqdm import tqdm
+    from sklearn.model_selection import TimeSeriesSplit
+    from sklearn.preprocessing import LabelEncoder
+    import xgboost as xgb
+    import sys
+    
+    # Configure Parallelism
+    total_cores = multiprocessing.cpu_count()
+    if n_jobs == -1:
+        n_jobs = max(1, total_cores - 1)
+        
+    # Limit threads per XGBoost instance to avoid oversubscription
+    threads_per_trial = max(1, total_cores // n_jobs)
+    
+    # Store raw_data for regime regeneration
+    _raw_data = raw_data if raw_data is not None else data
+    
+    print(f"\n🚀 Starting FULL Optimization: {n_trials} trials, {n_jobs} parallel jobs")
+    print("   Optimizing: Model Hyperparams + Signal Thresholds + Filters + Training Settings")
+    
+    # =========================================================================
+    # PRE-COMPUTE labels and features for all parameter combinations (SPEED FIX)
+    # =========================================================================
+    print("   Pre-computing labels for peak_valley_order 3-10...")
+    label_cache = {}
+    for order in range(3, 11):
+        label_cache[order], _ = detect_peaks_valleys(_raw_data, order=order)
+    
+    print("   Pre-computing features with/without regime detection...")
+    feature_cache = {
+        True: generate_features(_raw_data, use_regime=True),
+        False: generate_features(_raw_data, use_regime=False)
+    }
+    print("   ✅ Pre-computation complete. Starting parallel optimization...")
+    
+    # Check required columns in features
+    has_slope = 'slope' in features.columns
+    has_comp = 'composite_oscillator' in features.columns
+    has_adx = any(c.startswith('ADX_') for c in features.columns)
+    
+    # Get ADX column name if available
+    adx_col = None
+    if has_adx:
+        adx_col = [c for c in features.columns if c.startswith('ADX_')][0]
+    
+    def objective(trial):
+        # =================================================================
+        # 0. Training Settings (NEW)
+        # =================================================================
+        # Peak/Valley Sensitivity (affects label generation)
+        peak_valley_order = trial.suggest_int('peak_valley_order', 3, 10)
+        
+        # Class Weight Ratio (penalize missing BUY/SELL)
+        class_weight_ratio = trial.suggest_float('class_weight_ratio', 1.0, 5.0)
+        
+        # Decision Threshold (confidence required for signals)
+        decision_threshold = trial.suggest_float('decision_threshold', 0.3, 0.7)
+        
+        # Use SMOTE for class balancing
+        use_smote = trial.suggest_categorical('use_smote', [True, False])
+        
+        # Use Market Regime Detection
+        use_regime = trial.suggest_categorical('use_regime_detection', [True, False])
+        
+        # NOTE: optimize_for was removed - the objective ALWAYS maximizes total return
+        # The old parameter was never actually used in the objective function
+        
+        # =================================================================
+        # Use PRE-COMPUTED labels and features (FAST)
+        # =================================================================
+        trial_labels = label_cache[peak_valley_order]
+        trial_features = feature_cache[use_regime]
+        
+        # Align data
+        common_idx = _raw_data.index.intersection(trial_features.index).intersection(trial_labels.index)
+        X = trial_features.loc[common_idx]
+        trial_labels_aligned = trial_labels.loc[common_idx]
+        trial_data = _raw_data.loc[common_idx]
+        
+        # Drop NaN rows
+        valid_mask = X.notna().all(axis=1) & trial_labels_aligned.notna()
+        X = X.loc[valid_mask]
+        trial_labels_aligned = trial_labels_aligned.loc[valid_mask]
+        trial_data = trial_data.loc[valid_mask]
+        
+        if len(X) < 100:
+            return -1.0  # Not enough data
+        
+        # Encode labels
+        le = LabelEncoder()
+        y_encoded = le.fit_transform(trial_labels_aligned)
+        classes = le.classes_
+        
+        # Find indices for Buy (1) and Sell (-1)
+        buy_class_idx = np.where(classes == 1)[0][0] if 1 in classes else None
+        sell_class_idx = np.where(classes == -1)[0][0] if -1 in classes else None
+        
+        # =================================================================
+        # 1. XGBoost Model Hyperparameters (9 params)
+        # =================================================================
+        # Calculate class weights based on ratio
+        class_counts = np.bincount(y_encoded)
+        hold_weight = 1.0
+        signal_weight = class_weight_ratio
+        sample_weights_map = {
+            0: signal_weight if classes[0] != 0 else hold_weight,
+            1: signal_weight if classes[1] != 0 else hold_weight,
+            2: signal_weight if len(classes) > 2 and classes[2] != 0 else hold_weight
+        }
+        
+        params = {
+            'n_estimators': trial.suggest_int('n_estimators', 50, 2000),
+            'max_depth': trial.suggest_int('max_depth', 2, 15),
+            'learning_rate': trial.suggest_float('learning_rate', 0.001, 0.5, log=True),
+            'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+            'gamma': trial.suggest_float('gamma', 0, 5),
+            'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+            'reg_alpha': trial.suggest_float('reg_alpha', 1e-3, 10.0, log=True),
+            'reg_lambda': trial.suggest_float('reg_lambda', 1e-3, 10.0, log=True),
+            
+            'n_jobs': threads_per_trial,
+            'verbosity': 0,
+            'random_state': 42,
+            'objective': 'multi:softprob',
+            'num_class': len(classes),
+            'tree_method': 'hist',  # Faster histogram-based algorithm
+        }
+        
+        # =================================================================
+        # 2. ML Signal Thresholds (Separate Buy/Sell)
+        # =================================================================
+        ml_buy_thresh = trial.suggest_float('ml_buy_thresh', 0.20, 0.90)
+        ml_sell_thresh = trial.suggest_float('ml_sell_thresh', 0.20, 0.90)
+        
+        # =================================================================
+        # 3. Slope/Composite Signal Thresholds
+        # =================================================================
+        use_slope_signals = trial.suggest_categorical('use_slope_signals', [True, False])
+        slope_buy_thresh = trial.suggest_float('slope_buy', -0.9, -0.1) if has_slope else -0.5
+        slope_sell_thresh = trial.suggest_float('slope_sell', 0.1, 0.9) if has_slope else 0.5
+        slope_roc_thresh = trial.suggest_float('slope_roc_thresh', 0.0, 0.3)
+        use_mom_zone = trial.suggest_categorical('use_mom_zone', [True, False])
+        
+        # =================================================================
+        # 4. ML Confirmation for Slope Signals
+        # =================================================================
+        use_ml_confirm = trial.suggest_categorical('use_ml_confirm', [True, False])
+        ml_confirm_thresh = trial.suggest_float('ml_confirm_thresh', 0.10, 0.50)
+        
+        # =================================================================
+        # 5. Market Filters
+        # =================================================================
+        use_adx_filter = trial.suggest_categorical('use_adx_filter', [True, False]) if has_adx else False
+        adx_threshold = trial.suggest_int('adx_threshold', 15, 35) if has_adx else 20
+        
+        use_trend_filter = trial.suggest_categorical('use_trend_filter', [True, False])
+        
+        # =================================================================
+        # Cross-Validation Backtest (3 Folds)
+        # =================================================================
+        tscv = TimeSeriesSplit(n_splits=3)
+        returns = []
+        max_drawdowns = []
+        trade_counts = []
+        
+        for train_idx, val_idx in tscv.split(X):
+            # Split
+            X_t, X_v = X.iloc[train_idx], X.iloc[val_idx]
+            y_t, y_v = y_encoded[train_idx], y_encoded[val_idx]
+            d_v = trial_data.iloc[val_idx]
+            
+            # Apply SMOTE if enabled
+            X_train_final, y_train_final = X_t.values, y_t
+            if use_smote:
+                try:
+                    from imblearn.over_sampling import SMOTE
+                    smote = SMOTE(random_state=42, k_neighbors=min(5, min(np.bincount(y_t)) - 1))
+                    X_train_final, y_train_final = smote.fit_resample(X_t.values, y_t)
+                except Exception:
+                    pass  # Fall back to original if SMOTE fails
+            
+            # Calculate sample weights based on class_weight_ratio
+            sample_weights = np.array([sample_weights_map.get(y, 1.0) for y in y_train_final])
+            
+            # Train Base Model with sample weights
+            model = xgb.XGBClassifier(**params)
+            model.fit(X_train_final, y_train_final, sample_weight=sample_weights)
+            
+            # Predict Probs
+            probs = model.predict_proba(X_v)
+            p_buy = probs[:, buy_class_idx] if buy_class_idx is not None else np.zeros(len(X_v))
+            p_sell = probs[:, sell_class_idx] if sell_class_idx is not None else np.zeros(len(X_v))
+            
+            # Generate Signals
+            sigs = pd.Series(0, index=X_v.index)
+            
+            # ML-based signals (separate thresholds)
+            ml_buy_mask = p_buy > ml_buy_thresh
+            ml_sell_mask = p_sell > ml_sell_thresh
+            
+            # Slope-based signals (if enabled)
+            slope_buy_mask = pd.Series(True, index=X_v.index)
+            slope_sell_mask = pd.Series(True, index=X_v.index)
+            
+            if use_slope_signals and has_slope and has_comp:
+                slope = X_v['slope']
+                comp = X_v['composite_oscillator']
+                
+                # Basic slope conditions
+                slope_buy_mask = (comp < slope_buy_thresh) & (slope > slope_roc_thresh)
+                slope_sell_mask = (comp > slope_sell_thresh) & (slope < -slope_roc_thresh)
+                
+                # Momentum zone override
+                if use_mom_zone:
+                    mom_zone = (comp > 0.2) & (comp < 0.3) & (slope > 0.1)
+                    slope_buy_mask = slope_buy_mask | mom_zone
+                
+                # ML confirmation for slope signals
+                if use_ml_confirm:
+                    slope_buy_mask = slope_buy_mask & (p_buy > ml_confirm_thresh)
+                    slope_sell_mask = slope_sell_mask & (p_sell > ml_confirm_thresh)
+            
+            # Combine ML and Slope signals
+            if use_slope_signals:
+                sigs[ml_buy_mask & slope_buy_mask] = 1
+                sigs[ml_sell_mask & slope_sell_mask] = -1
+            else:
+                sigs[ml_buy_mask] = 1
+                sigs[ml_sell_mask] = -1
+            
+            # Apply ADX Filter (block signals in low-trend environments)
+            if use_adx_filter and adx_col and adx_col in X_v.columns:
+                adx_vals = X_v[adx_col]
+                chop_mask = adx_vals < adx_threshold
+                sigs.loc[chop_mask] = 0
+            
+            # Apply Trend Filter (only long in uptrend)
+            if use_trend_filter and len(d_v) > 50:
+                sma50 = d_v['close'].rolling(50).mean()
+                bear_mask = d_v['close'] < sma50
+                # Block buys in downtrend
+                sigs.loc[bear_mask & (sigs == 1)] = 0
+            
+            # Calculate Returns (LONG-ONLY strategy, matching Production backtest)
+            # BUY (1) = enter long, SELL (-1) = exit to cash (NOT short)
+            daily_rets = d_v['close'].pct_change().shift(-1).fillna(0)
+            
+            # Track position state for proper long-only simulation
+            position = 0  # 0 = cash, 1 = long
+            strat_rets_list = []
+            
+            for idx in sigs.index:
+                sig = sigs.loc[idx]
+                ret = daily_rets.loc[idx]
+                
+                if sig == 1 and position == 0:  # BUY signal, not holding
+                    position = 1
+                    strat_rets_list.append(ret)  # Start earning returns
+                elif sig == -1 and position == 1:  # SELL signal, holding
+                    position = 0
+                    strat_rets_list.append(0)  # Exit to cash, no return
+                elif position == 1:  # Holding, no signal
+                    strat_rets_list.append(ret)  # Continue earning returns
+                else:  # In cash
+                    strat_rets_list.append(0)
+            
+            strat_rets = pd.Series(strat_rets_list, index=sigs.index)
+            total_ret = (1 + strat_rets).prod() - 1  # Compound returns
+            
+            # Calculate Max Drawdown for risk adjustment
+            cumulative = (1 + strat_rets).cumprod()
+            peak = cumulative.cummax()
+            drawdown = (cumulative - peak) / peak
+            max_dd = drawdown.min()
+            
+            # Track metrics
+            num_trades = (sigs != 0).sum()
+            trade_counts.append(num_trades)
+            max_drawdowns.append(max_dd)
+            
+            # Penalize inactivity
+            if num_trades < 5:
+                total_ret -= 0.5
+                
+            returns.append(total_ret)
+        
+        # Risk-adjusted objective: Return - Drawdown Penalty
+        avg_return = np.mean(returns)
+        avg_dd = np.mean(max_drawdowns)
+        avg_trades = np.mean(trade_counts)
+        
+        # Penalize excessive drawdown
+        dd_penalty = max(0, (-avg_dd - 0.15)) * 2  # Penalize DD > 15%
+        
+        # Penalize too few trades (want active strategy)
+        trade_penalty = max(0, (10 - avg_trades) * 0.02)  # Want at least 10 trades
+        
+        return avg_return - dd_penalty - trade_penalty
+
+    # Run Optimization
+    # Disable verbosity from Optuna to keep console clean for TQDM
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(direction='maximize')
+    
+    with tqdm(total=n_trials, file=sys.stdout, desc="Optimizing Strategy") as pbar:
+        def logging_callback(study, trial):
+            pbar.update(1)
+            best_val = study.best_value
+            pbar.set_description(f"Best Return: {best_val:.2%}")
+            
+            # Only update Streamlit if we are running sequentially (safe)
+            if n_jobs == 1 and progress_callback:
+                 progress_callback(trial.number, n_trials)
+        
+        study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs, callbacks=[logging_callback])
+    
+    print(f"\n✅ Optimization Complete. Best Return: {study.best_value:.2%}")
+    print("Best Params:", study.best_params)
+    
+    # Return params with best_value included
+    result = study.best_params.copy()
+    result['best_value'] = study.best_value
+    return result

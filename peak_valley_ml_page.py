@@ -116,6 +116,94 @@ with st.sidebar.expander("💡 Popular Tickers"):
 
 # Historical Data Period removed - using Training Period instead (no duplication)
 
+# ML Training Parameters (defined first so they can be used in detection methods)
+st.sidebar.subheader("🎛️ ML Training Parameters")
+
+# Parameter optimization section
+st.sidebar.info("🔬 **Parameter Settings:**\nUse recommended values or run optimization to find best params for your data")
+
+# Check if we have saved optimal parameters
+optimal_params_file = "optimal_parameters.json"
+has_optimal_params = os.path.exists(optimal_params_file)
+
+if has_optimal_params:
+    import json
+    with open(optimal_params_file, 'r') as f:
+        saved_optimal = json.load(f)
+    st.sidebar.success(f"✅ Found optimal params from {saved_optimal.get('timestamp', 'previous run')}")
+    use_optimal_settings = st.sidebar.checkbox(
+        "Use Optimal Settings",
+        value=st.session_state.get('use_optimal_settings', True),
+        key='use_optimal_settings',
+        help="Use parameters found through systematic optimization"
+    )
+else:
+    use_optimal_settings = st.sidebar.checkbox(
+        "Use Recommended Settings",
+        value=st.session_state.get('use_optimal_settings', True),
+        key='use_optimal_settings',
+        help="Use recommended starting parameters"
+    )
+
+if use_optimal_settings:
+    if has_optimal_params:
+        # Use saved optimal parameters
+        params = saved_optimal['params']
+        peak_window_size = params.get('window_size', 3)
+        lead_time_days = params.get('lead_time_days', 1)
+        min_peak_height_pct = params.get('min_peak_height_pct', 3.0)
+        class_weight_ratio = params.get('class_weight_ratio', 5)
+        
+        st.sidebar.success(f"✅ Using optimized parameters (score: {saved_optimal.get('score', 'N/A'):.2f})")
+    else:
+        # Use recommended defaults
+        peak_window_size = 3
+        lead_time_days = 1
+        min_peak_height_pct = 3.0
+        class_weight_ratio = 5
+        
+        st.sidebar.success("✅ Using recommended parameters")
+else:
+    # Manual control for experimentation
+    st.sidebar.warning("⚠️ Manual mode - adjust carefully")
+    
+    # Class weight ratio
+    class_weight_ratio = st.sidebar.slider(
+        "Class Weight Ratio (BUY/SELL vs HOLD)",
+        min_value=1,
+        max_value=20,
+        value=5,
+        help="Balances rare signals vs common HOLD. Lower=more selective"
+    )
+    
+    # Window size for peak/valley detection
+    peak_window_size = st.sidebar.slider(
+        "Peak/Valley Window Size",
+        min_value=3,
+        max_value=10,
+        value=3,
+        help="Days to look for local extrema. 3=sensitive, 10=major turns only"
+    )
+    
+    # Lead time before peak/valley
+    lead_time_days = st.sidebar.slider(
+        "Lead Time Before Peak/Valley (days)",
+        min_value=0,
+        max_value=5,
+        value=1,
+        help="Days before peak/valley to signal. 1=most accurate"
+    )
+    
+    # Minimum peak height
+    min_peak_height_pct = st.sidebar.slider(
+        "Min Peak/Valley Height (%)",
+        min_value=1.0,
+        max_value=10.0,
+        value=3.0,
+        step=0.5,
+        help="Price change threshold. Higher=fewer but stronger signals"
+    )
+
 # Peak/Valley detection parameters
 st.sidebar.subheader("Peak/Valley Detection")
 
@@ -128,23 +216,20 @@ detection_method = st.sidebar.selectbox(
 
 # Method-specific parameters (optimized for 22% signal balance)
 if detection_method == 'scipy_peaks':
-    prominence_pct = st.sidebar.slider("Prominence (%)", 0.3, 5.0, 0.5, 0.1)  # Optimized for 22% signals
-    distance = st.sidebar.slider("Min Distance (days)", 1, 30, 3)  # Optimized for 22% signals  
-    detection_params = {'prominence_pct': prominence_pct, 'distance': distance}
+    distance = st.sidebar.slider("Min Distance (days)", 1, 30, peak_window_size)  # Use peak_window_size  
+    detection_params = {'prominence_pct': min_peak_height_pct, 'distance': distance}
     
 elif detection_method == 'rolling_window':
-    window_short = st.sidebar.slider("Short Window", 3, 15, 5)
+    window_short = st.sidebar.slider("Short Window", 3, 15, peak_window_size)
     window_long = st.sidebar.slider("Long Window", 10, 40, 15)  # Reduced from 20
-    min_change_pct = st.sidebar.slider("Min Change (%)", 0.5, 10.0, 2.0, 0.5)  # Reduced from 3.0
     detection_params = {
         'window_short': window_short,
         'window_long': window_long, 
-        'min_change_pct': min_change_pct
+        'min_change_pct': min_peak_height_pct
     }
     
 elif detection_method == 'percentage_swing':
-    swing_pct = st.sidebar.slider("Swing Threshold (%)", 1.0, 15.0, 3.0, 0.5)  # Reduced from 5.0
-    detection_params = {'swing_pct': swing_pct}
+    detection_params = {'swing_pct': min_peak_height_pct}
     
 elif detection_method == 'multi_timeframe':
     short_window = st.sidebar.slider("Short Timeframe", 5, 20, 8)  # Reduced from 10
@@ -163,12 +248,15 @@ include_lagged = st.sidebar.checkbox("Include Lagged Features", True)
 include_rolling = st.sidebar.checkbox("Include Rolling Features", True)
 feature_selection = st.sidebar.checkbox("Automatic Feature Selection", True)
 
-# Model selection
-st.sidebar.subheader("ML Models")
+# Model selection with performance guidance
+st.sidebar.subheader("🤖 ML Models")
+st.sidebar.info("💡 **Best Performers:**\n1. XGBoost (fastest, good accuracy)\n2. LightGBM (handles imbalance well)\n3. Random Forest (stable, interpretable)")
+
 models_to_train = st.sidebar.multiselect(
     "Select Models to Train",
     ['random_forest', 'xgboost', 'lightgbm', 'svm'],
-    default=['random_forest', 'xgboost']
+    default=['xgboost', 'lightgbm'],  # Best performers
+    help="XGBoost and LightGBM typically perform best for time series"
 )
 
 # SMOTE balancing toggle
@@ -184,37 +272,38 @@ if use_smote:
 else:
     st.sidebar.info("📊 Will use original imbalanced data")
 
-# Hyperparameter optimization settings
-st.sidebar.subheader("🔍 Hyperparameter Optimization")
-use_optimization = st.sidebar.checkbox(
-    "Enable Optuna Optimization", 
-    value=False,
-    help="Automatically tune model parameters for better performance"
-)
+# Hyperparameter Optimization
+st.sidebar.subheader("🔧 Hyperparameter Optimization")
+st.sidebar.info("🎯 **Optuna optimizes:**\n• Model architecture params\n• Regularization strength\n• Learning rates\n• Tree depths")
 
-# Trading Filter Optimization REMOVED - Revolutionary Peak/Valley approach executes ALL signals
+use_optimization = st.sidebar.checkbox(
+    "Use Optuna Optimization", 
+    value=True,
+    help="Strongly recommended - finds best model parameters automatically"
+)
 
 if use_optimization:
     n_trials = st.sidebar.slider(
         "Optimization Trials",
         min_value=10,
-        max_value=200,
-        value=50,
+        max_value=1000,
+        value=100,  # Increased default
         step=10,
-        help="More trials = better optimization but longer training time"
+        help="100+ trials recommended for best results. More trials = better parameters."
     )
     st.sidebar.info(f"⏱️ Est. time: ~{n_trials * len(models_to_train) * 2:.0f}s")
 else:
     n_trials = 50  # Default value
 
 # === MAIN CONTENT TABS ===
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📊 Data & Labels", 
     "🔧 Feature Engineering",
     "🎯 Model Training", 
     "📈 Predictions",
-    "🏆 Performance",
-    "🚀 Production"
+    "🔍 Model Analysis",
+    "🏭 Production",
+    "🔬 Parameter Optimization"
 ])
 
 # Initialize session state
@@ -301,26 +390,55 @@ with tab1:
                     peak_indices = argrelextrema(highs, np.greater, order=window)[0]
                     valley_indices = argrelextrema(lows, np.less, order=window)[0]
                     
-                    # CREATE PREDICTIVE LABELS (1 day before peak/valley)
+                    # Filter peaks/valleys by minimum height requirement
+                    filtered_peak_indices = []
+                    for idx in peak_indices:
+                        if idx > 0 and idx < len(highs) - 1:
+                            peak_height = highs[idx]
+                            # Check if peak is at least min_peak_height_pct above surrounding values
+                            left_val = highs[max(0, idx - window)]
+                            right_val = highs[min(len(highs) - 1, idx + window)]
+                            min_surrounding = min(left_val, right_val)
+                            if (peak_height - min_surrounding) / min_surrounding * 100 >= min_peak_height_pct:
+                                filtered_peak_indices.append(idx)
+                    
+                    filtered_valley_indices = []
+                    for idx in valley_indices:
+                        if idx > 0 and idx < len(lows) - 1:
+                            valley_depth = lows[idx]
+                            # Check if valley is at least min_peak_height_pct below surrounding values
+                            left_val = lows[max(0, idx - window)]
+                            right_val = lows[min(len(lows) - 1, idx + window)]
+                            max_surrounding = max(left_val, right_val)
+                            if (max_surrounding - valley_depth) / max_surrounding * 100 >= min_peak_height_pct:
+                                filtered_valley_indices.append(idx)
+                    
+                    # Use filtered indices
+                    peak_indices = filtered_peak_indices
+                    valley_indices = filtered_valley_indices
+                    
+                    # CREATE PREDICTIVE LABELS (lead_time_days before peak/valley)
                     labels = pd.Series(0, index=data.index, name='signal')  # Default HOLD
                     
-                    # Label day BEFORE peaks as SELL (-1)
+                    # Label lead_time_days BEFORE peaks as SELL (-1)
                     for peak_idx in peak_indices:
-                        if peak_idx > 0:  # Ensure we have a previous day
-                            prev_day = data.index[peak_idx - 1]
-                            labels.loc[prev_day] = -1  # SELL signal day before peak
+                        if peak_idx >= lead_time_days:  # Ensure we have enough previous days
+                            prev_day = data.index[peak_idx - lead_time_days]
+                            labels.loc[prev_day] = -1  # SELL signal lead_time_days before peak
                     
-                    # Label day BEFORE valleys as BUY (1)  
+                    # Label lead_time_days BEFORE valleys as BUY (1)  
                     for valley_idx in valley_indices:
-                        if valley_idx > 0:  # Ensure we have a previous day
-                            prev_day = data.index[valley_idx - 1]
-                            labels.loc[prev_day] = 1   # BUY signal day before valley
+                        if valley_idx >= lead_time_days:  # Ensure we have enough previous days
+                            prev_day = data.index[valley_idx - lead_time_days]
+                            labels.loc[prev_day] = 1   # BUY signal lead_time_days before valley
                     
                     # Debug output for predictive labeling
                     st.info(f"""
                     🔬 **Predictive Labeling Debug:**
                     - Detection method: {detection_method}
                     - Window used: {window}
+                    - Lead time: {lead_time_days} days
+                    - Min peak height: {min_peak_height_pct}%
                     - Peaks found: {len(peak_indices)} 
                     - Valleys found: {len(valley_indices)}
                     - BUY labels generated: {(labels == 1).sum()}
@@ -566,6 +684,20 @@ with tab2:
                         else:
                             print(f"   ✅ Preview should show diverse values")
                         
+                        # Handle NaN values before storing
+                        nan_count = ml_features.isnull().sum().sum()
+                        if nan_count > 0:
+                            print(f"   ⚠️ Found {nan_count} NaN values in features")
+                            print(f"   📋 NaN counts by column (top 10):")
+                            nan_cols = ml_features.isnull().sum().sort_values(ascending=False).head(10)
+                            for col, count in nan_cols.items():
+                                if count > 0:
+                                    print(f"      - {col}: {count} NaNs")
+                            
+                            # Fill NaN values with 0
+                            ml_features = ml_features.fillna(0)
+                            print(f"   ✅ Filled NaN values with 0")
+                        
                         # Store results
                         st.session_state.ml_features = ml_features
                         st.session_state.ml_engineer = engineer
@@ -682,12 +814,127 @@ with tab3:
             st.warning(f"Could not initialize loader: {e}")
             
     st.markdown("---")
-    
+
     if not st.session_state.ml_features_ready:
         st.info("👈 Please generate features first in the 'Feature Engineering' tab")
     else:
+        # === TRAINING SETTINGS (Always visible) ===
+        with st.expander("⚙️ **Training Settings** (Adjust these to improve signal generation)", expanded=True):
+            st.markdown("""
+            **🚨 If your model generates too few signals, try these adjustments:**
+            """)
+
+            ts_col1, ts_col2, ts_col3 = st.columns(3)
+
+            with ts_col1:
+                train_class_weight = st.slider(
+                    "Class Weight Ratio",
+                    min_value=1, max_value=20, value=10, step=1,
+                    help="Higher = prioritize BUY/SELL over HOLD. Try 10-15 for more signals.",
+                    key="train_class_weight_override"
+                )
+                st.caption("Higher → More BUY/SELL signals")
+
+            with ts_col2:
+                train_window_size = st.slider(
+                    "Peak/Valley Window",
+                    min_value=2, max_value=10, value=3, step=1,
+                    help="Smaller = more sensitive detection. Try 3 for more peaks/valleys.",
+                    key="train_window_override"
+                )
+                st.caption("Smaller → More sensitive")
+
+            with ts_col3:
+                train_lead_time = st.slider(
+                    "Lead Time (days)",
+                    min_value=1, max_value=5, value=2, step=1,
+                    help="Days before peak/valley to signal. Try 2-3 for earlier signals.",
+                    key="train_lead_time_override"
+                )
+                st.caption("Higher → Earlier signals")
+
+            ts_col4, ts_col5 = st.columns(2)
+
+            with ts_col4:
+                train_use_smote = st.checkbox(
+                    "Enable SMOTE Balancing",
+                    value=True,
+                    help="Balance training data by oversampling minority classes",
+                    key="train_smote_override"
+                )
+
+            with ts_col5:
+                train_min_height = st.slider(
+                    "Min Peak Height (%)",
+                    min_value=1.0, max_value=10.0, value=2.0, step=0.5,
+                    help="Minimum price move to consider as peak/valley. Lower = more signals.",
+                    key="train_min_height_override"
+                )
+
+            # Override the sidebar values with these training-specific settings
+            class_weight_ratio = train_class_weight
+            peak_window_size = train_window_size
+            lead_time_days = train_lead_time
+            use_smote = train_use_smote
+            min_peak_height_pct = train_min_height
+
+            st.info(f"📊 **Current Settings:** Window={peak_window_size}, Lead={lead_time_days}d, Weight={class_weight_ratio}:1, SMOTE={'On' if use_smote else 'Off'}, MinHeight={min_peak_height_pct}%")
+
+            st.warning("""
+            ⚠️ **Important:** Window, Lead Time, and Min Height affect label generation.
+            If you change these, click **Regenerate Labels** below, then retrain.
+            """)
+
+            if st.button("🔄 Regenerate Labels with New Settings", key="regen_labels_btn"):
+                # Regenerate labels with current settings
+                if 'ml_raw_data' in st.session_state and st.session_state.ml_raw_data is not None:
+                    data = st.session_state.ml_raw_data
+                    try:
+                        from peak_valley_detector import PeakValleyDetector
+                        detector = PeakValleyDetector()
+
+                        # Detect peaks and valleys with new settings
+                        peaks, valleys = detector.detect_peaks_valleys(
+                            data,
+                            method='scipy_peaks',
+                            distance=train_window_size
+                        )
+
+                        # Create labels with lead time
+                        labels = pd.Series(0, index=data.index)
+
+                        # Label lead_time_days BEFORE peaks as SELL (-1)
+                        for peak_idx in peaks:
+                            if peak_idx >= train_lead_time:
+                                prev_day = data.index[peak_idx - train_lead_time]
+                                labels.loc[prev_day] = -1
+
+                        # Label lead_time_days BEFORE valleys as BUY (1)
+                        for valley_idx in valleys:
+                            if valley_idx >= train_lead_time:
+                                prev_day = data.index[valley_idx - train_lead_time]
+                                labels.loc[prev_day] = 1
+
+                        # Update session state
+                        st.session_state.ml_labels = labels
+                        st.session_state.ml_peaks = peaks
+                        st.session_state.ml_valleys = valleys
+                        st.session_state.ml_labels_ready = True
+
+                        buy_count = (labels == 1).sum()
+                        sell_count = (labels == -1).sum()
+                        st.success(f"✅ Labels regenerated! {buy_count} BUY, {sell_count} SELL signals (Window={train_window_size}, Lead={train_lead_time}d)")
+                        st.rerun()
+
+                    except Exception as e:
+                        st.error(f"Failed to regenerate labels: {e}")
+                else:
+                    st.error("No data loaded. Please load data in Tab 1 first.")
+
+        st.markdown("---")
+
         col1, col2 = st.columns([2, 1])
-        
+
         with col1:
             if st.button("🚀 Train ML Models", type="primary"):
                 if not models_to_train:
@@ -849,6 +1096,14 @@ with tab3:
                             # Update samples count after balancing
                             st.session_state.ml_train_samples_balanced = len(X_train)
                             
+                            # Create class weights based on class_weight_ratio
+                            # HOLD (0) gets weight 1, BUY/SELL get class_weight_ratio
+                            class_weights = {
+                                -1: class_weight_ratio,  # SELL
+                                0: 1,                    # HOLD
+                                1: class_weight_ratio    # BUY
+                            }
+                            
                             # Train selected models
                             results = {}
                             for model_name in models_to_train:
@@ -858,8 +1113,13 @@ with tab3:
                                     # Check if Optuna is available
                                     try:
                                         import optuna
-                                        # Use optimization
-                                        train_result = ml_models.train_with_optimization(model_name, X_train, y_train, n_trials=n_trials)
+                                        # Store class weights in ml_models instance for optimization to use
+                                        ml_models.class_weights = class_weights
+                                        # Use optimization (class weights will be applied internally)
+                                        train_result = ml_models.train_with_optimization(
+                                            model_name, X_train, y_train, 
+                                            n_trials=n_trials
+                                        )
                                         if 'error' not in train_result:
                                             eval_result = ml_models.evaluate_model(model_name, X_test, y_test)
                                             results[model_name] = {**train_result, **eval_result}
@@ -875,8 +1135,17 @@ with tab3:
                                             
                                     except ImportError:
                                         st.warning("⚠️ Optuna not available. Training with default parameters.")
-                                        # Fallback to regular training
-                                        train_result = ml_models.train_model(model_name, X_train, y_train)
+                                        # Fallback to regular training with class weights
+                                        model_params = {}
+                                        if model_name in ['random_forest', 'svm']:
+                                            # RandomForest and SVM support class_weight for multiclass
+                                            model_params['class_weight'] = class_weights
+                                        # Note: XGBoost/LightGBM don't support class weights for multiclass
+                                        
+                                        train_result = ml_models.train_model(
+                                            model_name, X_train, y_train,
+                                            model_params=model_params
+                                        )
                                         if 'error' not in train_result:
                                             eval_result = ml_models.evaluate_model(model_name, X_test, y_test)
                                             results[model_name] = {**train_result, **eval_result}
@@ -884,7 +1153,16 @@ with tab3:
                                             results[model_name] = train_result
                                 else:
                                     st.write(f"Training {model_name} with default parameters...")
-                                    train_result = ml_models.train_model(model_name, X_train, y_train)
+                                    model_params = {}
+                                    if model_name in ['random_forest', 'svm']:
+                                        # RandomForest and SVM support class_weight for multiclass
+                                        model_params['class_weight'] = class_weights
+                                    # Note: XGBoost/LightGBM don't support class weights for multiclass
+                                    
+                                    train_result = ml_models.train_model(
+                                        model_name, X_train, y_train,
+                                        model_params=model_params
+                                    )
                                     if 'error' not in train_result:
                                         eval_result = ml_models.evaluate_model(model_name, X_test, y_test)
                                         results[model_name] = {**train_result, **eval_result}
@@ -914,6 +1192,7 @@ with tab3:
             **🎯 Peak/Valley ML Training:**
             • Uses peaks/valleys as labels (not random)
             • {smote_status} ({smote_description})
+            • Class Weight Ratio: {class_weight_ratio}:1 (BUY/SELL:HOLD)
             • 163.8% potential vs 0.9% baseline
             
             **Selected Models:**
@@ -1052,7 +1331,12 @@ with tab4:
         if st.button("🎯 Generate Current Signals", type="primary"):
             with st.spinner("Generating predictions..."):
                 try:
-                    features = st.session_state.ml_features
+                    features = st.session_state.ml_features.copy()  # Make a copy to avoid modifying session state
+                    
+                    # Double-check for NaN values
+                    if features.isnull().any().any():
+                        st.warning(f"Found {features.isnull().sum().sum()} NaN values in features. Filling with 0...")
+                        features = features.fillna(0)
                     
                     # Generate predictions
                     predictions, probabilities = ml_models.predict_signals(features, selected_model)
@@ -1074,19 +1358,25 @@ with tab4:
                         
                         st.subheader("📋 Predictions by Data Split")
                         
-                        # Training Set
-                        train_mask = full_summary['Date'] <= split_date
-                        train_preds = full_summary[train_mask]
-                        
-                        with st.expander(f"Training Data Predictions ({len(train_preds)} samples)", expanded=False):
-                            st.dataframe(train_preds, use_container_width=True)
-                        
-                        # Testing Set
-                        test_mask = full_summary['Date'] > split_date
-                        test_preds = full_summary[test_mask]
-                        
-                        st.markdown(f"### 🧪 Testing Data Predictions ({len(test_preds)} samples)")
-                        st.dataframe(test_preds, use_container_width=True)
+                        # Check if Date column contains datetime objects
+                        if not pd.api.types.is_datetime64_any_dtype(full_summary['Date']):
+                            # If features.index was numeric, skip date-based splitting
+                            st.warning("Features index is not datetime-based. Showing all predictions.")
+                            st.dataframe(full_summary, use_container_width=True)
+                        else:
+                            # Training Set
+                            train_mask = full_summary['Date'] <= split_date
+                            train_preds = full_summary[train_mask]
+                            
+                            with st.expander(f"Training Data Predictions ({len(train_preds)} samples)", expanded=False):
+                                st.dataframe(train_preds, use_container_width=True)
+                            
+                            # Testing Set
+                            test_mask = full_summary['Date'] > split_date
+                            test_preds = full_summary[test_mask]
+                            
+                            st.markdown(f"### 🧪 Testing Data Predictions ({len(test_preds)} samples)")
+                            st.dataframe(test_preds, use_container_width=True)
                         
                     else:
                         # Fallback to simple view
@@ -1111,15 +1401,27 @@ with tab4:
                     # 🎯 PEAK/VALLEY ENHANCEMENT: Candlestick Chart with Signals
                     st.subheader("📊 Candlestick Chart with Peak/Valley Signals")
                     
-                    # Get price data
+                    # Get price data - use same subset as Production tab for consistency
                     raw_data = st.session_state.ml_raw_data
+                    
+                    # Default to last 180 days to match Production tab default
+                    lookback_days = 180
+                    if len(raw_data) > lookback_days:
+                        raw_data = raw_data.tail(lookback_days)
+                        # Also subset predictions to match
+                        predictions = predictions[-lookback_days:]
+                        if probabilities is not None:
+                            probabilities = probabilities[-lookback_days:]
+                            confidence = np.max(probabilities, axis=1)
+                    
+                    x_price = raw_data.index.to_pydatetime()
                     
                     # Create candlestick chart
                     fig = go.Figure()
                     
                     # Add candlestick
                     fig.add_trace(go.Candlestick(
-                        x=raw_data.index,
+                        x=x_price,
                         open=raw_data['open'],
                         high=raw_data['high'], 
                         low=raw_data['low'],
@@ -1143,7 +1445,7 @@ with tab4:
                             peak_highs = raw_data.loc[peak_points, 'high']
                             peak_prices = peak_highs.values * 1.02  # Slightly above high
                             fig.add_trace(go.Scatter(
-                                x=peak_points,
+                                x=peak_points.to_pydatetime(),
                                 y=peak_prices,
                                 mode='markers',
                                 name='Actual Peaks',
@@ -1165,7 +1467,7 @@ with tab4:
                             valley_lows = raw_data.loc[valley_points, 'low']
                             valley_prices = valley_lows.values * 0.98  # Slightly below low
                             fig.add_trace(go.Scatter(
-                                x=valley_points,
+                                x=valley_points.to_pydatetime(),
                                 y=valley_prices,
                                 mode='markers',
                                 name='Actual Valleys',
@@ -1180,12 +1482,30 @@ with tab4:
                             st.warning(f"Could not plot valleys: {e}")
                     
                     # Overlay ML predictions (with different symbols) - safe access
-                    # Align features index with raw_data index  
-                    common_pred_idx = features.index.intersection(raw_data.index)
-                    
-                    if len(common_pred_idx) > 0:
+                    # Convert predictions to Series with proper index for alignment
+                    # predictions was already subset to last lookback_days at line 1412
+                    # raw_data was also subset to last lookback_days at line 1410
+                    # So they should be aligned by position
+
+                    if len(predictions) == len(raw_data):
+                        # Predictions and raw_data are same length - align by position
+                        predictions_series = pd.Series(predictions, index=raw_data.index)
+                        common_pred_idx = raw_data.index
+                        aligned_data = raw_data
+                        aligned_predictions = predictions_series.values
+                    else:
+                        # Different lengths - try to find common index
+                        # Create predictions series with features index, then intersect
+                        full_features = st.session_state.ml_features
+                        predictions_series = pd.Series(
+                            ml_models.predict_signals(full_features, selected_model)[0],
+                            index=full_features.index
+                        )
+                        common_pred_idx = predictions_series.index.intersection(raw_data.index)
                         aligned_data = raw_data.loc[common_pred_idx]
-                        aligned_predictions = predictions[:len(common_pred_idx)]
+                        aligned_predictions = predictions_series.loc[common_pred_idx].values
+
+                    if len(common_pred_idx) > 0:
                         
                         # ML BUY predictions - ensure boolean array
                         ml_buy_mask = np.array(aligned_predictions == 1)
@@ -1195,7 +1515,7 @@ with tab4:
                                 ml_buy_lows = aligned_data.loc[ml_buy_dates, 'low']
                                 ml_buy_prices = ml_buy_lows.values * 0.95  # Lower than valleys
                                 fig.add_trace(go.Scatter(
-                                    x=ml_buy_dates,
+                                    x=ml_buy_dates.to_pydatetime(),
                                     y=ml_buy_prices,
                                     mode='markers',
                                     name='ML BUY Signals',
@@ -1217,7 +1537,7 @@ with tab4:
                                 ml_sell_highs = aligned_data.loc[ml_sell_dates, 'high']
                                 ml_sell_prices = ml_sell_highs.values * 1.05  # Higher than peaks
                                 fig.add_trace(go.Scatter(
-                                    x=ml_sell_dates,
+                                    x=ml_sell_dates.to_pydatetime(),
                                     y=ml_sell_prices,
                                     mode='markers',
                                     name='ML SELL Signals',
@@ -1234,12 +1554,31 @@ with tab4:
                     # Add train/test split line if available
                     if 'ml_split_date' in st.session_state:
                         split_date = st.session_state.ml_split_date
-                        fig.add_vline(
-                            x=split_date,
-                            line_dash="dash",
-                            line_color="blue",
-                            annotation_text="Train/Test Split",
-                            annotation_position="top"
+                        # Convert to datetime if needed
+                        if isinstance(split_date, pd.Timestamp):
+                            split_datetime = split_date.to_pydatetime()
+                        else:
+                            split_datetime = split_date
+                        
+                        # Add vertical line using shapes instead of add_vline to avoid datetime arithmetic issues
+                        fig.add_shape(
+                            type="line",
+                            x0=split_datetime,
+                            x1=split_datetime,
+                            y0=0,
+                            y1=1,
+                            yref="paper",
+                            line=dict(color="blue", width=2, dash="dash")
+                        )
+                        
+                        # Add annotation separately
+                        fig.add_annotation(
+                            x=split_datetime,
+                            y=1.05,
+                            yref="paper",
+                            text="Train/Test Split",
+                            showarrow=False,
+                            font=dict(color="blue")
                         )
                     
                     # Configure layout
@@ -1265,12 +1604,13 @@ with tab4:
                     
                     # Signal accuracy analysis
                     st.subheader("🎯 Signal Accuracy Analysis")
-                    
-                    # Compare ML predictions vs actual labels - safe alignment
-                    accuracy_idx = features.index.intersection(labels.index)
+
+                    # Compare ML predictions vs actual labels - proper alignment using Series
+                    # Use predictions_series created above (already has proper index)
+                    accuracy_idx = predictions_series.index.intersection(labels.index)
                     if len(accuracy_idx) > 0:
                         aligned_labels = labels.loc[accuracy_idx]
-                        aligned_preds = predictions[:len(accuracy_idx)]
+                        aligned_preds = predictions_series.loc[accuracy_idx]
                     
                         col1, col2, col3 = st.columns(3)
                         
@@ -1915,7 +2255,9 @@ with tab6:
     # This prevents Tab 6 from interfering with Tab 3 training
     if st.session_state.get('training_in_progress', False):
         st.warning("⏳ Training in progress... Production tab will load after training completes.")
-        st.stop()
+        st.session_state['pv_production_skip'] = True
+    else:
+        st.session_state['pv_production_skip'] = False
     
     # 🎯 PEAK/VALLEY PRODUCTION HIGHLIGHTS
     st.markdown("""
@@ -2039,9 +2381,104 @@ with tab6:
             
         if health['issues']:
             st.warning(f"⚠️ System Issues: {', '.join(health['issues'])}")
-            
+
         st.markdown("---")
-        
+
+        # === 1.5 SIGNAL GENERATION SETTINGS (FIX FOR CLASS IMBALANCE) ===
+        # ---------------------------------------------------------
+        with st.expander("🎯 **Signal Generation Settings** (Click to tune - IMPORTANT for fixing low signal count)", expanded=True):
+            st.markdown("""
+            **Why this matters:** Your model predicts HOLD 98% of the time because of class imbalance.
+            Lowering the probability threshold from 50% to 30% can significantly increase signal count.
+            """)
+
+            sg_col1, sg_col2 = st.columns(2)
+
+            with sg_col1:
+                # Probability threshold - KEY FIX for class imbalance
+                prob_threshold = st.slider(
+                    "ML Probability Threshold",
+                    min_value=0.15, max_value=0.60, value=0.30, step=0.05,
+                    help="Lower = more signals. 0.30 recommended (vs default 0.50 which causes too few signals)",
+                    key="prod_prob_threshold"
+                )
+
+                st.caption(f"At {prob_threshold:.0%}: Model will signal BUY/SELL when confidence >= {prob_threshold:.0%}")
+
+            with sg_col2:
+                # Hybrid mode toggle
+                use_hybrid_signals = st.checkbox(
+                    "Enable Hybrid ML + RSI Signals",
+                    value=True,
+                    help="Adds RSI-based signals when ML misses extreme oversold/overbought conditions",
+                    key="prod_use_hybrid"
+                )
+
+                if use_hybrid_signals:
+                    rsi_col1, rsi_col2 = st.columns(2)
+                    with rsi_col1:
+                        rsi_oversold = st.number_input("RSI Oversold (BUY)", min_value=10, max_value=40, value=25, key="prod_rsi_os")
+                    with rsi_col2:
+                        rsi_overbought = st.number_input("RSI Overbought (SELL)", min_value=60, max_value=90, value=75, key="prod_rsi_ob")
+                else:
+                    rsi_oversold = 25
+                    rsi_overbought = 75
+
+            st.markdown("---")
+            st.markdown("**📊 Composite Tech Indicator Signals (Recommended - addresses model undertrade issue)**")
+
+            use_composite_signals = st.checkbox(
+                "Enable Composite Tech Signals",
+                value=True,
+                help="Uses composite oscillator (RSI+WillR+CCI+ROC) for additional BUY/SELL signals when ML says HOLD",
+                key="prod_use_composite"
+            )
+
+            if use_composite_signals:
+                comp_col1, comp_col2, comp_col3 = st.columns(3)
+                with comp_col1:
+                    comp_oversold = st.slider(
+                        "Composite Oversold (BUY)",
+                        min_value=-1.0, max_value=0.0, value=-0.5, step=0.1,
+                        help="BUY when composite < this value",
+                        key="prod_comp_os"
+                    )
+                with comp_col2:
+                    comp_overbought = st.slider(
+                        "Composite Overbought (SELL)",
+                        min_value=0.0, max_value=1.0, value=0.5, step=0.1,
+                        help="SELL when composite > this value",
+                        key="prod_comp_ob"
+                    )
+                with comp_col3:
+                    use_comp_crossover = st.checkbox(
+                        "Use Crossover Signals",
+                        value=True,
+                        help="BUY when crossing above oversold, SELL when crossing below overbought",
+                        key="prod_comp_cross"
+                    )
+            else:
+                comp_oversold = -0.5
+                comp_overbought = 0.5
+                use_comp_crossover = False
+
+            # Store settings in session_state so they persist and are accessible everywhere
+            st.session_state['prod_settings'] = {
+                'prob_threshold': prob_threshold,
+                'use_hybrid_signals': use_hybrid_signals,
+                'rsi_oversold': rsi_oversold,
+                'rsi_overbought': rsi_overbought,
+                'use_composite_signals': use_composite_signals,
+                'comp_oversold': comp_oversold,
+                'comp_overbought': comp_overbought,
+                'use_comp_crossover': use_comp_crossover
+            }
+
+            # Show current settings summary
+            st.success(f"**Current Settings:** Threshold={prob_threshold:.0%}, RSI Hybrid={'On' if use_hybrid_signals else 'Off'}, Composite={'On' if use_composite_signals else 'Off'}")
+
+        st.markdown("---")
+
         # === 2. MODEL PERFORMANCE PROFILE ===
         # ---------------------------------------------------------
         if config.get('active_model_path'):
@@ -2363,6 +2800,26 @@ with tab6:
                         st.rerun()
                 
                 # --- DATA LOADING & INCREMENTAL UPDATE LOGIC ---
+                disable_data_load = st.session_state.get('pv_production_skip', False)
+                auto_refresh = st.checkbox(
+                    "Auto-refresh data (hourly)",
+                    value=False,
+                    key="pv_prod_auto_refresh"
+                )
+                refresh_now = st.button(
+                    "🔄 Load/Refresh Production Data",
+                    type="secondary",
+                    key="pv_prod_refresh_now",
+                    disabled=disable_data_load
+                )
+
+                use_dl_features = False
+                active_model_path = config.get('active_model_path')
+                dl_path = None
+                if active_model_path:
+                    dl_path = active_model_path.replace('.joblib', '_dl_extractor.h5')
+                    use_dl_features = bool(dl_path and os.path.exists(dl_path))
+
                 features = None
                 raw_data = None
                 data_updated = False
@@ -2381,6 +2838,7 @@ with tab6:
                     time_diff = now - last_date
                     
                     should_update = (live_mode and time_diff.total_seconds() > 3600)
+                    should_update = (auto_refresh and time_diff.total_seconds() > 3600) or refresh_now
                     
                     if should_update:
                         # Use the current selected ticker, fallback to model's ticker (NO HARDCODING)
@@ -2430,21 +2888,15 @@ with tab6:
                                         
                                         # Re-engineer features (Need context, so pass full updated df)
                                         engineer = MLFeatureEngineer()
-                                        
-                                        # CRITICAL: Load DL Extractor for Incremental Update too!
-                                        active_model_path = config.get('active_model_path')
-                                        if active_model_path:
-                                            dl_path = active_model_path.replace('.joblib', '_dl_extractor.h5')
-                                            if os.path.exists(dl_path):
-                                                engineer.load_dl_model(dl_path)
-                                        
-                                        # CRITICAL FIX: Ensure DL features are generated for updates too
+                                        if use_dl_features and dl_path:
+                                            engineer.load_dl_model(dl_path)
+
                                         updated_features = engineer.prepare_ml_dataset(
                                             updated_raw,
                                             include_lagged=True,
                                             include_rolling=True,
                                             feature_selection=False,
-                                            use_dl_features=True # Force DL generation
+                                            use_dl_features=use_dl_features
                                         )
                                         
                                         # Update Session State
@@ -2464,111 +2916,100 @@ with tab6:
                 
                 else:
                     # Initial Load (No data exists)
-                    # Use the current selected ticker, fallback to model's ticker (NO HARDCODING)
-                    model_ticker = meta.get('ticker', st.session_state.get('selected_ticker'))
-                    current_ticker = st.session_state.get('selected_ticker', model_ticker)
-                    
-                    # Show what ticker we're loading
-                    if current_ticker != model_ticker:
-                        st.info(f"📊 Loading **{current_ticker}** data (model was trained on {model_ticker})")
-                    
-                    ticker = current_ticker
-                    # Use the same period as training to ensure indicator consistency
-                    train_period = meta.get('period', '5y')
-                    saved_at = meta.get('saved_at')
-                    
-                    # Attempt to calculate fixed start date to prevent indicator drift
-                    # Indicators like EMA depend on start date. If period='5y', the start shifts every day.
-                    # We want to anchor to (Model Saved Date - 5y) so the history remains stable.
-                    fixed_start = None
-                    if saved_at and train_period.endswith('y'):
-                        try:
-                            saved_dt = pd.to_datetime(saved_at)
-                            years = int(train_period[:-1])
-                            fixed_start = (saved_dt - timedelta(days=years*365)).strftime('%Y-%m-%d')
-                        except:
-                            pass
-                    
-                    with st.spinner(f"Initializing production data for {ticker} ({train_period})..."):
-                        try:
-                            # FORCE REAL HISTORICAL DATA - prevent test/future data (same logic as Tab 1)
-                            from datetime import datetime, timedelta
-                            
-                            if fixed_start:
-                                df = yf.Ticker(ticker).history(start=fixed_start, interval="1d")
-                            else:
-                                # Calculate explicit start date to ensure real historical data
-                                end_date = datetime.now().date()
-                                if train_period == '1y':
-                                    start_date = end_date - timedelta(days=365)
-                                elif train_period == '2y':
-                                    start_date = end_date - timedelta(days=730)
-                                elif train_period == '3y':
-                                    start_date = end_date - timedelta(days=1095)
-                                elif train_period == '5y':
-                                    start_date = end_date - timedelta(days=1825)
+                    if disable_data_load:
+                        st.info("Production data loading is disabled while training is in progress.")
+                    else:
+                        # Auto-load data on first visit
+                        if 'production_data_loaded' not in st.session_state:
+                            st.session_state.production_data_loaded = True
+                            refresh_now = True
+                        
+                    if refresh_now:
+                        # Use the current selected ticker, fallback to model's ticker (NO HARDCODING)
+                        model_ticker = meta.get('ticker', st.session_state.get('selected_ticker'))
+                        current_ticker = st.session_state.get('selected_ticker', model_ticker)
+                        
+                        # Show what ticker we're loading
+                        if current_ticker != model_ticker:
+                            st.info(f"📊 Loading **{current_ticker}** data (model was trained on {model_ticker})")
+                        
+                        ticker = current_ticker
+                        # Use the same period as training to ensure indicator consistency
+                        train_period = meta.get('period', '5y')
+                        saved_at = meta.get('saved_at')
+                        
+                        # Attempt to calculate fixed start date to prevent indicator drift
+                        # Indicators like EMA depend on start date. If period='5y', the start shifts every day.
+                        # We want to anchor to (Model Saved Date - 5y) so the history remains stable.
+                        fixed_start = None
+                        if saved_at and train_period.endswith('y'):
+                            try:
+                                saved_dt = pd.to_datetime(saved_at)
+                                years = int(train_period[:-1])
+                                fixed_start = (saved_dt - timedelta(days=years*365)).strftime('%Y-%m-%d')
+                            except:
+                                pass
+                        
+                        with st.spinner(f"Initializing production data for {ticker} ({train_period})..."):
+                            try:
+                                from datetime import datetime, timedelta
+
+                                if fixed_start:
+                                    df = yf.Ticker(ticker).history(start=fixed_start, interval="1d")
                                 else:
-                                    start_date = end_date - timedelta(days=1825)  # Default 5y
-                                
-                                df = yf.Ticker(ticker).history(start=start_date, end=end_date, interval="1d")
-                            
-                            # Verify we don't have future data
-                            if not df.empty:
-                                latest_date = df.index[-1].date()
-                                if latest_date > datetime.now().date():
-                                    st.error(f"❌ Invalid future data detected: {latest_date}. Using fallback period loading.")
-                                    df = yf.Ticker(ticker).history(period=train_period, interval="1d")
-                            
-                            # Ticker.history returns Index name 'Date' (with timezone usually), and columns capitalized
-                            if isinstance(df.columns, pd.MultiIndex):
-                                df.columns = df.columns.get_level_values(0)
-                                
-                            # Ensure columns match training format (lowercase)
-                            df.columns = [c.lower() for c in df.columns]
-                            
-                            # Check if empty
-                            if df.empty:
-                                st.error("No data returned from Yahoo Finance.")
-                            
-                            # Engineer features
-                            engineer = MLFeatureEngineer()
-                            
-                            # CRITICAL: Try to load the matching DL Extractor for the ACTIVE model
-                            # Use active model path from config, not selected_model (fixes double-activation bug)
-                            active_model_path = config.get('active_model_path')
-                            if active_model_path:
-                                # Construct expected DL path: model.joblib -> model_dl_extractor.h5
-                                dl_path = active_model_path.replace('.joblib', '_dl_extractor.h5')
-                                
-                                if os.path.exists(dl_path):
-                                    st.info(f"📂 Found matching DL Extractor: {os.path.basename(dl_path)}")
+                                    end_date = datetime.now().date()
+                                    if train_period == '1y':
+                                        start_date = end_date - timedelta(days=365)
+                                    elif train_period == '2y':
+                                        start_date = end_date - timedelta(days=730)
+                                    elif train_period == '3y':
+                                        start_date = end_date - timedelta(days=1095)
+                                    elif train_period == '5y':
+                                        start_date = end_date - timedelta(days=1825)
+                                    else:
+                                        start_date = end_date - timedelta(days=1825)
+
+                                    df = yf.Ticker(ticker).history(start=start_date, end=end_date, interval="1d")
+
+                                if not df.empty:
+                                    latest_date = df.index[-1].date()
+                                    if latest_date > datetime.now().date():
+                                        st.error(f"❌ Invalid future data detected: {latest_date}. Using fallback period loading.")
+                                        df = yf.Ticker(ticker).history(period=train_period, interval="1d")
+
+                                if isinstance(df.columns, pd.MultiIndex):
+                                    df.columns = df.columns.get_level_values(0)
+
+                                df.columns = [c.lower() for c in df.columns]
+
+                                if df.empty:
+                                    st.error("No data returned from Yahoo Finance.")
+
+                                engineer = MLFeatureEngineer()
+
+                                if use_dl_features and dl_path:
                                     engineer.load_dl_model(dl_path)
-                                else:
-                                    st.warning("⚠️ No matching DL Extractor found. Training new one (Features may drift!).")
-                            
-                            # Generate ALL features (no selection) to ensure we have what the model needs
-                            # We will filter to model_features later
-                            # CRITICAL FIX: Force DL features and disable selection for production consistency
-                            df_features = engineer.prepare_ml_dataset(
-                                df,
-                                include_lagged=True,
-                                include_rolling=True,
-                                feature_selection=False,
-                                use_dl_features=True  # Force DL generation
-                            )
-                            
-                            st.session_state.ml_raw_data = df
-                            st.session_state.ml_features = df_features
-                            raw_data = df
-                            features = df_features
-                        except Exception as e:
-                            st.error(f"Failed to load production data: {e}")
+
+                                df_features = engineer.prepare_ml_dataset(
+                                    df,
+                                    include_lagged=True,
+                                    include_rolling=True,
+                                    feature_selection=False,
+                                    use_dl_features=use_dl_features
+                                )
+
+                                st.session_state.ml_raw_data = df
+                                st.session_state.ml_features = df_features
+                                raw_data = df
+                                features = df_features
+                            except Exception as e:
+                                st.error(f"Failed to load production data: {e}")
 
                 # --- RENDER MONITOR ---
                 if features is not None and raw_data is not None:
                     
-                    # Dashboard Settings
-                    with st.expander("⚙️ Dashboard Settings", expanded=False):
+                    # Dashboard Settings (Chart duration only - Signal settings are above)
+                    with st.expander("⚙️ Chart Settings", expanded=False):
                         # Increased max to 2000 to allow full history validation
                         lookback_days = st.slider("Chart & Stats Duration (Days)", min_value=30, max_value=2000, value=180, step=30)
 
@@ -2612,54 +3053,279 @@ with tab6:
                     else:
                         X_input = subset_features
                         
-                    # Bulk Prediction
-                    raw_signals = prod_model.predict(X_input)
-                    
-                    # DECODE SIGNALS - CRITICAL FIX
-                    # Check if model already outputs trading signals (-1, 0, 1)
-                    raw_unique = np.unique(raw_signals)
-                    is_already_trading_format = set(raw_unique).issubset({-1, 0, 1})
-                    
-                    if is_already_trading_format:
-                        # Model already outputs correct trading signals - DON'T REMAP!
-                        signals = raw_signals
-                        st.success("✅ **Model outputs trading signals directly** - No decoding needed!")
-                        st.write(f"   Signals: {raw_unique} (already in -1=SELL, 0=HOLD, 1=BUY format)")
-                    elif prod_label_encoder:
-                        # Use the label encoder to convert back to original labels
-                        try:
-                            signals = prod_label_encoder.inverse_transform(raw_signals)
-                            encoder_mapping = dict(zip(range(len(prod_label_encoder.classes_)), prod_label_encoder.classes_))
-                            st.write(f"🔧 **Using Label Encoder:** {encoder_mapping}")
-                        except Exception as e:
-                            st.error(f"Label encoder failed: {e}")
-                            # Fall back to manual mapping
-                            signal_mapping = {0: -1, 1: 0, 2: 1}
-                            signals = np.array([signal_mapping.get(s, 0) for s in raw_signals])
-                            st.warning("⚠️ **Label Encoder Failed** - Using manual mapping: {0: -1 (SELL), 1: 0 (HOLD), 2: 1 (BUY)}")
-                    else:
-                        # Manual conversion: Assume 0=Sell(-1), 1=Hold(0), 2=Buy(1) 
-                        signal_mapping = {0: -1, 1: 0, 2: 1}  # Standard ML classification to trading signals
-                        signals = np.array([signal_mapping.get(s, 0) for s in raw_signals])
-                        st.warning("⚠️ **No Label Encoder Found** - Using manual mapping: {0: -1 (SELL), 1: 0 (HOLD), 2: 1 (BUY)}")
-                    
-                    # Comprehensive debugging
-                    decoded_unique = np.unique(signals)
-                    st.write(f"**🔄 Signal Conversion:** Raw {raw_unique} → Decoded {decoded_unique}")
-                    
-                    # Show actual signal distribution
-                    for i, raw_val in enumerate(raw_unique):
-                        corresponding_decoded = signals[raw_signals == raw_val]
-                        decoded_val = np.unique(corresponding_decoded)[0] if len(np.unique(corresponding_decoded)) == 1 else "MIXED"
-                        count = np.sum(raw_signals == raw_val)
-                        st.write(f"  • Raw {raw_val} → Decoded {decoded_val} ({count} occurrences)")
+                    # ============================================================
+                    # ENHANCED PREDICTION WITH CUSTOM THRESHOLD (FIX FOR CLASS IMBALANCE)
+                    # ============================================================
+                    # Instead of using predict() which uses 0.5 threshold, we use
+                    # predict_proba() with custom threshold to generate more signals
+
+                    # Read settings from session_state (set in Settings expander above)
+                    prod_settings = st.session_state.get('prod_settings', {})
+                    prob_threshold = prod_settings.get('prob_threshold', 0.30)
+                    use_hybrid_signals = prod_settings.get('use_hybrid_signals', True)
+                    rsi_oversold = prod_settings.get('rsi_oversold', 25)
+                    rsi_overbought = prod_settings.get('rsi_overbought', 75)
+                    use_composite_signals = prod_settings.get('use_composite_signals', True)
+                    comp_oversold = prod_settings.get('comp_oversold', -0.5)
+                    comp_overbought = prod_settings.get('comp_overbought', 0.5)
+                    use_comp_crossover = prod_settings.get('use_comp_crossover', True)
+
+                    # Debug: Show settings being used
+                    st.write(f"🔧 **Using Settings:** Threshold={prob_threshold:.0%}, RSI={'On' if use_hybrid_signals else 'Off'}, Composite={'On' if use_composite_signals else 'Off'}")
 
                     if hasattr(prod_model, 'predict_proba'):
+                        # Get probabilities for all classes
                         probs = prod_model.predict_proba(X_input)
                         confidences = np.max(probs, axis=1)
+
+                        # Also get raw predictions for debug display
+                        raw_signals = prod_model.predict(X_input)
+
+                        # Determine class indices
+                        # sklearn LabelEncoder encodes [-1, 0, 1] → [0, 1, 2]
+                        # So: index 0 = SELL (-1), index 1 = HOLD (0), index 2 = BUY (1)
+                        if hasattr(prod_model, 'classes_'):
+                            classes = list(prod_model.classes_)
+                            # Check if classes are already in original format [-1, 0, 1]
+                            if -1 in classes:
+                                # Original labels preserved
+                                sell_idx = classes.index(-1)
+                                hold_idx = classes.index(0)
+                                buy_idx = classes.index(1)
+                            else:
+                                # Encoded labels [0, 1, 2] → map to positions
+                                # Standard sklearn encoding: sorted original → 0,1,2
+                                # [-1, 0, 1] sorted is [-1, 0, 1] → encoded [0, 1, 2]
+                                sell_idx = 0   # Class 0 = original -1 (SELL)
+                                hold_idx = 1   # Class 1 = original 0 (HOLD)
+                                buy_idx = 2    # Class 2 = original 1 (BUY)
+                        else:
+                            # Default: assume standard encoding
+                            sell_idx, hold_idx, buy_idx = 0, 1, 2
+                            classes = [0, 1, 2]
+
+                        # Extract probabilities for BUY and SELL
+                        buy_probs = probs[:, buy_idx]
+                        sell_probs = probs[:, sell_idx]
+
+                        # Apply CUSTOM THRESHOLD (key fix for class imbalance)
+                        signals = np.zeros(len(probs), dtype=int)
+                        signals[buy_probs >= prob_threshold] = 1   # BUY when prob >= threshold
+                        signals[sell_probs >= prob_threshold] = -1  # SELL when prob >= threshold
+
+                        # If both BUY and SELL exceed threshold, pick the stronger one
+                        both_triggered = (buy_probs >= prob_threshold) & (sell_probs >= prob_threshold)
+                        signals[both_triggered & (buy_probs > sell_probs)] = 1
+                        signals[both_triggered & (sell_probs >= buy_probs)] = -1
+
+                        st.success(f"✅ **Using Custom Threshold: {prob_threshold:.0%}** (vs default 50%)")
+                        st.write(f"   Model classes: {classes} → SELL idx={sell_idx}, HOLD idx={hold_idx}, BUY idx={buy_idx}")
+
                     else:
-                        confidences = np.zeros(len(signals))
+                        # Fallback to standard predict if no predict_proba
+                        raw_signals = prod_model.predict(X_input)
+                        confidences = np.zeros(len(raw_signals))
                         probs = None
+
+                        # Decode signals
+                        raw_unique = np.unique(raw_signals)
+                        is_already_trading_format = set(raw_unique).issubset({-1, 0, 1})
+
+                        if is_already_trading_format:
+                            signals = raw_signals
+                        else:
+                            signal_mapping = {0: -1, 1: 0, 2: 1}
+                            signals = np.array([signal_mapping.get(s, 0) for s in raw_signals])
+
+                        st.warning("⚠️ Model doesn't support predict_proba - using default threshold")
+
+                    # ============================================================
+                    # HYBRID RSI SIGNALS (catch extreme conditions ML might miss)
+                    # ============================================================
+                    hybrid_buy_added = 0
+                    hybrid_sell_added = 0
+
+                    # Get the FULL features DataFrame (before filtering to model features)
+                    # This has all calculated indicators including RSI and composite_oscillator
+                    full_features = features.tail(lookback_days).copy()
+
+                    # Find RSI column in FULL features (not subset_features which is filtered)
+                    rsi_col = None
+                    rsi_source = None
+                    # Check full features first (where all indicators are)
+                    for col_name in ['RSI_14', 'rsi_14', 'rsi', 'RSI', 'RSI_14_lag_0']:
+                        if col_name in full_features.columns:
+                            rsi_col = col_name
+                            rsi_source = full_features
+                            break
+                    # Fallback to subset_features
+                    if rsi_col is None:
+                        for col_name in ['RSI_14', 'rsi_14', 'rsi', 'RSI', 'RSI_14_lag_0']:
+                            if col_name in subset_features.columns:
+                                rsi_col = col_name
+                                rsi_source = subset_features
+                                break
+
+                    if use_hybrid_signals and rsi_col is not None:
+                        rsi_values = rsi_source[rsi_col].values
+
+                        for i in range(len(signals)):
+                            # Only add RSI signal if ML said HOLD
+                            if signals[i] == 0:
+                                if rsi_values[i] < rsi_oversold:
+                                    signals[i] = 1  # RSI oversold → BUY
+                                    hybrid_buy_added += 1
+                                elif rsi_values[i] > rsi_overbought:
+                                    signals[i] = -1  # RSI overbought → SELL
+                                    hybrid_sell_added += 1
+
+                        if hybrid_buy_added > 0 or hybrid_sell_added > 0:
+                            st.info(f"🔄 **Hybrid RSI Signals Added:** +{hybrid_buy_added} BUY (RSI<{rsi_oversold}), +{hybrid_sell_added} SELL (RSI>{rsi_overbought})")
+                    elif use_hybrid_signals:
+                        # Show what columns are actually available for debugging
+                        feature_cols = [c for c in subset_features.columns if 'rsi' in c.lower()][:5]
+                        st.warning(f"⚠️ RSI column not found. RSI-like features in data: {feature_cols if feature_cols else 'None found'}")
+
+                    # ============================================================
+                    # COMPOSITE TECH SIGNALS (addresses model undertrade issue)
+                    # ============================================================
+                    # Settings already loaded from session_state above
+
+                    comp_buy_added = 0
+                    comp_sell_added = 0
+
+                    # Find composite oscillator column in FULL features (not filtered subset)
+                    comp_col = None
+                    comp_source = None
+                    # Check full features first
+                    for col_name in ['composite_oscillator', 'composite', 'comp_oscillator']:
+                        if col_name in full_features.columns:
+                            comp_col = col_name
+                            comp_source = full_features
+                            break
+                    # Fallback to subset_features
+                    if comp_col is None:
+                        for col_name in ['composite_oscillator', 'composite', 'comp_oscillator']:
+                            if col_name in subset_features.columns:
+                                comp_col = col_name
+                                comp_source = subset_features
+                                break
+
+                    # If composite_oscillator not found, CALCULATE IT ON-THE-FLY
+                    # Formula from ml_utils.py: (RSI_norm + WILLR_norm + CCI_norm + ROC_norm) / 4
+                    if comp_col is None and use_composite_signals:
+                        # Find required indicators (case-insensitive)
+                        def find_col(df, patterns):
+                            for pat in patterns:
+                                for c in df.columns:
+                                    if c.lower() == pat.lower():
+                                        return c
+                            return None
+
+                        rsi_c = find_col(full_features, ['RSI_14', 'rsi_14', 'RSI', 'rsi'])
+                        willr_c = find_col(full_features, ['WILLR_14', 'willr_14', 'williams_r', 'WILLR'])
+                        cci_c = find_col(full_features, ['CCI_14', 'cci_14', 'CCI_20', 'cci_20', 'CCI', 'cci'])
+                        roc_c = find_col(full_features, ['ROC_10', 'roc_10', 'ROC_14', 'roc_14', 'ROC', 'roc'])
+
+                        # Calculate CCI on-the-fly if missing but we have price data
+                        close_c = find_col(full_features, ['close', 'Close', 'CLOSE'])
+                        high_c = find_col(full_features, ['high', 'High', 'HIGH'])
+                        low_c = find_col(full_features, ['low', 'Low', 'LOW'])
+
+                        if cci_c is None and close_c and high_c and low_c:
+                            try:
+                                import pandas_ta as ta
+                                full_features['CCI_14_calc'] = ta.cci(full_features[high_c], full_features[low_c], full_features[close_c], length=14)
+                                cci_c = 'CCI_14_calc'
+                            except:
+                                pass
+
+                        # Calculate ROC on-the-fly if missing
+                        if roc_c is None and close_c:
+                            try:
+                                import pandas_ta as ta
+                                full_features['ROC_10_calc'] = ta.roc(full_features[close_c], length=10)
+                                roc_c = 'ROC_10_calc'
+                            except:
+                                pass
+
+                        # Check which components we found
+                        found_indicators = [x for x in [rsi_c, willr_c, cci_c, roc_c] if x is not None]
+
+                        if len(found_indicators) >= 2:  # Need at least 2 to create composite
+                            st.info(f"📐 Calculating composite_oscillator from: {found_indicators}")
+
+                            # Calculate normalized components
+                            components = []
+                            if rsi_c:
+                                rsi_norm = (full_features[rsi_c] - 50) / 50
+                                components.append(rsi_norm)
+                            if willr_c:
+                                # Williams %R ranges from -100 to 0, normalize to -1 to 1
+                                willr_norm = (full_features[willr_c] + 50) / 50
+                                components.append(willr_norm)
+                            if cci_c:
+                                cci_norm = (full_features[cci_c] / 100).clip(-1, 1)
+                                components.append(cci_norm)
+                            if roc_c:
+                                roc_norm = (full_features[roc_c] / 5).clip(-1, 1)
+                                components.append(roc_norm)
+
+                            # Average all available components
+                            full_features['composite_oscillator'] = sum(components) / len(components)
+                            comp_col = 'composite_oscillator'
+                            comp_source = full_features
+                            st.success(f"✅ Created composite_oscillator from {len(components)} indicators")
+                        else:
+                            missing = []
+                            if not rsi_c: missing.append('RSI_14')
+                            if not willr_c: missing.append('WILLR_14')
+                            if not cci_c: missing.append('CCI_14')
+                            if not roc_c: missing.append('ROC_10')
+                            st.warning(f"⚠️ Cannot calculate composite - missing: {missing}. Found only: {found_indicators}")
+
+                    if use_composite_signals and comp_col is not None:
+                        comp_values = comp_source[comp_col].values
+                        st.success(f"✅ Found composite oscillator: '{comp_col}' (range: {comp_values.min():.2f} to {comp_values.max():.2f})")
+
+                        for i in range(len(signals)):
+                            # Only add composite signal if ML still says HOLD after RSI
+                            if signals[i] == 0:
+                                if use_comp_crossover and i > 0:
+                                    # Crossover logic: signal when crossing threshold
+                                    prev_comp = comp_values[i-1] if i > 0 else comp_values[i]
+                                    curr_comp = comp_values[i]
+
+                                    # BUY: crossing UP through oversold level
+                                    if prev_comp < comp_oversold and curr_comp >= comp_oversold:
+                                        signals[i] = 1
+                                        comp_buy_added += 1
+                                    # SELL: crossing DOWN through overbought level
+                                    elif prev_comp > comp_overbought and curr_comp <= comp_overbought:
+                                        signals[i] = -1
+                                        comp_sell_added += 1
+                                else:
+                                    # Simple threshold logic
+                                    if comp_values[i] < comp_oversold:
+                                        signals[i] = 1  # Composite oversold → BUY
+                                        comp_buy_added += 1
+                                    elif comp_values[i] > comp_overbought:
+                                        signals[i] = -1  # Composite overbought → SELL
+                                        comp_sell_added += 1
+
+                        if comp_buy_added > 0 or comp_sell_added > 0:
+                            st.info(f"📊 **Composite Tech Signals Added:** +{comp_buy_added} BUY (comp<{comp_oversold}), +{comp_sell_added} SELL (comp>{comp_overbought})")
+
+                    elif use_composite_signals:
+                        # Check what columns are available in full_features
+                        comp_cols = [c for c in full_features.columns if 'composite' in c.lower()][:5]
+                        all_cols_count = len(full_features.columns)
+                        st.warning(f"⚠️ Composite oscillator not found in {all_cols_count} features. Composite-like: {comp_cols if comp_cols else 'None'}")
+
+                    # Show actual signal distribution for debugging
+                    signal_counts = pd.Series(signals).value_counts().sort_index()
+                    st.write(f"🎯 **Signal Debug:** Generated signals: {np.unique(signals)}")
+                    st.write(f"📊 **Signal Counts:** {dict(signal_counts)}")
 
                     # --- DEBUG SECTION ---
                     with st.expander("🕵️‍♂️ Debug Model Inputs (Why is it stuck?)"):
@@ -2889,10 +3555,13 @@ with tab6:
                         trades = []
                         equity_curve = [starting_capital]
                         
-                        for i in range(len(data)):
+                        # Ensure signals and data are aligned
+                        min_len = min(len(data), len(signals))
+                        
+                        for i in range(min_len):
                             current_price = data['close'].iloc[i]
                             current_date = data.index[i]
-                            signal = signals[i] if i < len(signals) else 0
+                            signal = signals[i]
                             
                             # Enter long position on BUY signal (NO FILTERING)
                             if signal == 1 and position is None:
@@ -2930,8 +3599,11 @@ with tab6:
                                 position = None
                             
                             # Calculate portfolio value
-                            portfolio_value = position['shares'] * current_price if position else capital
-                            equity_curve.append(portfolio_value)
+                            if position is not None:
+                                current_equity = position['shares'] * current_price
+                            else:
+                                current_equity = capital
+                            equity_curve.append(current_equity)
                         
                         # Close final position if still open
                         if position:
@@ -2977,6 +3649,123 @@ with tab6:
                     st.write(f"  • Trades executed: {len(trades_list)}")
                     st.write(f"  • Completed trades: {len([t for t in trades_list if t['profit'] is not None])}")
                     
+                    # Strategy 3: Rebalance Training Data
+                    st.write("\n**⚖️ STRATEGY 3: Retrain with Different Settings**")
+                    st.info("""💡 **Recommended Training Adjustments:**
+                    1. **Increase Lead Time**: Set 'Lead Time Before Peak/Valley' to 2-3 days
+                    2. **Use Smaller Window**: Try window_size=3 or 5 for more signals
+                    3. **Adjust Class Weights**: Increase weight for BUY/SELL vs HOLD (try 10:1)
+                    4. **Enable SMOTE**: Balance the training data
+                    5. **Lower Min Peak Height**: Set to 2% to catch smaller moves
+                    """)
+                    
+                    # Strategy 4: Feature Engineering
+                    st.write("\n**🔧 STRATEGY 4: Enhanced Features**")
+                    st.write("""Consider adding these features:
+                    • **Momentum Change**: Rate of RSI/MACD change
+                    • **Volume Spike**: Unusual volume activity
+                    • **Support/Resistance**: Distance from recent lows/highs
+                    • **Market Regime**: Bull/bear market indicator
+                    """)
+                    
+                    # Strategy 5: Time-based Exit Strategy
+                    st.write("\n**⏰ STRATEGY 5: Time-Based Exits**")
+                    time_exit_signals = signals.copy()
+                    max_hold_days = 10
+                    
+                    # Track position duration and force exit
+                    position_days = 0
+                    in_position = False
+                    
+                    for i in range(len(time_exit_signals)):
+                        if time_exit_signals[i] == 1:  # BUY signal
+                            in_position = True
+                            position_days = 0
+                        elif in_position:
+                            position_days += 1
+                            if position_days >= max_hold_days:
+                                time_exit_signals[i] = -1  # Force SELL
+                                in_position = False
+                        if time_exit_signals[i] == -1:  # SELL signal
+                            in_position = False
+                    
+                    time_exit_buy = np.sum(time_exit_signals == 1)
+                    time_exit_sell = np.sum(time_exit_signals == -1)
+                    st.write(f"  • **ML + {max_hold_days}-Day Exit Rule:**")
+                    st.write(f"    - BUY signals: {time_exit_buy}")
+                    st.write(f"    - SELL signals: {time_exit_sell} (was {sell_signals_count})")
+                    
+                    # Strategy 6: Ensemble Voting
+                    st.write("\n**🗳️ STRATEGY 6: Ensemble Approach**")
+                    st.info("""💡 **Train Multiple Models:**
+                    1. Train with window_size=3 (aggressive)
+                    2. Train with window_size=7 (moderate)
+                    3. Train with RSI-only features (simple)
+                    4. Vote: 2/3 models must agree for signal
+                    """)
+                    
+                    # Model Diagnostic
+                    st.write("\n**🔬 MODEL DIAGNOSTIC:**")
+                    if buy_signals_count < 10:
+                        st.error("""
+                        🚨 **CRITICAL: Model is NOT working properly!**
+                        
+                        Only {0} BUY signals in {1} days = {2:.1%} signal rate
+                        Expected: ~10-20% signal rate for good performance
+                        
+                        **IMMEDIATE ACTIONS:**
+                        1. Check if model file loaded correctly
+                        2. Verify feature engineering matches training
+                        3. Try a simple baseline model first
+                        4. Consider the model might be overfitted to training data
+                        """.format(buy_signals_count, len(subset_raw), buy_signals_count/len(subset_raw)))
+                    
+                    # Summary Recommendation
+                    st.write("\n**🌟 RECOMMENDED APPROACH (Try This First):**")
+                    st.success("""
+                    **Step 1: Quick Fix - Lower Probability Threshold**
+                    - If using XGBoost/RF, try threshold=0.3 instead of 0.5
+                    - This alone might double your BUY signals
+                    
+                    **Step 2: Retrain with Better Settings**
+                    - Set Lead Time = 2 days (catch moves earlier)
+                    - Use Class Weight Ratio = 10 (prioritize BUY/SELL)
+                    - Enable SMOTE = True (balance the data)
+                    - Window Size = 3 (more signals)
+                    
+                    **Step 3: Hybrid Approach**
+                    - Use ML signals as primary
+                    - Override with RSI<25 BUY, RSI>80 SELL
+                    - Add 10-day maximum holding period
+                    """)
+                    
+                    # RADICAL APPROACH
+                    st.write("\n**🚀 RADICAL APPROACH (If Above Fails):**")
+                    st.error("""
+                    **Option A: Change Labeling Strategy**
+                    Instead of peak/valley detection:
+                    - Label as BUY if next 5-day return > +3%
+                    - Label as SELL if next 5-day return < -3%
+                    - This directly optimizes for profitable moves
+                    
+                    **Option B: Use Different Model**
+                    - Try Logistic Regression (often works better for imbalanced data)
+                    - Use class_weight='balanced' parameter
+                    - Much simpler model, less prone to overfitting
+                    
+                    **Option C: Threshold-Free Approach**
+                    - Instead of classification, use regression
+                    - Predict next 5-day return directly
+                    - Buy when predicted return > 2%
+                    - Sell when predicted return < -2%
+                    
+                    **Option D: Simple Technical Rules**
+                    Forget ML temporarily and use:
+                    - BUY: RSI < 30 AND price < 20-day SMA
+                    - SELL: RSI > 70 OR price > Upper Bollinger Band
+                    - This baseline often beats complex ML models
+                    """)
+                    
                     # CRITICAL DEBUG: Show signal dates vs chart dates
                     buy_signal_dates = subset_raw.index[signals == 1]
                     sell_signal_dates = subset_raw.index[signals == -1]
@@ -3011,9 +3800,91 @@ with tab6:
                         chart_sell_dates = subset_raw.index[chart_sell_signals]
                         st.write(f"  • Chart sell dates: {[d.date() for d in chart_sell_dates]}")
                     
+                    # Calculate backtest metrics
+                    if len(trades_list) > 0:
+                        completed_trades = [t for t in trades_list if t.get('profit') is not None]
+                        if completed_trades:
+                            wins = [t for t in completed_trades if t['profit'] > 0]
+                            sim_win_rate = len(wins) / len(completed_trades)
+                            total_profit = sum(t['profit'] for t in completed_trades)
+                            sim_return = (final_capital - 100000) / 100000 * 100
+                        else:
+                            sim_win_rate = 0
+                            sim_return = 0
+                    else:
+                        sim_win_rate = 0
+                        sim_return = 0
+                        completed_trades = []
+                    
+                    sim_wins = len([t for t in completed_trades if t.get('profit', 0) > 0])
+                    sim_losses = len([t for t in completed_trades if t.get('profit', 0) <= 0])
+                    
                     # === CRITICAL DIAGNOSTIC: WHY NO BUY SIGNALS AT VALLEYS? ===
                     st.write("---")
                     st.subheader("🔬 VALLEY ANALYSIS: Why No BUY Signals?")
+                    
+                    # Strategy 1: Probability Threshold Adjustment
+                    st.write("\n**🎯 STRATEGY 1: Adjust Decision Thresholds**")
+                    if hasattr(prod_model, 'predict_proba'):
+                        # Get probabilities
+                        all_probs = prod_model.predict_proba(X_input)
+                        
+                        # Try different thresholds
+                        thresholds = [0.5, 0.4, 0.3, 0.25, 0.2]
+                        st.write("**Testing Lower Probability Thresholds:**")
+                        
+                        for thresh in thresholds:
+                            # Custom threshold predictions
+                            custom_signals = np.zeros(len(all_probs))
+                            
+                            # Assuming classes are in order [-1, 0, 1]
+                            if all_probs.shape[1] == 3:
+                                buy_probs = all_probs[:, 2]  # BUY class
+                                sell_probs = all_probs[:, 0]  # SELL class
+                                
+                                # Apply custom threshold
+                                custom_signals[buy_probs > thresh] = 1
+                                custom_signals[sell_probs > thresh] = -1
+                            
+                            buy_count = np.sum(custom_signals == 1)
+                            sell_count = np.sum(custom_signals == -1)
+                            
+                            st.write(f"  • Threshold {thresh:.0%}: {buy_count} BUY, {sell_count} SELL signals")
+                            
+                            # Quick backtest if we have enough signals
+                            if buy_count > 0:
+                                _, _, thresh_capital = run_production_backtest(subset_raw, custom_signals)
+                                thresh_return = (thresh_capital - 100000) / 100000 * 100
+                                st.write(f"    Return: {thresh_return:.1f}%")
+                    
+                    # Strategy 2: Combine ML with Simple Rules
+                    st.write("\n**🔗 STRATEGY 2: Hybrid ML + Rules Approach**")
+                    hybrid_signals = signals.copy()
+                    
+                    # Override with simple rules when extreme conditions
+                    if 'RSI_14' in subset_features.columns:
+                        rsi_values = subset_features['RSI_14'].values
+                        
+                        # Force BUY when RSI < 25 (extreme oversold)
+                        extreme_oversold = rsi_values < 25
+                        hybrid_signals[extreme_oversold] = 1
+                        
+                        # Force SELL when RSI > 80 (extreme overbought)
+                        extreme_overbought = rsi_values > 80
+                        hybrid_signals[extreme_overbought] = -1
+                        
+                        hybrid_buy_count = np.sum(hybrid_signals == 1)
+                        hybrid_sell_count = np.sum(hybrid_signals == -1)
+                        
+                        st.write(f"  • **ML + Extreme RSI Rules:**")
+                        st.write(f"    - BUY signals: {hybrid_buy_count} (was {buy_signals_count})")
+                        st.write(f"    - SELL signals: {hybrid_sell_count} (was {sell_signals_count})")
+                        
+                        # Backtest hybrid
+                        hybrid_trades, _, hybrid_capital = run_production_backtest(subset_raw, hybrid_signals)
+                        hybrid_return = (hybrid_capital - 100000) / 100000 * 100
+                        st.write(f"    - Return: {hybrid_return:.1f}%")
+                        st.write(f"    - Trades: {len(hybrid_trades)}")
                     
                     # Find actual valleys in the production data
                     from scipy.signal import argrelextrema
@@ -3073,15 +3944,96 @@ with tab6:
                                         feature_row = prod_features.loc[valley_ts]
                                         
                                         # Show key indicator values
-                                        st.write("   **Key Indicator Values:**")
-                                        for col in feature_row.index[:20]:  # First 20 features
-                                            val = feature_row[col]
-                                            if pd.notna(val):
-                                                st.write(f"      • {col}: {val:.4f}")
+                                        st.write("**Key Indicator Values:**")
+                                        for col in key_indicators:
+                                            if col in feature_row.index:
+                                                value = feature_row[col]
+                                                st.write(f"  • {col}: {value:.4f}")
+                                        
+                                        # Add feature importance visualization if available
+                                        if hasattr(prod_model, 'feature_importances_'):
+                                            st.write("\n**🎯 Top 10 Most Important Features:**")
+                                            feature_importance = pd.DataFrame({
+                                                'feature': prod_features.columns,
+                                                'importance': prod_model.feature_importances_
+                                            }).sort_values('importance', ascending=False).head(10)
+                                            
+                                            for idx, row in feature_importance.iterrows():
+                                                st.write(f"  • {row['feature']}: {row['importance']:.4f}")
+                                        
+                                        # Add threshold analysis
+                                        st.write("\n**🎚️ Decision Threshold Analysis:**")
+                                        if hasattr(prod_model, 'predict_proba'):
+                                            # Get probabilities for all signals
+                                            all_probs = prod_model.predict_proba(X_input)
+                                            buy_probs = all_probs[:, 2] if all_probs.shape[1] > 2 else all_probs[:, 1]
+                                            
+                                            # Show probability distribution
+                                            st.write(f"  • Mean BUY probability: {np.mean(buy_probs):.3f}")
+                                            st.write(f"  • Max BUY probability: {np.max(buy_probs):.3f}")
+                                            st.write(f"  • BUY signals (>50% prob): {np.sum(buy_probs > 0.5)}")
+                                            st.write(f"  • BUY signals (>33% prob): {np.sum(buy_probs > 0.33)}")
+                                            st.write(f"  • BUY signals (>25% prob): {np.sum(buy_probs > 0.25)}")
+                                            
+                                            # Find best threshold
+                                            best_thresh = 0.5
+                                            best_return = sim_return
+                                            
+                                            for t in [0.4, 0.3, 0.25, 0.2]:
+                                                test_signals = np.zeros(len(all_probs))
+                                                if all_probs.shape[1] == 3:
+                                                    test_signals[all_probs[:, 2] > t] = 1
+                                                    test_signals[all_probs[:, 0] > t] = -1
+                                                
+                                                _, _, test_capital = run_production_backtest(subset_raw, test_signals)
+                                                test_return = (test_capital - 100000) / 100000 * 100
+                                                
+                                                if test_return > best_return:
+                                                    best_return = test_return
+                                                    best_thresh = t
+                                            
+                                            if best_thresh != 0.5:
+                                                st.success(f"\n✨ **FOUND BETTER THRESHOLD: {best_thresh:.0%} gives {best_return:.1f}% return!**")
+                                            
+                                            # Extreme threshold test
+                                            st.write("\n**Testing EXTREME thresholds:**")
+                                            extreme_thresholds = [0.15, 0.1, 0.05]
+                                            for thresh in extreme_thresholds:
+                                                extreme_signals = np.zeros(len(all_probs))
+                                                if all_probs.shape[1] == 3:
+                                                    extreme_signals[all_probs[:, 2] > thresh] = 1
+                                                    extreme_signals[all_probs[:, 0] > thresh] = -1
+                                                
+                                                extreme_buy = np.sum(extreme_signals == 1)
+                                                extreme_sell = np.sum(extreme_signals == -1)
+                                                st.write(f"  • Threshold {thresh:.0%}: {extreme_buy} BUY, {extreme_sell} SELL signals")
+                                                
+                                                if extreme_buy > buy_signals_count * 2:
+                                                    st.info(f"💡 Threshold {thresh:.0%} gives {extreme_buy/buy_signals_count:.0f}x more BUY signals!")
                                     else:
                                         st.warning(f"   Valley date {valley_ts} not found in features index")
                             except Exception as e:
                                 st.error(f"   Feature analysis error: {e}")
+                    
+                    # Data Leakage Check
+                    st.write("---")
+                    st.write("**🔍 DATA LEAKAGE CHECK:**")
+                    
+                    # Check if features contain future information
+                    if 'close' in subset_features.columns:
+                        st.error("⚠️ Raw 'close' price in features - potential data leakage!")
+                    
+                    future_looking_features = [col for col in subset_features.columns if any(x in col.lower() for x in ['future', 'forward', 'next', 'tomorrow'])]
+                    if future_looking_features:
+                        st.error(f"⚠️ Potential future-looking features detected: {future_looking_features}")
+                    
+                    # Check for perfect predictors
+                    if hasattr(prod_model, 'feature_importances_'):
+                        importances = prod_model.feature_importances_
+                        if np.max(importances) > 0.5:
+                            top_feature_idx = np.argmax(importances)
+                            top_feature = prod_features[top_feature_idx]
+                            st.warning(f"⚠️ Feature '{top_feature}' has {importances[top_feature_idx]:.1%} importance - might be data leakage")
                     
                     # Compare training labels vs production predictions
                     st.write("---")
@@ -3356,25 +4308,94 @@ with tab6:
                     sim_losses = len(completed_trades) - sim_wins
                     sim_win_rate = sim_wins / len(completed_trades) if completed_trades else 0.0
                     
+                    # Add simple rule-based baseline for comparison
+                    st.write("\n**📊 Rule-Based Baseline Comparison:**")
+                    
+                    # Simple RSI strategy
+                    rsi_signals = np.zeros(len(subset_raw))
+                    if 'RSI_14' in subset_features.columns:
+                        rsi_values = subset_features['RSI_14'].values
+                        rsi_signals[rsi_values < 30] = 1  # BUY when oversold
+                        rsi_signals[rsi_values > 70] = -1  # SELL when overbought
+                        
+                        rsi_buy_count = np.sum(rsi_signals == 1)
+                        rsi_sell_count = np.sum(rsi_signals == -1)
+                        
+                        st.write(f"  • **Simple RSI Strategy** (RSI<30 BUY, RSI>70 SELL):")
+                        st.write(f"    - BUY signals: {rsi_buy_count}")
+                        st.write(f"    - SELL signals: {rsi_sell_count}")
+                        
+                        # Quick backtest of RSI strategy
+                        rsi_trades, rsi_equity, rsi_capital = run_production_backtest(subset_raw, rsi_signals)
+                        rsi_return = (rsi_capital - 100000) / 100000 * 100
+                        st.write(f"    - Return: {rsi_return:.1f}%")
+                        st.write(f"    - Trades: {len(rsi_trades)}")
+                        
+                        # Compare to Buy & Hold
+                        buy_hold_return = (subset_raw['close'].iloc[-1] - subset_raw['close'].iloc[0]) / subset_raw['close'].iloc[0] * 100
+                        st.write(f"\n  • **Buy & Hold Return**: {buy_hold_return:.1f}%")
+                        st.write(f"  • **ML Outperformance**: {sim_return - buy_hold_return:+.1f}%")
+                        st.write(f"  • **RSI Outperformance**: {rsi_return - buy_hold_return:+.1f}%")
+                    
                     # CRITICAL DEBUGGING: Why is performance so different from training?
                     st.error("🚨 **PERFORMANCE MISMATCH DETECTED:**")
-                    st.write(f"**🎯 Training Performance:** 735349% return, 78.5% win rate, 381 trades")
+                    # Get actual training performance from model metadata
+                    training_return = meta.get('total_return', 'N/A')
+                    training_win_rate = meta.get('win_rate', 0) * 100 if meta.get('win_rate') else 'N/A'
+                    training_trades = meta.get('trades_count', 'N/A')
+                    
+                    st.write(f"**🎯 Training Performance:** {training_return}% return, {training_win_rate}% win rate, {training_trades} trades")
                     st.write(f"**📉 Production Performance:** {sim_return:.1f}% return, {sim_win_rate:.0%} win rate, {len(trades_list)} trades")
-                    st.write("**🔍 Possible Issues:**")
+                    st.write("**🔍 Possible Issues:")
                     st.write("  • Data period mismatch (training vs production dates)")
                     st.write("  • Feature engineering differences")  
                     st.write("  • Model/data loading issues")
                     st.write("  • Signal decoding problems")
                     
-                    # Show data comparison
+                    # Show data period information
+                    st.write("\n**📅 Data Period Analysis:**")
                     training_period = meta.get('period', 'Unknown')
-                    st.write(f"**📊 Data Info:** Training period: {training_period}, Production data: {len(subset_raw)} days")
+                    training_split = meta.get('split_date', 'Unknown')
+                    st.write(f"  • **Training:** {training_period} period, split at {training_split}")
+                    st.write(f"  • **Production:** {subset_raw.index[0].date()} to {subset_raw.index[-1].date()} ({len(subset_raw)} days)")
+                    
+                    st.write(f"\n**📊 Data Info:** Training period: {training_period}, Production data: {len(subset_raw)} days")
+                    
+                    # Final diagnostic
+                    st.write("\n**🎯 QUICK DIAGNOSTIC:**")
+                    if buy_signals_count < 5:
+                        st.error("🔴 Model is too conservative - not enough BUY signals")
+                    if sell_signals_count < 5:
+                        st.error("🔴 Model is too conservative - not enough SELL signals")
+                    if buy_signals_count > 0 and sell_signals_count > 0:
+                        signal_ratio = buy_signals_count / sell_signals_count
+                        if signal_ratio < 0.5 or signal_ratio > 2.0:
+                            st.warning(f"🟡 Imbalanced signals - BUY/SELL ratio: {signal_ratio:.2f}")
+                    
+                    # Model confidence analysis
+                    if hasattr(prod_model, 'predict_proba') and 'all_probs' in locals():
+                        st.write("\n**📊 MODEL CONFIDENCE ANALYSIS:**")
+                        
+                        # Get max probability for each prediction
+                        max_probs = np.max(all_probs, axis=1)
+                        avg_confidence = np.mean(max_probs)
+                        
+                        st.write(f"  • Average model confidence: {avg_confidence:.1%}")
+                        st.write(f"  • Predictions with >90% confidence: {np.sum(max_probs > 0.9)}")
+                        st.write(f"  • Predictions with <60% confidence: {np.sum(max_probs < 0.6)}")
+                        
+                        if avg_confidence > 0.95:
+                            st.warning("⚠️ Model is overconfident - might be overfitted")
+                        elif avg_confidence < 0.4:
+                            st.warning("⚠️ Model has low confidence - might need more training data")
+                    
+                    # Show data comparison
                     
                     # === ORIGINAL SYSTEM RESTORED - NO ENHANCED ENGINE ===
                     # Removed enhanced trading engine integration to restore 78.5% win rate performance
                     # Get current status for display (simple approach)
-                    current_signal = signals[-1]
-                    current_conf = confidences[-1] 
+                    current_signal = signals[-1] if len(signals) > 0 else 0
+                    current_conf = confidences[-1] if len(confidences) > 0 else 0
                     current_price = subset_raw['close'].iloc[-1]
                     current_date = subset_raw.index[-1]
 
@@ -3429,13 +4450,20 @@ with tab6:
                     st.markdown(f"##### 📊 Active Model Performance ({len(subset_raw)} Days)")
                     p1, p2, p3, p4 = st.columns(4)
                     with p1:
-                        st.metric("Total Return", f"{sim_return:+.1f}%", delta=f"${final_capital - 100000:,.0f}")
+                        return_val = sim_return if 'sim_return' in locals() else 0
+                        capital_delta = (final_capital - 100000) if 'final_capital' in locals() else 0
+                        st.metric("Total Return", f"{return_val:+.1f}%", delta=f"${capital_delta:,.0f}")
                     with p2:
-                        st.metric("Win Rate", f"{sim_win_rate*100:.0f}%", f"{sim_wins}W / {sim_losses}L")
+                        win_rate_val = sim_win_rate if 'sim_win_rate' in locals() else 0
+                        wins_val = sim_wins if 'sim_wins' in locals() else 0
+                        losses_val = sim_losses if 'sim_losses' in locals() else 0
+                        st.metric("Win Rate", f"{win_rate_val*100:.0f}%", f"{wins_val}W / {losses_val}L")
                     with p3:
-                        st.metric("Trades", str(len(completed_trades)))
+                        trades_count = len(completed_trades) if 'completed_trades' in locals() else 0
+                        st.metric("Trades", str(trades_count))
                     with p4:
-                        st.metric("Est. Capital", f"${final_capital:,.0f}")
+                        capital_val = final_capital if 'final_capital' in locals() else 100000
+                        st.metric("Est. Capital", f"${capital_val:,.0f}")
                     
                     st.markdown("---")
 
@@ -4368,6 +5396,306 @@ Focus on SPECIFIC indicator values and WHY they triggered this signal. Avoid gen
 
     except Exception as e:
         st.error(f"Production Error: {e}")
+
+# Tab 7: Parameter Optimization
+with tab7:
+    st.title("🔬 Parameter Optimization")
+    st.markdown("Find optimal detection and training parameters through systematic backtesting")
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.info("""
+        **This optimizer will test combinations of:**
+        - Window sizes: 2, 3, 4, 5, 7, 10
+        - Lead times: 0, 1, 2, 3 days
+        - Min heights: 1%, 2%, 3%, 4%, 5%
+        - Class weights: 1, 3, 5, 7, 10, 15
+        - Model types: xgboost, lightgbm, random_forest
+        
+        **Total combinations:** ~540
+        """)
+    
+    with col2:
+        st.warning("""
+        ⏱️ **Time Estimate:**
+        - Fast mode: 30-60 minutes
+        - Full mode: 2-6 hours
+        
+        💡 Run overnight for best results
+        """)
+    
+    st.markdown("---")
+    
+    # Check data availability
+    if not st.session_state.ml_data_loaded:
+        st.warning("⚠️ Please load data in the 'Data & Labels' tab first")
+    else:
+        # Get data info
+        raw_data = st.session_state.ml_raw_data
+        data_start = raw_data.index[0]
+        data_end = raw_data.index[-1]
+        total_days = (data_end - data_start).days
+        
+        st.subheader("📅 Data Split Configuration")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Data Range", f"{data_start.strftime('%Y-%m-%d')} to {data_end.strftime('%Y-%m-%d')}")
+        with col2:
+            st.metric("Total Days", total_days)
+        with col3:
+            st.metric("Total Samples", len(raw_data))
+        
+        # Split configuration
+        st.markdown("### Configure Train/Test Split")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            train_pct = st.slider("Training Data %", 50, 80, 70, 5,
+                                help="Percentage of data for training")
+        
+        with col2:
+            gap_days = st.slider("Gap Days", 0, 30, 7,
+                               help="Days between train and test to prevent leakage")
+        
+        # Calculate split dates
+        train_samples = int(len(raw_data) * train_pct / 100)
+        train_end_idx = train_samples - 1
+        test_start_idx = min(train_end_idx + gap_days, len(raw_data) - 1)
+        
+        train_end_date = raw_data.index[train_end_idx]
+        test_start_date = raw_data.index[test_start_idx]
+        
+        # Display split info
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.info(f"**Training:** {data_start.strftime('%Y-%m-%d')} to {train_end_date.strftime('%Y-%m-%d')}")
+        with col2:
+            st.warning(f"**Gap:** {gap_days} days")
+        with col3:
+            st.success(f"**Testing:** {test_start_date.strftime('%Y-%m-%d')} to {data_end.strftime('%Y-%m-%d')}")
+        
+        st.markdown("---")
+        
+        # Optimization settings
+        st.subheader("🚀 Optimization Settings")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            optimization_mode = st.radio(
+                "Optimization Mode",
+                ["Fast (Reduced Space)", "Full (All Combinations)"],
+                help="Fast mode tests fewer combinations for quicker results"
+            )
+        
+        with col2:
+            max_workers = st.number_input(
+                "Parallel Workers",
+                min_value=1,
+                max_value=os.cpu_count(),
+                value=min(4, os.cpu_count() - 1),
+                help="More workers = faster but more CPU usage"
+            )
+        
+        # Test single parameter combination
+        if st.button("🧪 Test Single Combination"):
+            from parameter_optimizer import ParameterOptimizer
+            from ml_feature_engineer import MLFeatureEngineer
+            
+            with st.spinner("Testing single parameter combination..."):
+                optimizer = ParameterOptimizer()
+                engineer = MLFeatureEngineer()
+                precomputed_features = engineer.prepare_ml_dataset(
+                    raw_data,
+                    include_lagged=True,
+                    include_rolling=True,
+                    feature_selection=True,
+                    use_dl_features=False
+                ).fillna(0)
+                test_params = {
+                    'window_size': 3,
+                    'lead_time_days': 1,
+                    'min_peak_height_pct': 3.0,
+                    'class_weight_ratio': 5,
+                    'detection_method': 'predictive',
+                    'model_type': 'xgboost'
+                }
+                
+                result = optimizer.evaluate_params(
+                    test_params,
+                    raw_data,
+                    precomputed_features,
+                    train_end_date.strftime('%Y-%m-%d'),
+                    test_start_date.strftime('%Y-%m-%d')
+                )
+                
+                if 'error' in result:
+                    st.error(f"Error: {result['error']}")
+                    if 'traceback' in result:
+                        with st.expander("Full Error Traceback"):
+                            st.code(result['traceback'])
+                else:
+                    st.success("Test passed!")
+                    st.json(result)
+        
+        # Run optimization
+        if st.button("🎯 Start Parameter Optimization", type="primary"):
+            from parameter_optimizer import ParameterOptimizer
+            
+            with st.spinner("Running parameter optimization... This will take a while."):
+                # Progress container
+                progress_container = st.container()
+                
+                try:
+                    # Initialize optimizer
+                    optimizer = ParameterOptimizer()
+                    
+                    # Modify search space for fast mode
+                    if optimization_mode.startswith("Fast"):
+                        # Override search space with reduced options
+                        optimizer.define_search_space = lambda: {
+                            'window_size': [3, 5, 7],
+                            'lead_time_days': [1, 2],
+                            'min_peak_height_pct': [2.0, 3.0, 4.0],
+                            'class_weight_ratio': [3, 5, 10],
+                            'detection_method': ['predictive'],
+                            'model_type': ['xgboost', 'lightgbm']
+                        }
+                        progress_container.info("🏃 Running in fast mode with reduced parameter space")
+                    else:
+                        progress_container.info("🏋️ Running full optimization with all parameter combinations")
+                    
+                    # Run optimization
+                    results = optimizer.optimize_parameters(
+                        data=raw_data,
+                        train_end_date=train_end_date.strftime('%Y-%m-%d'),
+                        test_start_date=test_start_date.strftime('%Y-%m-%d'),
+                        max_workers=int(max_workers)
+                    )
+                    
+                    # Display results
+                    st.success("✅ Optimization Complete!")
+                    
+                    # Best parameters
+                    if results['best_params']:
+                        st.subheader("🏆 Best Parameters Found")
+                        best = results['best_params']
+                        
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Window Size", best['window_size'])
+                            st.metric("Lead Time", f"{best['lead_time_days']} days")
+                        with col2:
+                            st.metric("Min Height", f"{best['min_peak_height_pct']}%")
+                            st.metric("Class Weight", best['class_weight_ratio'])
+                        with col3:
+                            st.metric("Best Model", best['model_type'])
+                        
+                        st.metric("Composite Score", f"{results['best_score']:.2f}")
+                        
+                        # Save optimal parameters
+                        optimal_params = {
+                            'params': best,
+                            'score': results['best_score'],
+                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        }
+                        
+                        with open('optimal_parameters.json', 'w') as f:
+                            json.dump(optimal_params, f, indent=2)
+                        
+                        st.success("💾 Saved optimal parameters to optimal_parameters.json")
+
+                        col_apply_1, col_apply_2 = st.columns([1, 3])
+                        with col_apply_1:
+                            if st.button("✅ Apply Now", key="tab7_apply_now"):
+                                st.session_state.use_optimal_settings = True
+                                st.session_state.ml_data_loaded = False
+                                st.session_state.ml_features_ready = False
+                                st.session_state.ml_models_trained = False
+                                for k in ['ml_raw_data', 'ml_features_base', 'ml_labels', 'ml_detector', 'ml_features', 'ml_engineer', 'ml_models', 'ml_results']:
+                                    if k in st.session_state:
+                                        del st.session_state[k]
+                                st.rerun()
+                        with col_apply_2:
+                            st.info("Applies the saved file immediately by clearing cached labels/features/models. Then rerun: Data & Labels → Feature Engineering → Model Training.")
+                        
+                        # Top 10 results
+                        st.subheader("📊 Top 10 Parameter Combinations")
+                        if results['top_results']:
+                            top_df = pd.DataFrame(results['top_results'][:10])
+                            
+                            # Format for display
+                            display_cols = ['composite_score', 'test_return', 'test_sharpe', 
+                                          'test_win_rate', 'test_trades']
+                            params_df = pd.DataFrame([r['params'] for r in results['top_results'][:10]])
+                            
+                            results_df = pd.concat([
+                                top_df[display_cols].round(3),
+                                params_df
+                            ], axis=1)
+                            
+                            st.dataframe(results_df, use_container_width=True)
+                        
+                        # Download results
+                        st.download_button(
+                            "📥 Download Full Results",
+                            data=open(results['results_file'], 'r').read(),
+                            file_name=results['results_file'],
+                            mime="application/json"
+                        )
+                    else:
+                        st.error("❌ No valid parameter combinations found")
+                        
+                except Exception as e:
+                    st.error(f"❌ Optimization failed: {str(e)}")
+                    st.exception(e)
+        
+        # Load previous results
+        st.markdown("---")
+        st.subheader("📂 Load Previous Results")
+        
+        # List available result files
+        result_files = [f for f in os.listdir('.') if f.startswith('parameter_optimization_results_')]
+        
+        if result_files:
+            selected_file = st.selectbox("Select results file", result_files)
+            
+            if st.button("Load Results"):
+                with open(selected_file, 'r') as f:
+                    loaded_results = json.load(f)
+                
+                st.success(f"Loaded results from {selected_file}")
+                
+                # Display loaded results
+                if loaded_results.get('best_params'):
+                    st.subheader("Best Parameters")
+                    st.json(loaded_results['best_params'])
+                    st.metric("Best Score", f"{loaded_results.get('best_score', 'N/A')}")
+                    
+                    # Apply these parameters
+                    if st.button("✅ Apply These Parameters"):
+                        # Save as optimal
+                        optimal_params = {
+                            'params': loaded_results['best_params'],
+                            'score': loaded_results.get('best_score', 0),
+                            'timestamp': selected_file.replace('parameter_optimization_results_', '').replace('.json', '')
+                        }
+                        
+                        with open('optimal_parameters.json', 'w') as f:
+                            json.dump(optimal_params, f, indent=2)
+                        
+                        st.session_state.use_optimal_settings = True
+                        st.session_state.ml_data_loaded = False
+                        st.session_state.ml_features_ready = False
+                        st.session_state.ml_models_trained = False
+                        for k in ['ml_raw_data', 'ml_features_base', 'ml_labels', 'ml_detector', 'ml_features', 'ml_engineer', 'ml_models', 'ml_results']:
+                            if k in st.session_state:
+                                del st.session_state[k]
+                        st.success("✅ Parameters applied!")
+                        st.rerun()
+        else:
+            st.info("No previous optimization results found")
 
 # === FOOTER ===
 st.markdown("---")

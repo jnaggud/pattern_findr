@@ -11,6 +11,9 @@ import numpy as np
 from typing import Dict, List, Tuple
 import warnings
 warnings.filterwarnings('ignore')
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Import existing indicator system (no modifications needed)
 from indicators import get_all_indicators
@@ -21,7 +24,7 @@ try:
     DL_AVAILABLE = True
 except ImportError:
     DL_AVAILABLE = False
-    print("⚠️ Deep Learning modules not found. DL features will be skipped.")
+    logger.info("Deep Learning modules not found. DL features will be skipped.")
 
 class MLFeatureEngineer:
     """
@@ -70,7 +73,7 @@ class MLFeatureEngineer:
         Returns:
             DataFrame with all technical indicators
         """
-        print("🔧 Creating base features using existing indicators...")
+        logger.info("Creating base features using existing indicators...")
         
         # Prepare data format for existing indicator system
         data_for_indicators = data.copy()
@@ -84,7 +87,7 @@ class MLFeatureEngineer:
         # Use existing indicator system - no changes needed!
         enriched_data = get_all_indicators(data_for_indicators)
         
-        print(f"   ✅ Generated {len(enriched_data.columns)} base indicators")
+        logger.info(f"Generated {len(enriched_data.columns)} base indicators")
         return enriched_data
     
     def create_ml_specific_features(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -97,7 +100,7 @@ class MLFeatureEngineer:
         Returns:
             DataFrame with additional ML features
         """
-        print("🧠 Adding ML-specific features...")
+        logger.info("Adding ML-specific features...")
         
         ml_data = data.copy()
         
@@ -138,7 +141,7 @@ class MLFeatureEngineer:
         ml_data['month'] = ml_data.index.month
         ml_data['is_month_end'] = (ml_data.index.day > 25).astype(int)
         
-        print(f"   ✅ Added {len(ml_data.columns) - len(data.columns)} ML-specific features")
+        logger.info(f"Added {len(ml_data.columns) - len(data.columns)} ML-specific features")
         return ml_data
     
     def create_dl_features(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -164,9 +167,9 @@ class MLFeatureEngineer:
             return result
         except Exception as e:
             import traceback
-            print(f"⚠️ DL Feature Generation Failed: {e}")
-            print("Full traceback:")
-            traceback.print_exc()
+            logger.warning(f"DL Feature Generation Failed: {e}")
+            logger.debug("Full traceback:")
+            logger.debug(traceback.format_exc())
             return data
 
     def create_lagged_features(self, data: pd.DataFrame, 
@@ -183,7 +186,7 @@ class MLFeatureEngineer:
         Returns:
             DataFrame with lagged features
         """
-        print(f"📅 Creating lagged features for {lags} periods...")
+        logger.info(f"Creating lagged features for {lags} periods...")
         
         lagged_data = data.copy()
         
@@ -206,7 +209,7 @@ class MLFeatureEngineer:
                     lagged_data[lag_name] = data[col].shift(lag)
                     lag_count += 1
         
-        print(f"   ✅ Created {lag_count} lagged features")
+        logger.info(f"Created {lag_count} lagged features")
         return lagged_data
     
     def create_rolling_features(self, data: pd.DataFrame,
@@ -223,7 +226,7 @@ class MLFeatureEngineer:
         Returns:
             DataFrame with rolling features
         """
-        print(f"📊 Creating rolling statistics for windows {windows}...")
+        logger.info(f"Creating rolling statistics for windows {windows}...")
         
         rolling_data = data.copy()
         
@@ -251,7 +254,7 @@ class MLFeatureEngineer:
                     )
                     rolling_count += 3
         
-        print(f"   ✅ Created {rolling_count} rolling features")
+        logger.info(f"Created {rolling_count} rolling features")
         return rolling_data
     
     def select_features(self, data: pd.DataFrame, 
@@ -268,14 +271,14 @@ class MLFeatureEngineer:
         Returns:
             DataFrame with selected features
         """
-        print("🎯 Aggressive feature selection...")
+        logger.info("Aggressive feature selection...")
         
         # Start with numeric columns only
         numeric_cols = data.select_dtypes(include=[np.number]).columns.tolist()
         feature_data = data[numeric_cols].copy()
         initial_count = len(feature_data.columns)
         
-        print(f"   📊 Starting with {initial_count} numeric features")
+        logger.info(f"Starting with {initial_count} numeric features")
         
         # Step 1: Remove columns with too many NaN values
         nan_threshold = 0.3  # More strict - remove if >30% NaN
@@ -287,7 +290,7 @@ class MLFeatureEngineer:
         
         feature_data = feature_data[valid_cols]
         removed_nan = initial_count - len(valid_cols)
-        print(f"   ✅ Removed {removed_nan} features with >{nan_threshold*100}% missing data")
+        logger.info(f"Removed {removed_nan} features with >{nan_threshold*100}% missing data")
         
         # Step 2: Handle indicator warm-up period and remove truly problematic features
         if remove_low_variance:
@@ -325,9 +328,9 @@ class MLFeatureEngineer:
             features_to_remove = set(constant_features + low_variance_features)
             feature_data = feature_data.drop(columns=features_to_remove)
             
-            print(f"   ✅ Removed {len(constant_features)} truly constant features")
-            print(f"   ✅ Removed {len(low_variance_features)} problematic low-variance features")
-            print(f"   📊 Features kept: {feature_data.shape[1]} after intelligent filtering")
+            logger.info(f"Removed {len(constant_features)} truly constant features")
+            logger.info(f"Removed {len(low_variance_features)} problematic low-variance features")
+            logger.info(f"Features kept: {feature_data.shape[1]} after intelligent filtering")
         
         # Step 3: Remove identical columns (same values)
         if len(feature_data.columns) > 1:
@@ -351,7 +354,7 @@ class MLFeatureEngineer:
                         unique_cols.append(col)
             
             feature_data = feature_data[unique_cols]
-            print(f"   ✅ Removed {len(removed_identical)} identical features")
+            logger.info(f"Removed {len(removed_identical)} identical features")
         
         # Step 4: Remove highly correlated features (more aggressive)
         if len(feature_data.columns) > 1:
@@ -385,7 +388,7 @@ class MLFeatureEngineer:
                             to_remove.add(col_i)
             
             feature_data = feature_data.drop(columns=list(to_remove))
-            print(f"   ✅ Removed {len(to_remove)} highly correlated features (>{correlation_threshold})")
+            logger.info(f"Removed {len(to_remove)} highly correlated features (>{correlation_threshold})")
         
         # Step 5: Final sanity check - ensure meaningful variance spread
         if len(feature_data.columns) > 0:
@@ -407,7 +410,7 @@ class MLFeatureEngineer:
             
             removed_low_cv = len(feature_data.columns) - len(final_cols)
             feature_data = feature_data[final_cols]
-            print(f"   ✅ Removed {removed_low_cv} features with insufficient variation")
+            logger.info(f"Removed {removed_low_cv} features with insufficient variation")
         
         # Store final feature names
         self.feature_names = feature_data.columns.tolist()
@@ -415,10 +418,10 @@ class MLFeatureEngineer:
         final_count = len(self.feature_names)
         total_removed = initial_count - final_count
         
-        print(f"📋 Feature Selection Summary:")
-        print(f"   Initial features: {initial_count}")
-        print(f"   Final features: {final_count}")
-        print(f"   Total removed: {total_removed} ({total_removed/initial_count*100:.1f}%)")
+        logger.info("Feature Selection Summary")
+        logger.info(f"Initial features: {initial_count}")
+        logger.info(f"Final features: {final_count}")
+        logger.info(f"Total removed: {total_removed} ({total_removed/initial_count*100:.1f}%)")
         
         return feature_data
     
@@ -440,8 +443,7 @@ class MLFeatureEngineer:
         Returns:
             ML-ready feature DataFrame
         """
-        print(f"\n🚀 PREPARING ML DATASET")
-        print("=" * 50)
+        logger.info("Preparing ML dataset")
         
         # Step 1: Create base features using existing indicators
         ml_data = self.create_base_features(data)
@@ -465,10 +467,10 @@ class MLFeatureEngineer:
         if feature_selection:
             ml_data = self.select_features(ml_data)
         
-        print(f"\n✅ ML DATASET READY")
-        print(f"   Shape: {ml_data.shape}")
-        print(f"   Features: {len(self.feature_names) if self.feature_names else len(ml_data.columns)}")
-        print(f"   Date range: {ml_data.index.min()} to {ml_data.index.max()}")
+        logger.info("ML dataset ready")
+        logger.info(f"Shape: {ml_data.shape}")
+        logger.info(f"Features: {len(self.feature_names) if self.feature_names else len(ml_data.columns)}")
+        logger.info(f"Date range: {ml_data.index.min()} to {ml_data.index.max()}")
         
         return ml_data
     
