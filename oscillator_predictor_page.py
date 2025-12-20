@@ -652,9 +652,40 @@ def optimize_model_with_optuna(X_train, y_train, X_val, y_val,
         status = progress_container.empty()
         status.info(f"Running {n_trials} trials with {N_JOBS_OPTUNA} parallel workers...")
 
+    # Progress tracking for console output
+    import time
+    last_print_time = [time.time()]  # Use list to allow modification in closure
+    print_interval = 5  # Print every 5 seconds
+
+    def progress_callback(study, trial):
+        """Callback to print progress to console after each trial."""
+        current_time = time.time()
+        # Only print every few seconds to avoid flooding console
+        if current_time - last_print_time[0] >= print_interval:
+            last_print_time[0] = current_time
+
+            completed = len([t for t in study.trials if t.state.name == 'COMPLETE'])
+            failed = len([t for t in study.trials if t.state.name == 'FAIL'])
+            remaining = n_trials - completed - failed
+
+            best_val = study.best_value if study.best_trial else 0.0
+            best_params_str = ""
+            if study.best_trial:
+                # Show key params
+                bp = study.best_params
+                if 'n_estimators' in bp:
+                    best_params_str = f" | n_est={bp.get('n_estimators', '?')}, depth={bp.get('max_depth', '?')}"
+
+            print(f"  [{model_type}] Trial {completed}/{n_trials} ({remaining} remaining) | "
+                  f"Best F1: {best_val:.4f}{best_params_str}")
+
     try:
         # Suppress Optuna's verbose logging during optimization
         optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        print(f"\n{'='*60}")
+        print(f"Starting {model_type} optimization: {n_trials} trials, {N_JOBS_OPTUNA} workers")
+        print(f"{'='*60}")
 
         # Use all available cores (N_JOBS_OPTUNA = N_CORES - 1)
         # The objective is a picklable class instance with the data path
@@ -663,8 +694,18 @@ def optimize_model_with_optuna(X_train, y_train, X_val, y_val,
             n_trials=n_trials,
             n_jobs=N_JOBS_OPTUNA,
             show_progress_bar=False,  # Don't show in terminal, we have Streamlit UI
-            catch=(Exception,)  # Catch exceptions to continue other trials
+            catch=(Exception,),  # Catch exceptions to continue other trials
+            callbacks=[progress_callback]  # Add progress callback
         )
+
+        # Final summary
+        completed = len([t for t in study.trials if t.state.name == 'COMPLETE'])
+        failed = len([t for t in study.trials if t.state.name == 'FAIL'])
+        best_val = study.best_value if study.best_trial else 0.0
+        print(f"\n[{model_type}] COMPLETE: {completed} trials, {failed} failed | Best F1: {best_val:.4f}")
+        if study.best_trial:
+            print(f"[{model_type}] Best params: {study.best_params}")
+        print(f"{'='*60}\n")
 
         optuna.logging.set_verbosity(optuna.logging.INFO)
 
@@ -742,6 +783,13 @@ def train_multiple_models_with_optuna(X_train, y_train, X_val, y_val, X_test, y_
     """
     results = {}
 
+    # Console header
+    print(f"\n{'#'*70}")
+    print(f"# ML MODEL OPTIMIZATION - {len(model_types)} models x {n_trials} trials each")
+    print(f"# Models: {', '.join(model_types)}")
+    print(f"# Workers: {N_JOBS_OPTUNA} parallel")
+    print(f"{'#'*70}\n")
+
     for i, model_type in enumerate(model_types):
         # Create a container for this model's progress
         if progress_placeholder:
@@ -750,6 +798,8 @@ def train_multiple_models_with_optuna(X_train, y_train, X_val, y_val, X_test, y_
             progress_container = progress_placeholder.container()
         else:
             progress_container = None
+
+        print(f"\n>>> MODEL {i+1}/{len(model_types)}: {model_type.upper()} <<<")
 
         try:
             # Optimize (runs synchronously with full CPU utilization)
@@ -766,14 +816,40 @@ def train_multiple_models_with_optuna(X_train, y_train, X_val, y_val, X_test, y_
 
             results[model_type] = result
 
+            # Console output for completion
+            print(f">>> {model_type.upper()} TEST RESULTS: F1={metrics['f1_macro']:.4f}, Acc={metrics['accuracy']:.4f}")
+
             # Show completion message
             if progress_placeholder:
                 model_header.success(f"**{model_type}** complete! Val F1: {result['best_score']:.4f} | Test F1: {metrics['f1_macro']:.4f}")
 
         except Exception as e:
             results[model_type] = {'error': str(e)}
+            print(f">>> {model_type.upper()} FAILED: {str(e)}")
             if progress_placeholder:
                 model_header.error(f"**{model_type}** failed: {str(e)}")
+
+    # Final summary
+    print(f"\n{'#'*70}")
+    print(f"# OPTIMIZATION COMPLETE - SUMMARY")
+    print(f"{'#'*70}")
+    best_model = None
+    best_f1 = 0
+    for model_name, result in results.items():
+        if 'test_metrics' in result:
+            f1 = result['test_metrics']['f1_macro']
+            acc = result['test_metrics']['accuracy']
+            val_f1 = result['best_score']
+            print(f"  {model_name:20s}: Val F1={val_f1:.4f} | Test F1={f1:.4f} | Acc={acc:.4f}")
+            if f1 > best_f1:
+                best_f1 = f1
+                best_model = model_name
+        else:
+            print(f"  {model_name:20s}: FAILED - {result.get('error', 'unknown')}")
+
+    if best_model:
+        print(f"\n  BEST MODEL: {best_model} (Test F1: {best_f1:.4f})")
+    print(f"{'#'*70}\n")
 
     return results
 
