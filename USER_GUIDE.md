@@ -58,7 +58,7 @@ Pattern_FindR consists of 5 main pages, accessible via the dropdown at the top:
 
 ## 1. Strategy Optimization Page
 
-The original page for testing traditional technical analysis strategies.
+The original page for testing traditional technical analysis strategies. Now includes ALL indicators from the Oscillator Predictor page.
 
 ### Features
 
@@ -67,6 +67,37 @@ The original page for testing traditional technical analysis strategies.
 - **Strategy Testing**: Test various indicator-based strategies
 - **Backtesting**: Full backtest with trade log and performance metrics
 - **Optimization**: Grid search for optimal parameters
+- **Full Indicator Suite**: 200+ indicators including novel oscillators
+
+### Available Indicators
+
+This page now has access to ALL indicators developed across the platform:
+
+#### Traditional Indicators (via pandas_ta)
+- Momentum: RSI, MACD, Stochastic, CCI, Williams %R, MFI, ROC, etc.
+- Trend: ADX, Aroon, PSAR, VWAP, Ichimoku, SuperTrend, moving averages
+- Volatility: Bollinger Bands, ATR, Keltner Channels, Donchian
+- Volume: OBV, CMF, MFI, A/D Line, VWMA
+
+#### Oscillator-Based Indicators (from Oscillator Predictor)
+- **Composite Oscillator**: Weighted average of 15+ normalized oscillators
+- **Derivatives**: Velocity, acceleration, jerk of composite oscillator
+- **Rolling Statistics**: Mean, std, min, max, range, position (5/10/20 windows)
+- **Momentum Features**: 3/5/10-bar momentum, zero-crossing detection
+
+#### Novel Oscillators (8 Advanced Indicators)
+| Indicator | Description |
+|-----------|-------------|
+| **ARWO** | Adaptive Regime-Weighted Oscillator |
+| **DCO** | Divergence Consensus Oscillator |
+| **VCMO** | Volume-Confirmed Momentum Oscillator |
+| **ICS** | Indicator Convergence Score |
+| **MJI** | Momentum Jerk Indicator |
+| **PRF** | Percentile Rank Fusion |
+| **EWAF** | Entropy-Weighted Adaptive Fusion |
+| **KFIF** | Kalman-Filtered Indicator Fusion |
+
+Plus velocities and consensus/dispersion features for all novel oscillators.
 
 ### How to Use
 
@@ -480,7 +511,9 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 | `app.py` | Main application entry point |
 | `oscillator_predictor_page.py` | Oscillator Predictor page |
 | `velocity_live_trader.py` | Live trading bot |
-| `novel_indicators.py` | Novel indicator implementations |
+| `novel_indicators.py` | Novel indicator implementations (8 oscillators) |
+| `oscillator_indicators.py` | Oscillator-based features (composite, derivatives, rolling stats) |
+| `indicators.py` | Master indicator integration (200+ indicators) |
 | `optuna_worker.py` | Optimization worker |
 | `strategy_discovery_engine.py` | Strategy discovery |
 
@@ -501,4 +534,4 @@ For issues or feature requests, please open an issue on GitHub.
 ---
 
 *Last updated: December 2024*
-*Version: 2.0 with Novel Indicators*
+*Version: 2.1 - All indicators now available in Strategy Optimization*

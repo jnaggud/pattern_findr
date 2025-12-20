@@ -15,6 +15,16 @@ except Exception as e:
         return {}
 from ml_indicators import integrate_ml_indicators, ML_INDICATOR_LIST
 
+# Import oscillator-based indicators (composite oscillator, derivatives, novel indicators)
+try:
+    from oscillator_indicators import integrate_oscillator_indicators, OSCILLATOR_INDICATOR_LIST
+    OSCILLATOR_INDICATORS_AVAILABLE = True
+except ImportError as e:
+    OSCILLATOR_INDICATORS_AVAILABLE = False
+    OSCILLATOR_INDICATOR_LIST = []
+    def integrate_oscillator_indicators(data):
+        return data
+
 # Suppress specific FutureWarning from pandas_ta
 warnings.filterwarnings("ignore", category=FutureWarning, module="pandas_ta.candles.ha")
 
@@ -551,5 +561,28 @@ def get_all_indicators(data, optuna_params=None):
     # Mark rows where indicators aren't ready (first 50 rows as warmup period)
     data['indicators_ready'] = True
     data.iloc[:50, data.columns.get_loc('indicators_ready')] = False
+
+    # --- Add Oscillator-Based Indicators ---
+    # This adds: composite oscillator, derivatives (velocity, acceleration, jerk),
+    # rolling statistics, novel oscillators (ARWO, DCO, VCMO, ICS, MJI, PRF, EWAF, KFIF),
+    # and consensus/dispersion features
+    try:
+        # Reset index temporarily for oscillator indicator processing
+        temp_data = data.reset_index()
+
+        # Integrate all oscillator indicators
+        temp_data = integrate_oscillator_indicators(temp_data)
+
+        # Get new columns added by oscillator indicators
+        original_cols = set(data.columns)
+        new_cols = [c for c in temp_data.columns if c not in original_cols and c != 'date']
+
+        # Add new oscillator columns back to data
+        for col in new_cols:
+            if col in temp_data.columns:
+                data[col] = temp_data[col].values
+
+    except Exception as e:
+        print(f"Warning: Could not calculate oscillator indicators: {e}")
 
     return data
