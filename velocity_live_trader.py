@@ -1303,8 +1303,38 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
     print(f"📁 State file: {get_state_file_path(strategy_name=strategy_name, ticker=ticker)}")
     print(f"📁 History file: {get_history_file_path(strategy_name=strategy_name, ticker=ticker)}")
 
+    # FETCH FRESH DATA FOR SYNC - bundled data may be stale!
+    print(f"\n🔄 Fetching FRESH data for state sync check...")
+    fresh_backtest = None
+    try:
+        fresh_df = fetch_price_data(ticker, api_key, days=200, interval=interval)
+        if not fresh_df.empty:
+            fresh_df = calculate_composite_oscillator(fresh_df, config)
+            fresh_backtest = run_historical_backtest(fresh_df, config)
+
+            # Show fresh data position vs bundled data position
+            fresh_pos = fresh_backtest.get('current_position')
+            bundled_pos = backtest.get('current_position') if backtest else None
+
+            print(f"   Fresh data range: {fresh_df.index[0].strftime('%Y-%m-%d')} to {fresh_df.index[-1].strftime('%Y-%m-%d')}")
+            if fresh_pos:
+                print(f"   Fresh backtest position: LONG @ ${fresh_pos['entry_price']:.2f} on {fresh_pos['entry_date']}")
+            else:
+                print(f"   Fresh backtest position: None")
+
+            # Check if bundled and fresh differ
+            if bundled_pos and fresh_pos:
+                if abs(bundled_pos['entry_price'] - fresh_pos['entry_price']) > 1:
+                    print(f"   ⚠️  Bundled data is STALE! Using fresh data for sync.")
+    except Exception as e:
+        print(f"   ⚠️ Could not fetch fresh data: {e}")
+        fresh_backtest = backtest  # Fall back to bundled
+
+    # Use fresh backtest for sync if available, otherwise fall back to bundled
+    sync_backtest = fresh_backtest if fresh_backtest else backtest
+
     # SYNC STATE WITH BACKTEST - handles missed entries/exits
-    backtest_position = backtest.get('current_position') if backtest else None
+    backtest_position = sync_backtest.get('current_position') if sync_backtest else None
     state_position = trade_state.get('position')
 
     # Case 1: No state but backtest shows position - missed entry
