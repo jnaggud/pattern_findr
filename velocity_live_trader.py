@@ -1453,13 +1453,14 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             # Send Discord notification about missed exit + new entry
             pnl_info = f"\n**Missed Trade P&L:** {missed_trade.get('pnl', 0):+.2f}%" if missed_trade else ""
             unrealized_pnl = ((sync_current_price - backtest_entry) / backtest_entry * 100) if backtest_entry > 0 else 0
+            pnl_emoji = "🟢" if unrealized_pnl >= 0 else "🔴"
             sync_msg = (
                 f"⚠️ **[{strategy_label}] State Sync - Missed Exit + New Entry**\n"
                 f"---\n"
                 f"**Previous tracking:** {state_position.upper()} @ ${state_entry:.2f}\n"
                 f"**Previous entry time:** {str(state_time)[:16]}{pnl_info}\n"
                 f"---\n"
-                f"**Now tracking:** {backtest_position['position'].upper()} @ ${backtest_entry:.2f} ({unrealized_pnl:+.1f}%)\n"
+                f"{pnl_emoji} **Now tracking:** {backtest_position['position'].upper()} @ ${backtest_entry:.2f} ({unrealized_pnl:+.1f}%)\n"
                 f"**New entry time:** {str(backtest_time)[:16]}\n"
                 f"**Current Price:** ${sync_current_price:,.2f}\n"
                 f"---\n"
@@ -1477,9 +1478,10 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
         if trade_state.get('position'):
             entry_price = trade_state.get('entry_price', 0)
             unrealized_pnl = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
-            pos_status = f"**Position:** LONG @ ${entry_price:.2f} ({unrealized_pnl:+.1f}%)"
+            pnl_emoji = "🟢" if unrealized_pnl >= 0 else "🔴"
+            pos_status = f"{pnl_emoji} **Position:** LONG @ ${entry_price:.2f} ({unrealized_pnl:+.1f}%)"
         else:
-            pos_status = "**Position:** None"
+            pos_status = "⚪ **Position:** None"
 
         startup_msg = (
             f"🤖 **[{strategy_label}] Live Trader Started**\n"
