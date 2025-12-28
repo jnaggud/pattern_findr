@@ -1204,6 +1204,20 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
     # Create a short label for Discord messages (e.g., "BTC-USD 2Y" or "SPY 5Y")
     strategy_label = f"{ticker} {optimization_period.upper()}" if optimization_period else ticker
 
+    # ============================================================
+    # PROMINENT STARTUP BANNER - Shows which strategy this terminal is running
+    # ============================================================
+    print(f"\n")
+    print(f"╔════════════════════════════════════════════════════════════╗")
+    print(f"║                                                            ║")
+    print(f"║   🚀 RUNNING: {strategy_label:^42} 🚀   ║")
+    print(f"║                                                            ║")
+    print(f"╠════════════════════════════════════════════════════════════╣")
+    print(f"║   Strategy: {strategy_name[:44]:44}   ║")
+    print(f"║   Config:   {config_path[:44]:44}   ║")
+    print(f"╚════════════════════════════════════════════════════════════╝")
+    print(f"\n")
+
     # Risk parameters
     stop_loss_pct = config.get('stop_loss_pct', 5.0)
     take_profit_pct = config.get('take_profit_pct', 10.0)
@@ -1418,7 +1432,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
     while True:
         try:
             current_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            print(f"\n[{current_time_str}] Update Cycle...")
+            print(f"\n[{current_time_str}] 📡 {strategy_label} | {strategy_name} | Update Cycle")
 
             # --- CONFIG HOT-RELOAD ---
             if os.path.exists(config_path):
@@ -1864,7 +1878,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     trade_state['last_signal_time'] = str(signal_time)
                     save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
 
-            print(f"Next check in {check_interval_seconds} seconds...")
+            print(f"⏳ [{strategy_label} | {strategy_name}] Next check in {check_interval_seconds // 60} min")
             time.sleep(check_interval_seconds)
 
         except KeyboardInterrupt:
