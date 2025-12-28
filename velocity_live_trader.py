@@ -1413,7 +1413,16 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
     # Send startup notification with stats and chart
     startup_chart = None
     if backtest:
-        pos_status = f"**Position:** LONG @ ${backtest['current_position']['entry_price']:.2f} ({backtest['current_position']['unrealized_pnl']:+.1f}%)" if backtest['current_position'] else "**Position:** None"
+        # Use SYNCED trade_state for position display, not bundled backtest
+        if trade_state.get('position'):
+            entry_price = trade_state.get('entry_price', 0)
+            # Get current price from fresh data if available
+            current_price = fresh_df.iloc[-1]['close'] if fresh_backtest and not fresh_df.empty else df.iloc[-1]['close']
+            unrealized_pnl = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+            pos_status = f"**Position:** LONG @ ${entry_price:.2f} ({unrealized_pnl:+.1f}%)"
+        else:
+            pos_status = "**Position:** None"
+
         startup_msg = (
             f"🤖 **[{strategy_label}] Live Trader Started**\n"
             f"**Strategy:** {strategy_name}\n"
@@ -1428,9 +1437,11 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             f"---\n"
             f"_Monitoring for signals..._"
         )
-        # Generate chart for startup
+        # Generate chart for startup - use fresh data if available for accurate position display
         try:
-            startup_chart = generate_velocity_chart(df, backtest, config, ticker)
+            chart_df = fresh_df if fresh_backtest and not fresh_df.empty else df
+            chart_backtest = fresh_backtest if fresh_backtest else backtest
+            startup_chart = generate_velocity_chart(chart_df, chart_backtest, config, ticker)
             print("✅ Generated startup chart for Discord")
         except Exception as e:
             print(f"⚠️ Could not generate startup chart: {e}")
