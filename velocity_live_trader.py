@@ -1355,21 +1355,47 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
         old_time = trade_state.get('entry_time', 'Unknown')
         print(f"⚠️  STATE MISMATCH: State={state_position.upper()} @ ${old_entry:.2f}, Backtest=None")
         print(f"   🔄 Missed exit detected - clearing state to sync with backtest")
+
+        # Find and record the missed trade from backtest exits
+        missed_trade = None
+        if sync_backtest and sync_backtest.get('exits'):
+            for exit_trade in sync_backtest['exits']:
+                # Match by entry price (within 0.5% tolerance)
+                if abs(exit_trade.get('entry_price', 0) - old_entry) / old_entry < 0.005:
+                    missed_trade = exit_trade
+                    break
+
+        if missed_trade:
+            # Record the missed trade to history
+            stats = log_closed_trade(
+                ticker=ticker,
+                position_type=state_position,
+                entry_price=old_entry,
+                exit_price=missed_trade.get('price', 0),
+                entry_time=str(old_time),
+                exit_time=str(missed_trade.get('date', '')),
+                exit_reason=f"[SYNC] {missed_trade.get('reason', 'Unknown')}",
+                pnl_pct=missed_trade.get('pnl', 0),
+                strategy_name=strategy_name
+            )
+            print(f"   📝 Recorded missed trade: {missed_trade.get('pnl', 0):+.2f}% ({missed_trade.get('reason', 'Unknown')})")
+
         trade_state = {'position': None, 'entry_price': None, 'entry_time': None, 'last_signal_time': None}
         save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
         print(f"   ✅ State synced - position cleared")
 
         # Send Discord notification about missed exit
+        pnl_info = f"\n**Missed Trade P&L:** {missed_trade.get('pnl', 0):+.2f}%" if missed_trade else ""
         sync_msg = (
             f"⚠️ **[{strategy_label}] State Sync - Missed Exit**\n"
             f"---\n"
             f"**Previous tracking:** {state_position.upper()} @ ${old_entry:.2f}\n"
-            f"**Entry time:** {str(old_time)[:16]}\n"
+            f"**Entry time:** {str(old_time)[:16]}{pnl_info}\n"
             f"---\n"
             f"**Backtest shows:** Position was closed\n"
             f"**Action:** State cleared, now tracking no position\n"
             f"---\n"
-            f"_Note: The exit signal was missed. Check trade history for details._"
+            f"_Trade recorded to history for accurate metrics._"
         )
         send_discord_alert(webhook_url, sync_msg)
 
@@ -1387,6 +1413,30 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             print(f"   Backtest says: {backtest_position['position'].upper()} @ ${backtest_entry:.2f}")
             print(f"   🔄 Syncing state with backtest (missed exit + new entry)")
 
+            # Find and record the missed trade from backtest exits
+            missed_trade = None
+            if sync_backtest and sync_backtest.get('exits'):
+                for exit_trade in sync_backtest['exits']:
+                    # Match by entry price (within 0.5% tolerance)
+                    if abs(exit_trade.get('entry_price', 0) - state_entry) / state_entry < 0.005:
+                        missed_trade = exit_trade
+                        break
+
+            if missed_trade:
+                # Record the missed trade to history
+                stats = log_closed_trade(
+                    ticker=ticker,
+                    position_type=state_position,
+                    entry_price=state_entry,
+                    exit_price=missed_trade.get('price', 0),
+                    entry_time=str(state_time),
+                    exit_time=str(missed_trade.get('date', '')),
+                    exit_reason=f"[SYNC] {missed_trade.get('reason', 'Unknown')}",
+                    pnl_pct=missed_trade.get('pnl', 0),
+                    strategy_name=strategy_name
+                )
+                print(f"   📝 Recorded missed trade: {missed_trade.get('pnl', 0):+.2f}% ({missed_trade.get('reason', 'Unknown')})")
+
             trade_state = {
                 'position': backtest_position['position'],
                 'entry_price': backtest_position['entry_price'],
@@ -1397,16 +1447,17 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             print(f"   ✅ State synced - now tracking: {backtest_position['position'].upper()} @ ${backtest_entry:.2f}")
 
             # Send Discord notification about missed exit + new entry
+            pnl_info = f"\n**Missed Trade P&L:** {missed_trade.get('pnl', 0):+.2f}%" if missed_trade else ""
             sync_msg = (
                 f"⚠️ **[{strategy_label}] State Sync - Missed Exit + New Entry**\n"
                 f"---\n"
                 f"**Previous tracking:** {state_position.upper()} @ ${state_entry:.2f}\n"
-                f"**Previous entry time:** {str(state_time)[:16]}\n"
+                f"**Previous entry time:** {str(state_time)[:16]}{pnl_info}\n"
                 f"---\n"
                 f"**Now tracking:** {backtest_position['position'].upper()} @ ${backtest_entry:.2f}\n"
                 f"**New entry time:** {str(backtest_time)[:16]}\n"
                 f"---\n"
-                f"_Note: Exit of previous trade + entry of new trade were missed._"
+                f"_Trade recorded to history for accurate metrics._"
             )
             send_discord_alert(webhook_url, sync_msg)
 
