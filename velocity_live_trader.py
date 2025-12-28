@@ -1307,16 +1307,34 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
     # Case 2: State shows position but backtest shows none - missed exit
     elif state_position is not None and backtest_position is None:
-        print(f"⚠️  STATE MISMATCH: State={state_position.upper()} @ ${trade_state.get('entry_price', 0):.2f}, Backtest=None")
+        old_entry = trade_state.get('entry_price', 0)
+        old_time = trade_state.get('entry_time', 'Unknown')
+        print(f"⚠️  STATE MISMATCH: State={state_position.upper()} @ ${old_entry:.2f}, Backtest=None")
         print(f"   🔄 Missed exit detected - clearing state to sync with backtest")
         trade_state = {'position': None, 'entry_price': None, 'entry_time': None, 'last_signal_time': None}
         save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
         print(f"   ✅ State synced - position cleared")
 
+        # Send Discord notification about missed exit
+        sync_msg = (
+            f"⚠️ **[{strategy_label}] State Sync - Missed Exit**\n"
+            f"---\n"
+            f"**Previous tracking:** {state_position.upper()} @ ${old_entry:.2f}\n"
+            f"**Entry time:** {str(old_time)[:16]}\n"
+            f"---\n"
+            f"**Backtest shows:** Position was closed\n"
+            f"**Action:** State cleared, now tracking no position\n"
+            f"---\n"
+            f"_Note: The exit signal was missed. Check trade history for details._"
+        )
+        send_discord_alert(webhook_url, sync_msg)
+
     # Case 3: Both show position but entry prices differ - missed exit AND new entry
     elif state_position is not None and backtest_position is not None:
         state_entry = trade_state.get('entry_price', 0)
+        state_time = trade_state.get('entry_time', 'Unknown')
         backtest_entry = backtest_position.get('entry_price', 0)
+        backtest_time = backtest_position.get('entry_date', 'Unknown')
 
         # Check if entries differ by more than 0.5% (they should match if same trade)
         if state_entry > 0 and abs(state_entry - backtest_entry) / state_entry > 0.005:
@@ -1333,6 +1351,20 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             }
             save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
             print(f"   ✅ State synced - now tracking: {backtest_position['position'].upper()} @ ${backtest_entry:.2f}")
+
+            # Send Discord notification about missed exit + new entry
+            sync_msg = (
+                f"⚠️ **[{strategy_label}] State Sync - Missed Exit + New Entry**\n"
+                f"---\n"
+                f"**Previous tracking:** {state_position.upper()} @ ${state_entry:.2f}\n"
+                f"**Previous entry time:** {str(state_time)[:16]}\n"
+                f"---\n"
+                f"**Now tracking:** {backtest_position['position'].upper()} @ ${backtest_entry:.2f}\n"
+                f"**New entry time:** {str(backtest_time)[:16]}\n"
+                f"---\n"
+                f"_Note: Exit of previous trade + entry of new trade were missed._"
+            )
+            send_discord_alert(webhook_url, sync_msg)
 
     # Send startup notification with stats and chart
     startup_chart = None
