@@ -77,6 +77,13 @@ except ImportError:
 # Default Discord webhook (same as live_trader.py)
 DEFAULT_DISCORD_WEBHOOK = ""
 
+# Legal disclaimer appended to all Discord messages
+LEGAL_DISCLAIMER = (
+    "\n\n_⚠️ **Disclaimer:** This is not financial advice. Past performance does not "
+    "guarantee future results. Trading involves substantial risk of loss. Only trade "
+    "with capital you can afford to lose. For educational purposes only._"
+)
+
 # Strategy storage directories
 VELOCITY_STRATEGIES_DIR = "velocity_strategies"
 PRODUCTION_CONFIG_PATH = "production_env/velocity_config.json"
@@ -108,6 +115,7 @@ def list_saved_strategies() -> list:
                     'config_path': config_file,
                     'config': config,
                     'ticker': config.get('ticker', 'Unknown'),
+                    'strategy_name': config.get('strategy_name', item),  # For state file naming
                     'signal_type': config.get('signal_type', 'Unknown'),
                     'created': config.get('deployed_at', 'Unknown')
                 })
@@ -220,11 +228,34 @@ def select_strategy_interactive(default_config_path: str = None) -> str:
             selected = strategies[idx - 1]
             print(f"\n✅ Selected: {selected['name']}")
 
-            # Copy to production config for hot-reload compatibility
-            shutil.copy(selected['config_path'], PRODUCTION_CONFIG_PATH)
-            print(f"   Copied to {PRODUCTION_CONFIG_PATH} for hot-reload support")
+            # Use strategy's own config file directly (NOT shared production config)
+            # This allows multiple instances to run different strategies simultaneously
+            strategy_config_path = selected['config_path']
+            print(f"   Using config: {strategy_config_path}")
 
-            return PRODUCTION_CONFIG_PATH
+            # Check if there's an existing state file for this strategy and offer to reset
+            ticker = selected['ticker']
+            strat_name = selected.get('strategy_name', selected['name'])
+            state_file = get_state_file_path(strategy_name=strat_name, ticker=ticker)
+            if os.path.exists(state_file):
+                try:
+                    with open(state_file, 'r') as f:
+                        existing_state = json.load(f)
+                    if existing_state.get('position'):
+                        print(f"\n⚠️  Existing position found for {strat_name}:")
+                        print(f"   Position: {existing_state.get('position').upper()}")
+                        print(f"   Entry: ${existing_state.get('entry_price', 0):.2f}")
+                        print(f"   Time: {existing_state.get('entry_time', 'Unknown')}")
+                        reset = input("\n   Reset trading state? (y/N): ").strip().lower()
+                        if reset == 'y':
+                            os.remove(state_file)
+                            print(f"   ✅ State reset - will sync with backtest on startup")
+                        else:
+                            print(f"   ℹ️  Keeping existing position")
+                except:
+                    pass
+
+            return strategy_config_path
         else:
             print(f"❌ Invalid selection: {idx}")
             return None
@@ -249,52 +280,34 @@ def load_config(config_path: str = "production_env/velocity_config.json") -> dic
 
 
 def fetch_price_data(ticker: str, api_key: str = None, days: int = 200, interval: str = "1d") -> pd.DataFrame:
-    """Fetch historical price data for the ticker."""
+    """
+    Fetch historical price data using yfinance.
+    Uses EXACT same method as Streamlit (oscillator_predictor_page.py line 1238-1242)
+    """
+    if not YFINANCE_AVAILABLE:
+        raise RuntimeError("yfinance not installed. Run: pip install yfinance")
 
-    if POLYGON_AVAILABLE and api_key:
-        try:
-            client = RESTClient(api_key)
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=days)
+    print(f"📊 Fetching {ticker} via yfinance ({days} days, {interval})")
 
-            # Convert interval to Polygon format
-            timespan = "day" if interval == "1d" else "hour" if interval == "1h" else "minute"
-            multiplier = 1
+    # Calculate date range
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days)
 
-            aggs = client.get_aggs(
-                ticker=ticker.replace("-", ""),  # BTC-USD -> BTCUSD for Polygon
-                multiplier=multiplier,
-                timespan=timespan,
-                from_=start_date.strftime("%Y-%m-%d"),
-                to=end_date.strftime("%Y-%m-%d"),
-                limit=50000
-            )
+    # Use yf.download() - exact same as Streamlit
+    df = yf.download(ticker, start=start_date, end=end_date, interval=interval, progress=False)
 
-            if aggs:
-                df = pd.DataFrame([{
-                    'timestamp': a.timestamp,
-                    'open': a.open,
-                    'high': a.high,
-                    'low': a.low,
-                    'close': a.close,
-                    'volume': a.volume
-                } for a in aggs])
+    # Handle MultiIndex columns (exact same as Streamlit line 1239)
+    df.columns = df.columns.get_level_values(0) if isinstance(df.columns, pd.MultiIndex) else df.columns
 
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                df.set_index('timestamp', inplace=True)
-                df = df.sort_index()
-                return df
-        except Exception as e:
-            print(f"Polygon API error: {e}. Falling back to yfinance.")
+    # Normalize column names to lowercase (exact same as Streamlit line 1242)
+    df.columns = df.columns.str.lower()
 
-    # Fallback to yfinance
-    if YFINANCE_AVAILABLE:
-        ticker_yf = yf.Ticker(ticker)
-        df = ticker_yf.history(period=f"{days}d", interval=interval)
-        df.columns = [c.lower() for c in df.columns]
-        return df
+    if len(df) > 0:
+        print(f"   ✓ Loaded {len(df)} bars: {df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')}")
+    else:
+        print(f"   ⚠ Warning: No data returned for {ticker}")
 
-    raise RuntimeError("No data source available. Install polygon-api-client or yfinance.")
+    return df
 
 
 def calculate_composite_oscillator(df: pd.DataFrame, config: dict = None) -> pd.DataFrame:
@@ -359,6 +372,10 @@ def calculate_velocity_signals(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     oversold_threshold = config.get('oversold_threshold', -0.3)
     overbought_threshold = config.get('overbought_threshold', 0.3)
 
+    # Velocity and acceleration thresholds (match Streamlit)
+    vel_threshold = config.get('vel_threshold', 0)
+    accel_threshold = config.get('accel_threshold', 0)
+
     # Extra filters
     rsi_filter = config.get('rsi_filter', 'none')
     rsi_period = config.get('rsi_period', 14)
@@ -409,8 +426,9 @@ def calculate_velocity_signals(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         raw_buy = df['vel_cross_up'] & in_oversold
         raw_sell = df['vel_cross_down'] & in_overbought
     elif signal_type == 'velocity_crossover_or_zone':
-        raw_buy = df['vel_cross_up'] | in_oversold
-        raw_sell = df['vel_cross_down'] | in_overbought
+        # Balanced: velocity crossover OR extreme zone (more trades)
+        raw_buy = df['vel_cross_up'] | extreme_oversold
+        raw_sell = df['vel_cross_down'] | extreme_overbought
     elif signal_type == 'zone_only':
         raw_buy = extreme_oversold & (velocity > 0)
         raw_sell = extreme_overbought & (velocity < 0)
@@ -418,44 +436,73 @@ def calculate_velocity_signals(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         raw_buy = strong_momentum_up & (osc_smooth < 0)
         raw_sell = strong_momentum_down & (osc_smooth > 0)
     elif signal_type == 'any_reversal':
-        raw_buy = df['vel_cross_up'] | extreme_oversold
-        raw_sell = df['vel_cross_down'] | extreme_overbought
+        # Most aggressive: velocity crossover OR extreme zone OR strong momentum in zone
+        raw_buy = df['vel_cross_up'] | extreme_oversold | (strong_momentum_up & in_oversold)
+        raw_sell = df['vel_cross_down'] | extreme_overbought | (strong_momentum_down & in_overbought)
     elif signal_type == 'double_bottom':
-        osc_min_10 = osc_smooth.rolling(10, min_periods=1).min()
-        raw_buy = (osc_smooth <= osc_min_10 * 0.95) & df['vel_cross_up']
-        osc_max_10 = osc_smooth.rolling(10, min_periods=1).max()
-        raw_sell = (osc_smooth >= osc_max_10 * 0.95) & df['vel_cross_down']
+        # Look for second velocity crossover up while still in oversold
+        vel_cross_up_count = df['vel_cross_up'].rolling(10).sum()
+        raw_buy = (vel_cross_up_count >= 2) & in_oversold
+        vel_cross_down_count = df['vel_cross_down'].rolling(10).sum()
+        raw_sell = (vel_cross_down_count >= 2) & in_overbought
     elif signal_type == 'divergence':
-        close_lower = df['close'] < df['close'].shift(5)
-        osc_higher = osc_smooth > osc_smooth.shift(5)
-        raw_buy = close_lower & osc_higher & in_oversold
-        close_higher = df['close'] > df['close'].shift(5)
-        osc_lower = osc_smooth < osc_smooth.shift(5)
-        raw_sell = close_higher & osc_lower & in_overbought
+        # Bullish divergence: price lower low, oscillator higher low
+        close_prices = df['close']
+        price_lower_low = (close_prices < close_prices.rolling(5).min().shift(1))
+        osc_higher_low = (osc_smooth > osc_smooth.rolling(5).min().shift(1))
+        raw_buy = price_lower_low & osc_higher_low & in_oversold
+        # Bearish divergence: price higher high, oscillator lower high
+        price_higher_high = (close_prices > close_prices.rolling(5).max().shift(1))
+        osc_lower_high = (osc_smooth < osc_smooth.rolling(5).max().shift(1))
+        raw_sell = price_higher_high & osc_lower_high & in_overbought
     elif signal_type == 'breakout':
-        raw_buy = (osc_smooth > oversold_threshold) & (osc_smooth.shift(1) <= oversold_threshold) & (velocity > 0)
-        raw_sell = (osc_smooth < overbought_threshold) & (osc_smooth.shift(1) >= overbought_threshold) & (velocity < 0)
+        # Oscillator breaks above/below threshold (entry on breakout)
+        osc_breaks_above = (osc_smooth > oversold_threshold) & (osc_smooth.shift(1) <= oversold_threshold)
+        osc_breaks_below = (osc_smooth < overbought_threshold) & (osc_smooth.shift(1) >= overbought_threshold)
+        raw_buy = osc_breaks_above  # Buy when breaking out of oversold
+        raw_sell = osc_breaks_below  # Sell when breaking into overbought
     else:
         raw_buy = df['vel_cross_up'] & in_oversold
         raw_sell = df['vel_cross_down'] & in_overbought
 
-    # Apply acceleration filter
+    # Apply velocity magnitude filter (match Streamlit)
+    if vel_threshold > 0:
+        raw_buy = raw_buy & (velocity.abs() >= vel_threshold)
+        raw_sell = raw_sell & (velocity.abs() >= vel_threshold)
+
+    # Apply acceleration filter (match Streamlit exactly)
     if require_accel:
-        raw_buy = raw_buy & (acceleration > 0)
-        raw_sell = raw_sell & (acceleration < 0)
+        buy_accel_cond = acceleration > 0
+        sell_accel_cond = acceleration < 0
+        if accel_threshold > 0:
+            buy_accel_cond = buy_accel_cond & (acceleration.abs() >= accel_threshold)
+            sell_accel_cond = sell_accel_cond & (acceleration.abs() >= accel_threshold)
+        raw_buy = raw_buy & buy_accel_cond
+        raw_sell = raw_sell & sell_accel_cond
 
     # Apply extra indicator filters
-    # RSI filter
+    # RSI filter - matches Streamlit options: none, oversold_only, overbought_only, both
     if rsi_filter != 'none':
         # Calculate RSI if not already done
         if 'rsi' not in df.columns:
             delta = df['close'].diff()
             gain = delta.where(delta > 0, 0).rolling(window=rsi_period).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=rsi_period).mean()
-            rs = gain / loss
+            rs = gain / (loss + 1e-10)  # Add small epsilon to avoid division by zero
             df['rsi'] = 100 - (100 / (1 + rs))
 
-        if rsi_filter == 'confirm':
+        if rsi_filter == 'oversold_only':
+            # Only filter buy signals - require RSI to be oversold
+            raw_buy = raw_buy & (df['rsi'] < rsi_oversold)
+        elif rsi_filter == 'overbought_only':
+            # Only filter sell signals - require RSI to be overbought
+            raw_sell = raw_sell & (df['rsi'] > rsi_overbought)
+        elif rsi_filter == 'both':
+            # Filter both buy and sell signals
+            raw_buy = raw_buy & (df['rsi'] < rsi_oversold)
+            raw_sell = raw_sell & (df['rsi'] > rsi_overbought)
+        # Legacy options for backward compatibility
+        elif rsi_filter == 'confirm':
             raw_buy = raw_buy & (df['rsi'] < rsi_oversold)
             raw_sell = raw_sell & (df['rsi'] > rsi_overbought)
         elif rsi_filter == 'divergence':
@@ -481,17 +528,14 @@ def calculate_velocity_signals(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         raw_buy = raw_buy & macd_bullish
         raw_sell = raw_sell & macd_bearish
 
-    # Bollinger Band filter
+    # Bollinger Band filter (match Streamlit exactly)
     if use_bb_filter:
-        bb_period = 20
-        bb_std = 2
-        bb_middle = df['close'].rolling(window=bb_period).mean()
-        bb_std_val = df['close'].rolling(window=bb_period).std()
-        df['bb_lower'] = bb_middle - (bb_std * bb_std_val)
-        df['bb_upper'] = bb_middle + (bb_std * bb_std_val)
-
-        raw_buy = raw_buy & (df['close'] < df['bb_lower'] * 1.02)
-        raw_sell = raw_sell & (df['close'] > df['bb_upper'] * 0.98)
+        bb_sma = df['close'].rolling(20).mean()
+        bb_std_val = df['close'].rolling(20).std()
+        bb_upper = bb_sma + 2 * bb_std_val
+        bb_lower = bb_sma - 2 * bb_std_val
+        raw_buy = raw_buy & (df['close'] < bb_lower)
+        raw_sell = raw_sell & (df['close'] > bb_upper)
 
     df['buy_signal'] = raw_buy
     df['sell_signal'] = raw_sell
@@ -499,11 +543,16 @@ def calculate_velocity_signals(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     return df
 
 
-def send_discord_alert(webhook_url: str, message: str, chart_buf: io.BytesIO = None):
+def send_discord_alert(webhook_url: str, message: str, chart_buf: io.BytesIO = None,
+                       include_disclaimer: bool = True):
     """Send alert to Discord webhook with optional chart image."""
     if not webhook_url:
         print(f"[ALERT] {message}")
         return False
+
+    # Append legal disclaimer to all messages
+    if include_disclaimer:
+        message = message + LEGAL_DISCLAIMER
 
     try:
         if chart_buf:
@@ -526,8 +575,17 @@ def send_discord_alert(webhook_url: str, message: str, chart_buf: io.BytesIO = N
         return False
 
 
-def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, ticker: str) -> io.BytesIO:
-    """Generate a velocity strategy chart for Discord."""
+def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, ticker: str,
+                            title_suffix: str = "") -> io.BytesIO:
+    """Generate a velocity strategy chart for Discord.
+
+    Args:
+        df: DataFrame with price and indicator data
+        backtest: Backtest results dict
+        config: Strategy config
+        ticker: Ticker symbol
+        title_suffix: Optional suffix for chart title (e.g., " - Last 180 Days")
+    """
     try:
         # Use all available data (full test period)
         df_plot = df.copy()
@@ -578,7 +636,7 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
             pos = backtest['current_position']
             ax1.axhline(pos['entry_price'], color='cyan', linestyle='--', alpha=0.7, label=f"Entry ${pos['entry_price']:.2f}")
 
-        ax1.set_title(f"{ticker} - Velocity Strategy", color='white', fontsize=14, fontweight='bold')
+        ax1.set_title(f"{ticker} - JD Strategy{title_suffix}", color='white', fontsize=14, fontweight='bold')
         ax1.set_ylabel("Price ($)", color='white')
         ax1.legend(loc='upper left', facecolor='#1a1a2e', labelcolor='white')
         # Format x-axis with dates
@@ -588,11 +646,11 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
             ax1.tick_params(axis='x', labelsize=8)
             plt.setp(ax1.xaxis.get_majorticklabels(), rotation=0)
 
-        # 2. Oscillator with thresholds
+        # 2. JD Oscillator with thresholds
         ax2 = axes[1]
         osc_col = 'osc_smooth' if 'osc_smooth' in df_plot.columns else 'composite_smooth'
         if osc_col in df_plot.columns:
-            ax2.plot(df_plot.index, df_plot[osc_col], color='#e94560', linewidth=1.5, label='Oscillator')
+            ax2.plot(df_plot.index, df_plot[osc_col], color='#e94560', linewidth=1.5, label='JD_Osc')
             ax2.axhline(config.get('oversold_threshold', -0.3), color='lime', linestyle='--', alpha=0.7, label='Oversold')
             ax2.axhline(config.get('overbought_threshold', 0.3), color='red', linestyle='--', alpha=0.7, label='Overbought')
             ax2.axhline(0, color='gray', linestyle='-', alpha=0.5)
@@ -602,7 +660,7 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
             ax2.fill_between(df_plot.index, df_plot[osc_col], 0,
                             where=(df_plot[osc_col] > config.get('overbought_threshold', 0.3)),
                             color='red', alpha=0.3)
-        ax2.set_ylabel("Oscillator", color='white')
+        ax2.set_ylabel("JD_Osc", color='white')
         ax2.set_ylim(-1.2, 1.2)
         ax2.legend(loc='upper left', facecolor='#1a1a2e', labelcolor='white', fontsize='small')
         # Format x-axis with dates
@@ -612,14 +670,14 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
             ax2.tick_params(axis='x', labelsize=8)
             plt.setp(ax2.xaxis.get_majorticklabels(), rotation=0)
 
-        # 3. Velocity & Acceleration
+        # 3. JD Signal Indicators
         ax3 = axes[2]
         if 'velocity' in df_plot.columns:
-            ax3.plot(df_plot.index, df_plot['velocity'], color='#00d9ff', linewidth=1.2, label='Velocity')
+            ax3.plot(df_plot.index, df_plot['velocity'], color='#00d9ff', linewidth=1.2, label='JD_Signal')
         if 'acceleration' in df_plot.columns:
-            ax3.plot(df_plot.index, df_plot['acceleration'], color='#ffd700', linewidth=1.0, alpha=0.7, label='Acceleration')
+            ax3.plot(df_plot.index, df_plot['acceleration'], color='#ffd700', linewidth=1.0, alpha=0.7, label='JD_Trend')
         ax3.axhline(0, color='gray', linestyle='-', alpha=0.5)
-        ax3.set_ylabel("Vel/Accel", color='white')
+        ax3.set_ylabel("JD_Signal", color='white')
         ax3.legend(loc='upper left', facecolor='#1a1a2e', labelcolor='white', fontsize='small')
         # Format x-axis with dates
         if isinstance(df_plot.index, pd.DatetimeIndex):
@@ -794,8 +852,71 @@ def run_historical_backtest(df: pd.DataFrame, config: dict) -> dict:
     }
 
 
-def load_trade_state(state_path: str = "velocity_trade_state.json") -> dict:
-    """Load current trade state from file."""
+def run_backtest_for_period(df: pd.DataFrame, config: dict, days: int = None) -> tuple:
+    """
+    Run backtest for a specific period of days.
+    Returns (filtered_df, backtest_results).
+
+    Args:
+        df: Full DataFrame with price and indicator data
+        config: Strategy config
+        days: Number of days to include (from end). If None, use all data.
+    """
+    if days is not None and len(df) > days:
+        df_period = df.iloc[-days:].copy()
+    else:
+        df_period = df.copy()
+
+    # Recalculate signals on the filtered data
+    df_period = calculate_velocity_signals(df_period, config)
+
+    # Run backtest on filtered data
+    backtest = run_historical_backtest(df_period, config)
+
+    return df_period, backtest
+
+
+def get_state_file_path(strategy_name: str = None, ticker: str = None) -> str:
+    """Get strategy-specific state file path.
+
+    Uses strategy_name if provided (allows multiple strategies per ticker),
+    falls back to ticker for backwards compatibility.
+    """
+    if strategy_name:
+        safe_name = strategy_name.replace("/", "-").replace(":", "-").replace(" ", "_")
+        return f"velocity_trade_state_{safe_name}.json"
+    elif ticker:
+        safe_ticker = ticker.replace("/", "-").replace(":", "-").replace(" ", "_")
+        return f"velocity_trade_state_{safe_ticker}.json"
+    return "velocity_trade_state.json"
+
+
+def get_history_file_path(strategy_name: str = None, ticker: str = None) -> str:
+    """Get strategy-specific trade history file path.
+
+    Uses strategy_name if provided (allows multiple strategies per ticker),
+    falls back to ticker for backwards compatibility.
+    """
+    if strategy_name:
+        safe_name = strategy_name.replace("/", "-").replace(":", "-").replace(" ", "_")
+        return f"velocity_trade_history_{safe_name}.json"
+    elif ticker:
+        safe_ticker = ticker.replace("/", "-").replace(":", "-").replace(" ", "_")
+        return f"velocity_trade_history_{safe_ticker}.json"
+    return "velocity_trade_history.json"
+
+
+def load_trade_state(strategy_name: str = None, ticker: str = None, state_path: str = None) -> dict:
+    """Load current trade state from file.
+
+    Args:
+        strategy_name: Strategy name (preferred - allows multiple strategies per ticker)
+        ticker: Ticker symbol (fallback for backwards compatibility)
+        state_path: Override path (legacy support)
+    """
+    if state_path is None:
+        state_path = get_state_file_path(strategy_name=strategy_name, ticker=ticker)
+
     if os.path.exists(state_path):
         with open(state_path, 'r') as f:
             return json.load(f)
@@ -807,48 +928,249 @@ def load_trade_state(state_path: str = "velocity_trade_state.json") -> dict:
     }
 
 
-def save_trade_state(state: dict, state_path: str = "velocity_trade_state.json"):
-    """Save trade state to file."""
+def save_trade_state(state: dict, strategy_name: str = None, ticker: str = None, state_path: str = None):
+    """Save trade state to file.
+
+    Args:
+        state: Trade state dict
+        strategy_name: Strategy name (preferred - allows multiple strategies per ticker)
+        ticker: Ticker symbol (fallback for backwards compatibility)
+        state_path: Override path (legacy support)
+    """
+    if state_path is None:
+        state_path = get_state_file_path(strategy_name=strategy_name, ticker=ticker)
+
     with open(state_path, 'w') as f:
         json.dump(state, f, indent=2, default=str)
 
 
+def load_trade_history(strategy_name: str = None, ticker: str = None, history_path: str = None) -> list:
+    """Load trade history from file.
+
+    Args:
+        strategy_name: Strategy name (preferred - allows multiple strategies per ticker)
+        ticker: Ticker symbol (fallback for backwards compatibility)
+        history_path: Override path (legacy support)
+    """
+    if history_path is None:
+        history_path = get_history_file_path(strategy_name=strategy_name, ticker=ticker)
+
+    if os.path.exists(history_path):
+        try:
+            with open(history_path, 'r') as f:
+                return json.load(f)
+        except:
+            return []
+    return []
+
+
+def save_trade_history(history: list, strategy_name: str = None, ticker: str = None, history_path: str = None):
+    """Save trade history to file.
+
+    Args:
+        history: Trade history list
+        strategy_name: Strategy name (preferred - allows multiple strategies per ticker)
+        ticker: Ticker symbol (fallback for backwards compatibility)
+        history_path: Override path (legacy support)
+    """
+    if history_path is None:
+        history_path = get_history_file_path(strategy_name=strategy_name, ticker=ticker)
+
+    with open(history_path, 'w') as f:
+        json.dump(history, f, indent=2, default=str)
+
+
+def log_closed_trade(ticker: str, position_type: str, entry_price: float, exit_price: float,
+                     entry_time: str, exit_time: str, exit_reason: str, pnl_pct: float,
+                     strategy_name: str = None):
+    """Log a closed trade to history and return cumulative stats."""
+    history = load_trade_history(strategy_name=strategy_name, ticker=ticker)
+
+    trade = {
+        "id": len(history) + 1,
+        "ticker": ticker,
+        "strategy_name": strategy_name,
+        "type": position_type,
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "entry_time": entry_time,
+        "exit_time": exit_time,
+        "exit_reason": exit_reason,
+        "pnl_pct": pnl_pct,
+        "pnl_dollars": (pnl_pct / 100) * 10000  # Assuming $10k position
+    }
+
+    history.append(trade)
+    save_trade_history(history, strategy_name=strategy_name, ticker=ticker)
+
+    # Calculate cumulative stats
+    total_trades = len(history)
+    winners = [t for t in history if t['pnl_pct'] > 0]
+    losers = [t for t in history if t['pnl_pct'] < 0]
+    win_rate = (len(winners) / total_trades * 100) if total_trades > 0 else 0
+    total_pnl = sum(t['pnl_pct'] for t in history)
+    total_pnl_dollars = sum(t.get('pnl_dollars', 0) for t in history)
+    avg_win = sum(t['pnl_pct'] for t in winners) / len(winners) if winners else 0
+    avg_loss = sum(t['pnl_pct'] for t in losers) / len(losers) if losers else 0
+
+    return {
+        "total_trades": total_trades,
+        "winners": len(winners),
+        "losers": len(losers),
+        "win_rate": win_rate,
+        "total_pnl_pct": total_pnl,
+        "total_pnl_dollars": total_pnl_dollars,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+    }
+
+
 def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, config: dict,
                        ticker: str, title: str = "📊 Status Update", trade_state: dict = None):
-    """Send a scheduled status update with chart to Discord."""
+    """Send a scheduled status update with TWO charts to Discord.
+
+    Sends two posts:
+    1. Full timeframe chart with stats over entire period
+    2. Last 180 days chart with stats recalculated for that window
+    """
     try:
-        # Generate chart
-        chart_buf = generate_velocity_chart(df, backtest, config, ticker)
+        # Helper function to build position section
+        def build_position_section(current_price, trade_state_local, backtest_local, config_local):
+            pos_section = "📭 **Position:** No active position"
 
-        # Build status message
-        pos_status = "No position"
-        if trade_state and trade_state.get('position') == 'long':
-            entry_price = trade_state.get('entry_price', 0)
-            current_price = df['close'].iloc[-1]
-            pnl = ((current_price - entry_price) / entry_price) * 100 if entry_price else 0
-            pos_status = f"LONG @ ${entry_price:.2f} ({pnl:+.1f}%)"
-        elif backtest.get('current_position'):
-            pos = backtest['current_position']
-            pos_status = f"LONG @ ${pos['entry_price']:.2f} ({pos['unrealized_pnl']:+.1f}%)"
+            if trade_state_local and trade_state_local.get('position'):
+                pos_type = trade_state_local.get('position', '').upper()
+                entry_price = trade_state_local.get('entry_price', 0)
+                entry_time_str = trade_state_local.get('entry_time', '')
 
-        msg = (
-            f"**{title}: {ticker}**\n"
-            f"**Strategy:** {config.get('strategy_name', 'velocity')}\n"
-            f"**Signal Type:** {config.get('signal_type')}\n"
+                # Calculate P&L
+                if pos_type == 'LONG':
+                    pnl = ((current_price - entry_price) / entry_price) * 100 if entry_price else 0
+                else:
+                    pnl = ((entry_price - current_price) / entry_price) * 100 if entry_price else 0
+
+                pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+
+                # Calculate hold duration
+                hold_duration = "N/A"
+                if entry_time_str:
+                    try:
+                        entry_dt = datetime.strptime(entry_time_str.split('.')[0], '%Y-%m-%d %H:%M:%S')
+                        duration = datetime.now() - entry_dt
+                        days = duration.days
+                        hours = duration.seconds // 3600
+                        if days > 0:
+                            hold_duration = f"{days}d {hours}h"
+                        else:
+                            hold_duration = f"{hours}h {(duration.seconds % 3600) // 60}m"
+                    except:
+                        hold_duration = "N/A"
+
+                # Estimate P&L in dollars
+                position_size = 10000
+                pnl_dollars = (pnl / 100) * position_size
+
+                # Stop loss and take profit levels
+                stop_loss_pct = config_local.get('stop_loss_pct', 5)
+                take_profit_pct = config_local.get('take_profit_pct', 10)
+
+                if pos_type == 'LONG':
+                    sl_price = entry_price * (1 - stop_loss_pct/100)
+                    tp_price = entry_price * (1 + take_profit_pct/100)
+                else:
+                    sl_price = entry_price * (1 + stop_loss_pct/100)
+                    tp_price = entry_price * (1 - take_profit_pct/100)
+
+                pos_section = (
+                    f"{pnl_emoji} **Position:** {pos_type}\n"
+                    f"• Entry: ${entry_price:.2f} on {entry_time_str[:10] if entry_time_str else 'N/A'}\n"
+                    f"• Current: ${current_price:.2f} | **P&L: {pnl:+.2f}%** (${pnl_dollars:+,.0f})\n"
+                    f"• Duration: {hold_duration}\n"
+                    f"• SL: ${sl_price:.2f} | TP: ${tp_price:.2f}"
+                )
+            elif backtest_local and backtest_local.get('current_position'):
+                pos = backtest_local['current_position']
+                pos_section = f"🟢 **Position:** LONG @ ${pos['entry_price']:.2f} ({pos['unrealized_pnl']:+.1f}%)"
+
+            return pos_section
+
+        # Create strategy label for clear identification
+        opt_period = config.get('optimization_period', '')
+        strategy_label = f"{ticker} {opt_period.upper()}" if opt_period else ticker
+        current_price = df['close'].iloc[-1]
+
+        # Calculate date range for full data
+        full_start = df.index[0].strftime('%Y-%m-%d') if hasattr(df.index[0], 'strftime') else str(df.index[0])[:10]
+        full_end = df.index[-1].strftime('%Y-%m-%d') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])[:10]
+        full_days = len(df)
+
+        # --- CHART 1: Full Timeframe ---
+        chart_buf_full = generate_velocity_chart(df, backtest, config, ticker,
+                                                  title_suffix=f" (Full: {full_days} bars)")
+        pos_section = build_position_section(current_price, trade_state, backtest, config)
+
+        msg_full = (
+            f"**{title}: {strategy_label}** [1/2 Full Timeframe]\n"
+            f"**Period:** {full_start} to {full_end} ({full_days} bars)\n"
             f"---\n"
-            f"📊 **Stats:**\n"
+            f"{pos_section}\n"
+            f"---\n"
+            f"📊 **Full Period Stats:**\n"
             f"• Trades: {backtest['num_trades']} | Win Rate: {backtest['win_rate']:.0f}%\n"
             f"• Return: {backtest['total_return']:.1f}% | PF: {backtest['profit_factor']:.1f}\n"
-            f"• Position: {pos_status}\n"
             f"---\n"
             f"_Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}_"
         )
 
-        send_discord_alert(webhook_url, msg, chart_buf)
-        print(f"✅ Sent status update: {title}")
+        send_discord_alert(webhook_url, msg_full, chart_buf_full)
+        print(f"✅ Sent full timeframe update: {title}")
+
+        # --- CHART 2: Recent Period (180 days or half of data) ---
+        # Determine subset size: use 180 days if available, otherwise half the data
+        min_bars_for_subset = 20  # Need at least 20 bars to make a meaningful subset
+
+        if len(df) > min_bars_for_subset:
+            if len(df) > 180:
+                subset_days = 180
+                period_label = "Last 180 Days"
+            else:
+                subset_days = len(df) // 2
+                period_label = f"Last {subset_days} Days"
+
+            df_subset, backtest_subset = run_backtest_for_period(df, config, days=subset_days)
+
+            # Calculate date range for subset window
+            period_start = df_subset.index[0].strftime('%Y-%m-%d') if hasattr(df_subset.index[0], 'strftime') else str(df_subset.index[0])[:10]
+            period_end = df_subset.index[-1].strftime('%Y-%m-%d') if hasattr(df_subset.index[-1], 'strftime') else str(df_subset.index[-1])[:10]
+
+            chart_buf_subset = generate_velocity_chart(df_subset, backtest_subset, config, ticker,
+                                                        title_suffix=f" ({period_label})")
+
+            # Position section stays the same (current position)
+            pos_section_subset = build_position_section(current_price, trade_state, backtest_subset, config)
+
+            msg_subset = (
+                f"**{title}: {strategy_label}** [2/2 {period_label}]\n"
+                f"**Period:** {period_start} to {period_end} ({len(df_subset)} bars)\n"
+                f"---\n"
+                f"{pos_section_subset}\n"
+                f"---\n"
+                f"📊 **{period_label} Stats:**\n"
+                f"• Trades: {backtest_subset['num_trades']} | Win Rate: {backtest_subset['win_rate']:.0f}%\n"
+                f"• Return: {backtest_subset['total_return']:.1f}% | PF: {backtest_subset['profit_factor']:.1f}\n"
+                f"---\n"
+                f"_Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}_"
+            )
+
+            send_discord_alert(webhook_url, msg_subset, chart_buf_subset)
+            print(f"✅ Sent {period_label} update: {title}")
+        else:
+            print(f"ℹ️ Skipping subset chart (only {len(df)} bars available, need >{min_bars_for_subset})")
 
     except Exception as e:
         print(f"⚠️ Failed to send status update: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def run_live_trader(config_path: str = "production_env/velocity_config.json", skip_selection: bool = False):
@@ -877,6 +1199,10 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
     api_key = config.get('polygon_api_key')
     webhook_url = config.get('discord_webhook') or DEFAULT_DISCORD_WEBHOOK
     strategy_name = config.get('strategy_name', 'velocity_strategy')
+    optimization_period = config.get('optimization_period', '')  # e.g., "1y", "2y", "5y"
+
+    # Create a short label for Discord messages (e.g., "BTC-USD 2Y" or "SPY 5Y")
+    strategy_label = f"{ticker} {optimization_period.upper()}" if optimization_period else ticker
 
     # Risk parameters
     stop_loss_pct = config.get('stop_loss_pct', 5.0)
@@ -893,23 +1219,34 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
     print(f"Discord Webhook: {'Configured' if webhook_url else 'Not configured'}")
     print(f"{'='*60}\n")
 
-    # Try to load saved data from Streamlit (exact match) or fetch new data
-    saved_data_path = "production_env/velocity_data.parquet"
-    backtest_days = 250
+    # Use data period from config if available, otherwise default to 365 days
+    backtest_days = config.get('data_period_days', 365)
+    print(f"📅 Data period: {backtest_days} days (from config)")
 
     print(f"📊 Running historical backtest...")
     try:
-        if os.path.exists(saved_data_path):
-            print(f"   Loading saved data from Streamlit: {saved_data_path}")
-            df = pd.read_parquet(saved_data_path)
-            print(f"   Loaded {len(df)} bars (exact Streamlit data)")
-            # Data already has oscillator calculated - just ensure osc_smooth alias exists
-            if 'composite_smooth' in df.columns and 'osc_smooth' not in df.columns:
-                df['osc_smooth'] = df['composite_smooth']
+        # Check for bundled data from Streamlit (ensures EXACT same data)
+        bundle_name = config.get('bundle_name')
+        bundled_data_path = None
+        if bundle_name:
+            bundled_data_path = os.path.join(VELOCITY_STRATEGIES_DIR, bundle_name, "data.parquet")
+
+        df = None
+        if bundled_data_path and os.path.exists(bundled_data_path):
+            # Load exact data from Streamlit bundle
+            print(f"   📦 Loading bundled data from: {bundled_data_path}")
+            df = pd.read_parquet(bundled_data_path)
+            # Ensure index is DatetimeIndex
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df.index = pd.to_datetime(df.index)
+            print(f"   ✓ Loaded {len(df)} bars: {df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')}")
+            print(f"   ✓ Using EXACT same data as Streamlit!")
         else:
-            print(f"   Fetching {backtest_days} days of fresh data...")
+            # Fetch fresh data via yfinance (fallback)
+            print(f"   Fetching fresh data via yfinance...")
             df = fetch_price_data(ticker, api_key, days=backtest_days, interval=interval)
-            df = calculate_composite_oscillator(df, config)
+
+        df = calculate_composite_oscillator(df, config)
         backtest = run_historical_backtest(df, config)
 
         print(f"\n{'='*60}")
@@ -947,27 +1284,62 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
         print(f"⚠️ Could not run historical backtest: {e}")
         backtest = None
 
-    # Load or initialize trade state from backtest
-    trade_state = load_trade_state()
+    # Load or initialize trade state from backtest (ticker-specific)
+    trade_state = load_trade_state(strategy_name=strategy_name, ticker=ticker)
+    print(f"📁 State file: {get_state_file_path(strategy_name=strategy_name, ticker=ticker)}")
+    print(f"📁 History file: {get_history_file_path(strategy_name=strategy_name, ticker=ticker)}")
 
-    # If no saved state but backtest shows open position, initialize from backtest
-    if trade_state.get('position') is None and backtest and backtest['current_position']:
-        pos = backtest['current_position']
+    # SYNC STATE WITH BACKTEST - handles missed entries/exits
+    backtest_position = backtest.get('current_position') if backtest else None
+    state_position = trade_state.get('position')
+
+    # Case 1: No state but backtest shows position - missed entry
+    if state_position is None and backtest_position:
+        pos = backtest_position
         trade_state = {
             'position': pos['position'],
             'entry_price': pos['entry_price'],
             'entry_time': pos['entry_date'],
             'last_signal_time': pos['entry_date'],
         }
-        save_trade_state(trade_state)
-        print(f"✅ Initialized position from historical backtest: LONG @ ${pos['entry_price']:.2f}")
+        save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
+        print(f"✅ Initialized position from backtest: LONG @ ${pos['entry_price']:.2f}")
+
+    # Case 2: State shows position but backtest shows none - missed exit
+    elif state_position is not None and backtest_position is None:
+        print(f"⚠️  STATE MISMATCH: State={state_position.upper()} @ ${trade_state.get('entry_price', 0):.2f}, Backtest=None")
+        print(f"   🔄 Missed exit detected - clearing state to sync with backtest")
+        trade_state = {'position': None, 'entry_price': None, 'entry_time': None, 'last_signal_time': None}
+        save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
+        print(f"   ✅ State synced - position cleared")
+
+    # Case 3: Both show position but entry prices differ - missed exit AND new entry
+    elif state_position is not None and backtest_position is not None:
+        state_entry = trade_state.get('entry_price', 0)
+        backtest_entry = backtest_position.get('entry_price', 0)
+
+        # Check if entries differ by more than 0.5% (they should match if same trade)
+        if state_entry > 0 and abs(state_entry - backtest_entry) / state_entry > 0.005:
+            print(f"⚠️  STATE MISMATCH: Different entries detected!")
+            print(f"   State says: {state_position.upper()} @ ${state_entry:.2f}")
+            print(f"   Backtest says: {backtest_position['position'].upper()} @ ${backtest_entry:.2f}")
+            print(f"   🔄 Syncing state with backtest (missed exit + new entry)")
+
+            trade_state = {
+                'position': backtest_position['position'],
+                'entry_price': backtest_position['entry_price'],
+                'entry_time': backtest_position['entry_date'],
+                'last_signal_time': backtest_position['entry_date'],
+            }
+            save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
+            print(f"   ✅ State synced - now tracking: {backtest_position['position'].upper()} @ ${backtest_entry:.2f}")
 
     # Send startup notification with stats and chart
     startup_chart = None
     if backtest:
         pos_status = f"**Position:** LONG @ ${backtest['current_position']['entry_price']:.2f} ({backtest['current_position']['unrealized_pnl']:+.1f}%)" if backtest['current_position'] else "**Position:** None"
         startup_msg = (
-            f"🤖 **[VELOCITY] Live Trader Started**\n"
+            f"🤖 **[{strategy_label}] Live Trader Started**\n"
             f"**Strategy:** {strategy_name}\n"
             f"**Ticker:** {ticker}\n"
             f"**Signal Type:** {config.get('signal_type')}\n"
@@ -988,7 +1360,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             print(f"⚠️ Could not generate startup chart: {e}")
     else:
         startup_msg = (
-            f"🤖 **[VELOCITY] Live Trader Started**\n"
+            f"🤖 **[{strategy_label}] Live Trader Started**\n"
             f"**Strategy:** {strategy_name}\n"
             f"**Ticker:** {ticker}\n"
             f"**Interval:** {interval}\n"
@@ -1168,15 +1540,62 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         )
 
                     pnl_emoji = "✅" if pnl_pct > 0 else "❌"
+
+                    # Calculate hold duration
+                    entry_time_str = trade_state.get('entry_time', '')
+                    hold_duration = "N/A"
+                    if entry_time_str:
+                        try:
+                            entry_dt = datetime.strptime(entry_time_str.split('.')[0], '%Y-%m-%d %H:%M:%S')
+                            duration = current_time - entry_dt
+                            days = duration.days
+                            hours = duration.seconds // 3600
+                            if days > 0:
+                                hold_duration = f"{days}d {hours}h"
+                            else:
+                                hold_duration = f"{hours}h {(duration.seconds % 3600) // 60}m"
+                        except:
+                            hold_duration = "N/A"
+
+                    # Estimate P&L in dollars (assuming $10k position size)
+                    position_size = 10000
+                    pnl_dollars = (pnl_pct / 100) * position_size
+
                     exit_msg = (
-                        f"📤 **[VELOCITY] LONG EXIT - {ticker}** {pnl_emoji}\n"
+                        f"📤 **[{strategy_label}] LONG EXIT** {pnl_emoji}\n"
                         f"**Reason:** {exit_reason}\n"
-                        f"**Entry:** ${entry_price:.2f}\n"
-                        f"**Exit:** ${current_price:.2f}\n"
-                        f"**P&L:** {pnl_pct:+.2f}%\n"
-                        f"**Time:** {current_time}\n"
+                        f"---\n"
+                        f"📅 **Entry:** {entry_time_str[:16] if entry_time_str else 'N/A'} @ ${entry_price:.2f}\n"
+                        f"📅 **Exit:** {current_time.strftime('%Y-%m-%d %H:%M')} @ ${current_price:.2f}\n"
+                        f"⏱️ **Hold Duration:** {hold_duration}\n"
+                        f"---\n"
+                        f"💰 **P&L:** {pnl_pct:+.2f}% (${pnl_dollars:+,.0f} on $10k)\n"
                         f"{stats_section}"
                     )
+
+                    # Log closed trade and get cumulative stats
+                    cumulative = log_closed_trade(
+                        ticker=ticker,
+                        position_type="LONG",
+                        entry_price=entry_price,
+                        exit_price=current_price,
+                        entry_time=entry_time_str,
+                        exit_time=current_time.strftime('%Y-%m-%d %H:%M:%S'),
+                        exit_reason=exit_reason,
+                        pnl_pct=pnl_pct,
+                        strategy_name=strategy_name
+                    )
+
+                    # Add cumulative stats to message
+                    cumulative_section = (
+                        f"---\n"
+                        f"📈 **Cumulative Performance:**\n"
+                        f"• Trades: {cumulative['total_trades']} ({cumulative['winners']}W / {cumulative['losers']}L)\n"
+                        f"• Win Rate: {cumulative['win_rate']:.0f}%\n"
+                        f"• Total P&L: {cumulative['total_pnl_pct']:+.2f}% (${cumulative['total_pnl_dollars']:+,.0f})\n"
+                    )
+
+                    exit_msg += cumulative_section
 
                     send_discord_alert(webhook_url, exit_msg, exit_chart)
                     print(f"EXIT LONG: {exit_reason}")
@@ -1184,7 +1603,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     trade_state['position'] = None
                     trade_state['entry_price'] = None
                     trade_state['entry_time'] = None
-                    save_trade_state(trade_state)
+                    save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
 
             elif trade_state['position'] == 'short':
                 entry_price = trade_state['entry_price']
@@ -1226,15 +1645,62 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         )
 
                     pnl_emoji = "✅" if pnl_pct > 0 else "❌"
+
+                    # Calculate hold duration
+                    entry_time_str = trade_state.get('entry_time', '')
+                    hold_duration = "N/A"
+                    if entry_time_str:
+                        try:
+                            entry_dt = datetime.strptime(entry_time_str.split('.')[0], '%Y-%m-%d %H:%M:%S')
+                            duration = current_time - entry_dt
+                            days = duration.days
+                            hours = duration.seconds // 3600
+                            if days > 0:
+                                hold_duration = f"{days}d {hours}h"
+                            else:
+                                hold_duration = f"{hours}h {(duration.seconds % 3600) // 60}m"
+                        except:
+                            hold_duration = "N/A"
+
+                    # Estimate P&L in dollars (assuming $10k position size)
+                    position_size = 10000
+                    pnl_dollars = (pnl_pct / 100) * position_size
+
                     exit_msg = (
-                        f"📤 **[VELOCITY] SHORT EXIT - {ticker}** {pnl_emoji}\n"
+                        f"📤 **[{strategy_label}] SHORT EXIT** {pnl_emoji}\n"
                         f"**Reason:** {exit_reason}\n"
-                        f"**Entry:** ${entry_price:.2f}\n"
-                        f"**Exit:** ${current_price:.2f}\n"
-                        f"**P&L:** {pnl_pct:+.2f}%\n"
-                        f"**Time:** {current_time}\n"
+                        f"---\n"
+                        f"📅 **Entry:** {entry_time_str[:16] if entry_time_str else 'N/A'} @ ${entry_price:.2f}\n"
+                        f"📅 **Exit:** {current_time.strftime('%Y-%m-%d %H:%M')} @ ${current_price:.2f}\n"
+                        f"⏱️ **Hold Duration:** {hold_duration}\n"
+                        f"---\n"
+                        f"💰 **P&L:** {pnl_pct:+.2f}% (${pnl_dollars:+,.0f} on $10k)\n"
                         f"{stats_section}"
                     )
+
+                    # Log closed trade and get cumulative stats
+                    cumulative = log_closed_trade(
+                        ticker=ticker,
+                        position_type="SHORT",
+                        entry_price=entry_price,
+                        exit_price=current_price,
+                        entry_time=entry_time_str,
+                        exit_time=current_time.strftime('%Y-%m-%d %H:%M:%S'),
+                        exit_reason=exit_reason,
+                        pnl_pct=pnl_pct,
+                        strategy_name=strategy_name
+                    )
+
+                    # Add cumulative stats to message
+                    cumulative_section = (
+                        f"---\n"
+                        f"📈 **Cumulative Performance:**\n"
+                        f"• Trades: {cumulative['total_trades']} ({cumulative['winners']}W / {cumulative['losers']}L)\n"
+                        f"• Win Rate: {cumulative['win_rate']:.0f}%\n"
+                        f"• Total P&L: {cumulative['total_pnl_pct']:+.2f}% (${cumulative['total_pnl_dollars']:+,.0f})\n"
+                    )
+
+                    exit_msg += cumulative_section
 
                     send_discord_alert(webhook_url, exit_msg, exit_chart)
                     print(f"EXIT SHORT: {exit_reason}")
@@ -1242,7 +1708,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     trade_state['position'] = None
                     trade_state['entry_price'] = None
                     trade_state['entry_time'] = None
-                    save_trade_state(trade_state)
+                    save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
 
             # Check for new entry signals (only if not in position)
             if trade_state['position'] is None:
@@ -1307,13 +1773,9 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         )
 
                     buy_msg = (
-                        f"📈 **[VELOCITY] BUY SIGNAL - {ticker}**{signal_note}\n"
-                        f"**Strategy:** {strategy_name}\n"
-                        f"**Signal Type:** {config.get('signal_type')}\n"
+                        f"📈 **[{strategy_label}] BUY SIGNAL**{signal_note}\n"
                         f"**Signal Time:** {signal_time}\n"
                         f"**Entry Price:** ${current_price:.2f}\n"
-                        f"**Oscillator:** {signal_bar['osc_smooth']:.4f}\n"
-                        f"**Velocity:** {signal_bar['velocity']:.4f}\n"
                         f"{stats_section}"
                         f"---\n"
                         f"_SL: ${current_price * (1 - stop_loss_pct/100):.2f} | TP: ${current_price * (1 + take_profit_pct/100):.2f}_"
@@ -1326,7 +1788,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     trade_state['entry_price'] = current_price
                     trade_state['entry_time'] = str(current_time)
                     trade_state['last_signal_time'] = str(signal_time)
-                    save_trade_state(trade_state)
+                    save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
 
                 elif effective_sell:
                     signal_bar = recent_sell_signal['bar']
@@ -1353,13 +1815,9 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         )
 
                     sell_msg = (
-                        f"📉 **[VELOCITY] SELL SIGNAL - {ticker}**{signal_note}\n"
-                        f"**Strategy:** {strategy_name}\n"
-                        f"**Signal Type:** {config.get('signal_type')}\n"
+                        f"📉 **[{strategy_label}] SELL SIGNAL**{signal_note}\n"
                         f"**Signal Time:** {signal_time}\n"
                         f"**Entry Price:** ${current_price:.2f}\n"
-                        f"**Oscillator:** {signal_bar['osc_smooth']:.4f}\n"
-                        f"**Velocity:** {signal_bar['velocity']:.4f}\n"
                         f"{stats_section}"
                         f"---\n"
                         f"_SL: ${current_price * (1 + stop_loss_pct/100):.2f} | TP: ${current_price * (1 - take_profit_pct/100):.2f}_"
@@ -1372,7 +1830,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     trade_state['entry_price'] = current_price
                     trade_state['entry_time'] = str(current_time)
                     trade_state['last_signal_time'] = str(signal_time)
-                    save_trade_state(trade_state)
+                    save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
 
             print(f"Next check in {check_interval_seconds} seconds...")
             time.sleep(check_interval_seconds)
