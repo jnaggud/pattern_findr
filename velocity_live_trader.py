@@ -1464,11 +1464,12 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
     # Send startup notification with stats and chart
     startup_chart = None
     if backtest:
+        # Get current price from fresh data if available
+        current_price = fresh_df.iloc[-1]['close'] if fresh_backtest and not fresh_df.empty else df.iloc[-1]['close']
+
         # Use SYNCED trade_state for position display, not bundled backtest
         if trade_state.get('position'):
             entry_price = trade_state.get('entry_price', 0)
-            # Get current price from fresh data if available
-            current_price = fresh_df.iloc[-1]['close'] if fresh_backtest and not fresh_df.empty else df.iloc[-1]['close']
             unrealized_pnl = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
             pos_status = f"**Position:** LONG @ ${entry_price:.2f} ({unrealized_pnl:+.1f}%)"
         else:
@@ -1478,6 +1479,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             f"🤖 **[{strategy_label}] Live Trader Started**\n"
             f"**Strategy:** {strategy_name}\n"
             f"**Ticker:** {ticker}\n"
+            f"**Current Price:** ${current_price:,.2f}\n"
             f"**Signal Type:** {config.get('signal_type')}\n"
             f"**Risk:** SL={stop_loss_pct:.1f}%, TP={take_profit_pct:.1f}%\n"
             f"---\n"
