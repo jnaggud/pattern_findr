@@ -1333,6 +1333,9 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
     # Use fresh backtest for sync if available, otherwise fall back to bundled
     sync_backtest = fresh_backtest if fresh_backtest else backtest
 
+    # Get current price for Discord messages
+    sync_current_price = fresh_df.iloc[-1]['close'] if (fresh_backtest and not fresh_df.empty) else (df.iloc[-1]['close'] if not df.empty else 0)
+
     # SYNC STATE WITH BACKTEST - handles missed entries/exits
     backtest_position = sync_backtest.get('current_position') if sync_backtest else None
     state_position = trade_state.get('position')
@@ -1394,6 +1397,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             f"---\n"
             f"**Backtest shows:** Position was closed\n"
             f"**Action:** State cleared, now tracking no position\n"
+            f"**Current Price:** ${sync_current_price:,.2f}\n"
             f"---\n"
             f"_Trade recorded to history for accurate metrics._"
         )
@@ -1448,14 +1452,16 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
             # Send Discord notification about missed exit + new entry
             pnl_info = f"\n**Missed Trade P&L:** {missed_trade.get('pnl', 0):+.2f}%" if missed_trade else ""
+            unrealized_pnl = ((sync_current_price - backtest_entry) / backtest_entry * 100) if backtest_entry > 0 else 0
             sync_msg = (
                 f"⚠️ **[{strategy_label}] State Sync - Missed Exit + New Entry**\n"
                 f"---\n"
                 f"**Previous tracking:** {state_position.upper()} @ ${state_entry:.2f}\n"
                 f"**Previous entry time:** {str(state_time)[:16]}{pnl_info}\n"
                 f"---\n"
-                f"**Now tracking:** {backtest_position['position'].upper()} @ ${backtest_entry:.2f}\n"
+                f"**Now tracking:** {backtest_position['position'].upper()} @ ${backtest_entry:.2f} ({unrealized_pnl:+.1f}%)\n"
                 f"**New entry time:** {str(backtest_time)[:16]}\n"
+                f"**Current Price:** ${sync_current_price:,.2f}\n"
                 f"---\n"
                 f"_Trade recorded to history for accurate metrics._"
             )
