@@ -84,6 +84,16 @@ LEGAL_DISCLAIMER = (
     "with capital you can afford to lose. For educational purposes only._"
 )
 
+# Secondary webhooks for Haus Hedge server (posts to both servers)
+HAUS_HEDGE_WEBHOOKS = {
+    "velocity_SPY_1y": "",
+    "velocity_SPY_2y": "",
+    "velocity_SPY_5y": "",
+    "velocity_BTC_1y": "",
+    "velocity_BTC_2y": "",
+    "velocity_BTC_5y": "",
+}
+
 # Strategy storage directories
 VELOCITY_STRATEGIES_DIR = "velocity_strategies"
 PRODUCTION_CONFIG_PATH = "production_env/velocity_config.json"
@@ -308,6 +318,24 @@ def fetch_price_data(ticker: str, api_key: str = None, days: int = 200, interval
         print(f"   ⚠ Warning: No data returned for {ticker}")
 
     return df
+
+
+def fetch_realtime_price(ticker: str) -> float:
+    """
+    Fetch real-time/current price for display purposes.
+    This is separate from daily bar data - used to show actual current price.
+    """
+    try:
+        t = yf.Ticker(ticker)
+        # Try multiple fields in order of preference
+        info = t.info
+        price = info.get('regularMarketPrice') or info.get('currentPrice') or info.get('previousClose')
+        if price:
+            return float(price)
+    except Exception as e:
+        print(f"   ⚠ Could not fetch real-time price: {e}")
+
+    return None
 
 
 def calculate_composite_oscillator(df: pd.DataFrame, config: dict = None) -> pd.DataFrame:
@@ -544,8 +572,11 @@ def calculate_velocity_signals(df: pd.DataFrame, config: dict) -> pd.DataFrame:
 
 
 def send_discord_alert(webhook_url: str, message: str, chart_buf: io.BytesIO = None,
-                       include_disclaimer: bool = True):
-    """Send alert to Discord webhook with optional chart image."""
+                       include_disclaimer: bool = True, strategy_name: str = None):
+    """Send alert to Discord webhook with optional chart image.
+
+    Also sends to secondary Haus Hedge webhook if strategy_name is provided.
+    """
     if not webhook_url:
         print(f"[ALERT] {message}")
         return False
@@ -554,37 +585,59 @@ def send_discord_alert(webhook_url: str, message: str, chart_buf: io.BytesIO = N
     if include_disclaimer:
         message = message + LEGAL_DISCLAIMER
 
-    try:
-        if chart_buf:
-            # Send with image attachment
-            chart_buf.seek(0)
-            files = {'file': ('chart.png', chart_buf, 'image/png')}
-            payload = {'content': message}
-            response = requests.post(webhook_url, data=payload, files=files)
-        else:
-            payload = {"content": message}
-            response = requests.post(webhook_url, json=payload)
+    def post_to_webhook(url: str, msg: str, chart: io.BytesIO = None) -> bool:
+        """Helper to post to a single webhook."""
+        try:
+            if chart:
+                chart.seek(0)
+                files = {'file': ('chart.png', chart, 'image/png')}
+                payload = {'content': msg}
+                response = requests.post(url, data=payload, files=files)
+            else:
+                payload = {"content": msg}
+                response = requests.post(url, json=payload)
 
-        if response.status_code in [200, 204]:
-            return True
-        else:
-            print(f"Discord webhook error: {response.status_code}")
+            if response.status_code in [200, 204]:
+                return True
+            else:
+                print(f"Discord webhook error: {response.status_code}")
+                return False
+        except Exception as e:
+            print(f"Discord webhook error: {e}")
             return False
-    except Exception as e:
-        print(f"Discord webhook error: {e}")
-        return False
+
+    # Send to primary webhook
+    primary_success = post_to_webhook(webhook_url, message, chart_buf)
+
+    # Send to secondary Haus Hedge webhook if strategy exists
+    if strategy_name and strategy_name in HAUS_HEDGE_WEBHOOKS:
+        secondary_url = HAUS_HEDGE_WEBHOOKS[strategy_name]
+        # Reset chart buffer for second send
+        if chart_buf:
+            chart_buf.seek(0)
+        secondary_success = post_to_webhook(secondary_url, message, chart_buf)
+        if secondary_success:
+            print(f"   📤 Also posted to Haus Hedge server")
+
+    return primary_success
 
 
 def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, ticker: str,
-                            title_suffix: str = "") -> io.BytesIO:
+                            title_suffix: str = "", trade_history: list = None,
+                            current_position: dict = None, locked_backtest: dict = None,
+                            full_period_backtest: dict = None) -> io.BytesIO:
     """Generate a velocity strategy chart for Discord.
 
     Args:
         df: DataFrame with price and indicator data
-        backtest: Backtest results dict
+        backtest: Backtest results dict (used for stats and equity curve) - typically recent/fresh data
         config: Strategy config
         ticker: Ticker symbol
         title_suffix: Optional suffix for chart title (e.g., " - Last 180 Days")
+        trade_history: Optional list of locked trades from trade_history.json (prevents repainting)
+        current_position: Optional current position dict with entry_price, entry_signal_bar
+        locked_backtest: Optional locked backtest dict with frozen entry/exit markers (prevents repainting)
+        full_period_backtest: Optional full period backtest for showing both recent and full stats
     """
     try:
         # Use all available data (full test period)
@@ -619,20 +672,70 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
         ax1.plot(df_plot.index, df_plot['close'], color='white', linewidth=1.5, label='Price')
         ax1.fill_between(df_plot.index, df_plot['low'], df_plot['high'], color='gray', alpha=0.2)
 
-        # Plot trade markers from backtest
-        if backtest and backtest.get('entries'):
-            for entry in backtest['entries']:
-                if entry['date'] in df_plot.index:
-                    ax1.scatter(entry['date'], entry['price'], marker='^', color='lime', s=100, zorder=5)
+        # Plot trade markers from LOCKED backtest (prevents repainting)
+        # The locked_backtest is frozen at startup and only appended to when new signals occur.
+        # This ensures historical markers never shift position.
+        markers_source = locked_backtest if locked_backtest else backtest
 
-        if backtest and backtest.get('exits'):
-            for exit in backtest['exits']:
-                if exit['date'] in df_plot.index:
-                    color = 'green' if exit['pnl'] > 0 else 'red'
-                    ax1.scatter(exit['date'], exit['price'], marker='v', color=color, s=100, zorder=5)
+        if markers_source and markers_source.get('entries'):
+            for entry in markers_source['entries']:
+                # Handle both datetime objects and strings
+                entry_date = entry['date']
+                if isinstance(entry_date, str):
+                    try:
+                        entry_date = pd.to_datetime(entry_date)
+                    except:
+                        continue
 
-        # Mark current open position
-        if backtest and backtest.get('current_position'):
+                # Find closest date in index for plotting
+                # LONG entries: green up triangle, SHORT entries: red down triangle
+                is_long = entry.get('position', 'long') == 'long'
+                marker_shape = '^' if is_long else 'v'
+                marker_color = 'lime' if is_long else 'red'
+
+                if entry_date in df_plot.index:
+                    ax1.scatter(entry_date, entry['price'], marker=marker_shape, color=marker_color, s=100, zorder=5)
+                else:
+                    # Try to find the closest date
+                    try:
+                        closest_idx = df_plot.index.get_indexer([entry_date], method='nearest')[0]
+                        if 0 <= closest_idx < len(df_plot):
+                            closest_date = df_plot.index[closest_idx]
+                            ax1.scatter(closest_date, entry['price'], marker=marker_shape, color=marker_color, s=100, zorder=5)
+                    except:
+                        pass
+
+        if markers_source and markers_source.get('exits'):
+            for exit_trade in markers_source['exits']:
+                # Handle both datetime objects and strings
+                exit_date = exit_trade['date']
+                if isinstance(exit_date, str):
+                    try:
+                        exit_date = pd.to_datetime(exit_date)
+                    except:
+                        continue
+
+                # Find closest date in index for plotting
+                if exit_date in df_plot.index:
+                    color = 'green' if exit_trade['pnl'] > 0 else 'red'
+                    ax1.scatter(exit_date, exit_trade['price'], marker='v', color=color, s=100, zorder=5)
+                else:
+                    # Try to find the closest date
+                    try:
+                        closest_idx = df_plot.index.get_indexer([exit_date], method='nearest')[0]
+                        if 0 <= closest_idx < len(df_plot):
+                            closest_date = df_plot.index[closest_idx]
+                            color = 'green' if exit_trade['pnl'] > 0 else 'red'
+                            ax1.scatter(closest_date, exit_trade['price'], marker='v', color=color, s=100, zorder=5)
+                    except:
+                        pass
+
+        # Mark current open position - use LOCKED trade_state (current_position) if provided
+        # This ensures the entry line shows YOUR ACTUAL tracked position, not the recalculated one
+        if current_position and current_position.get('entry_price'):
+            ax1.axhline(current_position['entry_price'], color='cyan', linestyle='--', alpha=0.7,
+                       label=f"Entry ${current_position['entry_price']:.2f}")
+        elif backtest and backtest.get('current_position'):
             pos = backtest['current_position']
             ax1.axhline(pos['entry_price'], color='cyan', linestyle='--', alpha=0.7, label=f"Entry ${pos['entry_price']:.2f}")
 
@@ -705,8 +808,22 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
         ax4.set_ylabel("Equity", color='white')
         ax4.set_xlabel("Trade #", color='white')
 
-        # Stats annotation
-        if backtest:
+        # Stats annotation - show both full period and recent stats if available
+        if full_period_backtest and backtest:
+            # Show both: Full period on top, Recent below
+            full_stats = (f"Full Period: {full_period_backtest['num_trades']} trades | "
+                         f"Win: {full_period_backtest['win_rate']:.0f}% | "
+                         f"Return: {full_period_backtest['total_return']:.1f}% | "
+                         f"PF: {full_period_backtest['profit_factor']:.1f}")
+            recent_stats = (f"Recent 200D: {backtest['num_trades']} trades | "
+                           f"Win: {backtest['win_rate']:.0f}% | "
+                           f"Return: {backtest['total_return']:.1f}% | "
+                           f"PF: {backtest['profit_factor']:.1f}")
+            fig.text(0.5, 0.035, full_stats, ha='center', color='white', fontsize=10,
+                    bbox=dict(boxstyle='round', facecolor='#0f3460', alpha=0.8))
+            fig.text(0.5, 0.008, recent_stats, ha='center', color='#00ff88', fontsize=10,
+                    bbox=dict(boxstyle='round', facecolor='#0f3460', alpha=0.8))
+        elif backtest:
             stats_text = (f"Trades: {backtest['num_trades']} | "
                          f"Win: {backtest['win_rate']:.0f}% | "
                          f"Return: {backtest['total_return']:.1f}% | "
@@ -715,7 +832,9 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                     bbox=dict(boxstyle='round', facecolor='#0f3460', alpha=0.8))
 
         plt.tight_layout()
-        plt.subplots_adjust(bottom=0.12)
+        # Adjust bottom margin based on whether we have one or two stat lines
+        bottom_margin = 0.14 if full_period_backtest else 0.12
+        plt.subplots_adjust(bottom=bottom_margin)
 
         # Save to buffer
         buf = io.BytesIO()
@@ -906,6 +1025,181 @@ def get_history_file_path(strategy_name: str = None, ticker: str = None) -> str:
     return "velocity_trade_history.json"
 
 
+def get_locked_backtest_path(strategy_name: str = None, ticker: str = None) -> str:
+    """Get strategy-specific locked backtest file path.
+
+    The locked backtest stores frozen entry/exit signals that don't repaint.
+    """
+    if strategy_name:
+        safe_name = strategy_name.replace("/", "-").replace(":", "-").replace(" ", "_")
+        return f"velocity_locked_backtest_{safe_name}.json"
+    elif ticker:
+        safe_ticker = ticker.replace("/", "-").replace(":", "-").replace(" ", "_")
+        return f"velocity_locked_backtest_{safe_ticker}.json"
+    return "velocity_locked_backtest.json"
+
+
+def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str = None, trade_state: dict = None):
+    """Save backtest results as a locked snapshot (prevents repainting).
+
+    Stores entries, exits, and stats at a point in time. These markers
+    won't change even as new data comes in.
+
+    IMPORTANT: If trade_state has a tracked position, we reconcile the backtest
+    with it - removing any conflicting entries and using the tracked position
+    as the source of truth for the current open position.
+    """
+    path = get_locked_backtest_path(strategy_name=strategy_name, ticker=ticker)
+
+    # Extract the serializable parts of the backtest
+    locked = {
+        "locked_at": datetime.now().isoformat(),
+        "entries": [],
+        "exits": [],
+        "current_position": backtest.get('current_position'),
+        "num_trades": backtest.get('num_trades', 0),
+        "win_rate": backtest.get('win_rate', 0),
+        "total_return": backtest.get('total_return', 0),
+        "profit_factor": backtest.get('profit_factor', 0),
+    }
+
+    # Get the tracked position's entry date (if any) for reconciliation
+    tracked_entry_date = None
+    if trade_state and trade_state.get('position') and trade_state.get('entry_time'):
+        try:
+            tracked_entry_str = str(trade_state['entry_time']).split('.')[0]
+            tracked_entry_date = pd.to_datetime(tracked_entry_str)
+            print(f"   📍 Tracked position: {trade_state['position'].upper()} @ ${trade_state.get('entry_price', 0):.2f} on {tracked_entry_date}")
+        except:
+            pass
+
+    # Convert entries to serializable format
+    # If we have a tracked position, exclude any backtest entries on or after that date
+    # (those are the "repainted" entries that don't match reality)
+    for entry in backtest.get('entries', []):
+        entry_date = entry['date']
+        if isinstance(entry_date, str):
+            try:
+                entry_date = pd.to_datetime(entry_date)
+            except:
+                pass
+
+        # Skip entries that conflict with tracked position
+        if tracked_entry_date is not None and hasattr(entry_date, 'date'):
+            if entry_date >= tracked_entry_date:
+                print(f"   ⏭️  Skipping backtest entry {entry_date} (conflicts with tracked position)")
+                continue
+
+        locked["entries"].append({
+            "date": str(entry['date']),
+            "price": entry['price'],
+            "position": entry.get('position', 'long')
+        })
+
+    # If we have a tracked position, add it as the current entry
+    if trade_state and trade_state.get('position') and trade_state.get('entry_price'):
+        locked["entries"].append({
+            "date": str(trade_state.get('entry_time', '')),
+            "price": trade_state['entry_price'],
+            "position": trade_state['position']
+        })
+        print(f"   ✅ Added tracked {trade_state['position'].upper()} entry to locked backtest")
+
+        # Update current_position to match trade_state
+        locked["current_position"] = {
+            "position": trade_state['position'],
+            "entry_price": trade_state['entry_price'],
+            "entry_date": str(trade_state.get('entry_time', ''))
+        }
+
+    # Convert exits to serializable format
+    for exit_trade in backtest.get('exits', []):
+        locked["exits"].append({
+            "date": str(exit_trade['date']),
+            "price": exit_trade['price'],
+            "pnl": exit_trade['pnl'],
+            "reason": exit_trade.get('reason', ''),
+            "entry_price": exit_trade.get('entry_price', 0),
+            "entry_date": str(exit_trade.get('entry_date', ''))
+        })
+
+    with open(path, 'w') as f:
+        json.dump(locked, f, indent=2, default=str)
+
+    print(f"   🔒 Locked backtest saved: {len(locked['entries'])} entries, {len(locked['exits'])} exits")
+    return locked
+
+
+def load_locked_backtest(strategy_name: str = None, ticker: str = None) -> dict:
+    """Load locked backtest snapshot.
+
+    Returns None if no locked backtest exists (will be created on startup).
+    """
+    path = get_locked_backtest_path(strategy_name=strategy_name, ticker=ticker)
+
+    if os.path.exists(path):
+        try:
+            with open(path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"   ⚠️ Could not load locked backtest: {e}")
+            return None
+    return None
+
+
+def append_to_locked_backtest(entry: dict = None, exit_trade: dict = None,
+                               strategy_name: str = None, ticker: str = None):
+    """Append a new entry or exit to the locked backtest.
+
+    Called when a NEW signal is detected (at end of day). This adds
+    the signal to the locked backtest so it appears on future charts.
+    """
+    locked = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
+
+    if locked is None:
+        print("   ⚠️ No locked backtest to append to")
+        return
+
+    if entry:
+        locked["entries"].append({
+            "date": str(entry.get('date', '')),
+            "price": entry.get('price', 0),
+            "position": entry.get('position', 'long')
+        })
+        print(f"   🔒 Appended new entry to locked backtest: {entry.get('date')}")
+
+    if exit_trade:
+        locked["exits"].append({
+            "date": str(exit_trade.get('date', '')),
+            "price": exit_trade.get('price', 0),
+            "pnl": exit_trade.get('pnl', 0),
+            "reason": exit_trade.get('reason', ''),
+            "entry_price": exit_trade.get('entry_price', 0),
+            "entry_date": str(exit_trade.get('entry_date', ''))
+        })
+        # Update stats
+        locked["num_trades"] = len(locked["exits"])
+        if locked["exits"]:
+            winners = [e for e in locked["exits"] if e['pnl'] > 0]
+            locked["win_rate"] = (len(winners) / len(locked["exits"])) * 100
+            locked["total_return"] = sum(e['pnl'] for e in locked["exits"])
+        print(f"   🔒 Appended new exit to locked backtest: {exit_trade.get('date')}")
+
+    # Update current position status
+    if exit_trade:
+        locked["current_position"] = None
+    elif entry:
+        locked["current_position"] = {
+            "position": entry.get('position', 'long'),
+            "entry_price": entry.get('price', 0),
+            "entry_date": str(entry.get('date', ''))
+        }
+
+    path = get_locked_backtest_path(strategy_name=strategy_name, ticker=ticker)
+    with open(path, 'w') as f:
+        json.dump(locked, f, indent=2, default=str)
+
+
 def load_trade_state(strategy_name: str = None, ticker: str = None, state_path: str = None) -> dict:
     """Load current trade state from file.
 
@@ -924,6 +1218,7 @@ def load_trade_state(strategy_name: str = None, ticker: str = None, state_path: 
         "position": None,  # None, "long", or "short"
         "entry_price": None,
         "entry_time": None,
+        "entry_signal_bar": None,  # Bar datetime that generated entry signal (for locked charts)
         "last_signal_time": None,
     }
 
@@ -982,8 +1277,13 @@ def save_trade_history(history: list, strategy_name: str = None, ticker: str = N
 
 def log_closed_trade(ticker: str, position_type: str, entry_price: float, exit_price: float,
                      entry_time: str, exit_time: str, exit_reason: str, pnl_pct: float,
-                     strategy_name: str = None):
-    """Log a closed trade to history and return cumulative stats."""
+                     strategy_name: str = None, entry_signal_bar: str = None, exit_signal_bar: str = None):
+    """Log a closed trade to history and return cumulative stats.
+
+    Args:
+        entry_signal_bar: The datetime of the bar that generated the entry signal (for chart plotting)
+        exit_signal_bar: The datetime of the bar that generated the exit signal (for chart plotting)
+    """
     history = load_trade_history(strategy_name=strategy_name, ticker=ticker)
 
     trade = {
@@ -995,6 +1295,8 @@ def log_closed_trade(ticker: str, position_type: str, entry_price: float, exit_p
         "exit_price": exit_price,
         "entry_time": entry_time,
         "exit_time": exit_time,
+        "entry_signal_bar": entry_signal_bar or entry_time,  # Fallback to entry_time if not provided
+        "exit_signal_bar": exit_signal_bar or exit_time,  # Fallback to exit_time if not provided
         "exit_reason": exit_reason,
         "pnl_pct": pnl_pct,
         "pnl_dollars": (pnl_pct / 100) * 10000  # Assuming $10k position
@@ -1026,14 +1328,24 @@ def log_closed_trade(ticker: str, position_type: str, entry_price: float, exit_p
 
 
 def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, config: dict,
-                       ticker: str, title: str = "📊 Status Update", trade_state: dict = None):
+                       ticker: str, title: str = "📊 Status Update", trade_state: dict = None,
+                       strategy_name: str = None, locked_backtest: dict = None,
+                       realtime_price: float = None):
     """Send a scheduled status update with TWO charts to Discord.
 
     Sends two posts:
     1. Full timeframe chart with stats over entire period
     2. Last 180 days chart with stats recalculated for that window
+
+    Uses locked_backtest for chart markers to prevent repainting.
+    Uses realtime_price (if provided) for current price display instead of daily bar close.
     """
     try:
+        # Load locked trade history to prevent repainting on charts
+        trade_history = load_trade_history(strategy_name=strategy_name, ticker=ticker)
+        # Load locked backtest if not provided
+        if locked_backtest is None:
+            locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
         # Helper function to build position section
         def build_position_section(current_price, trade_state_local, backtest_local, config_local):
             pos_section = "📭 **Position:** No active position"
@@ -1090,14 +1402,17 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
                 )
             elif backtest_local and backtest_local.get('current_position'):
                 pos = backtest_local['current_position']
-                pos_section = f"🟢 **Position:** LONG @ ${pos['entry_price']:.2f} ({pos['unrealized_pnl']:+.1f}%)"
+                pos_type_bt = pos.get('position', 'long').upper()
+                pnl_emoji_bt = "🟢" if pos['unrealized_pnl'] >= 0 else "🔴"
+                pos_section = f"{pnl_emoji_bt} **Position:** {pos_type_bt} @ ${pos['entry_price']:.2f} ({pos['unrealized_pnl']:+.1f}%)"
 
             return pos_section
 
         # Create strategy label for clear identification
         opt_period = config.get('optimization_period', '')
         strategy_label = f"{ticker} {opt_period.upper()}" if opt_period else ticker
-        current_price = df['close'].iloc[-1]
+        # Use real-time price for display if available, otherwise fall back to daily bar close
+        current_price = realtime_price if realtime_price else df['close'].iloc[-1]
 
         # Calculate date range for full data
         full_start = df.index[0].strftime('%Y-%m-%d') if hasattr(df.index[0], 'strftime') else str(df.index[0])[:10]
@@ -1106,7 +1421,10 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
 
         # --- CHART 1: Full Timeframe ---
         chart_buf_full = generate_velocity_chart(df, backtest, config, ticker,
-                                                  title_suffix=f" (Full: {full_days} bars)")
+                                                  title_suffix=f" (Full: {full_days} bars)",
+                                                  trade_history=trade_history,
+                                                  current_position=trade_state,
+                                                  locked_backtest=locked_backtest)
         pos_section = build_position_section(current_price, trade_state, backtest, config)
 
         msg_full = (
@@ -1122,7 +1440,7 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
             f"_Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}_"
         )
 
-        send_discord_alert(webhook_url, msg_full, chart_buf_full)
+        send_discord_alert(webhook_url, msg_full, chart_buf_full, strategy_name=strategy_name)
         print(f"✅ Sent full timeframe update: {title}")
 
         # --- CHART 2: Recent Period (180 days or half of data) ---
@@ -1144,7 +1462,10 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
             period_end = df_subset.index[-1].strftime('%Y-%m-%d') if hasattr(df_subset.index[-1], 'strftime') else str(df_subset.index[-1])[:10]
 
             chart_buf_subset = generate_velocity_chart(df_subset, backtest_subset, config, ticker,
-                                                        title_suffix=f" ({period_label})")
+                                                        title_suffix=f" ({period_label})",
+                                                        trade_history=trade_history,
+                                                        current_position=trade_state,
+                                                        locked_backtest=locked_backtest)
 
             # Position section stays the same (current position)
             pos_section_subset = build_position_section(current_price, trade_state, backtest_subset, config)
@@ -1162,7 +1483,7 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
                 f"_Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}_"
             )
 
-            send_discord_alert(webhook_url, msg_subset, chart_buf_subset)
+            send_discord_alert(webhook_url, msg_subset, chart_buf_subset, strategy_name=strategy_name)
             print(f"✅ Sent {period_label} update: {title}")
         else:
             print(f"ℹ️ Skipping subset chart (only {len(df)} bars available, need >{min_bars_for_subset})")
@@ -1379,7 +1700,9 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 exit_time=str(missed_trade.get('date', '')),
                 exit_reason=f"[SYNC] {missed_trade.get('reason', 'Unknown')}",
                 pnl_pct=missed_trade.get('pnl', 0),
-                strategy_name=strategy_name
+                strategy_name=strategy_name,
+                entry_signal_bar=trade_state.get('entry_signal_bar'),  # Use stored signal bar if available
+                exit_signal_bar=str(missed_trade.get('date', ''))  # Exit bar from backtest
             )
             print(f"   📝 Recorded missed trade: {missed_trade.get('pnl', 0):+.2f}% ({missed_trade.get('reason', 'Unknown')})")
 
@@ -1401,7 +1724,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             f"---\n"
             f"_Trade recorded to history for accurate metrics._"
         )
-        send_discord_alert(webhook_url, sync_msg)
+        send_discord_alert(webhook_url, sync_msg, strategy_name=strategy_name)
 
     # Case 3: Both show position but entry prices differ - missed exit AND new entry
     elif state_position is not None and backtest_position is not None:
@@ -1437,7 +1760,9 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     exit_time=str(missed_trade.get('date', '')),
                     exit_reason=f"[SYNC] {missed_trade.get('reason', 'Unknown')}",
                     pnl_pct=missed_trade.get('pnl', 0),
-                    strategy_name=strategy_name
+                    strategy_name=strategy_name,
+                    entry_signal_bar=trade_state.get('entry_signal_bar'),  # Use stored signal bar if available
+                    exit_signal_bar=str(missed_trade.get('date', ''))  # Exit bar from backtest
                 )
                 print(f"   📝 Recorded missed trade: {missed_trade.get('pnl', 0):+.2f}% ({missed_trade.get('reason', 'Unknown')})")
 
@@ -1466,7 +1791,24 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 f"---\n"
                 f"_Trade recorded to history for accurate metrics._"
             )
-            send_discord_alert(webhook_url, sync_msg)
+            send_discord_alert(webhook_url, sync_msg, strategy_name=strategy_name)
+
+    # ============================================================
+    # LOCK THE BACKTEST - Freeze entry/exit markers to prevent repainting
+    # ============================================================
+    # Use fresh backtest if available (most up-to-date), otherwise bundled
+    backtest_to_lock = fresh_backtest if fresh_backtest else backtest
+    locked_backtest = None
+    if backtest_to_lock:
+        print(f"\n🔒 Locking backtest snapshot (prevents repainting)...")
+        # Pass trade_state to reconcile backtest entries with tracked position
+        locked_backtest = save_locked_backtest(backtest_to_lock, strategy_name=strategy_name, ticker=ticker, trade_state=trade_state)
+        print(f"📁 Locked backtest file: {get_locked_backtest_path(strategy_name=strategy_name, ticker=ticker)}")
+    else:
+        # Try to load existing locked backtest if no fresh data
+        locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
+        if locked_backtest:
+            print(f"🔒 Loaded existing locked backtest from previous session")
 
     # Send startup notification with stats and chart
     startup_chart = None
@@ -1476,12 +1818,32 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
         # Use SYNCED trade_state for position display, not bundled backtest
         if trade_state.get('position'):
+            pos_type = trade_state.get('position', 'long').upper()
             entry_price = trade_state.get('entry_price', 0)
-            unrealized_pnl = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+            # Calculate P&L correctly for LONG vs SHORT
+            if pos_type == 'LONG':
+                unrealized_pnl = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+            else:  # SHORT
+                unrealized_pnl = ((entry_price - current_price) / entry_price * 100) if entry_price > 0 else 0
             pnl_emoji = "🟢" if unrealized_pnl >= 0 else "🔴"
-            pos_status = f"{pnl_emoji} **Position:** LONG @ ${entry_price:.2f} ({unrealized_pnl:+.1f}%)"
+            pos_status = f"{pnl_emoji} **Position:** {pos_type} @ ${entry_price:.2f} ({unrealized_pnl:+.1f}%)"
         else:
             pos_status = "⚪ **Position:** None"
+
+        # Build stats sections - show both full period and recent if available
+        full_period_stats = (
+            f"📊 **Full Period Stats ({backtest.get('num_trades', 0)} trades):**\n"
+            f"• Win Rate: {backtest['win_rate']:.0f}% | Return: {backtest['total_return']:.1f}%\n"
+            f"• Profit Factor: {backtest['profit_factor']:.1f}"
+        )
+
+        recent_stats = ""
+        if fresh_backtest and fresh_backtest != backtest:
+            recent_stats = (
+                f"\n📈 **Recent 200 Days ({fresh_backtest.get('num_trades', 0)} trades):**\n"
+                f"• Win Rate: {fresh_backtest['win_rate']:.0f}% | Return: {fresh_backtest['total_return']:.1f}%\n"
+                f"• Profit Factor: {fresh_backtest['profit_factor']:.1f}"
+            )
 
         startup_msg = (
             f"🤖 **[{strategy_label}] Live Trader Started**\n"
@@ -1491,9 +1853,8 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             f"**Signal Type:** {config.get('signal_type')}\n"
             f"**Risk:** SL={stop_loss_pct:.1f}%, TP={take_profit_pct:.1f}%\n"
             f"---\n"
-            f"📊 **Historical Stats:**\n"
-            f"• Trades: {backtest['num_trades']} | Win Rate: {backtest['win_rate']:.0f}%\n"
-            f"• Return: {backtest['total_return']:.1f}% | PF: {backtest['profit_factor']:.1f}\n"
+            f"{full_period_stats}{recent_stats}\n"
+            f"---\n"
             f"{pos_status}\n"
             f"---\n"
             f"_Monitoring for signals..._"
@@ -1502,8 +1863,16 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
         try:
             chart_df = fresh_df if fresh_backtest and not fresh_df.empty else df
             chart_backtest = fresh_backtest if fresh_backtest else backtest
-            startup_chart = generate_velocity_chart(chart_df, chart_backtest, config, ticker)
-            print("✅ Generated startup chart for Discord")
+            # Load locked trade history to prevent repainting
+            startup_trade_history = load_trade_history(strategy_name=strategy_name, ticker=ticker)
+            # Use LOCKED backtest for markers (prevents repainting)
+            # Pass both backtests so chart can show both stat lines
+            startup_chart = generate_velocity_chart(chart_df, chart_backtest, config, ticker,
+                                                    trade_history=startup_trade_history,
+                                                    current_position=trade_state,
+                                                    locked_backtest=locked_backtest,
+                                                    full_period_backtest=backtest)
+            print("✅ Generated startup chart for Discord (using locked backtest markers)")
         except Exception as e:
             print(f"⚠️ Could not generate startup chart: {e}")
     else:
@@ -1517,7 +1886,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             f"---\n"
             f"_Monitoring for signals..._"
         )
-    send_discord_alert(webhook_url, startup_msg, startup_chart)
+    send_discord_alert(webhook_url, startup_msg, startup_chart, strategy_name=strategy_name)
 
     # Determine check interval based on data interval
     # Check frequently enough to catch scheduled update windows
@@ -1530,6 +1899,12 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
     # Track scheduled alerts to avoid duplicates
     daily_alerts = set()
+
+    # Track the last completed bar we evaluated for signals (prevents re-evaluation)
+    last_signal_bar_evaluated = None
+
+    # Determine if this is a crypto or stock ticker for signal timing
+    is_crypto = ticker.upper() in ['BTC-USD', 'ETH-USD', 'SOL-USD', 'DOGE-USD'] or '-USD' in ticker.upper()
 
     while True:
         try:
@@ -1560,7 +1935,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         print(f"✅ Config reloaded: {ticker} / {config.get('signal_type')}")
 
                         # Notify Discord
-                        send_discord_alert(webhook_url, f"🔄 **Config Reloaded**\nTicker: {ticker}\nSignal: {config.get('signal_type')}")
+                        send_discord_alert(webhook_url, f"🔄 **Config Reloaded**\nTicker: {ticker}\nSignal: {config.get('signal_type')}", strategy_name=strategy_name)
                     except Exception as e:
                         print(f"⚠️ Failed to reload config: {e}")
 
@@ -1580,10 +1955,14 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
             # Get latest row
             latest = df.iloc[-1]
-            current_price = latest['close']
+            bar_close_price = latest['close']  # Daily bar close (for signal logic)
             current_time = df.index[-1]
 
-            print(f"Current Price: ${current_price:.2f}")
+            # Fetch real-time price for display (separate from daily bar)
+            realtime_price = fetch_realtime_price(ticker)
+            current_price = realtime_price if realtime_price else bar_close_price
+
+            print(f"Current Price: ${current_price:.2f} (real-time)" if realtime_price else f"Current Price: ${current_price:.2f} (bar close)")
             print(f"Oscillator: {latest['osc_smooth']:.4f}")
             print(f"Velocity: {latest['velocity']:.4f}")
             print(f"Acceleration: {latest['acceleration']:.4f}")
@@ -1610,7 +1989,8 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 key = f"{day_str}_OPEN"
                 if key not in daily_alerts and status_backtest:
                     send_status_update(webhook_url, df, status_backtest, config, ticker,
-                                     "🔔 Market Open Update", trade_state)
+                                     "🔔 Market Open Update", trade_state, strategy_name=strategy_name,
+                                     realtime_price=realtime_price)
                     daily_alerts.add(key)
 
             # Mid-Day Update (11:00-11:15 AM)
@@ -1618,7 +1998,8 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 key = f"{day_str}_MID"
                 if key not in daily_alerts and status_backtest:
                     send_status_update(webhook_url, df, status_backtest, config, ticker,
-                                     "☀️ Mid-Day Update", trade_state)
+                                     "☀️ Mid-Day Update", trade_state, strategy_name=strategy_name,
+                                     realtime_price=realtime_price)
                     daily_alerts.add(key)
 
             # Market Close Update (15:00-15:15 PM)
@@ -1626,7 +2007,8 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 key = f"{day_str}_CLOSE"
                 if key not in daily_alerts and status_backtest:
                     send_status_update(webhook_url, df, status_backtest, config, ticker,
-                                     "🏁 Market Close Update", trade_state)
+                                     "🏁 Market Close Update", trade_state, strategy_name=strategy_name,
+                                     realtime_price=realtime_price)
                     daily_alerts.add(key)
 
             # Hourly Updates (9:00 - 16:00, except 11 and 15 which have special alerts)
@@ -1636,7 +2018,8 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     key = f"{day_str}_HOUR_{hour}"
                     if key not in daily_alerts and status_backtest:
                         send_status_update(webhook_url, df, status_backtest, config, ticker,
-                                         f"⏱️ {hour}:00 Market Update", trade_state)
+                                         f"⏱️ {hour}:00 Market Update", trade_state, strategy_name=strategy_name,
+                                         realtime_price=realtime_price)
                         daily_alerts.add(key)
 
             # Midnight Update
@@ -1644,7 +2027,8 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 key = f"{day_str}_MIDNIGHT"
                 if key not in daily_alerts and status_backtest:
                     send_status_update(webhook_url, df, status_backtest, config, ticker,
-                                     "🌙 Midnight Update", trade_state)
+                                     "🌙 Midnight Update", trade_state, strategy_name=strategy_name,
+                                     realtime_price=realtime_price)
                     daily_alerts.add(key)
 
             # Check for exit conditions first (if in position)
@@ -1673,7 +2057,9 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     exit_backtest = None
                     try:
                         exit_backtest = run_historical_backtest(df, config)
-                        exit_chart = generate_velocity_chart(df, exit_backtest, config, ticker)
+                        # Use locked backtest for markers to prevent repainting
+                        exit_chart = generate_velocity_chart(df, exit_backtest, config, ticker,
+                                                            locked_backtest=locked_backtest)
                     except Exception as e:
                         print(f"Could not generate exit chart: {e}")
 
@@ -1731,8 +2117,25 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         exit_time=current_time.strftime('%Y-%m-%d %H:%M:%S'),
                         exit_reason=exit_reason,
                         pnl_pct=pnl_pct,
-                        strategy_name=strategy_name
+                        strategy_name=strategy_name,
+                        entry_signal_bar=trade_state.get('entry_signal_bar'),  # Locked entry signal bar
+                        exit_signal_bar=str(current_time)  # Exit bar
                     )
+
+                    # Append exit to locked backtest (for future charts)
+                    append_to_locked_backtest(
+                        exit_trade={
+                            'date': current_time,
+                            'price': current_price,
+                            'pnl': pnl_pct,
+                            'reason': exit_reason,
+                            'entry_price': entry_price,
+                            'entry_date': trade_state.get('entry_time', '')
+                        },
+                        strategy_name=strategy_name, ticker=ticker
+                    )
+                    # Reload the locked backtest with the new exit
+                    locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
 
                     # Add cumulative stats to message
                     cumulative_section = (
@@ -1745,12 +2148,13 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
                     exit_msg += cumulative_section
 
-                    send_discord_alert(webhook_url, exit_msg, exit_chart)
+                    send_discord_alert(webhook_url, exit_msg, exit_chart, strategy_name=strategy_name)
                     print(f"EXIT LONG: {exit_reason}")
 
                     trade_state['position'] = None
                     trade_state['entry_price'] = None
                     trade_state['entry_time'] = None
+                    trade_state['entry_signal_bar'] = None  # Clear signal bar
                     save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
 
             elif trade_state['position'] == 'short':
@@ -1778,7 +2182,9 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     exit_backtest = None
                     try:
                         exit_backtest = run_historical_backtest(df, config)
-                        exit_chart = generate_velocity_chart(df, exit_backtest, config, ticker)
+                        # Use locked backtest for markers to prevent repainting
+                        exit_chart = generate_velocity_chart(df, exit_backtest, config, ticker,
+                                                            locked_backtest=locked_backtest)
                     except Exception as e:
                         print(f"Could not generate exit chart: {e}")
 
@@ -1836,8 +2242,25 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         exit_time=current_time.strftime('%Y-%m-%d %H:%M:%S'),
                         exit_reason=exit_reason,
                         pnl_pct=pnl_pct,
-                        strategy_name=strategy_name
+                        strategy_name=strategy_name,
+                        entry_signal_bar=trade_state.get('entry_signal_bar'),  # Locked entry signal bar
+                        exit_signal_bar=str(current_time)  # Exit bar
                     )
+
+                    # Append exit to locked backtest (for future charts)
+                    append_to_locked_backtest(
+                        exit_trade={
+                            'date': current_time,
+                            'price': current_price,
+                            'pnl': pnl_pct,
+                            'reason': exit_reason,
+                            'entry_price': entry_price,
+                            'entry_date': trade_state.get('entry_time', '')
+                        },
+                        strategy_name=strategy_name, ticker=ticker
+                    )
+                    # Reload the locked backtest with the new exit
+                    locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
 
                     # Add cumulative stats to message
                     cumulative_section = (
@@ -1850,34 +2273,87 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
                     exit_msg += cumulative_section
 
-                    send_discord_alert(webhook_url, exit_msg, exit_chart)
+                    send_discord_alert(webhook_url, exit_msg, exit_chart, strategy_name=strategy_name)
                     print(f"EXIT SHORT: {exit_reason}")
 
                     trade_state['position'] = None
                     trade_state['entry_price'] = None
                     trade_state['entry_time'] = None
+                    trade_state['entry_signal_bar'] = None  # Clear signal bar
                     save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
 
             # Check for new entry signals (only if not in position)
             if trade_state['position'] is None:
-                # Check for recent signals we might have missed (look back up to 3 bars)
-                lookback_bars = 3
+                # For daily interval, only evaluate COMPLETED bars to prevent repainting
+                # The current bar (df.iloc[-1]) is still forming, use df.iloc[-2] for signals
+
+                now = datetime.now()
+                should_check_signals = False
+
+                if interval == "1d":
+                    # Get the last COMPLETED bar (not the current forming bar)
+                    if len(df) >= 2:
+                        completed_bar = df.iloc[-2]
+                        completed_bar_time = df.index[-2]
+
+                        # Check if we've already evaluated this bar
+                        if str(completed_bar_time) != str(last_signal_bar_evaluated):
+                            if is_crypto:
+                                # Crypto: Check anytime after midnight UTC when new bar available
+                                # If the completed bar is from yesterday (or earlier), we can evaluate
+                                should_check_signals = True
+                                print(f"   📊 [CRYPTO] Evaluating completed bar: {completed_bar_time}")
+                            else:
+                                # Stocks (SPY): Only evaluate after market close (4 PM ET = 16:00)
+                                # Check if current time is after 16:00
+                                if now.hour >= 16:
+                                    should_check_signals = True
+                                    print(f"   📊 [STOCK] Market closed - Evaluating completed bar: {completed_bar_time}")
+                                else:
+                                    print(f"   ⏳ [STOCK] Market open - Waiting for close to evaluate signals")
+                else:
+                    # For non-daily intervals, use existing logic
+                    should_check_signals = True
+                    completed_bar = df.iloc[-1]
+                    completed_bar_time = df.index[-1]
+
                 recent_buy_signal = None
                 recent_sell_signal = None
 
-                for i in range(1, min(lookback_bars + 1, len(df))):
-                    bar = df.iloc[-i]
-                    bar_time = df.index[-i]
+                if should_check_signals and interval == "1d" and len(df) >= 2:
+                    # Only check the COMPLETED bar for daily strategies
+                    bar = completed_bar
+                    bar_time = completed_bar_time
                     last_signal_time = trade_state.get('last_signal_time')
 
                     # Skip if already processed this bar
-                    if last_signal_time and str(bar_time) == str(last_signal_time):
-                        continue
+                    if not (last_signal_time and str(bar_time) == str(last_signal_time)):
+                        if bar['buy_signal']:
+                            recent_buy_signal = {'bar': bar, 'time': bar_time, 'index': -2}
+                            print(f"   ✅ BUY signal on completed bar {bar_time}")
+                        if bar['sell_signal']:
+                            recent_sell_signal = {'bar': bar, 'time': bar_time, 'index': -2}
+                            print(f"   ✅ SELL signal on completed bar {bar_time}")
 
-                    if bar['buy_signal'] and recent_buy_signal is None:
-                        recent_buy_signal = {'bar': bar, 'time': bar_time, 'index': -i}
-                    if bar['sell_signal'] and recent_sell_signal is None:
-                        recent_sell_signal = {'bar': bar, 'time': bar_time, 'index': -i}
+                    # Mark this bar as evaluated
+                    last_signal_bar_evaluated = str(completed_bar_time)
+
+                elif should_check_signals and interval != "1d":
+                    # Non-daily: use original lookback logic
+                    lookback_bars = 3
+                    for i in range(1, min(lookback_bars + 1, len(df))):
+                        bar = df.iloc[-i]
+                        bar_time = df.index[-i]
+                        last_signal_time = trade_state.get('last_signal_time')
+
+                        # Skip if already processed this bar
+                        if last_signal_time and str(bar_time) == str(last_signal_time):
+                            continue
+
+                        if bar['buy_signal'] and recent_buy_signal is None:
+                            recent_buy_signal = {'bar': bar, 'time': bar_time, 'index': -i}
+                        if bar['sell_signal'] and recent_sell_signal is None:
+                            recent_sell_signal = {'bar': bar, 'time': bar_time, 'index': -i}
 
                 # Log recent signals found
                 if recent_buy_signal and recent_buy_signal['index'] < -1:
@@ -1901,12 +2377,22 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     signal_time = recent_buy_signal['time']
                     signal_note = " (MISSED - acting now)" if recent_buy_signal['index'] < -1 else ""
 
+                    # Append new entry to locked backtest (for future charts)
+                    append_to_locked_backtest(
+                        entry={'date': signal_time, 'price': current_price, 'position': 'long'},
+                        strategy_name=strategy_name, ticker=ticker
+                    )
+                    # Reload the locked backtest with the new entry
+                    locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
+
                     # Run backtest to get stats for the signal alert
                     signal_backtest = None
                     signal_chart = None
                     try:
                         signal_backtest = run_historical_backtest(df, config)
-                        signal_chart = generate_velocity_chart(df, signal_backtest, config, ticker)
+                        # Use locked backtest for markers to prevent repainting
+                        signal_chart = generate_velocity_chart(df, signal_backtest, config, ticker,
+                                                              locked_backtest=locked_backtest)
                     except Exception as e:
                         print(f"Could not generate signal chart: {e}")
 
@@ -1929,12 +2415,13 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         f"_SL: ${current_price * (1 - stop_loss_pct/100):.2f} | TP: ${current_price * (1 + take_profit_pct/100):.2f}_"
                     )
 
-                    send_discord_alert(webhook_url, buy_msg, signal_chart)
+                    send_discord_alert(webhook_url, buy_msg, signal_chart, strategy_name=strategy_name)
                     print(f"BUY SIGNAL SENT!{signal_note}")
 
                     trade_state['position'] = 'long'
                     trade_state['entry_price'] = current_price
                     trade_state['entry_time'] = str(current_time)
+                    trade_state['entry_signal_bar'] = str(signal_time)  # Lock the signal bar for charts
                     trade_state['last_signal_time'] = str(signal_time)
                     save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
 
@@ -1943,12 +2430,22 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     signal_time = recent_sell_signal['time']
                     signal_note = " (MISSED - acting now)" if recent_sell_signal['index'] < -1 else ""
 
+                    # Append new entry to locked backtest (for future charts)
+                    append_to_locked_backtest(
+                        entry={'date': signal_time, 'price': current_price, 'position': 'short'},
+                        strategy_name=strategy_name, ticker=ticker
+                    )
+                    # Reload the locked backtest with the new entry
+                    locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
+
                     # Run backtest to get stats for the signal alert
                     signal_backtest = None
                     signal_chart = None
                     try:
                         signal_backtest = run_historical_backtest(df, config)
-                        signal_chart = generate_velocity_chart(df, signal_backtest, config, ticker)
+                        # Use locked backtest for markers to prevent repainting
+                        signal_chart = generate_velocity_chart(df, signal_backtest, config, ticker,
+                                                              locked_backtest=locked_backtest)
                     except Exception as e:
                         print(f"Could not generate signal chart: {e}")
 
@@ -1971,12 +2468,13 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         f"_SL: ${current_price * (1 + stop_loss_pct/100):.2f} | TP: ${current_price * (1 - take_profit_pct/100):.2f}_"
                     )
 
-                    send_discord_alert(webhook_url, sell_msg, signal_chart)
+                    send_discord_alert(webhook_url, sell_msg, signal_chart, strategy_name=strategy_name)
                     print(f"SELL SIGNAL SENT!{signal_note}")
 
                     trade_state['position'] = 'short'
                     trade_state['entry_price'] = current_price
                     trade_state['entry_time'] = str(current_time)
+                    trade_state['entry_signal_bar'] = str(signal_time)  # Lock the signal bar for charts
                     trade_state['last_signal_time'] = str(signal_time)
                     save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
 
@@ -1986,11 +2484,11 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
         except KeyboardInterrupt:
             print("\n\nShutting down...")
             shutdown_msg = "🛑 **[VELOCITY] Live Trader Stopped**\n_Manually terminated._"
-            send_discord_alert(webhook_url, shutdown_msg)
+            send_discord_alert(webhook_url, shutdown_msg, strategy_name=strategy_name)
             break
         except Exception as e:
             error_msg = f"⚠️ **[VELOCITY] Error in Trader**\n```{str(e)}```"
-            send_discord_alert(webhook_url, error_msg)
+            send_discord_alert(webhook_url, error_msg, strategy_name=strategy_name)
             print(f"Error: {e}")
             time.sleep(60)  # Wait 1 minute on error
 
