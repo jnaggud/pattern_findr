@@ -1400,11 +1400,8 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
                     f"• Duration: {hold_duration}\n"
                     f"• SL: ${sl_price:.2f} | TP: ${tp_price:.2f}"
                 )
-            elif backtest_local and backtest_local.get('current_position'):
-                pos = backtest_local['current_position']
-                pos_type_bt = pos.get('position', 'long').upper()
-                pnl_emoji_bt = "🟢" if pos['unrealized_pnl'] >= 0 else "🔴"
-                pos_section = f"{pnl_emoji_bt} **Position:** {pos_type_bt} @ ${pos['entry_price']:.2f} ({pos['unrealized_pnl']:+.1f}%)"
+            # NOTE: Removed fallback to backtest position - only show TRACKED positions
+            # This prevents confusion when backtest shows a position but we're not actually tracking it
 
             return pos_section
 
@@ -1983,6 +1980,13 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 status_backtest = run_historical_backtest(df, config)
             except:
                 pass
+
+            # Check for position sync issues - warn if backtest shows position but we're not tracking
+            if status_backtest and status_backtest.get('current_position'):
+                bt_pos = status_backtest['current_position']
+                if not trade_state.get('position'):
+                    print(f"   ⚠️  SYNC WARNING: Backtest shows {bt_pos.get('position', 'unknown').upper()} @ ${bt_pos.get('entry_price', 0):.2f}")
+                    print(f"   ⚠️  But trade_state has no position! Consider restarting to sync.")
 
             # Market Open Update (8:30-8:45 AM)
             if "08:30" <= hm <= "08:45":
