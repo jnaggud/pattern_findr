@@ -9,6 +9,9 @@ This module contains all reusable functions for:
 - Backtest engine
 - Discord alerts and chart generation
 
+IMPORTANT: This is a SIGNAL-ONLY system. It does NOT execute trades.
+See velocity_production_utils.py for the full disclaimer.
+
 Used by:
 - velocity_live_trader.py (single strategy CLI)
 - velocity_multi_trader.py (multi-strategy runner)
@@ -18,11 +21,35 @@ import json
 import os
 import time
 import io
+import logging
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 import requests
 import matplotlib.pyplot as plt
+
+# Import production utilities for safe file operations and logging
+try:
+    from velocity_production_utils import (
+        safe_json_write, safe_json_read, get_logger,
+        is_market_open, get_market_time, validate_trade_state,
+        load_webhook_from_env, HeartbeatMonitor
+    )
+    PRODUCTION_UTILS_AVAILABLE = True
+except ImportError:
+    PRODUCTION_UTILS_AVAILABLE = False
+    # Fallback: define minimal versions
+    def get_logger(name):
+        return logging.getLogger(name)
+    def safe_json_write(path, data, indent=2):
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=indent, default=str)
+        return True
+    def safe_json_read(path, default=None):
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                return json.load(f)
+        return default
 
 # Import oscillator calculations from Streamlit source of truth
 from oscillator_predictor_page import (
@@ -450,52 +477,78 @@ def get_locked_backtest_path(strategy_name: str = None, ticker: str = None) -> s
 
 
 def load_trade_state(strategy_name: str = None, ticker: str = None, state_path: str = None) -> dict:
-    """Load current trade state from file."""
+    """Load current trade state from file with safe file locking."""
+    logger = get_logger("velocity.state")
+
     if state_path is None:
         state_path = get_state_file_path(strategy_name=strategy_name, ticker=ticker)
 
-    if os.path.exists(state_path):
-        with open(state_path, 'r') as f:
-            return json.load(f)
-    return {
-        "position": None,
+    default_state = {
+        "position": None,  # None or "long" (LONG-only strategy)
         "entry_price": None,
         "entry_time": None,
         "entry_signal_bar": None,
         "last_signal_time": None,
     }
 
+    state = safe_json_read(state_path, default=default_state)
+
+    # Validate loaded state
+    if PRODUCTION_UTILS_AVAILABLE:
+        is_valid, error = validate_trade_state(state)
+        if not is_valid:
+            logger.warning(f"Invalid trade state in {state_path}: {error}")
+            # Return state anyway but log the issue
+
+    return state
+
 
 def save_trade_state(state: dict, strategy_name: str = None, ticker: str = None, state_path: str = None):
-    """Save trade state to file."""
+    """Save trade state to file with atomic write and file locking."""
+    logger = get_logger("velocity.state")
+
     if state_path is None:
         state_path = get_state_file_path(strategy_name=strategy_name, ticker=ticker)
 
-    with open(state_path, 'w') as f:
-        json.dump(state, f, indent=2, default=str)
+    # Validate before saving
+    if PRODUCTION_UTILS_AVAILABLE:
+        is_valid, error = validate_trade_state(state)
+        if not is_valid:
+            logger.warning(f"Saving potentially invalid state to {state_path}: {error}")
+
+    success = safe_json_write(state_path, state, indent=2)
+    if not success:
+        logger.error(f"Failed to save trade state to {state_path}")
+    else:
+        logger.debug(f"Saved trade state to {state_path}")
 
 
 def load_trade_history(strategy_name: str = None, ticker: str = None, history_path: str = None) -> list:
-    """Load trade history from file."""
+    """Load trade history from file with safe file locking."""
+    logger = get_logger("velocity.history")
+
     if history_path is None:
         history_path = get_history_file_path(strategy_name=strategy_name, ticker=ticker)
 
-    if os.path.exists(history_path):
-        try:
-            with open(history_path, 'r') as f:
-                return json.load(f)
-        except:
-            return []
-    return []
+    history = safe_json_read(history_path, default=[])
+
+    if not isinstance(history, list):
+        logger.warning(f"Invalid history format in {history_path}, returning empty list")
+        return []
+
+    return history
 
 
 def save_trade_history(history: list, strategy_name: str = None, ticker: str = None, history_path: str = None):
-    """Save trade history to file."""
+    """Save trade history to file with atomic write and file locking."""
+    logger = get_logger("velocity.history")
+
     if history_path is None:
         history_path = get_history_file_path(strategy_name=strategy_name, ticker=ticker)
 
-    with open(history_path, 'w') as f:
-        json.dump(history, f, indent=2, default=str)
+    success = safe_json_write(history_path, history, indent=2)
+    if not success:
+        logger.error(f"Failed to save trade history to {history_path}")
 
 
 def log_closed_trade(ticker: str, position_type: str, entry_price: float, exit_price: float,
@@ -557,6 +610,7 @@ def log_closed_trade(ticker: str, position_type: str, entry_price: float, exit_p
 
 def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str = None, trade_state: dict = None):
     """Save backtest results as a locked snapshot (prevents repainting)."""
+    logger = get_logger("velocity.backtest")
     path = get_locked_backtest_path(strategy_name=strategy_name, ticker=ticker)
 
     locked = {
@@ -577,8 +631,8 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
             tracked_entry_str = str(trade_state['entry_time']).split('.')[0]
             tracked_entry_date = pd.to_datetime(tracked_entry_str)
             print(f"   Tracked position: {trade_state['position'].upper()} @ ${trade_state.get('entry_price', 0):.2f} on {tracked_entry_date}")
-        except:
-            pass
+        except (ValueError, TypeError) as e:
+            logger.debug(f"Could not parse tracked entry time: {e}")
 
     # Convert entries to serializable format
     for entry in backtest.get('entries', []):
@@ -586,8 +640,8 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
         if isinstance(entry_date, str):
             try:
                 entry_date = pd.to_datetime(entry_date)
-            except:
-                pass
+            except (ValueError, TypeError):
+                pass  # Keep as string if parsing fails
 
         # Skip entries that conflict with tracked position
         if tracked_entry_date is not None and hasattr(entry_date, 'date'):
@@ -627,25 +681,27 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
             "entry_date": str(exit_trade.get('entry_date', ''))
         })
 
-    with open(path, 'w') as f:
-        json.dump(locked, f, indent=2, default=str)
+    # Use safe atomic write with file locking
+    success = safe_json_write(path, locked, indent=2)
+    if success:
+        print(f"   Locked backtest saved: {len(locked['entries'])} entries, {len(locked['exits'])} exits")
+    else:
+        logger = get_logger("velocity.backtest")
+        logger.error(f"Failed to save locked backtest to {path}")
 
-    print(f"   Locked backtest saved: {len(locked['entries'])} entries, {len(locked['exits'])} exits")
     return locked
 
 
 def load_locked_backtest(strategy_name: str = None, ticker: str = None) -> dict:
-    """Load locked backtest snapshot."""
+    """Load locked backtest snapshot with safe file locking."""
+    logger = get_logger("velocity.backtest")
     path = get_locked_backtest_path(strategy_name=strategy_name, ticker=ticker)
 
-    if os.path.exists(path):
-        try:
-            with open(path, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"   Could not load locked backtest: {e}")
-            return None
-    return None
+    result = safe_json_read(path, default=None)
+    if result is None and os.path.exists(path):
+        logger.warning(f"Could not load locked backtest from {path}")
+
+    return result
 
 
 def append_to_locked_backtest(entry: dict = None, exit_trade: dict = None,
@@ -712,8 +768,10 @@ def append_to_locked_backtest(entry: dict = None, exit_trade: dict = None,
         }
 
     path = get_locked_backtest_path(strategy_name=strategy_name, ticker=ticker)
-    with open(path, 'w') as f:
-        json.dump(locked, f, indent=2, default=str)
+    success = safe_json_write(path, locked, indent=2)
+    if not success:
+        logger = get_logger("velocity.backtest")
+        logger.error(f"Failed to append to locked backtest: {path}")
 
 
 def detect_and_add_missed_signals(fresh_backtest: dict, strategy_name: str = None, ticker: str = None) -> int:
@@ -1046,7 +1104,8 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                 if is_missed:
                     color = 'orange'
                 else:
-                    color = 'green' if exit_trade['pnl'] > 0 else 'red'
+                    # LONG-only: All exits are dark green (forest green) down triangles
+                    color = '#228B22'  # Forest green for all long exits
 
                 if exit_date in df_plot.index:
                     ax1.scatter(exit_date, exit_trade['price'], marker='v', color=color, s=100, zorder=5)
@@ -1059,9 +1118,14 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                     except:
                         pass
 
+        # Entry line: Use current_position (trade_state) first, then locked_backtest, then fresh backtest
+        # This ensures consistency with the locked backtest markers
         if current_position and current_position.get('entry_price'):
             ax1.axhline(current_position['entry_price'], color='cyan', linestyle='--', alpha=0.7,
                        label=f"Entry ${current_position['entry_price']:.2f}")
+        elif locked_backtest and locked_backtest.get('current_position'):
+            pos = locked_backtest['current_position']
+            ax1.axhline(pos['entry_price'], color='cyan', linestyle='--', alpha=0.7, label=f"Entry ${pos['entry_price']:.2f}")
         elif backtest and backtest.get('current_position'):
             pos = backtest['current_position']
             ax1.axhline(pos['entry_price'], color='cyan', linestyle='--', alpha=0.7, label=f"Entry ${pos['entry_price']:.2f}")
@@ -1108,15 +1172,16 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
             ax3.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
             ax3.xaxis.set_major_locator(mdates.MonthLocator())
 
-        # 4. Equity Curve
+        # 4. Equity Curve - Use locked_backtest for consistency with markers
         ax4 = axes[3]
-        if backtest and backtest.get('exits'):
+        equity_source = locked_backtest if locked_backtest and locked_backtest.get('exits') else backtest
+        if equity_source and equity_source.get('exits'):
             equity = [100]
-            for exit in backtest['exits']:
+            for exit in equity_source['exits']:
                 equity.append(equity[-1] * (1 + exit['pnl']/100))
 
-            if backtest.get('current_position'):
-                unrealized = backtest['current_position'].get('unrealized_pnl', 0)
+            if equity_source.get('current_position'):
+                unrealized = equity_source['current_position'].get('unrealized_pnl', 0)
                 if unrealized:
                     equity.append(equity[-1] * (1 + unrealized/100))
 
@@ -1127,26 +1192,27 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
         ax4.set_ylabel("Equity", color='white')
         ax4.set_xlabel("Trade #", color='white')
 
-        # Stats annotation
-        if full_period_backtest and backtest:
+        # Stats annotation - Use locked_backtest for consistency with markers when available
+        stats_source = locked_backtest if locked_backtest and locked_backtest.get('num_trades') else backtest
+        if full_period_backtest and stats_source:
             full_stats = (f"Full Period: {full_period_backtest['num_trades']} trades | "
                          f"Win: {full_period_backtest['win_rate']:.0f}% | "
                          f"Return: {full_period_backtest['total_return']:.1f}% | "
                          f"PF: {full_period_backtest['profit_factor']:.1f}")
-            period_label = f"Recent {backtest.get('period_days', len(df_plot))}D"
-            recent_stats = (f"{period_label}: {backtest['num_trades']} trades | "
-                           f"Win: {backtest['win_rate']:.0f}% | "
-                           f"Return: {backtest['total_return']:.1f}% | "
-                           f"PF: {backtest['profit_factor']:.1f}")
+            period_label = f"Recent {stats_source.get('period_days', len(df_plot))}D"
+            recent_stats = (f"{period_label}: {stats_source['num_trades']} trades | "
+                           f"Win: {stats_source['win_rate']:.0f}% | "
+                           f"Return: {stats_source['total_return']:.1f}% | "
+                           f"PF: {stats_source['profit_factor']:.1f}")
             fig.text(0.5, 0.035, full_stats, ha='center', color='white', fontsize=10,
                     bbox=dict(boxstyle='round', facecolor='#0f3460', alpha=0.8))
             fig.text(0.5, 0.008, recent_stats, ha='center', color='#00ff88', fontsize=10,
                     bbox=dict(boxstyle='round', facecolor='#0f3460', alpha=0.8))
-        elif backtest:
-            stats_text = (f"Trades: {backtest['num_trades']} | "
-                         f"Win: {backtest['win_rate']:.0f}% | "
-                         f"Return: {backtest['total_return']:.1f}% | "
-                         f"PF: {backtest['profit_factor']:.1f}")
+        elif stats_source:
+            stats_text = (f"Trades: {stats_source['num_trades']} | "
+                         f"Win: {stats_source['win_rate']:.0f}% | "
+                         f"Return: {stats_source['total_return']:.1f}% | "
+                         f"PF: {stats_source['profit_factor']:.1f}")
             fig.text(0.5, 0.02, stats_text, ha='center', color='white', fontsize=11,
                     bbox=dict(boxstyle='round', facecolor='#0f3460', alpha=0.8))
 

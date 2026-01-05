@@ -1,6 +1,10 @@
 """
 Velocity Multi-Strategy Trader
 
+IMPORTANT: This is a SIGNAL-ONLY system. It does NOT execute actual trades.
+It monitors price data, generates trading signals, and sends alerts to Discord.
+You must manually execute trades if you choose to act on the signals.
+
 Runs multiple velocity strategies in a single process with interactive selection.
 Uses velocity_core.py for all shared logic.
 
@@ -9,6 +13,8 @@ Features:
 - Shared data fetches per ticker (BTC, SPY fetched once each)
 - Independent state/backtest files per strategy
 - Single main loop processing all selected strategies
+- LONG-only trading signals (no SHORT positions)
+- Production-ready file locking and error handling
 
 Usage:
     python velocity_multi_trader.py
@@ -16,9 +22,28 @@ Usage:
 
 import os
 import time
+import logging
 from datetime import datetime, timedelta
 from collections import defaultdict
 import pandas as pd
+
+# Import production utilities
+try:
+    from velocity_production_utils import (
+        get_logger, is_market_open, get_market_time,
+        HeartbeatMonitor, print_signal_only_disclaimer
+    )
+    PRODUCTION_UTILS_AVAILABLE = True
+except ImportError:
+    PRODUCTION_UTILS_AVAILABLE = False
+    def get_logger(name):
+        return logging.getLogger(name)
+    def is_market_open(ticker):
+        return {"is_open": True}
+    def get_market_time():
+        return datetime.now()
+    def print_signal_only_disclaimer():
+        print("WARNING: This is a SIGNAL-ONLY system. It does NOT execute trades.")
 
 # Import all shared logic from velocity_core
 from velocity_core import (
@@ -256,6 +281,20 @@ def process_strategy(strat: dict, current_price: float, df_fresh: pd.DataFrame) 
     trade_state = strat['trade_state']
     webhook_url = strat['webhook_url']
 
+    # Check if this is a crypto ticker (24/7) vs stock (market hours)
+    is_crypto = any(ticker.upper().startswith(c) for c in ['BTC', 'ETH', 'DOGE', 'SOL', 'ADA'])
+
+    # For stocks (SPY), only evaluate NEW entry signals after market close (4 PM ET)
+    # Exit checks (stop loss, take profit) always run since they use real-time price
+    should_check_entries = True
+    if not is_crypto:
+        market_time = get_market_time()  # Eastern Time
+        et_hour = market_time.hour
+        if et_hour < 16:
+            # Market still open - don't evaluate entry signals yet
+            # (daily bar not complete)
+            should_check_entries = False
+
     # Calculate signals on fresh data
     df = calculate_composite_oscillator(df_fresh.copy(), config)
     df = calculate_velocity_signals(df, config)
@@ -347,7 +386,7 @@ def process_strategy(strat: dict, current_price: float, df_fresh: pd.DataFrame) 
     # ========================================
     # CHECK ENTRIES (if no position)
     # ========================================
-    if position is None:
+    if position is None and should_check_entries:
         buy_signal = last_bar.get('buy_signal', False)
         sell_signal = last_bar.get('sell_signal', False)
 
@@ -393,6 +432,11 @@ def process_strategy(strat: dict, current_price: float, df_fresh: pd.DataFrame) 
 
 def run_multi_trader():
     """Main multi-strategy trading loop."""
+    logger = get_logger("velocity.multi")
+
+    # Print signal-only disclaimer
+    if PRODUCTION_UTILS_AVAILABLE:
+        print_signal_only_disclaimer()
 
     # Interactive selection
     selected_strategies = select_strategies_interactive()
@@ -403,6 +447,8 @@ def run_multi_trader():
 
     print(f"\n{'='*60}")
     print(f"STARTING MULTI-TRADER WITH {len(selected_strategies)} STRATEGIES")
+    print(f"{'='*60}")
+    print(f"NOTE: This is a SIGNAL-ONLY system. No trades will be executed.")
     print(f"{'='*60}")
 
     # Group strategies by ticker for data sharing
@@ -451,6 +497,17 @@ def run_multi_trader():
     # ========================================
     check_interval_seconds = 900  # 15 minutes
 
+    # Initialize heartbeat monitor (sends status every 4 hours)
+    heartbeat = None
+    if PRODUCTION_UTILS_AVAILABLE and enabled_strategies:
+        first_strategy = enabled_strategies[0]
+        heartbeat = HeartbeatMonitor(
+            interval_hours=4.0,
+            webhook_url=first_strategy.get('webhook_url'),
+            strategy_name="multi_trader",
+            send_func=lambda msg: send_discord_alert(first_strategy.get('webhook_url', DEFAULT_DISCORD_WEBHOOK), msg)
+        )
+
     print(f"\nEntering main loop (check every {check_interval_seconds // 60} min)")
     print("Press Ctrl+C to stop\n")
 
@@ -458,6 +515,11 @@ def run_multi_trader():
         try:
             loop_start = datetime.now()
             print(f"\n[{loop_start.strftime('%Y-%m-%d %H:%M:%S')}] Update Cycle")
+
+            # Send heartbeat if interval has passed
+            if heartbeat:
+                heartbeat.record_cycle()
+                heartbeat.check()
 
             # ========================================
             # PHASE 1: FETCH FRESH DATA (once per ticker)

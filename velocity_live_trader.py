@@ -1,8 +1,9 @@
 """
 Velocity-Based Live Trader
 
-Real-time trading bot that monitors oscillator velocity/acceleration signals
-and sends alerts to Discord. Designed for velocity strategy deployment.
+IMPORTANT: This is a SIGNAL-ONLY system. It does NOT execute actual trades.
+It monitors price data, generates trading signals, and sends alerts to Discord.
+You must manually execute trades if you choose to act on the signals.
 
 Features:
 - Interactive strategy selection at startup
@@ -10,6 +11,8 @@ Features:
 - Config hot-reloading during runtime
 - Scheduled status updates (market open, mid-day, close, hourly)
 - Historical backtest on startup with charts
+- LONG-only trading signals (no SHORT positions)
+- Production-ready file locking and error handling
 
 Usage:
     python velocity_live_trader.py [--config path/to/config.json]
@@ -19,6 +22,7 @@ import json
 import os
 import time
 import argparse
+import logging
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
@@ -26,6 +30,29 @@ import requests
 import matplotlib.pyplot as plt
 import io
 import shutil
+
+# Import production utilities for safe operations
+try:
+    from velocity_production_utils import (
+        safe_json_write, safe_json_read, get_logger,
+        is_market_open, get_market_time, HeartbeatMonitor,
+        load_webhook_from_env, print_signal_only_disclaimer,
+        SIGNAL_ONLY_DISCLAIMER
+    )
+    PRODUCTION_UTILS_AVAILABLE = True
+except ImportError:
+    PRODUCTION_UTILS_AVAILABLE = False
+    print("Warning: velocity_production_utils.py not found. Using basic operations.")
+    def get_logger(name):
+        return logging.getLogger(name)
+    def is_market_open(ticker):
+        return {"is_open": True, "reason": "Unknown"}
+    def get_market_time():
+        return datetime.now()
+    def load_webhook_from_env(name):
+        return None
+    def print_signal_only_disclaimer():
+        print("WARNING: This is a SIGNAL-ONLY system. It does NOT execute trades.")
 
 # Import oscillator calculations directly from Streamlit source of truth
 from oscillator_predictor_page import (
@@ -757,7 +784,8 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                 if is_missed:
                     color = 'orange'
                 else:
-                    color = 'green' if exit_trade['pnl'] > 0 else 'red'
+                    # LONG-only: All exits are dark green (forest green) down triangles
+                    color = '#228B22'  # Forest green for all long exits
 
                 if exit_date in df_plot.index:
                     ax1.scatter(exit_date, exit_trade['price'], marker='v', color=color, s=100, zorder=5)
@@ -773,9 +801,13 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
 
         # Mark current open position - use LOCKED trade_state (current_position) if provided
         # This ensures the entry line shows YOUR ACTUAL tracked position, not the recalculated one
+        # Priority: current_position (trade_state) > locked_backtest > fresh backtest
         if current_position and current_position.get('entry_price'):
             ax1.axhline(current_position['entry_price'], color='cyan', linestyle='--', alpha=0.7,
                        label=f"Entry ${current_position['entry_price']:.2f}")
+        elif locked_backtest and locked_backtest.get('current_position'):
+            pos = locked_backtest['current_position']
+            ax1.axhline(pos['entry_price'], color='cyan', linestyle='--', alpha=0.7, label=f"Entry ${pos['entry_price']:.2f}")
         elif backtest and backtest.get('current_position'):
             pos = backtest['current_position']
             ax1.axhline(pos['entry_price'], color='cyan', linestyle='--', alpha=0.7, label=f"Entry ${pos['entry_price']:.2f}")
@@ -830,17 +862,19 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
             ax3.tick_params(axis='x', labelsize=8)
             plt.setp(ax3.xaxis.get_majorticklabels(), rotation=0)
 
-        # 4. Equity Curve (if we have backtest data)
+        # 4. Equity Curve - Use backtest (period-specific) for equity to match displayed timeframe
+        # Markers come from locked_backtest (filtered to chart range), but equity shows period stats
         ax4 = axes[3]
-        if backtest and backtest.get('exits'):
+        equity_source = backtest if backtest and backtest.get('exits') else locked_backtest
+        if equity_source and equity_source.get('exits'):
             # Build simple equity curve from trades
             equity = [100]
-            for exit in backtest['exits']:
+            for exit in equity_source['exits']:
                 equity.append(equity[-1] * (1 + exit['pnl']/100))
 
             # Add unrealized if open position (use .get() to handle missing key)
-            if backtest.get('current_position'):
-                unrealized = backtest['current_position'].get('unrealized_pnl', 0)
+            if equity_source.get('current_position'):
+                unrealized = equity_source['current_position'].get('unrealized_pnl', 0)
                 if unrealized:
                     equity.append(equity[-1] * (1 + unrealized/100))
 
@@ -851,28 +885,30 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
         ax4.set_ylabel("Equity", color='white')
         ax4.set_xlabel("Trade #", color='white')
 
-        # Stats annotation - show both full period and recent stats if available
-        if full_period_backtest and backtest:
+        # Stats annotation - Use backtest (period-specific) to match displayed timeframe
+        # Markers come from locked_backtest (filtered), but stats should reflect visible period
+        stats_source = backtest if backtest and backtest.get('num_trades') else locked_backtest
+        if full_period_backtest and stats_source:
             # Show both: Full period on top, Recent below
             full_stats = (f"Full Period: {full_period_backtest['num_trades']} trades | "
                          f"Win: {full_period_backtest['win_rate']:.0f}% | "
                          f"Return: {full_period_backtest['total_return']:.1f}% | "
                          f"PF: {full_period_backtest['profit_factor']:.1f}")
-            # Use period_days from backtest if available, otherwise default to chart period
-            period_label = f"Recent {backtest.get('period_days', len(df_plot))}D"
-            recent_stats = (f"{period_label}: {backtest['num_trades']} trades | "
-                           f"Win: {backtest['win_rate']:.0f}% | "
-                           f"Return: {backtest['total_return']:.1f}% | "
-                           f"PF: {backtest['profit_factor']:.1f}")
+            # Use period_days from stats_source if available, otherwise default to chart period
+            period_label = f"Recent {stats_source.get('period_days', len(df_plot))}D"
+            recent_stats = (f"{period_label}: {stats_source['num_trades']} trades | "
+                           f"Win: {stats_source['win_rate']:.0f}% | "
+                           f"Return: {stats_source['total_return']:.1f}% | "
+                           f"PF: {stats_source['profit_factor']:.1f}")
             fig.text(0.5, 0.035, full_stats, ha='center', color='white', fontsize=10,
                     bbox=dict(boxstyle='round', facecolor='#0f3460', alpha=0.8))
             fig.text(0.5, 0.008, recent_stats, ha='center', color='#00ff88', fontsize=10,
                     bbox=dict(boxstyle='round', facecolor='#0f3460', alpha=0.8))
-        elif backtest:
-            stats_text = (f"Trades: {backtest['num_trades']} | "
-                         f"Win: {backtest['win_rate']:.0f}% | "
-                         f"Return: {backtest['total_return']:.1f}% | "
-                         f"PF: {backtest['profit_factor']:.1f}")
+        elif stats_source:
+            stats_text = (f"Trades: {stats_source['num_trades']} | "
+                         f"Win: {stats_source['win_rate']:.0f}% | "
+                         f"Return: {stats_source['total_return']:.1f}% | "
+                         f"PF: {stats_source['profit_factor']:.1f}")
             fig.text(0.5, 0.02, stats_text, ha='center', color='white', fontsize=11,
                     bbox=dict(boxstyle='round', facecolor='#0f3460', alpha=0.8))
 
@@ -1085,27 +1121,49 @@ def get_locked_backtest_path(strategy_name: str = None, ticker: str = None) -> s
 
 
 def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str = None, trade_state: dict = None):
-    """Save backtest results as a locked snapshot (prevents repainting).
+    """Save or update locked backtest snapshot (prevents repainting).
 
-    Stores entries, exits, and stats at a point in time. These markers
-    won't change even as new data comes in.
+    IMPORTANT: This function now PRESERVES historical data.
+    - If a locked backtest exists, it loads it and only appends NEW entries/exits
+    - Stats are recalculated from all exits (historical + new)
+    - This prevents losing historical trade data on each restart
 
-    IMPORTANT: If trade_state has a tracked position, we reconcile the backtest
-    with it - removing any conflicting entries and using the tracked position
-    as the source of truth for the current open position.
+    If trade_state has a tracked position, we reconcile the backtest
+    with it - using the tracked position as the source of truth.
     """
     path = get_locked_backtest_path(strategy_name=strategy_name, ticker=ticker)
 
-    # Extract the serializable parts of the backtest
+    # Try to load existing locked backtest to preserve historical data
+    existing_locked = None
+    if os.path.exists(path):
+        try:
+            with open(path, 'r') as f:
+                existing_locked = json.load(f)
+            print(f"   📂 Loaded existing locked backtest: {len(existing_locked.get('entries', []))} entries, {len(existing_locked.get('exits', []))} exits")
+        except Exception as e:
+            print(f"   ⚠️ Could not load existing locked backtest: {e}")
+
+    # Find the latest exit date in existing locked backtest
+    # Only add trades AFTER this date (don't try to merge overlapping periods)
+    latest_exit_date = None
+    if existing_locked and existing_locked.get('exits'):
+        for exit_trade in existing_locked['exits']:
+            exit_date_str = str(exit_trade.get('date', ''))[:10]
+            if exit_date_str and (latest_exit_date is None or exit_date_str > latest_exit_date):
+                latest_exit_date = exit_date_str
+        if latest_exit_date:
+            print(f"   📅 Latest exit in locked backtest: {latest_exit_date}")
+
+    # Start with existing data or empty
     locked = {
         "locked_at": datetime.now().isoformat(),
-        "entries": [],
-        "exits": [],
-        "current_position": backtest.get('current_position'),
-        "num_trades": backtest.get('num_trades', 0),
-        "win_rate": backtest.get('win_rate', 0),
-        "total_return": backtest.get('total_return', 0),
-        "profit_factor": backtest.get('profit_factor', 0),
+        "entries": existing_locked.get('entries', []) if existing_locked else [],
+        "exits": existing_locked.get('exits', []) if existing_locked else [],
+        "current_position": None,
+        "num_trades": 0,
+        "win_rate": 0,
+        "total_return": 0,
+        "profit_factor": 0,
     }
 
     # Get the tracked position's entry date (if any) for reconciliation
@@ -1118,11 +1176,18 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
         except:
             pass
 
-    # Convert entries to serializable format
-    # If we have a tracked position, exclude any backtest entries on or after that date
-    # (those are the "repainted" entries that don't match reality)
+    # Add NEW entries from fresh backtest (only entries AFTER latest exit date)
+    new_entries_added = 0
     for entry in backtest.get('entries', []):
         entry_date = entry['date']
+        entry_date_str = str(entry_date)[:10]
+
+        # Only add entries AFTER the latest exit in locked backtest
+        # This prevents duplicates from overlapping data periods
+        if latest_exit_date and entry_date_str <= latest_exit_date:
+            continue
+
+        # Parse date for comparison with tracked position
         if isinstance(entry_date, str):
             try:
                 entry_date = pd.to_datetime(entry_date)
@@ -1140,25 +1205,20 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
             "price": entry['price'],
             "position": entry.get('position', 'long')
         })
+        new_entries_added += 1
 
-    # If we have a tracked position, add it as the current entry
-    if trade_state and trade_state.get('position') and trade_state.get('entry_price'):
-        locked["entries"].append({
-            "date": str(trade_state.get('entry_time', '')),
-            "price": trade_state['entry_price'],
-            "position": trade_state['position']
-        })
-        print(f"   ✅ Added tracked {trade_state['position'].upper()} entry to locked backtest")
+    if new_entries_added > 0:
+        print(f"   ➕ Added {new_entries_added} new entries (after {latest_exit_date})")
 
-        # Update current_position to match trade_state
-        locked["current_position"] = {
-            "position": trade_state['position'],
-            "entry_price": trade_state['entry_price'],
-            "entry_date": str(trade_state.get('entry_time', ''))
-        }
-
-    # Convert exits to serializable format
+    # Add NEW exits from fresh backtest (only exits AFTER latest exit date)
+    new_exits_added = 0
     for exit_trade in backtest.get('exits', []):
+        exit_date_str = str(exit_trade['date'])[:10]
+
+        # Only add exits AFTER the latest exit in locked backtest
+        if latest_exit_date and exit_date_str <= latest_exit_date:
+            continue
+
         locked["exits"].append({
             "date": str(exit_trade['date']),
             "price": exit_trade['price'],
@@ -1167,11 +1227,59 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
             "entry_price": exit_trade.get('entry_price', 0),
             "entry_date": str(exit_trade.get('entry_date', ''))
         })
+        new_exits_added += 1
+
+    if new_exits_added > 0:
+        print(f"   ➕ Added {new_exits_added} new exits (after {latest_exit_date})")
+
+    # Handle tracked position - add or update
+    if trade_state and trade_state.get('position') and trade_state.get('entry_price'):
+        tracked_entry_str = str(trade_state.get('entry_time', ''))[:10]
+
+        # Remove any existing entries that match tracked position date (to avoid duplicates)
+        locked["entries"] = [e for e in locked["entries"] if str(e.get('date', ''))[:10] != tracked_entry_str]
+
+        # Add the tracked position as entry
+        locked["entries"].append({
+            "date": str(trade_state.get('entry_time', '')),
+            "price": trade_state['entry_price'],
+            "position": trade_state['position']
+        })
+        print(f"   ✅ Synced tracked {trade_state['position'].upper()} entry in locked backtest")
+
+        # Update current_position
+        locked["current_position"] = {
+            "position": trade_state['position'],
+            "entry_price": trade_state['entry_price'],
+            "entry_date": str(trade_state.get('entry_time', ''))
+        }
+
+    # RECALCULATE STATS from all exits (not from fresh backtest)
+    num_trades = len(locked["exits"])
+    if num_trades > 0:
+        wins = sum(1 for e in locked["exits"] if e.get('pnl', 0) > 0)
+        win_pnl = sum(e.get('pnl', 0) for e in locked["exits"] if e.get('pnl', 0) > 0)
+        loss_pnl = abs(sum(e.get('pnl', 0) for e in locked["exits"] if e.get('pnl', 0) < 0))
+
+        # Calculate COMPOUNDED return (not simple sum)
+        # Sort exits by date and compound returns
+        sorted_exits = sorted(locked["exits"], key=lambda x: str(x.get('date', '')))
+        equity = 1.0
+        for exit_trade in sorted_exits:
+            pnl_pct = exit_trade.get('pnl', 0)
+            equity *= (1 + pnl_pct / 100)
+        total_return = (equity - 1) * 100
+
+        locked["num_trades"] = num_trades
+        locked["win_rate"] = (wins / num_trades) * 100
+        locked["total_return"] = total_return
+        locked["profit_factor"] = win_pnl / loss_pnl if loss_pnl > 0 else float('inf') if win_pnl > 0 else 0
 
     with open(path, 'w') as f:
         json.dump(locked, f, indent=2, default=str)
 
     print(f"   🔒 Locked backtest saved: {len(locked['entries'])} entries, {len(locked['exits'])} exits")
+    print(f"   📊 Recalculated stats: {locked['num_trades']} trades, {locked['win_rate']:.1f}% win, {locked['total_return']:.1f}% return")
     return locked
 
 
@@ -1245,8 +1353,18 @@ def append_to_locked_backtest(entry: dict = None, exit_trade: dict = None,
         locked["num_missed"] = len(missed_exits)
         if tracked_exits:
             winners = [e for e in tracked_exits if e['pnl'] > 0]
+            losers = [e for e in tracked_exits if e['pnl'] <= 0]
             locked["win_rate"] = (len(winners) / len(tracked_exits)) * 100
-            locked["total_return"] = sum(e['pnl'] for e in tracked_exits)
+            # Use COMPOUNDED return (consistent with other calculations)
+            sorted_exits = sorted(tracked_exits, key=lambda x: str(x.get('date', '')))
+            equity = 1.0
+            for exit_trade in sorted_exits:
+                equity *= (1 + exit_trade['pnl'] / 100)
+            locked["total_return"] = (equity - 1) * 100
+            # Calculate profit factor
+            win_pnl = sum(e['pnl'] for e in winners) if winners else 0
+            loss_pnl = abs(sum(e['pnl'] for e in losers)) if losers else 0.001
+            locked["profit_factor"] = win_pnl / loss_pnl if loss_pnl > 0 else (float('inf') if win_pnl > 0 else 0)
         if missed_exits:
             missed_winners = [e for e in missed_exits if e['pnl'] > 0]
             locked["missed_win_rate"] = (len(missed_winners) / len(missed_exits)) * 100 if missed_exits else 0
@@ -1638,7 +1756,12 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
                 winners = [e for e in subset_exits if e['pnl'] > 0]
                 losers = [e for e in subset_exits if e['pnl'] <= 0]
                 backtest_subset['win_rate'] = (len(winners) / len(subset_exits)) * 100
-                backtest_subset['total_return'] = sum(e['pnl'] for e in subset_exits)
+                # Use COMPOUNDED return to match equity curve
+                sorted_exits = sorted(subset_exits, key=lambda x: str(x.get('date', '')))
+                equity = 1.0
+                for exit_trade in sorted_exits:
+                    equity *= (1 + exit_trade['pnl'] / 100)
+                backtest_subset['total_return'] = (equity - 1) * 100
                 total_wins = sum(e['pnl'] for e in winners) if winners else 0
                 total_losses = abs(sum(e['pnl'] for e in losers)) if losers else 0.001
                 backtest_subset['profit_factor'] = total_wins / total_losses if total_losses > 0 else total_wins
@@ -1985,19 +2108,31 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
     # ============================================================
     # LOCK THE BACKTEST - Freeze entry/exit markers to prevent repainting
     # ============================================================
-    # Use fresh backtest if available (most up-to-date), otherwise bundled
-    backtest_to_lock = fresh_backtest if fresh_backtest else backtest
+    # Check if locked backtest already exists
+    locked_backtest_path = get_locked_backtest_path(strategy_name=strategy_name, ticker=ticker)
+    existing_locked = os.path.exists(locked_backtest_path)
+
     locked_backtest = None
-    if backtest_to_lock:
-        print(f"\n🔒 Locking backtest snapshot (prevents repainting)...")
-        # Pass trade_state to reconcile backtest entries with tracked position
-        locked_backtest = save_locked_backtest(backtest_to_lock, strategy_name=strategy_name, ticker=ticker, trade_state=trade_state)
-        print(f"📁 Locked backtest file: {get_locked_backtest_path(strategy_name=strategy_name, ticker=ticker)}")
-    else:
-        # Try to load existing locked backtest if no fresh data
-        locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
-        if locked_backtest:
+    if existing_locked:
+        # Existing locked backtest - use fresh_backtest to add new signals only
+        # (save_locked_backtest will preserve existing data and only append new)
+        print(f"\n🔒 Updating locked backtest with any new signals...")
+        if fresh_backtest:
+            locked_backtest = save_locked_backtest(fresh_backtest, strategy_name=strategy_name, ticker=ticker, trade_state=trade_state)
+        else:
+            locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
             print(f"🔒 Loaded existing locked backtest from previous session")
+    else:
+        # FIRST STARTUP - seed from bundled backtest (full historical data)
+        # This ensures we capture all historical trades, not just last 200 days
+        if backtest:
+            print(f"\n🔒 Creating initial locked backtest from full historical data...")
+            locked_backtest = save_locked_backtest(backtest, strategy_name=strategy_name, ticker=ticker, trade_state=trade_state)
+            print(f"📁 Locked backtest file: {locked_backtest_path}")
+        elif fresh_backtest:
+            print(f"\n🔒 Creating initial locked backtest from recent data...")
+            locked_backtest = save_locked_backtest(fresh_backtest, strategy_name=strategy_name, ticker=ticker, trade_state=trade_state)
+            print(f"📁 Locked backtest file: {locked_backtest_path}")
 
     # Detect missed signals during downtime
     if locked_backtest and fresh_backtest:
@@ -2050,13 +2185,46 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 f"• _(Not included in main stats)_"
             )
 
+        # Calculate Recent 126 Days stats (half trading year) from locked_backtest
+        # This matches the chart's "Last 126 Days" period
         recent_stats = ""
-        if fresh_backtest and fresh_backtest != backtest:
-            recent_stats = (
-                f"\n📈 **Recent 200 Days ({fresh_backtest.get('num_trades', 0)} trades):**\n"
-                f"• Win Rate: {fresh_backtest['win_rate']:.0f}% | Return: {fresh_backtest['total_return']:.1f}%\n"
-                f"• Profit Factor: {fresh_backtest['profit_factor']:.1f}"
-            )
+        recent_days = 126
+        if locked_backtest and locked_backtest.get('exits'):
+            # Get the chart date range (126 days back from latest data)
+            chart_end = fresh_df.index[-1] if fresh_backtest and not fresh_df.empty else df.index[-1]
+            chart_start = chart_end - pd.Timedelta(days=recent_days)
+
+            # Filter exits to 126-day window
+            recent_exits = []
+            for exit_trade in locked_backtest['exits']:
+                exit_date = exit_trade.get('date', '')
+                if isinstance(exit_date, str):
+                    try:
+                        exit_date = pd.to_datetime(exit_date)
+                    except:
+                        continue
+                if exit_date >= chart_start and exit_date <= chart_end:
+                    recent_exits.append(exit_trade)
+
+            if recent_exits:
+                winners = [e for e in recent_exits if e['pnl'] > 0]
+                losers = [e for e in recent_exits if e['pnl'] <= 0]
+                win_rate = (len(winners) / len(recent_exits)) * 100
+                # Compounded return
+                sorted_exits = sorted(recent_exits, key=lambda x: str(x.get('date', '')))
+                equity = 1.0
+                for exit_trade in sorted_exits:
+                    equity *= (1 + exit_trade['pnl'] / 100)
+                total_return = (equity - 1) * 100
+                total_wins = sum(e['pnl'] for e in winners) if winners else 0
+                total_losses = abs(sum(e['pnl'] for e in losers)) if losers else 0.001
+                profit_factor = total_wins / total_losses if total_losses > 0 else total_wins
+
+                recent_stats = (
+                    f"\n📈 **Recent {recent_days} Days ({len(recent_exits)} trades):**\n"
+                    f"• Win Rate: {win_rate:.0f}% | Return: {total_return:.1f}%\n"
+                    f"• Profit Factor: {profit_factor:.1f}"
+                )
 
         startup_msg = (
             f"🤖 **[{strategy_label}] Live Trader Started**\n"
@@ -2136,7 +2304,12 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 winners = [e for e in recent_exits if e['pnl'] > 0]
                 losers = [e for e in recent_exits if e['pnl'] <= 0]
                 recent_backtest['win_rate'] = (len(winners) / len(recent_exits)) * 100
-                recent_backtest['total_return'] = sum(e['pnl'] for e in recent_exits)
+                # Use COMPOUNDED return to match equity curve
+                sorted_exits = sorted(recent_exits, key=lambda x: str(x.get('date', '')))
+                equity = 1.0
+                for exit_trade in sorted_exits:
+                    equity *= (1 + exit_trade['pnl'] / 100)
+                recent_backtest['total_return'] = (equity - 1) * 100
                 total_wins = sum(e['pnl'] for e in winners) if winners else 0
                 total_losses = abs(sum(e['pnl'] for e in losers)) if losers else 0.001
                 recent_backtest['profit_factor'] = total_wins / total_losses if total_losses > 0 else total_wins
@@ -2146,7 +2319,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                                                    trade_history=startup_trade_history,
                                                    current_position=trade_state,
                                                    locked_backtest=locked_backtest,
-                                                   full_period_backtest=backtest)
+                                                   full_period_backtest=locked_backtest)
             print(f"✅ Generated recent {recent_days}-day chart (subset of bundled data, {recent_backtest['num_trades']} trades)")
 
             # Use recent chart for main display (full period chart can be added later)
@@ -2252,7 +2425,11 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             print(f"Position: {trade_state['position']}")
 
             # --- SCHEDULED STATUS UPDATES ---
-            now = datetime.now()
+            # Use Eastern Time for stocks (SPY market hours), UTC for crypto
+            if is_crypto:
+                now = datetime.now()  # Local time is fine for 24/7 crypto
+            else:
+                now = get_market_time()  # Eastern Time for stock market hours
             day_str = now.strftime("%Y-%m-%d")
             hm = now.strftime("%H:%M")
             hour = now.hour
@@ -2272,8 +2449,8 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     print(f"   ⚠️  SYNC WARNING: Backtest shows {bt_pos.get('position', 'unknown').upper()} @ ${bt_pos.get('entry_price', 0):.2f}")
                     print(f"   ⚠️  But trade_state has no position! Consider restarting to sync.")
 
-            # Market Open Update (8:30-8:45 AM)
-            if "08:30" <= hm <= "08:45":
+            # Market Open Update (8:30-8:45 AM ET for stocks)
+            if "08:30" <= hm <= "08:45" and not is_crypto:
                 key = f"{day_str}_OPEN"
                 if key not in daily_alerts and status_backtest:
                     send_status_update(webhook_url, df, status_backtest, config, ticker,
@@ -2281,8 +2458,8 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                                      realtime_price=realtime_price)
                     daily_alerts.add(key)
 
-            # Mid-Day Update (11:00-11:15 AM)
-            if "11:00" <= hm <= "11:15":
+            # Mid-Day Update (11:00-11:15 AM ET for stocks)
+            if "11:00" <= hm <= "11:15" and not is_crypto:
                 key = f"{day_str}_MID"
                 if key not in daily_alerts and status_backtest:
                     send_status_update(webhook_url, df, status_backtest, config, ticker,
@@ -2290,8 +2467,8 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                                      realtime_price=realtime_price)
                     daily_alerts.add(key)
 
-            # Market Close Update (15:00-15:15 PM)
-            if "15:00" <= hm <= "15:15":
+            # Market Close Update (15:00-15:15 PM ET for stocks)
+            if "15:00" <= hm <= "15:15" and not is_crypto:
                 key = f"{day_str}_CLOSE"
                 if key not in daily_alerts and status_backtest:
                     send_status_update(webhook_url, df, status_backtest, config, ticker,
@@ -2299,18 +2476,18 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                                      realtime_price=realtime_price)
                     daily_alerts.add(key)
 
-            # Hourly Updates (9:00 - 16:00, except 11 and 15 which have special alerts)
+            # Hourly Updates (9:00 - 16:00 ET for stocks, except 11 and 15 which have special alerts)
             # Window is first 15 minutes of each hour to ensure it gets hit
-            if 9 <= hour <= 16 and minute < 15:
+            if 9 <= hour <= 16 and minute < 15 and not is_crypto:
                 if hour not in [11, 15]:
                     key = f"{day_str}_HOUR_{hour}"
                     if key not in daily_alerts and status_backtest:
                         send_status_update(webhook_url, df, status_backtest, config, ticker,
-                                         f"⏱️ {hour}:00 Market Update", trade_state, strategy_name=strategy_name,
+                                         f"⏱️ {hour}:00 ET Market Update", trade_state, strategy_name=strategy_name,
                                          realtime_price=realtime_price)
                         daily_alerts.add(key)
 
-            # Midnight Update
+            # Midnight Update (for both crypto and stocks - crypto uses local time, stocks use ET)
             if hour == 0 and minute < 5:
                 key = f"{day_str}_MIDNIGHT"
                 if key not in daily_alerts and status_backtest:
@@ -2444,136 +2621,16 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     trade_state['entry_signal_bar'] = None  # Clear signal bar
                     save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
 
-            elif trade_state['position'] == 'short':
-                entry_price = trade_state['entry_price']
-                pnl_pct = ((entry_price - current_price) / entry_price) * 100
-
-                exit_reason = None
-
-                # Stop loss
-                if pnl_pct <= -stop_loss_pct:
-                    exit_reason = f"Stop Loss ({pnl_pct:.2f}%)"
-                # Take profit
-                elif pnl_pct >= take_profit_pct:
-                    exit_reason = f"Take Profit ({pnl_pct:.2f}%)"
-                # Exit on opposite signal
-                elif exit_on_opposite_signal and latest['buy_signal']:
-                    exit_reason = f"Opposite Signal ({pnl_pct:.2f}%)"
-                # Exit on midline cross
-                elif exit_on_midline_cross and latest['osc_smooth'] < 0:
-                    exit_reason = f"Midline Cross ({pnl_pct:.2f}%)"
-
-                if exit_reason:
-                    # Generate chart and get stats for exit
-                    exit_chart = None
-                    exit_backtest = None
-                    try:
-                        exit_backtest = run_historical_backtest(df, config)
-                        # Use locked backtest for markers to prevent repainting
-                        exit_chart = generate_velocity_chart(df, exit_backtest, config, ticker,
-                                                            locked_backtest=locked_backtest)
-                    except Exception as e:
-                        print(f"Could not generate exit chart: {e}")
-
-                    # Build stats section
-                    stats_section = ""
-                    if exit_backtest:
-                        stats_section = (
-                            f"---\n"
-                            f"📊 **Strategy Stats:**\n"
-                            f"• Trades: {exit_backtest['num_trades']} | Win Rate: {exit_backtest['win_rate']:.0f}%\n"
-                            f"• Total Return: {exit_backtest['total_return']:.1f}% | PF: {exit_backtest['profit_factor']:.1f}\n"
-                        )
-
-                    pnl_emoji = "✅" if pnl_pct > 0 else "❌"
-
-                    # Calculate hold duration
-                    entry_time_str = trade_state.get('entry_time', '')
-                    hold_duration = "N/A"
-                    if entry_time_str:
-                        try:
-                            entry_dt = datetime.strptime(entry_time_str.split('.')[0], '%Y-%m-%d %H:%M:%S')
-                            duration = current_time - entry_dt
-                            days = duration.days
-                            hours = duration.seconds // 3600
-                            if days > 0:
-                                hold_duration = f"{days}d {hours}h"
-                            else:
-                                hold_duration = f"{hours}h {(duration.seconds % 3600) // 60}m"
-                        except:
-                            hold_duration = "N/A"
-
-                    # Calculate actual dollar P&L per unit
-                    pnl_dollars = entry_price - current_price  # SHORT: profit when price goes down
-
-                    exit_msg = (
-                        f"📤 **[{strategy_label}] SHORT EXIT** {pnl_emoji}\n"
-                        f"**Reason:** {exit_reason}\n"
-                        f"---\n"
-                        f"📅 **Entry:** {entry_time_str[:16] if entry_time_str else 'N/A'} @ ${entry_price:.2f}\n"
-                        f"📅 **Exit:** {current_time.strftime('%Y-%m-%d %H:%M')} @ ${current_price:.2f}\n"
-                        f"⏱️ **Hold Duration:** {hold_duration}\n"
-                        f"---\n"
-                        f"💰 **P&L:** {pnl_pct:+.2f}% (${pnl_dollars:+,.2f}/unit)\n"
-                        f"{stats_section}"
-                    )
-
-                    # Log closed trade and get cumulative stats
-                    cumulative = log_closed_trade(
-                        ticker=ticker,
-                        position_type="SHORT",
-                        entry_price=entry_price,
-                        exit_price=current_price,
-                        entry_time=entry_time_str,
-                        exit_time=current_time.strftime('%Y-%m-%d %H:%M:%S'),
-                        exit_reason=exit_reason,
-                        pnl_pct=pnl_pct,
-                        strategy_name=strategy_name,
-                        entry_signal_bar=trade_state.get('entry_signal_bar'),  # Locked entry signal bar
-                        exit_signal_bar=str(current_time)  # Exit bar
-                    )
-
-                    # Append exit to locked backtest (for future charts)
-                    append_to_locked_backtest(
-                        exit_trade={
-                            'date': current_time,
-                            'price': current_price,
-                            'pnl': pnl_pct,
-                            'reason': exit_reason,
-                            'entry_price': entry_price,
-                            'entry_date': trade_state.get('entry_time', '')
-                        },
-                        strategy_name=strategy_name, ticker=ticker
-                    )
-                    # Reload the locked backtest with the new exit
-                    locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
-
-                    # Add cumulative stats to message
-                    cumulative_section = (
-                        f"---\n"
-                        f"📈 **Cumulative Performance:**\n"
-                        f"• Trades: {cumulative['total_trades']} ({cumulative['winners']}W / {cumulative['losers']}L)\n"
-                        f"• Win Rate: {cumulative['win_rate']:.0f}%\n"
-                        f"• Total P&L: {cumulative['total_pnl_pct']:+.2f}% (${cumulative['total_pnl_dollars']:+,.0f})\n"
-                    )
-
-                    exit_msg += cumulative_section
-
-                    send_discord_alert(webhook_url, exit_msg, exit_chart, strategy_name=strategy_name)
-                    print(f"EXIT SHORT: {exit_reason}")
-
-                    trade_state['position'] = None
-                    trade_state['entry_price'] = None
-                    trade_state['entry_time'] = None
-                    trade_state['entry_signal_bar'] = None  # Clear signal bar
-                    save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
+            # NOTE: SHORT positions are not supported in this LONG-only strategy
+            # The backtest engine only tracks LONG positions (position=1 or position=0)
 
             # Check for new entry signals (only if not in position)
             if trade_state['position'] is None:
                 # For daily interval, only evaluate COMPLETED bars to prevent repainting
                 # The current bar (df.iloc[-1]) is still forming, use df.iloc[-2] for signals
 
-                now = datetime.now()
+                # Use Eastern Time for stock market hour checks (SPY closes at 4 PM ET)
+                market_time = get_market_time()  # Returns Eastern Time
                 should_check_signals = False
 
                 if interval == "1d":
@@ -2591,12 +2648,13 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                                 print(f"   📊 [CRYPTO] Evaluating completed bar: {completed_bar_time}")
                             else:
                                 # Stocks (SPY): Only evaluate after market close (4 PM ET = 16:00)
-                                # Check if current time is after 16:00
-                                if now.hour >= 16:
+                                # market_time is already in Eastern Time via get_market_time()
+                                et_hour = market_time.hour
+                                if et_hour >= 16:
                                     should_check_signals = True
-                                    print(f"   📊 [STOCK] Market closed - Evaluating completed bar: {completed_bar_time}")
+                                    print(f"   📊 [STOCK] Market closed ({market_time.strftime('%H:%M')} ET) - Evaluating completed bar: {completed_bar_time}")
                                 else:
-                                    print(f"   ⏳ [STOCK] Market open - Waiting for close to evaluate signals")
+                                    print(f"   ⏳ [STOCK] Market open ({market_time.strftime('%H:%M')} ET) - Waiting for 4 PM ET close to evaluate signals")
                 else:
                     # For non-daily intervals, use existing logic
                     should_check_signals = True

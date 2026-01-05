@@ -209,8 +209,11 @@ def fetch_and_cache(ticker: str, days: int = 200, interval: str = "1d",
         cached_last = datetime.strptime(cached_info['last_date'], '%Y-%m-%d').date()
         cache_age_days = (today - cached_last).days
 
-        # If cache is fresh (within 1 day for daily data), use it
-        if cache_age_days <= 1 and interval == '1d':
+        # If cache is fresh (same day for daily data), use it
+        # For daily candles, we need today's data after midnight to detect new signals
+        # cache_age_days == 0 means cache was updated today
+        # cache_age_days == 1 means cache is from yesterday - needs refresh for today's completed candle
+        if cache_age_days == 0 and interval == '1d':
             print(f"   📦 Using cached data for {ticker} (last update: {cached_info['last_date']})")
             df = load_price_data(ticker, interval, start_date.strftime('%Y-%m-%d'), db_path=db_path)
             if len(df) >= days * 0.9:  # Have at least 90% of requested data
