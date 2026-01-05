@@ -2187,14 +2187,21 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
         # Calculate Recent 126 Days stats (half trading year) from locked_backtest
         # This matches the chart's "Last 126 Days" period
+        # IMPORTANT: Use 126 TRADING days (rows), not calendar days, to match chart
         recent_stats = ""
         recent_days = 126
         if locked_backtest and locked_backtest.get('exits'):
-            # Get the chart date range (126 days back from latest data)
-            chart_end = fresh_df.index[-1] if fresh_backtest and not fresh_df.empty else df.index[-1]
-            chart_start = chart_end - pd.Timedelta(days=recent_days)
+            # Get the chart date range using same logic as chart generation
+            # Use the last 126 rows of price data (trading days) for consistency
+            chart_df = fresh_df if fresh_backtest and not fresh_df.empty else df
+            if len(chart_df) > recent_days:
+                df_recent_for_stats = chart_df.iloc[-recent_days:]
+            else:
+                df_recent_for_stats = chart_df
+            chart_start = df_recent_for_stats.index.min()
+            chart_end = df_recent_for_stats.index.max()
 
-            # Filter exits to 126-day window
+            # Filter exits to 126-trading-day window (matches chart exactly)
             recent_exits = []
             for exit_trade in locked_backtest['exits']:
                 exit_date = exit_trade.get('date', '')
