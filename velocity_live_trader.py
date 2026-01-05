@@ -2038,15 +2038,24 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
         )
         send_discord_alert(webhook_url, sync_msg, strategy_name=strategy_name)
 
-    # Case 3: Both show position but entry prices differ - missed exit AND new entry
+    # Case 3: Both show position but entries differ - missed exit AND new entry
     elif state_position is not None and backtest_position is not None:
         state_entry = trade_state.get('entry_price', 0)
         state_time = trade_state.get('entry_time', 'Unknown')
         backtest_entry = backtest_position.get('entry_price', 0)
         backtest_time = backtest_position.get('entry_date', 'Unknown')
 
-        # Check if entries differ by more than 0.5% (they should match if same trade)
-        if state_entry > 0 and abs(state_entry - backtest_entry) / state_entry > 0.005:
+        # Compare BOTH price AND date to detect different trades
+        # Two trades with similar prices but different dates are DIFFERENT trades
+        price_diff_pct = abs(state_entry - backtest_entry) / state_entry if state_entry > 0 else 1
+
+        # Parse dates for comparison
+        state_date_str = str(state_time)[:10] if state_time else ''
+        backtest_date_str = str(backtest_time)[:10] if backtest_time else ''
+        dates_differ = state_date_str != backtest_date_str
+
+        # Trigger sync if: prices differ by >0.5% OR dates are different
+        if state_entry > 0 and (price_diff_pct > 0.005 or dates_differ):
             print(f"⚠️  STATE MISMATCH: Different entries detected!")
             print(f"   State says: {state_position.upper()} @ ${state_entry:.2f}")
             print(f"   Backtest says: {backtest_position['position'].upper()} @ ${backtest_entry:.2f}")
