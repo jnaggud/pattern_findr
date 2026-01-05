@@ -1366,7 +1366,7 @@ def load_trade_state(strategy_name: str = None, ticker: str = None, state_path: 
         with open(state_path, 'r') as f:
             return json.load(f)
     return {
-        "position": None,  # None, "long", or "short"
+        "position": None,  # None or "long" (LONG-only strategy)
         "entry_price": None,
         "entry_time": None,
         "entry_signal_bar": None,  # Bar datetime that generated entry signal (for locked charts)
@@ -2712,55 +2712,11 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
 
                 elif effective_sell:
-                    signal_bar = recent_sell_signal['bar']
+                    # LONG-ONLY STRATEGY: Sell signals are ignored when not in position
+                    # They are only used to EXIT existing long positions (handled above)
                     signal_time = recent_sell_signal['time']
-                    signal_note = " (MISSED - acting now)" if recent_sell_signal['index'] < -1 else ""
-
-                    # Append new entry to locked backtest (for future charts)
-                    append_to_locked_backtest(
-                        entry={'date': signal_time, 'price': current_price, 'position': 'short'},
-                        strategy_name=strategy_name, ticker=ticker
-                    )
-                    # Reload the locked backtest with the new entry
-                    locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
-
-                    # Run backtest to get stats for the signal alert
-                    signal_backtest = None
-                    signal_chart = None
-                    try:
-                        signal_backtest = run_historical_backtest(df, config)
-                        # Use locked backtest for markers to prevent repainting
-                        signal_chart = generate_velocity_chart(df, signal_backtest, config, ticker,
-                                                              locked_backtest=locked_backtest)
-                    except Exception as e:
-                        print(f"Could not generate signal chart: {e}")
-
-                    # Build comprehensive sell message with stats
-                    stats_section = ""
-                    if signal_backtest:
-                        stats_section = (
-                            f"---\n"
-                            f"📊 **Strategy Stats:**\n"
-                            f"• Trades: {signal_backtest['num_trades']} | Win Rate: {signal_backtest['win_rate']:.0f}%\n"
-                            f"• Total Return: {signal_backtest['total_return']:.1f}% | PF: {signal_backtest['profit_factor']:.1f}\n"
-                        )
-
-                    sell_msg = (
-                        f"📉 **[{strategy_label}] SELL SIGNAL**{signal_note}\n"
-                        f"**Signal Time:** {signal_time}\n"
-                        f"**Entry Price:** ${current_price:.2f}\n"
-                        f"{stats_section}"
-                        f"---\n"
-                        f"_SL: ${current_price * (1 + stop_loss_pct/100):.2f} | TP: ${current_price * (1 - take_profit_pct/100):.2f}_"
-                    )
-
-                    send_discord_alert(webhook_url, sell_msg, signal_chart, strategy_name=strategy_name)
-                    print(f"SELL SIGNAL SENT!{signal_note}")
-
-                    trade_state['position'] = 'short'
-                    trade_state['entry_price'] = current_price
-                    trade_state['entry_time'] = str(current_time)
-                    trade_state['entry_signal_bar'] = str(signal_time)  # Lock the signal bar for charts
+                    print(f"   ℹ️  Sell signal on {signal_time} ignored (LONG-only strategy, no position)")
+                    # Update last_signal_time to avoid re-processing
                     trade_state['last_signal_time'] = str(signal_time)
                     save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
 

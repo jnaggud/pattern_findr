@@ -277,13 +277,10 @@ def process_strategy(strat: dict, current_price: float, df_fresh: pd.DataFrame) 
     strategy_label = f"{ticker} {strat['lookback'].upper()}"
 
     # ========================================
-    # CHECK EXITS (if in position)
+    # CHECK EXITS (if in position) - LONG ONLY
     # ========================================
-    if position:
-        if position == 'long':
-            pnl_pct = ((current_price - entry_price) / entry_price) * 100
-        else:  # short
-            pnl_pct = ((entry_price - current_price) / entry_price) * 100
+    if position == 'long':
+        pnl_pct = ((current_price - entry_price) / entry_price) * 100
 
         exit_reason = None
         osc = last_bar.get('osc_smooth', 0)
@@ -293,18 +290,14 @@ def process_strategy(strat: dict, current_price: float, df_fresh: pd.DataFrame) 
             exit_reason = "Stop Loss"
         elif take_profit_pct > 0 and pnl_pct >= take_profit_pct:
             exit_reason = "Take Profit"
-        elif position == 'long' and exit_on_midline and osc > 0:
+        elif exit_on_midline and osc > 0:
             exit_reason = "Midline Cross"
-        elif position == 'short' and exit_on_midline and osc < 0:
-            exit_reason = "Midline Cross"
-        elif position == 'long' and exit_on_opposite and last_bar.get('sell_signal', False):
-            exit_reason = "Opposite Signal"
-        elif position == 'short' and exit_on_opposite and last_bar.get('buy_signal', False):
+        elif exit_on_opposite and last_bar.get('sell_signal', False):
             exit_reason = "Opposite Signal"
 
         if exit_reason:
             pnl_emoji = "+" if pnl_pct >= 0 else ""
-            pnl_dollars = current_price - entry_price if position == 'long' else entry_price - current_price
+            pnl_dollars = current_price - entry_price
 
             # Log trade
             entry_time = trade_state.get('entry_time', '')
@@ -390,29 +383,12 @@ def process_strategy(strat: dict, current_price: float, df_fresh: pd.DataFrame) 
             print(f"   [{strategy_label}] LONG ENTRY @ ${current_price:.2f}")
 
         elif sell_signal:
-            # SHORT entry
-            trade_state['position'] = 'short'
-            trade_state['entry_price'] = current_price
-            trade_state['entry_time'] = str(datetime.now())
+            # LONG-ONLY STRATEGY: Sell signals are ignored when not in position
+            # They are only used to EXIT existing long positions (handled above)
+            print(f"   [{strategy_label}] Sell signal ignored (LONG-only strategy, no position)")
             trade_state['last_signal_time'] = signal_str
             save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
             strat['trade_state'] = trade_state
-
-            # Append to locked backtest
-            append_to_locked_backtest(
-                entry={'date': str(signal_date), 'price': current_price, 'position': 'short'},
-                strategy_name=strategy_name,
-                ticker=ticker
-            )
-
-            # Send Discord alert
-            sell_msg = (
-                f"**[{strategy_label}] SHORT ENTRY**\n"
-                f"Signal: {signal_str}\n"
-                f"Entry: ${current_price:.2f}"
-            )
-            send_discord_alert(webhook_url, sell_msg, strategy_name=strategy_name)
-            print(f"   [{strategy_label}] SHORT ENTRY @ ${current_price:.2f}")
 
 
 def run_multi_trader():
