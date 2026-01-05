@@ -289,14 +289,35 @@ def load_config(config_path: str = "production_env/velocity_config.json") -> dic
         return json.load(f)
 
 
-def fetch_price_data(ticker: str, api_key: str = None, days: int = 200, interval: str = "1d") -> pd.DataFrame:
+def fetch_price_data(ticker: str, api_key: str = None, days: int = 200, interval: str = "1d",
+                     use_cache: bool = True) -> pd.DataFrame:
     """
-    Fetch historical price data using yfinance.
+    Fetch historical price data using yfinance with optional caching.
     Uses EXACT same method as Streamlit (oscillator_predictor_page.py line 1238-1242)
+
+    Args:
+        ticker: The ticker symbol
+        api_key: Not used (kept for compatibility)
+        days: Number of days of data to fetch
+        interval: Data interval ('1d', '1h', etc.)
+        use_cache: If True, use local SQLite cache to reduce API calls
     """
     if not YFINANCE_AVAILABLE:
         raise RuntimeError("yfinance not installed. Run: pip install yfinance")
 
+    # Try to use cached data first
+    if use_cache:
+        try:
+            from data_cache import fetch_and_cache
+            df = fetch_and_cache(ticker, days=days, interval=interval)
+            if not df.empty:
+                return df
+        except ImportError:
+            print("   ⚠️ data_cache module not found, fetching directly")
+        except Exception as e:
+            print(f"   ⚠️ Cache error: {e}, fetching directly")
+
+    # Fallback to direct yfinance fetch
     print(f"📊 Fetching {ticker} via yfinance ({days} days, {interval})")
 
     # Calculate date range
@@ -677,6 +698,10 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
         # This ensures historical markers never shift position.
         markers_source = locked_backtest if locked_backtest else backtest
 
+        # Get chart date range for filtering markers
+        chart_start = df_plot.index.min()
+        chart_end = df_plot.index.max()
+
         if markers_source and markers_source.get('entries'):
             for entry in markers_source['entries']:
                 # Handle both datetime objects and strings
@@ -687,16 +712,24 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                     except:
                         continue
 
-                # Find closest date in index for plotting
+                # SKIP markers outside the chart's date range (prevents clustering at edges)
+                if entry_date < chart_start or entry_date > chart_end:
+                    continue
+
                 # LONG entries: green up triangle, SHORT entries: red down triangle
+                # MISSED entries: orange color
                 is_long = entry.get('position', 'long') == 'long'
+                is_missed = entry.get('missed', False)
                 marker_shape = '^' if is_long else 'v'
-                marker_color = 'lime' if is_long else 'red'
+                if is_missed:
+                    marker_color = 'orange'
+                else:
+                    marker_color = 'lime' if is_long else 'red'
 
                 if entry_date in df_plot.index:
                     ax1.scatter(entry_date, entry['price'], marker=marker_shape, color=marker_color, s=100, zorder=5)
                 else:
-                    # Try to find the closest date
+                    # Try to find the closest date within range
                     try:
                         closest_idx = df_plot.index.get_indexer([entry_date], method='nearest')[0]
                         if 0 <= closest_idx < len(df_plot):
@@ -715,17 +748,25 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                     except:
                         continue
 
-                # Find closest date in index for plotting
-                if exit_date in df_plot.index:
+                # SKIP markers outside the chart's date range (prevents clustering at edges)
+                if exit_date < chart_start or exit_date > chart_end:
+                    continue
+
+                # MISSED exits: orange color
+                is_missed = exit_trade.get('missed', False)
+                if is_missed:
+                    color = 'orange'
+                else:
                     color = 'green' if exit_trade['pnl'] > 0 else 'red'
+
+                if exit_date in df_plot.index:
                     ax1.scatter(exit_date, exit_trade['price'], marker='v', color=color, s=100, zorder=5)
                 else:
-                    # Try to find the closest date
+                    # Try to find the closest date within range
                     try:
                         closest_idx = df_plot.index.get_indexer([exit_date], method='nearest')[0]
                         if 0 <= closest_idx < len(df_plot):
                             closest_date = df_plot.index[closest_idx]
-                            color = 'green' if exit_trade['pnl'] > 0 else 'red'
                             ax1.scatter(closest_date, exit_trade['price'], marker='v', color=color, s=100, zorder=5)
                     except:
                         pass
@@ -797,9 +838,11 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
             for exit in backtest['exits']:
                 equity.append(equity[-1] * (1 + exit['pnl']/100))
 
-            # Add unrealized if open position
+            # Add unrealized if open position (use .get() to handle missing key)
             if backtest.get('current_position'):
-                equity.append(equity[-1] * (1 + backtest['current_position']['unrealized_pnl']/100))
+                unrealized = backtest['current_position'].get('unrealized_pnl', 0)
+                if unrealized:
+                    equity.append(equity[-1] * (1 + unrealized/100))
 
             ax4.plot(range(len(equity)), equity, color='#00ff88', linewidth=2)
             ax4.fill_between(range(len(equity)), 100, equity, alpha=0.3,
@@ -815,7 +858,9 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                          f"Win: {full_period_backtest['win_rate']:.0f}% | "
                          f"Return: {full_period_backtest['total_return']:.1f}% | "
                          f"PF: {full_period_backtest['profit_factor']:.1f}")
-            recent_stats = (f"Recent 200D: {backtest['num_trades']} trades | "
+            # Use period_days from backtest if available, otherwise default to chart period
+            period_label = f"Recent {backtest.get('period_days', len(df_plot))}D"
+            recent_stats = (f"{period_label}: {backtest['num_trades']} trades | "
                            f"Win: {backtest['win_rate']:.0f}% | "
                            f"Return: {backtest['total_return']:.1f}% | "
                            f"PF: {backtest['profit_factor']:.1f}")
@@ -1148,11 +1193,19 @@ def load_locked_backtest(strategy_name: str = None, ticker: str = None) -> dict:
 
 
 def append_to_locked_backtest(entry: dict = None, exit_trade: dict = None,
-                               strategy_name: str = None, ticker: str = None):
+                               strategy_name: str = None, ticker: str = None,
+                               missed: bool = False):
     """Append a new entry or exit to the locked backtest.
 
     Called when a NEW signal is detected (at end of day). This adds
     the signal to the locked backtest so it appears on future charts.
+
+    Args:
+        entry: Entry signal dict with date, price, position
+        exit_trade: Exit trade dict with date, price, pnl, reason, etc.
+        strategy_name: Strategy name for file path
+        ticker: Ticker symbol for file path
+        missed: If True, marks the signal as missed (bot was down)
     """
     locked = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
 
@@ -1161,29 +1214,46 @@ def append_to_locked_backtest(entry: dict = None, exit_trade: dict = None,
         return
 
     if entry:
-        locked["entries"].append({
+        entry_record = {
             "date": str(entry.get('date', '')),
             "price": entry.get('price', 0),
             "position": entry.get('position', 'long')
-        })
-        print(f"   🔒 Appended new entry to locked backtest: {entry.get('date')}")
+        }
+        if missed:
+            entry_record["missed"] = True
+        locked["entries"].append(entry_record)
+        label = "🟠 missed" if missed else "🔒"
+        print(f"   {label} Appended new entry to locked backtest: {entry.get('date')}")
 
     if exit_trade:
-        locked["exits"].append({
+        exit_record = {
             "date": str(exit_trade.get('date', '')),
             "price": exit_trade.get('price', 0),
             "pnl": exit_trade.get('pnl', 0),
             "reason": exit_trade.get('reason', ''),
             "entry_price": exit_trade.get('entry_price', 0),
             "entry_date": str(exit_trade.get('entry_date', ''))
-        })
-        # Update stats
-        locked["num_trades"] = len(locked["exits"])
-        if locked["exits"]:
-            winners = [e for e in locked["exits"] if e['pnl'] > 0]
-            locked["win_rate"] = (len(winners) / len(locked["exits"])) * 100
-            locked["total_return"] = sum(e['pnl'] for e in locked["exits"])
-        print(f"   🔒 Appended new exit to locked backtest: {exit_trade.get('date')}")
+        }
+        if missed:
+            exit_record["missed"] = True
+        locked["exits"].append(exit_record)
+        # Update stats (exclude missed trades from main stats)
+        tracked_exits = [e for e in locked["exits"] if not e.get('missed')]
+        missed_exits = [e for e in locked["exits"] if e.get('missed')]
+
+        locked["num_trades"] = len(tracked_exits)
+        locked["num_missed"] = len(missed_exits)
+        if tracked_exits:
+            winners = [e for e in tracked_exits if e['pnl'] > 0]
+            locked["win_rate"] = (len(winners) / len(tracked_exits)) * 100
+            locked["total_return"] = sum(e['pnl'] for e in tracked_exits)
+        if missed_exits:
+            missed_winners = [e for e in missed_exits if e['pnl'] > 0]
+            locked["missed_win_rate"] = (len(missed_winners) / len(missed_exits)) * 100 if missed_exits else 0
+            locked["missed_return"] = sum(e['pnl'] for e in missed_exits)
+
+        label = "🟠 missed" if missed else "🔒"
+        print(f"   {label} Appended new exit to locked backtest: {exit_trade.get('date')}")
 
     # Update current position status
     if exit_trade:
@@ -1198,6 +1268,87 @@ def append_to_locked_backtest(entry: dict = None, exit_trade: dict = None,
     path = get_locked_backtest_path(strategy_name=strategy_name, ticker=ticker)
     with open(path, 'w') as f:
         json.dump(locked, f, indent=2, default=str)
+
+
+def detect_and_add_missed_signals(fresh_backtest: dict, strategy_name: str = None, ticker: str = None) -> int:
+    """Detect signals that occurred while bot was down and add them as missed.
+
+    Compares fresh backtest entries/exits with locked_backtest to find signals
+    that occurred after the last tracked signal. Adds them with missed=True.
+
+    Returns: Number of missed signals detected and added.
+    """
+    locked = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
+    if locked is None or fresh_backtest is None:
+        return 0
+
+    # Find the last tracked entry date in locked backtest
+    locked_entries = locked.get('entries', [])
+    locked_exits = locked.get('exits', [])
+
+    last_locked_date = None
+    for entry in locked_entries:
+        entry_date = pd.to_datetime(entry['date']) if entry.get('date') else None
+        if entry_date and (last_locked_date is None or entry_date > last_locked_date):
+            last_locked_date = entry_date
+    for exit_t in locked_exits:
+        exit_date = pd.to_datetime(exit_t['date']) if exit_t.get('date') else None
+        if exit_date and (last_locked_date is None or exit_date > last_locked_date):
+            last_locked_date = exit_date
+
+    if last_locked_date is None:
+        return 0
+
+    # Get set of existing entry dates to avoid duplicates
+    existing_entry_dates = set()
+    for entry in locked_entries:
+        if entry.get('date'):
+            existing_entry_dates.add(str(entry['date'])[:10])
+
+    existing_exit_dates = set()
+    for exit_t in locked_exits:
+        if exit_t.get('date'):
+            existing_exit_dates.add(str(exit_t['date'])[:10])
+
+    missed_count = 0
+
+    # Check fresh backtest entries for missed signals
+    for entry in fresh_backtest.get('entries', []):
+        entry_date = pd.to_datetime(entry['date']) if entry.get('date') else None
+        if entry_date and entry_date > last_locked_date:
+            date_str = str(entry['date'])[:10]
+            if date_str not in existing_entry_dates:
+                append_to_locked_backtest(
+                    entry={'date': entry['date'], 'price': entry['price'], 'position': entry.get('position', 'long')},
+                    strategy_name=strategy_name, ticker=ticker, missed=True
+                )
+                existing_entry_dates.add(date_str)
+                missed_count += 1
+
+    # Check fresh backtest exits for missed signals
+    for exit_t in fresh_backtest.get('exits', []):
+        exit_date = pd.to_datetime(exit_t['date']) if exit_t.get('date') else None
+        if exit_date and exit_date > last_locked_date:
+            date_str = str(exit_t['date'])[:10]
+            if date_str not in existing_exit_dates:
+                append_to_locked_backtest(
+                    exit_trade={
+                        'date': exit_t['date'],
+                        'price': exit_t['price'],
+                        'pnl': exit_t.get('pnl', 0),
+                        'reason': exit_t.get('reason', 'Missed'),
+                        'entry_price': exit_t.get('entry_price', 0),
+                        'entry_date': exit_t.get('entry_date', '')
+                    },
+                    strategy_name=strategy_name, ticker=ticker, missed=True
+                )
+                existing_exit_dates.add(date_str)
+                missed_count += 1
+
+    if missed_count > 0:
+        print(f"   🟠 Detected and added {missed_count} missed signals from downtime")
+
+    return missed_count
 
 
 def load_trade_state(strategy_name: str = None, ticker: str = None, state_path: str = None) -> dict:
@@ -1286,6 +1437,12 @@ def log_closed_trade(ticker: str, position_type: str, entry_price: float, exit_p
     """
     history = load_trade_history(strategy_name=strategy_name, ticker=ticker)
 
+    # Calculate actual dollar P&L per unit
+    if position_type.upper() == 'LONG':
+        pnl_dollars = exit_price - entry_price
+    else:  # SHORT
+        pnl_dollars = entry_price - exit_price
+
     trade = {
         "id": len(history) + 1,
         "ticker": ticker,
@@ -1299,7 +1456,7 @@ def log_closed_trade(ticker: str, position_type: str, entry_price: float, exit_p
         "exit_signal_bar": exit_signal_bar or exit_time,  # Fallback to exit_time if not provided
         "exit_reason": exit_reason,
         "pnl_pct": pnl_pct,
-        "pnl_dollars": (pnl_pct / 100) * 10000  # Assuming $10k position
+        "pnl_dollars": pnl_dollars  # Actual dollar P&L per unit
     }
 
     history.append(trade)
@@ -1378,9 +1535,11 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
                     except:
                         hold_duration = "N/A"
 
-                # Estimate P&L in dollars
-                position_size = 10000
-                pnl_dollars = (pnl / 100) * position_size
+                # Calculate actual dollar P&L per unit (e.g., per 1 BTC or 1 share)
+                if pos_type == 'LONG':
+                    pnl_dollars = current_price - entry_price
+                else:  # SHORT
+                    pnl_dollars = entry_price - current_price
 
                 # Stop loss and take profit levels
                 stop_loss_pct = config_local.get('stop_loss_pct', 5)
@@ -1440,19 +1599,49 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
         send_discord_alert(webhook_url, msg_full, chart_buf_full, strategy_name=strategy_name)
         print(f"✅ Sent full timeframe update: {title}")
 
-        # --- CHART 2: Recent Period (180 days or half of data) ---
-        # Determine subset size: use 180 days if available, otherwise half the data
+        # --- CHART 2: Recent Period (126 days = half trading year) ---
+        # Use SUBSET of bundled data to prevent repainting (NOT fresh data)
         min_bars_for_subset = 20  # Need at least 20 bars to make a meaningful subset
+        subset_days = 126  # Half a trading year
 
         if len(df) > min_bars_for_subset:
-            if len(df) > 180:
-                subset_days = 180
-                period_label = "Last 180 Days"
+            if len(df) > subset_days:
+                period_label = f"Last {subset_days} Days"
             else:
                 subset_days = len(df) // 2
                 period_label = f"Last {subset_days} Days"
 
-            df_subset, backtest_subset = run_backtest_for_period(df, config, days=subset_days)
+            # Use SUBSET of bundled df (NOT run_backtest_for_period which causes repainting)
+            df_subset = df.iloc[-subset_days:].copy()
+
+            # Filter locked_backtest to get stats and exits for just the subset period
+            subset_start = df_subset.index[0]
+            subset_exits = []
+            if locked_backtest and locked_backtest.get('exits'):
+                for exit_trade in locked_backtest['exits']:
+                    if not exit_trade.get('missed'):
+                        exit_date = pd.to_datetime(exit_trade['date'])
+                        if exit_date >= subset_start:
+                            subset_exits.append(exit_trade)
+
+            # Build backtest_subset with exits for equity curve
+            backtest_subset = {
+                'num_trades': len(subset_exits),
+                'win_rate': 0,
+                'total_return': 0,
+                'profit_factor': 0,
+                'exits': subset_exits,  # Include exits for equity curve
+                'current_position': locked_backtest.get('current_position') if locked_backtest else None,
+                'period_days': subset_days  # Store the period for label
+            }
+            if subset_exits:
+                winners = [e for e in subset_exits if e['pnl'] > 0]
+                losers = [e for e in subset_exits if e['pnl'] <= 0]
+                backtest_subset['win_rate'] = (len(winners) / len(subset_exits)) * 100
+                backtest_subset['total_return'] = sum(e['pnl'] for e in subset_exits)
+                total_wins = sum(e['pnl'] for e in winners) if winners else 0
+                total_losses = abs(sum(e['pnl'] for e in losers)) if losers else 0.001
+                backtest_subset['profit_factor'] = total_wins / total_losses if total_losses > 0 else total_wins
 
             # Calculate date range for subset window
             period_start = df_subset.index[0].strftime('%Y-%m-%d') if hasattr(df_subset.index[0], 'strftime') else str(df_subset.index[0])[:10]
@@ -1473,7 +1662,7 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
                 f"---\n"
                 f"{pos_section_subset}\n"
                 f"---\n"
-                f"📊 **{period_label} Stats:**\n"
+                f"📊 **{period_label} Stats (Tracked Only):**\n"
                 f"• Trades: {backtest_subset['num_trades']} | Win Rate: {backtest_subset['win_rate']:.0f}%\n"
                 f"• Return: {backtest_subset['total_return']:.1f}% | PF: {backtest_subset['profit_factor']:.1f}\n"
                 f"---\n"
@@ -1624,7 +1813,10 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
     # FETCH FRESH DATA FOR SYNC - bundled data may be stale!
     print(f"\n🔄 Fetching FRESH data for state sync check...")
     fresh_backtest = None
+    fresh_df = pd.DataFrame()  # Initialize empty to prevent NameError
     try:
+        import time
+        time.sleep(1)  # Small delay to avoid rate limiting
         fresh_df = fetch_price_data(ticker, api_key, days=200, interval=interval)
         if not fresh_df.empty:
             fresh_df = calculate_composite_oscillator(fresh_df, config)
@@ -1807,6 +1999,14 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
         if locked_backtest:
             print(f"🔒 Loaded existing locked backtest from previous session")
 
+    # Detect missed signals during downtime
+    if locked_backtest and fresh_backtest:
+        num_missed = detect_and_add_missed_signals(fresh_backtest, strategy_name=strategy_name, ticker=ticker)
+        if num_missed > 0:
+            print(f"🟠 Found {num_missed} missed signal(s) during downtime - marked in orange on charts")
+            # Reload the locked backtest to get the updated version with missed signals
+            locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
+
     # Send startup notification with stats and chart
     startup_chart = None
     if backtest:
@@ -1827,12 +2027,28 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
         else:
             pos_status = "⚪ **Position:** None"
 
-        # Build stats sections - show both full period and recent if available
+        # Build stats sections - show tracked stats from locked_backtest (excludes missed trades)
+        # Use locked_backtest for tracked stats if available, otherwise fall back to bundled backtest
+        stats_source = locked_backtest if locked_backtest else backtest
+        num_tracked = stats_source.get('num_trades', 0)
+        num_missed = stats_source.get('num_missed', 0)
+
         full_period_stats = (
-            f"📊 **Full Period Stats ({backtest.get('num_trades', 0)} trades):**\n"
-            f"• Win Rate: {backtest['win_rate']:.0f}% | Return: {backtest['total_return']:.1f}%\n"
-            f"• Profit Factor: {backtest['profit_factor']:.1f}"
+            f"📊 **Tracked Stats ({num_tracked} trades):**\n"
+            f"• Win Rate: {stats_source.get('win_rate', 0):.0f}% | Return: {stats_source.get('total_return', 0):.1f}%\n"
+            f"• Profit Factor: {stats_source.get('profit_factor', 0):.1f}"
         )
+
+        # Show missed trades stats separately if any exist
+        missed_stats = ""
+        if num_missed > 0:
+            missed_return = stats_source.get('missed_return', 0)
+            missed_win_rate = stats_source.get('missed_win_rate', 0)
+            missed_stats = (
+                f"\n🟠 **Missed During Downtime ({num_missed} trades):**\n"
+                f"• Win Rate: {missed_win_rate:.0f}% | Return: {missed_return:.1f}%\n"
+                f"• _(Not included in main stats)_"
+            )
 
         recent_stats = ""
         if fresh_backtest and fresh_backtest != backtest:
@@ -1850,28 +2066,96 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             f"**Signal Type:** {config.get('signal_type')}\n"
             f"**Risk:** SL={stop_loss_pct:.1f}%, TP={take_profit_pct:.1f}%\n"
             f"---\n"
-            f"{full_period_stats}{recent_stats}\n"
+            f"{full_period_stats}{missed_stats}{recent_stats}\n"
             f"---\n"
             f"{pos_status}\n"
             f"---\n"
             f"_Monitoring for signals..._"
         )
-        # Generate chart for startup - use fresh data if available for accurate position display
+        # Generate charts for startup
+        # Use fresh data if bundled data is stale (so current position shows on chart)
+        # Markers come from locked_backtest to prevent repainting
         try:
-            chart_df = fresh_df if fresh_backtest and not fresh_df.empty else df
-            chart_backtest = fresh_backtest if fresh_backtest else backtest
-            # Load locked trade history to prevent repainting
             startup_trade_history = load_trade_history(strategy_name=strategy_name, ticker=ticker)
-            # Use LOCKED backtest for markers (prevents repainting)
-            # Pass both backtests so chart can show both stat lines
-            startup_chart = generate_velocity_chart(chart_df, chart_backtest, config, ticker,
-                                                    trade_history=startup_trade_history,
-                                                    current_position=trade_state,
-                                                    locked_backtest=locked_backtest,
-                                                    full_period_backtest=backtest)
-            print("✅ Generated startup chart for Discord (using locked backtest markers)")
+
+            # Determine which data to use for charts
+            # If fresh data is available and more recent, use it for charts
+            # Otherwise fall back to bundled data (charts may not show recent positions)
+            chart_df = df  # Default to bundled
+            try:
+                if fresh_backtest and fresh_df is not None and len(fresh_df) > 0:
+                    bundled_end = df.index[-1] if len(df) > 0 else None
+                    fresh_end = fresh_df.index[-1]
+                    if bundled_end and fresh_end > bundled_end:
+                        chart_df = fresh_df
+                        print(f"📊 Using fresh data for charts (bundled ends {bundled_end.strftime('%Y-%m-%d')}, fresh ends {fresh_end.strftime('%Y-%m-%d')})")
+                    else:
+                        print(f"📊 Using bundled data for charts (up to {bundled_end.strftime('%Y-%m-%d') if bundled_end else 'unknown'})")
+                else:
+                    print(f"📊 Using bundled data for charts (fresh data not available)")
+            except Exception as e:
+                print(f"📊 Using bundled data for charts (error checking fresh: {e})")
+
+            # FULL PERIOD chart - use all available data
+            full_period_chart = generate_velocity_chart(chart_df, backtest, config, ticker,
+                                                        title_suffix=" - Full Period",
+                                                        trade_history=startup_trade_history,
+                                                        current_position=trade_state,
+                                                        locked_backtest=locked_backtest,
+                                                        full_period_backtest=backtest)
+            print("✅ Generated full period chart")
+
+            # RECENT 126 days chart - subset of chart data
+            recent_days = 126  # Half a trading year
+            if len(chart_df) > recent_days:
+                df_recent = chart_df.iloc[-recent_days:].copy()
+            else:
+                df_recent = chart_df.copy()
+
+            # Calculate subset stats from locked_backtest for the recent period
+            recent_start = df_recent.index.min()
+            recent_exits = []
+            if locked_backtest and locked_backtest.get('exits'):
+                for exit_trade in locked_backtest['exits']:
+                    if not exit_trade.get('missed'):
+                        exit_date = pd.to_datetime(exit_trade['date'])
+                        if exit_date >= recent_start:
+                            recent_exits.append(exit_trade)
+
+            # Build recent_backtest with exits for equity curve
+            recent_backtest = {
+                'num_trades': len(recent_exits),
+                'win_rate': 0,
+                'total_return': 0,
+                'profit_factor': 0,
+                'exits': recent_exits,  # Include exits for equity curve
+                'current_position': locked_backtest.get('current_position') if locked_backtest else None,
+                'period_days': recent_days  # Store the period for label
+            }
+            if recent_exits:
+                winners = [e for e in recent_exits if e['pnl'] > 0]
+                losers = [e for e in recent_exits if e['pnl'] <= 0]
+                recent_backtest['win_rate'] = (len(winners) / len(recent_exits)) * 100
+                recent_backtest['total_return'] = sum(e['pnl'] for e in recent_exits)
+                total_wins = sum(e['pnl'] for e in winners) if winners else 0
+                total_losses = abs(sum(e['pnl'] for e in losers)) if losers else 0.001
+                recent_backtest['profit_factor'] = total_wins / total_losses if total_losses > 0 else total_wins
+
+            recent_chart = generate_velocity_chart(df_recent, recent_backtest, config, ticker,
+                                                   title_suffix=f" - Last {recent_days} Days",
+                                                   trade_history=startup_trade_history,
+                                                   current_position=trade_state,
+                                                   locked_backtest=locked_backtest,
+                                                   full_period_backtest=backtest)
+            print(f"✅ Generated recent {recent_days}-day chart (subset of bundled data, {recent_backtest['num_trades']} trades)")
+
+            # Use recent chart for main display (full period chart can be added later)
+            startup_chart = recent_chart
         except Exception as e:
             print(f"⚠️ Could not generate startup chart: {e}")
+            import traceback
+            traceback.print_exc()
+            startup_chart = None
     else:
         startup_msg = (
             f"🤖 **[{strategy_label}] Live Trader Started**\n"
@@ -2095,9 +2379,8 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         except:
                             hold_duration = "N/A"
 
-                    # Estimate P&L in dollars (assuming $10k position size)
-                    position_size = 10000
-                    pnl_dollars = (pnl_pct / 100) * position_size
+                    # Calculate actual dollar P&L per unit
+                    pnl_dollars = current_price - entry_price  # LONG: profit when price goes up
 
                     exit_msg = (
                         f"📤 **[{strategy_label}] LONG EXIT** {pnl_emoji}\n"
@@ -2107,7 +2390,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         f"📅 **Exit:** {current_time.strftime('%Y-%m-%d %H:%M')} @ ${current_price:.2f}\n"
                         f"⏱️ **Hold Duration:** {hold_duration}\n"
                         f"---\n"
-                        f"💰 **P&L:** {pnl_pct:+.2f}% (${pnl_dollars:+,.0f} on $10k)\n"
+                        f"💰 **P&L:** {pnl_pct:+.2f}% (${pnl_dollars:+,.2f}/unit)\n"
                         f"{stats_section}"
                     )
 
@@ -2220,9 +2503,8 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         except:
                             hold_duration = "N/A"
 
-                    # Estimate P&L in dollars (assuming $10k position size)
-                    position_size = 10000
-                    pnl_dollars = (pnl_pct / 100) * position_size
+                    # Calculate actual dollar P&L per unit
+                    pnl_dollars = entry_price - current_price  # SHORT: profit when price goes down
 
                     exit_msg = (
                         f"📤 **[{strategy_label}] SHORT EXIT** {pnl_emoji}\n"
@@ -2232,7 +2514,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         f"📅 **Exit:** {current_time.strftime('%Y-%m-%d %H:%M')} @ ${current_price:.2f}\n"
                         f"⏱️ **Hold Duration:** {hold_duration}\n"
                         f"---\n"
-                        f"💰 **P&L:** {pnl_pct:+.2f}% (${pnl_dollars:+,.0f} on $10k)\n"
+                        f"💰 **P&L:** {pnl_pct:+.2f}% (${pnl_dollars:+,.2f}/unit)\n"
                         f"{stats_section}"
                     )
 

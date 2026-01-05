@@ -380,4 +380,389 @@ When optimizing, enable **"🔴 LIVE TRADING SIMULATION MODE"**:
 6. **Track performance** and replace losers quickly
 7. **Diversify** - different strategies per ticker
 
-**Happy Trading! 🚀📈**
+**Happy Trading!**
+
+---
+---
+
+# Velocity Trading System (CLI Bots)
+
+The Velocity Trading System is an automated trading bot that monitors oscillator velocity and acceleration signals. It runs in the terminal and sends Discord alerts.
+
+---
+
+## Quick Start
+
+### Single Strategy Mode
+```bash
+python velocity_live_trader.py
+```
+- Interactive menu to select one strategy
+- Runs continuously monitoring for signals
+- Sends Discord alerts on entries/exits
+
+### Multi-Strategy Mode
+```bash
+python velocity_multi_trader.py
+```
+- Interactive menu to select multiple strategies
+- Runs all selected strategies in one process
+- Shares data fetches (BTC and SPY fetched once each)
+
+---
+
+## The 6 Available Strategies
+
+| Strategy | Ticker | Lookback Period | Description |
+|----------|--------|-----------------|-------------|
+| velocity_BTC_1y | BTC-USD | 1 year | Optimized on 1 year of BTC data |
+| velocity_BTC_2y | BTC-USD | 2 years | Optimized on 2 years of BTC data |
+| velocity_BTC_5y | BTC-USD | 5 years | Optimized on 5 years of BTC data |
+| velocity_SPY_1y | SPY | 1 year | Optimized on 1 year of SPY data |
+| velocity_SPY_2y | SPY | 2 years | Optimized on 2 years of SPY data |
+| velocity_SPY_5y | SPY | 5 years | Optimized on 5 years of SPY data |
+
+---
+
+## Single Strategy Mode (velocity_live_trader.py)
+
+### Starting
+```bash
+python velocity_live_trader.py
+```
+
+### Strategy Selection Menu
+```
+============================================================
+VELOCITY STRATEGY SELECTION
+============================================================
+
+Saved Strategies:
+  1. velocity_BTC_1y_20251222_103111
+      Ticker: BTC-USD | Signal: velocity_crossover_and_zone
+      Created: 2024-12-22 10:31:11
+
+  2. velocity_SPY_5y_20251222_094920
+      Ticker: SPY | Signal: velocity_crossover_and_zone
+      Created: 2024-12-22 09:49:20
+  ...
+
+Enter strategy number (or 'p' for production config, 'q' to quit):
+```
+
+### What It Does
+1. Loads selected strategy configuration
+2. Runs historical backtest on startup
+3. Syncs position state with backtest
+4. Sends startup Discord alert with charts
+5. Enters main loop:
+   - Checks for exit conditions every 15 minutes
+   - Checks for new entry signals
+   - Sends scheduled status updates (market open, mid-day, close)
+
+### Command Line Options
+```bash
+# Use specific config file
+python velocity_live_trader.py --config path/to/config.json
+
+# Skip interactive selection
+python velocity_live_trader.py --skip-selection
+
+# Save current config as a named bundle
+python velocity_live_trader.py --save my_strategy_name
+```
+
+---
+
+## Multi-Strategy Mode (velocity_multi_trader.py)
+
+### Starting
+```bash
+python velocity_multi_trader.py
+```
+
+### Strategy Selection Menu
+```
+============================================================
+VELOCITY MULTI-TRADER - Strategy Selection
+============================================================
+
+Available Strategies:
+  [1] BTC-USD 1Y    - Position: SHORT @ $87138.14
+  [2] BTC-USD 2Y    - Position: None
+  [3] BTC-USD 5Y    - Position: None
+  [4] SPY 1Y        - Position: LONG @ $684.83
+  [5] SPY 2Y        - Position: LONG @ $674.48
+  [6] SPY 5Y        - Position: LONG @ $674.48
+
+Enter strategy numbers (comma-separated), 'all', or 'q' to quit:
+> 1,4,5,6
+
+Selected 4 strategies:
+  - BTC-USD 1Y
+  - SPY 1Y
+  - SPY 2Y
+  - SPY 5Y
+
+Press Enter to start, or 'q' to quit:
+```
+
+### Selection Options
+- Enter specific numbers: `1,3,5` or `1, 3, 5`
+- Run all strategies: `all`
+- Quit: `q`
+
+### Benefits Over Running Multiple Single Instances
+- Single process instead of 6 terminals
+- Shared data fetches (reduces API calls)
+- Centralized monitoring
+- Easier to start/stop
+
+---
+
+## File Structure
+
+### Strategy Configurations
+```
+velocity_strategies/
+├── velocity_BTC_1y_20251222_103111/
+│   ├── velocity_config.json    # Strategy parameters
+│   └── data.parquet            # Bundled price data (optional)
+├── velocity_BTC_2y_20251222_104158/
+│   └── velocity_config.json
+└── ...
+```
+
+### State Files (per strategy)
+```
+velocity_trade_state_velocity_BTC_1y.json    # Current position
+velocity_trade_history_velocity_BTC_1y.json  # Closed trades log
+velocity_locked_backtest_velocity_BTC_1y.json # Frozen chart markers
+```
+
+### Core Modules
+```
+velocity_live_trader.py   # Single strategy runner
+velocity_multi_trader.py  # Multi-strategy runner
+velocity_core.py          # Shared logic module
+data_cache.py             # SQLite price data cache
+```
+
+---
+
+## Configuration Parameters
+
+Each strategy config (`velocity_config.json`) contains:
+
+### Basic Settings
+```json
+{
+    "ticker": "BTC-USD",
+    "interval": "1d",
+    "strategy_name": "velocity_BTC_1y",
+    "optimization_period": "1y"
+}
+```
+
+### Signal Settings
+```json
+{
+    "signal_type": "velocity_crossover_and_zone",
+    "oscillator_type": "composite_smooth",
+    "vel_smoothing": 3,
+    "oversold_threshold": -0.3,
+    "overbought_threshold": 0.3,
+    "require_accel": true
+}
+```
+
+### Risk Management
+```json
+{
+    "stop_loss_pct": 5.0,
+    "take_profit_pct": 10.0,
+    "exit_on_opposite_signal": true,
+    "exit_on_midline_cross": false
+}
+```
+
+### Discord
+```json
+{
+    "discord_webhook": "https://discord.com/api/webhooks/..."
+}
+```
+
+---
+
+## Signal Types
+
+| Signal Type | Description |
+|-------------|-------------|
+| `velocity_crossover_and_zone` | Velocity crosses zero AND in oversold/overbought zone |
+| `velocity_crossover_or_zone` | Velocity crosses zero OR in extreme zone |
+| `zone_only` | Only enters in extreme zones with positive velocity |
+| `momentum` | Strong momentum detection |
+| `any_reversal` | Most aggressive - any reversal signal |
+| `double_bottom` | Two velocity crossovers in oversold zone |
+| `divergence` | Price/oscillator divergence |
+| `breakout` | Oscillator breaks threshold |
+
+---
+
+## Discord Alerts
+
+The system sends Discord alerts for:
+
+1. **Startup** - Strategy loaded with charts and stats
+2. **Entry Signals** - BUY/SELL with entry price
+3. **Exit Signals** - Exit reason, P&L, hold duration
+4. **Scheduled Updates** - Market open, mid-day, close (with charts)
+5. **Errors** - Any critical errors
+
+### Dual Webhooks
+Each strategy can post to two Discord servers:
+- Primary webhook (from config)
+- Secondary Haus Hedge webhook (if strategy name matches)
+
+---
+
+## State Management
+
+### Trade State File
+Tracks current open position:
+```json
+{
+    "position": "long",
+    "entry_price": 87138.14,
+    "entry_time": "2024-12-29 10:00:00",
+    "entry_signal_bar": "2024-12-29",
+    "last_signal_time": "2024-12-29"
+}
+```
+
+### Locked Backtest
+Prevents chart marker repainting:
+```json
+{
+    "locked_at": "2024-12-29T10:00:00",
+    "entries": [...],
+    "exits": [...],
+    "current_position": {...},
+    "num_trades": 16,
+    "win_rate": 100.0,
+    "total_return": 31.43
+}
+```
+
+### Trade History
+Log of all closed trades:
+```json
+[
+    {
+        "id": 1,
+        "ticker": "BTC-USD",
+        "type": "LONG",
+        "entry_price": 85000.00,
+        "exit_price": 87000.00,
+        "pnl_pct": 2.35,
+        "pnl_dollars": 2000.00,
+        "exit_reason": "Opposite Signal"
+    }
+]
+```
+
+---
+
+## Data Caching
+
+The system uses SQLite caching (`data_cache.py`) to:
+- Reduce yfinance API calls
+- Speed up startup time
+- Provide data when API is unavailable
+
+Cache location: `price_data.db`
+
+### Cache Commands
+```bash
+# List cached tickers
+python data_cache.py list
+
+# Fetch and cache ticker
+python data_cache.py fetch BTC-USD 365
+
+# Clear cache
+python data_cache.py clear
+python data_cache.py clear BTC-USD  # Specific ticker
+```
+
+---
+
+## Troubleshooting
+
+### "No data returned for ticker"
+- Check internet connection
+- yfinance may be rate limiting - wait a few minutes
+- Try: `python data_cache.py fetch BTC-USD 200`
+
+### "Config file not found"
+- Verify the strategy exists in `velocity_strategies/`
+- Check the config path in the error message
+
+### Discord alerts not sending
+- Verify webhook URL is valid
+- Check for webhook rate limiting (wait 1-2 minutes)
+
+### Position mismatch on startup
+- The system auto-syncs with backtest on startup
+- Check console output for "STATE MISMATCH" messages
+- State files can be manually edited if needed
+
+### Charts not appearing
+- Check for errors in console output
+- Verify matplotlib is installed: `pip install matplotlib`
+
+---
+
+## Stopping the Bot
+
+- Press `Ctrl+C` to gracefully stop
+- The bot will send a shutdown notification to Discord
+- State is automatically saved before exit
+
+---
+
+## Best Practices
+
+1. **Run in screen/tmux** - Keep running even if SSH disconnects
+   ```bash
+   screen -S velocity
+   python velocity_multi_trader.py
+   # Ctrl+A, D to detach
+   # screen -r velocity to reattach
+   ```
+
+2. **Monitor logs** - Check console for errors and signals
+
+3. **Don't edit state files while running** - Stop the bot first
+
+4. **Backup state files** - Before major changes
+   ```bash
+   cp velocity_trade_state_*.json backups/
+   ```
+
+5. **Test with one strategy first** - Before running all 6
+
+---
+
+## Architecture
+
+```
+velocity_core.py              # Shared logic (signals, state, alerts)
+       |
+       +---> velocity_live_trader.py   # Single strategy CLI
+       |
+       +---> velocity_multi_trader.py  # Multi-strategy CLI
+```
+
+Both runners use the same core logic, ensuring consistent behavior.
