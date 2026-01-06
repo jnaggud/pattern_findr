@@ -284,16 +284,27 @@ def process_strategy(strat: dict, current_price: float, df_fresh: pd.DataFrame) 
     # Check if this is a crypto ticker (24/7) vs stock (market hours)
     is_crypto = any(ticker.upper().startswith(c) for c in ['BTC', 'ETH', 'DOGE', 'SOL', 'ADA'])
 
-    # For stocks (SPY), only evaluate NEW entry signals after market close (4 PM ET)
+    # For daily strategies, only evaluate signals after bar is complete:
+    # - Stocks (SPY): after 4 PM ET (market close)
+    # - Crypto (BTC): after 00:30 UTC (midnight UTC + 30 min buffer)
     # Exit checks (stop loss, take profit) always run since they use real-time price
-    should_check_entries = True
-    if not is_crypto:
+    should_check_signals = True
+    if is_crypto:
+        # Crypto (BTC): Daily bar closes at 00:00 UTC
+        # Wait 30 min buffer for data to finalize
+        utc_now = datetime.utcnow()
+        utc_hour = utc_now.hour
+        utc_minute = utc_now.minute
+        if utc_hour == 0 and utc_minute < 30:
+            should_check_signals = False
+            print(f"   ⏳ [{ticker}] Waiting for new daily bar (UTC: {utc_now.strftime('%H:%M')})")
+    else:
+        # Stocks (SPY): Daily bar closes at 4 PM ET
         market_time = get_market_time()  # Eastern Time
         et_hour = market_time.hour
         if et_hour < 16:
-            # Market still open - don't evaluate entry signals yet
-            # (daily bar not complete)
-            should_check_entries = False
+            # Market still open - don't evaluate signals yet (daily bar not complete)
+            should_check_signals = False
 
     # Calculate signals on fresh data
     df = calculate_composite_oscillator(df_fresh.copy(), config)
@@ -325,14 +336,17 @@ def process_strategy(strat: dict, current_price: float, df_fresh: pd.DataFrame) 
         osc = last_bar.get('osc_smooth', 0)
 
         # Check exit conditions
+        # Price-based exits (stop loss, take profit) run anytime using real-time price
         if stop_loss_pct > 0 and pnl_pct <= -stop_loss_pct:
             exit_reason = "Stop Loss"
         elif take_profit_pct > 0 and pnl_pct >= take_profit_pct:
             exit_reason = "Take Profit"
-        elif exit_on_midline and osc > 0:
-            exit_reason = "Midline Cross"
-        elif exit_on_opposite and last_bar.get('sell_signal', False):
-            exit_reason = "Opposite Signal"
+        # Signal-based exits only after daily bar is complete
+        elif should_check_signals:
+            if exit_on_midline and osc > 0:
+                exit_reason = "Midline Cross"
+            elif exit_on_opposite and last_bar.get('sell_signal', False):
+                exit_reason = "Opposite Signal"
 
         if exit_reason:
             pnl_emoji = "+" if pnl_pct >= 0 else ""
@@ -386,7 +400,7 @@ def process_strategy(strat: dict, current_price: float, df_fresh: pd.DataFrame) 
     # ========================================
     # CHECK ENTRIES (if no position)
     # ========================================
-    if position is None and should_check_entries:
+    if position is None and should_check_signals:
         buy_signal = last_bar.get('buy_signal', False)
         sell_signal = last_bar.get('sell_signal', False)
 

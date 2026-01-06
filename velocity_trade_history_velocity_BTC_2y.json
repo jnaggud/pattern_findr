@@ -1,0 +1,43 @@
+[
+  {
+    "id": 1,
+    "ticker": "BTC-USD",
+    "strategy_name": "velocity_BTC_2y",
+    "type": "long",
+    "entry_price": 85462.5078125,
+    "exit_price": 90394.3125,
+    "entry_time": "2025-12-18 00:00:00",
+    "exit_time": "2025-11-30 00:00:00",
+    "exit_reason": "[SYNC] Opposite Signal",
+    "pnl_pct": 6.232908859738617,
+    "pnl_dollars": 623.2908859738617
+  },
+  {
+    "id": 2,
+    "ticker": "BTC-USD",
+    "strategy_name": "velocity_BTC_2y",
+    "type": "LONG",
+    "entry_price": 87234.7421875,
+    "exit_price": 87138.140625,
+    "entry_time": "2025-12-25 00:00:00",
+    "exit_time": "2025-12-29 00:00:00",
+    "exit_reason": "Opposite Signal (-0.11%)",
+    "pnl_pct": -0.11073748838778845,
+    "pnl_dollars": -11.073748838778844
+  },
+  {
+    "id": 3,
+    "ticker": "BTC-USD",
+    "strategy_name": "velocity_BTC_2y",
+    "type": "short",
+    "entry_price": 87138.140625,
+    "exit_price": 87508.828125,
+    "entry_time": "2025-12-29 00:00:00",
+    "exit_time": "2025-12-31 00:00:00",
+    "entry_signal_bar": "2025-12-29 00:00:00",
+    "exit_signal_bar": "2025-12-31 00:00:00",
+    "exit_reason": "[SYNC] Opposite Signal",
+    "pnl_pct": 0.3141935548005485,
+    "pnl_dollars": 31.41935548005485
+  }
+]

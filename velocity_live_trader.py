@@ -2519,18 +2519,50 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
                 exit_reason = None
 
-                # Stop loss
+                # Stop loss - uses real-time price (can trigger anytime)
                 if pnl_pct <= -stop_loss_pct:
                     exit_reason = f"Stop Loss ({pnl_pct:.2f}%)"
-                # Take profit
+                # Take profit - uses real-time price (can trigger anytime)
                 elif pnl_pct >= take_profit_pct:
                     exit_reason = f"Take Profit ({pnl_pct:.2f}%)"
-                # Exit on opposite signal
-                elif exit_on_opposite_signal and latest['sell_signal']:
-                    exit_reason = f"Opposite Signal ({pnl_pct:.2f}%)"
-                # Exit on midline cross
-                elif exit_on_midline_cross and latest['osc_smooth'] > 0:
-                    exit_reason = f"Midline Cross ({pnl_pct:.2f}%)"
+                # Signal-based exits (opposite signal, midline cross)
+                # For daily strategies: use COMPLETED bar (df.iloc[-2]) to prevent repainting
+                # For stocks (SPY): only check after market close (4 PM ET)
+                # For crypto (BTC): only check after midnight UTC (00:00 UTC)
+                else:
+                    # Determine which bar to use for signal-based exits
+                    if interval == "1d" and len(df) >= 2:
+                        signal_bar = df.iloc[-2]  # Completed bar for daily
+                        signal_bar_time = df.index[-2]
+
+                        # Check if daily bar is complete before evaluating signal exits
+                        can_check_signal_exits = True
+                        if is_crypto:
+                            # Crypto (BTC): Daily bar closes at 00:00 UTC
+                            # Only evaluate after new bar starts (wait 30 min buffer for data)
+                            utc_now = datetime.utcnow()
+                            utc_hour = utc_now.hour
+                            utc_minute = utc_now.minute
+                            # Check between 00:30 UTC and 23:59 UTC (avoid checking right at midnight)
+                            if utc_hour == 0 and utc_minute < 30:
+                                can_check_signal_exits = False
+                                print(f"   ⏳ [CRYPTO] Waiting for new daily bar (UTC: {utc_now.strftime('%H:%M')})")
+                        else:
+                            # Stocks (SPY): Daily bar closes at 4 PM ET
+                            market_time = get_market_time()
+                            if market_time.hour < 16:
+                                can_check_signal_exits = False
+                    else:
+                        signal_bar = latest  # Use latest for intraday
+                        can_check_signal_exits = True
+
+                    if can_check_signal_exits:
+                        # Exit on opposite signal
+                        if exit_on_opposite_signal and signal_bar['sell_signal']:
+                            exit_reason = f"Opposite Signal ({pnl_pct:.2f}%)"
+                        # Exit on midline cross (oscillator crosses above 0 = bearish for long)
+                        elif exit_on_midline_cross and signal_bar['osc_smooth'] > 0:
+                            exit_reason = f"Midline Cross ({pnl_pct:.2f}%)"
 
                 if exit_reason:
                     # Generate chart and get stats for exit
@@ -2658,10 +2690,17 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         # Check if we've already evaluated this bar
                         if str(completed_bar_time) != str(last_signal_bar_evaluated):
                             if is_crypto:
-                                # Crypto: Check anytime after midnight UTC when new bar available
-                                # If the completed bar is from yesterday (or earlier), we can evaluate
-                                should_check_signals = True
-                                print(f"   📊 [CRYPTO] Evaluating completed bar: {completed_bar_time}")
+                                # Crypto (BTC): Daily bar closes at 00:00 UTC
+                                # Only evaluate after new bar starts (wait 30 min buffer for data)
+                                utc_now = datetime.utcnow()
+                                utc_hour = utc_now.hour
+                                utc_minute = utc_now.minute
+                                # Check between 00:30 UTC and 23:59 UTC (avoid checking right at midnight)
+                                if utc_hour == 0 and utc_minute < 30:
+                                    print(f"   ⏳ [CRYPTO] Waiting for new daily bar to finalize (UTC: {utc_now.strftime('%H:%M')})")
+                                else:
+                                    should_check_signals = True
+                                    print(f"   📊 [CRYPTO] Evaluating completed bar: {completed_bar_time} (UTC: {utc_now.strftime('%H:%M')})")
                             else:
                                 # Stocks (SPY): Only evaluate after market close (4 PM ET = 16:00)
                                 # market_time is already in Eastern Time via get_market_time()

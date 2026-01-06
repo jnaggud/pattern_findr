@@ -1,0 +1,60 @@
+[
+  {
+    "id": 1,
+    "ticker": "BTC-USD",
+    "strategy_name": "velocity_BTC_5y",
+    "type": "long",
+    "entry_price": 88175.18,
+    "exit_price": 88490.015625,
+    "entry_time": "2025-12-14 00:00:00",
+    "exit_time": "2025-12-22 00:00:00",
+    "exit_reason": "[SYNC] Opposite Signal",
+    "pnl_pct": 0.35705732453940453,
+    "pnl_dollars": 35.705732453940456
+  },
+  {
+    "id": 2,
+    "ticker": "BTC-USD",
+    "strategy_name": "velocity_BTC_5y",
+    "type": "LONG",
+    "entry_price": 87414.0,
+    "exit_price": 94447.75,
+    "entry_time": "2025-12-23 00:00:00",
+    "exit_time": "2026-01-04 00:00:00",
+    "entry_signal_bar": "2025-12-23 00:00:00",
+    "exit_signal_bar": "2026-01-04 00:00:00",
+    "exit_reason": "Take Profit (8.05%)",
+    "pnl_pct": 8.046479968883704,
+    "pnl_dollars": 7033.75
+  },
+  {
+    "id": 3,
+    "ticker": "BTC-USD",
+    "strategy_name": "velocity_BTC_5y",
+    "type": "LONG",
+    "entry_price": 87414.0,
+    "exit_price": 94547.79,
+    "entry_time": "2025-12-23 00:00:00",
+    "exit_time": "2026-01-04 00:00:00",
+    "entry_signal_bar": "2025-12-23 00:00:00",
+    "exit_signal_bar": "2026-01-04 00:00:00",
+    "exit_reason": "Take Profit (8.16%)",
+    "pnl_pct": 8.1609238794701,
+    "pnl_dollars": 7133.789999999994
+  },
+  {
+    "id": 4,
+    "ticker": "BTC-USD",
+    "strategy_name": "velocity_BTC_5y",
+    "type": "LONG",
+    "entry_price": 87414.0,
+    "exit_price": 94333.35,
+    "entry_time": "2025-12-23 00:00:00",
+    "exit_time": "2026-01-04 00:00:00",
+    "entry_signal_bar": "2025-12-23 00:00:00",
+    "exit_signal_bar": "2026-01-04 00:00:00",
+    "exit_reason": "Take Profit (7.92%)",
+    "pnl_pct": 7.915608483766909,
+    "pnl_dollars": 6919.350000000006
+  }
+]
