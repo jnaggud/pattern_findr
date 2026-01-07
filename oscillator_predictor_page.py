@@ -47,8 +47,104 @@ except ImportError:
 # For parallel processing
 import os
 import json
+import time
 import multiprocessing
 from joblib import Parallel, delayed
+
+# Price prediction module
+try:
+    from price_prediction import PriceRangePredictor, PriceTargetCalculator, ExitTimingPredictor
+    PRICE_PREDICTION_AVAILABLE = True
+except ImportError:
+    PRICE_PREDICTION_AVAILABLE = False
+
+# Polygon API for options data
+try:
+    from polygon_manager import PolygonManager
+    POLYGON_AVAILABLE = True
+except ImportError:
+    POLYGON_AVAILABLE = False
+
+# Market hours utilities (for data refresh logic)
+try:
+    from velocity_production_utils import is_market_open, get_market_time
+    MARKET_UTILS_AVAILABLE = True
+except ImportError:
+    MARKET_UTILS_AVAILABLE = False
+
+# Optimization timing tracking
+OPTIMIZATION_TIMING_FILE = "optimization_timing.json"
+
+def load_optimization_timing() -> dict:
+    """Load optimization timing history."""
+    if os.path.exists(OPTIMIZATION_TIMING_FILE):
+        try:
+            with open(OPTIMIZATION_TIMING_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return {"runs": [], "avg_trials_per_minute": None}
+
+def save_optimization_timing(trials: int, duration_seconds: float, n_workers: int):
+    """Save optimization timing data and update average."""
+    timing_data = load_optimization_timing()
+
+    trials_per_minute = (trials / duration_seconds) * 60 if duration_seconds > 0 else 0
+
+    # Add this run
+    timing_data["runs"].append({
+        "timestamp": datetime.now().isoformat(),
+        "trials": trials,
+        "duration_seconds": round(duration_seconds, 1),
+        "n_workers": n_workers,
+        "trials_per_minute": round(trials_per_minute, 0)
+    })
+
+    # Keep only last 20 runs
+    timing_data["runs"] = timing_data["runs"][-20:]
+
+    # Calculate weighted average (more recent runs weighted higher)
+    if timing_data["runs"]:
+        # Weight recent runs more heavily
+        weights = [i + 1 for i in range(len(timing_data["runs"]))]
+        weighted_sum = sum(r["trials_per_minute"] * w for r, w in zip(timing_data["runs"], weights))
+        total_weight = sum(weights)
+        timing_data["avg_trials_per_minute"] = round(weighted_sum / total_weight, 0)
+
+    with open(OPTIMIZATION_TIMING_FILE, 'w') as f:
+        json.dump(timing_data, f, indent=2)
+
+    return trials_per_minute
+
+def estimate_optimization_time(trials: int, n_workers: int) -> str:
+    """Estimate optimization time based on historical data."""
+    timing_data = load_optimization_timing()
+
+    if not timing_data.get("avg_trials_per_minute"):
+        return "No timing data yet - run an optimization first"
+
+    avg_rate = timing_data["avg_trials_per_minute"]
+
+    # Rough adjustment for worker count (not perfectly linear)
+    # Use the most recent run's worker count as baseline
+    if timing_data["runs"]:
+        last_workers = timing_data["runs"][-1].get("n_workers", 8)
+        # Scaling factor: more workers = faster, but diminishing returns
+        if last_workers != n_workers:
+            # Approximate scaling: sqrt relationship for diminishing returns
+            scale_factor = (n_workers / last_workers) ** 0.7
+            avg_rate = avg_rate * scale_factor
+
+    estimated_minutes = trials / avg_rate
+
+    if estimated_minutes < 1:
+        return f"~{int(estimated_minutes * 60)} seconds"
+    elif estimated_minutes < 60:
+        return f"~{int(estimated_minutes)} minutes"
+    else:
+        hours = int(estimated_minutes // 60)
+        mins = int(estimated_minutes % 60)
+        return f"~{hours}h {mins}m"
 
 # Force spawn method to avoid TensorFlow re-import issues in worker processes
 # Must be done before any multiprocessing happens
@@ -963,6 +1059,96 @@ def create_lstm_features(df: pd.DataFrame, sequence_length: int = 20) -> pd.Data
 
 
 # ============================================================================
+# CHART UTILITIES FOR INTRADAY DATA
+# ============================================================================
+
+class ChartHelper:
+    """
+    Helper class for creating gap-free financial charts.
+
+    For daily data: Uses datetime index directly
+    For intraday data: Uses sequential integers with datetime labels
+
+    Usage:
+        helper = ChartHelper(df, interval)
+        x_vals = helper.get_x(df.index)  # For dataframe series
+        x_trade = helper.get_x(trade_date)  # For single date
+        helper.apply_formatting(fig)  # Apply axis formatting
+    """
+
+    def __init__(self, df: pd.DataFrame, interval: str):
+        self.df = df
+        self.interval = interval
+        self.is_intraday = interval != "1d"
+
+        if self.is_intraday:
+            # Create datetime to index mapping
+            self.date_to_idx = {dt: i for i, dt in enumerate(df.index)}
+        else:
+            self.date_to_idx = None
+
+    def get_x(self, dates):
+        """
+        Convert datetime(s) to appropriate x-axis values.
+
+        Args:
+            dates: Single datetime, list of datetimes, or DatetimeIndex
+
+        Returns:
+            Appropriate x values for plotting
+        """
+        if not self.is_intraday:
+            return dates
+
+        # Handle different input types
+        if hasattr(dates, '__iter__') and not isinstance(dates, str):
+            if hasattr(dates, 'tolist'):  # DatetimeIndex or Series
+                return [self.date_to_idx.get(d, None) for d in dates]
+            else:  # List
+                return [self._lookup_date(d) for d in dates]
+        else:
+            # Single date
+            return self._lookup_date(dates)
+
+    def _lookup_date(self, dt):
+        """Look up a date in the mapping, with fallback for close matches."""
+        if dt in self.date_to_idx:
+            return self.date_to_idx[dt]
+        # Try to find closest date
+        for ref_dt, idx in self.date_to_idx.items():
+            if abs((ref_dt - dt).total_seconds()) < 3600:  # Within 1 hour
+                return idx
+        return None
+
+    def apply_formatting(self, fig):
+        """Apply axis formatting to the figure."""
+        if not self.is_intraday:
+            return
+
+        # Set up tick labels showing dates/times
+        n_ticks = min(12, len(self.df))
+        step = max(1, len(self.df) // n_ticks)
+        tickvals = list(range(0, len(self.df), step))
+        ticktext = []
+        for i in tickvals:
+            if i < len(self.df):
+                ticktext.append(self.df.index[i].strftime('%b %d\n%H:%M'))
+        tickvals = tickvals[:len(ticktext)]
+
+        fig.update_xaxes(
+            tickmode='array',
+            tickvals=tickvals,
+            ticktext=ticktext
+        )
+
+
+# Legacy function for backward compatibility
+def apply_rangebreaks_to_figure(fig, interval: str, xaxis_name: str = "xaxis"):
+    """Legacy function - now a no-op since we use sequential indexing."""
+    pass
+
+
+# ============================================================================
 # STEP 6: STREAMLIT PAGE
 # ============================================================================
 
@@ -983,7 +1169,47 @@ def render_oscillator_predictor_page():
 
     # Data settings
     ticker = st.sidebar.text_input("Ticker Symbol", value="SPY")
+    st.session_state['ticker'] = ticker  # Store for access in sub-functions
+
+    # Starting capital
+    starting_capital = st.sidebar.number_input(
+        "Starting Capital ($)",
+        min_value=1000,
+        max_value=10000000,
+        value=100000,
+        step=1000,
+        help="Initial capital for backtest calculations"
+    )
+
+    # Store in session state for access throughout
+    st.session_state['starting_capital'] = starting_capital
+
+    # Data period settings
+    st.sidebar.subheader("Data Period")
     years = st.sidebar.slider("Years of Data", 1, 10, 5)
+
+    # Bar interval/timeframe selector
+    interval_options = {
+        "1 Day": "1d",
+        "12 Hours": "12h",  # Note: yfinance doesn't support 12h, we'll handle this
+        "4 Hours": "4h",    # Note: yfinance doesn't support 4h directly
+        "1 Hour": "1h",
+        "15 Minutes": "15m"
+    }
+    interval_display = st.sidebar.selectbox(
+        "Bar Length",
+        list(interval_options.keys()),
+        index=0,
+        help="Timeframe for each bar. Note: Intraday data (< 1 day) is limited to 60 days for free data."
+    )
+    interval = interval_options[interval_display]
+
+    # Store interval in session state
+    st.session_state['data_interval'] = interval
+
+    # Warning for intraday data limitations
+    if interval != "1d":
+        st.sidebar.warning(f"⚠️ Intraday data ({interval_display}) limited to ~60 days history with free yfinance API.")
 
     # Peak detection settings
     st.sidebar.subheader("Peak Detection")
@@ -996,10 +1222,10 @@ def render_oscillator_predictor_page():
 
     # Model settings
     st.sidebar.subheader("Model Settings")
-    test_size = st.sidebar.slider("Test Size", 0.1, 0.4, 0.2, 0.05)
+    test_size = st.sidebar.slider("Test Size", 0.1, 0.7, 0.2, 0.05)
 
     # Check if key settings changed - if so, clear model state to prevent mismatch
-    current_settings = f"{ticker}_{years}_{prominence}_{distance}_{lookahead}_{test_size}"
+    current_settings = f"{ticker}_{years}_{interval}_{prominence}_{distance}_{lookahead}_{test_size}"
     if 'osc_settings_hash' not in st.session_state:
         st.session_state['osc_settings_hash'] = current_settings
     elif st.session_state['osc_settings_hash'] != current_settings:
@@ -1073,27 +1299,105 @@ def render_oscillator_predictor_page():
     st.header("Step 1: Load Data")
 
     @st.cache_data(ttl=3600)
-    def load_data(ticker: str, years: int):
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=years*365)
-        df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+    def load_data(ticker: str, years: int, interval: str = "1d", include_today: bool = False):
+        """
+        Load data with specified interval.
+
+        Args:
+            include_today: If True, extends end_date to include today's data.
+                           Should be True when market is closed for daily data.
+
+        yfinance limitations:
+        - 1d: unlimited history
+        - 1h: up to 730 days
+        - 15m, 30m: up to 60 days
+        - 4h, 12h: not directly supported, resample from 1h
+        """
+        # yfinance end is EXCLUSIVE, add 1 day to include today when market is closed
+        if include_today:
+            end_date = datetime.now() + timedelta(days=1)
+        else:
+            end_date = datetime.now()
+
+        # Adjust history based on interval limitations
+        if interval in ["15m", "30m"]:
+            # Max 60 days for minute data
+            max_days = min(years * 365, 59)
+            start_date = datetime.now() - timedelta(days=max_days)
+            yf_interval = interval
+        elif interval in ["1h"]:
+            # Max 730 days for hourly data
+            max_days = min(years * 365, 729)
+            start_date = datetime.now() - timedelta(days=max_days)
+            yf_interval = "1h"
+        elif interval in ["4h", "12h"]:
+            # Not directly supported - fetch 1h and resample
+            max_days = min(years * 365, 729)
+            start_date = datetime.now() - timedelta(days=max_days)
+            yf_interval = "1h"
+        else:
+            # Daily data - unlimited
+            start_date = datetime.now() - timedelta(days=years * 365)
+            yf_interval = "1d"
+
+        df = yf.download(ticker, start=start_date, end=end_date, interval=yf_interval, progress=False)
         df.columns = df.columns.get_level_values(0) if isinstance(df.columns, pd.MultiIndex) else df.columns
+
+        # Normalize column names to lowercase for consistency
+        df.columns = df.columns.str.lower()
+
+        # Resample if needed for 4h or 12h
+        if interval == "4h" and not df.empty:
+            df = df.resample('4h').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            }).dropna()
+        elif interval == "12h" and not df.empty:
+            df = df.resample('12h').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            }).dropna()
+
         return df
 
-    with st.spinner(f"Loading {ticker} data..."):
-        raw_data = load_data(ticker, years)
+    # Check market status to determine if today's bar is complete
+    include_today = False
+    market_status_str = ""
+    if MARKET_UTILS_AVAILABLE:
+        market_status = is_market_open(ticker)
+        include_today = not market_status.get('is_open', True)  # Include today if market closed
+        market_status_str = "CLOSED" if include_today else "OPEN"
+
+    with st.spinner(f"Loading {ticker} data ({interval_display})..."):
+        raw_data = load_data(ticker, years, interval, include_today=include_today)
 
     if raw_data.empty:
         st.error("Failed to load data. Check ticker symbol.")
         return
 
-    st.success(f"Loaded {len(raw_data)} bars from {raw_data.index[0].date()} to {raw_data.index[-1].date()}")
+    # Display appropriate date/time info based on interval
+    if interval == "1d":
+        date_range = f"{raw_data.index[0].date()} to {raw_data.index[-1].date()}"
+    else:
+        date_range = f"{raw_data.index[0]} to {raw_data.index[-1]}"
+
+    market_info = f" | Market: {market_status_str}" if market_status_str else ""
+    st.success(f"Loaded {len(raw_data)} bars ({interval_display}) from {date_range}{market_info}")
 
     # Step 2: Create Composite Oscillator
     st.header("Step 2: Create Composite Oscillator")
 
     with st.spinner("Calculating indicators and composite oscillator..."):
         df = create_composite_oscillator(raw_data)
+
+    # Store full dataframe in session state for save buttons to access
+    st.session_state['df'] = df
 
     # Show component indicators
     component_cols = [c for c in df.columns if c.endswith('_norm') or c in ['bb_position', 'adx_trend']]
@@ -1106,14 +1410,16 @@ def render_oscillator_predictor_page():
                 st.write(f"- {col}: range [{valid_data.min():.2f}, {valid_data.max():.2f}]")
 
     # Plot composite oscillator
+    chart_osc = ChartHelper(df, interval)
     fig_osc = go.Figure()
-    fig_osc.add_trace(go.Scatter(x=df.index, y=df['composite_smooth'],
+    fig_osc.add_trace(go.Scatter(x=chart_osc.get_x(df.index), y=df['composite_smooth'],
                                   mode='lines', name='Composite Oscillator'))
     fig_osc.add_hline(y=0.5, line_dash="dash", line_color="red", annotation_text="Overbought")
     fig_osc.add_hline(y=-0.5, line_dash="dash", line_color="green", annotation_text="Oversold")
     fig_osc.add_hline(y=0, line_dash="dot", line_color="gray")
     fig_osc.update_layout(title="Composite Oscillator", height=300,
                           yaxis_title="Value (-1 to +1)", xaxis_title="Date")
+    chart_osc.apply_formatting(fig_osc)
     st.plotly_chart(fig_osc, use_container_width=True)
 
     # Step 3: Detect Peaks & Valleys
@@ -1231,9 +1537,23 @@ def render_oscillator_predictor_page():
 
         # Buy & Hold comparison
         bh_return = ((df['close'].iloc[-1] - df['close'].iloc[0]) / df['close'].iloc[0]) * 100
-        years = (df.index[-1] - df.index[0]).days / 365
-        st.write(f"**Buy & Hold Return:** {bh_return:.1f}% over {years:.1f} years")
+        data_years = (df.index[-1] - df.index[0]).days / 365
+        st.write(f"**Buy & Hold Return:** {bh_return:.1f}% over {data_years:.1f} years")
         st.write(f"**Strategy vs B&H:** {total_return_pct - bh_return:+.1f}%")
+
+        # Capital metrics row
+        st.markdown("---")
+        st.markdown("##### 💰 Capital Performance (Theoretical Perfect)")
+        perf_ending_capital = starting_capital * (1 + total_return_pct / 100)
+        perf_profit_loss = perf_ending_capital - starting_capital
+        perf_bh_ending_capital = starting_capital * (1 + bh_return / 100)
+
+        col13, col14, col15, col16 = st.columns(4)
+        col13.metric("Starting Capital", f"${starting_capital:,.0f}")
+        col14.metric("Ending Capital", f"${perf_ending_capital:,.0f}",
+                    delta=f"${perf_profit_loss:+,.0f}")
+        col15.metric("Buy & Hold Capital", f"${perf_bh_ending_capital:,.0f}")
+        col16.metric("Strategy Advantage", f"${perf_ending_capital - perf_bh_ending_capital:+,.0f}")
 
         # Trade table
         with st.expander("View All Perfect Trades", expanded=False):
@@ -1249,34 +1569,38 @@ def render_oscillator_predictor_page():
     st.markdown("---")
 
     # Visualize peaks and valleys
+    chart_pv = ChartHelper(df, interval)
+    x_vals_pv = chart_pv.get_x(df.index)
+
     fig_pv = make_subplots(rows=2, cols=1, shared_xaxes=True,
                            vertical_spacing=0.05, row_heights=[0.7, 0.3])
 
     # Price with peak/valley markers
-    fig_pv.add_trace(go.Scatter(x=df.index, y=df['close'], mode='lines',
+    fig_pv.add_trace(go.Scatter(x=x_vals_pv, y=df['close'], mode='lines',
                                  name='Price', line=dict(color='blue')), row=1, col=1)
 
     # Mark peaks (sell points)
     peak_mask = df['is_peak'] == 1
-    fig_pv.add_trace(go.Scatter(x=df.index[peak_mask], y=df['close'][peak_mask],
+    fig_pv.add_trace(go.Scatter(x=chart_pv.get_x(df.index[peak_mask]), y=df['close'][peak_mask],
                                  mode='markers', name='Oscillator Peak (SELL)',
                                  marker=dict(symbol='triangle-down', size=12, color='red')),
                      row=1, col=1)
 
     # Mark valleys (buy points)
     valley_mask = df['is_valley'] == 1
-    fig_pv.add_trace(go.Scatter(x=df.index[valley_mask], y=df['close'][valley_mask],
+    fig_pv.add_trace(go.Scatter(x=chart_pv.get_x(df.index[valley_mask]), y=df['close'][valley_mask],
                                  mode='markers', name='Oscillator Valley (BUY)',
                                  marker=dict(symbol='triangle-up', size=12, color='green')),
                      row=1, col=1)
 
     # Oscillator
-    fig_pv.add_trace(go.Scatter(x=df.index, y=df['composite_smooth'], mode='lines',
+    fig_pv.add_trace(go.Scatter(x=x_vals_pv, y=df['composite_smooth'], mode='lines',
                                  name='Oscillator', line=dict(color='purple')), row=2, col=1)
     fig_pv.add_hline(y=0.5, line_dash="dash", line_color="red", row=2, col=1)
     fig_pv.add_hline(y=-0.5, line_dash="dash", line_color="green", row=2, col=1)
 
     fig_pv.update_layout(height=600, title="Price with Oscillator Peaks/Valleys")
+    chart_pv.apply_formatting(fig_pv)
     st.plotly_chart(fig_pv, use_container_width=True)
 
     # Step 4: Create ML Features
@@ -1450,10 +1774,28 @@ def render_oscillator_predictor_page():
         col7.metric("Outperformance", f"{scipy_total_return - scipy_market_return:+.1f}%")
         col8.metric("Wins / Losses", f"{len(scipy_wins)} / {len(scipy_losses)}")
 
+        # Capital metrics row
+        st.markdown("---")
+        st.markdown("##### 💰 Capital Performance")
+        scipy_ending_capital = starting_capital * (1 + scipy_total_return / 100)
+        scipy_profit_loss = scipy_ending_capital - starting_capital
+        scipy_bh_ending_capital = starting_capital * (1 + scipy_market_return / 100)
+
+        col9, col10, col11, col12 = st.columns(4)
+        col9.metric("Starting Capital", f"${starting_capital:,.0f}")
+        col10.metric("Ending Capital", f"${scipy_ending_capital:,.0f}",
+                    delta=f"${scipy_profit_loss:+,.0f}")
+        col11.metric("Buy & Hold Capital", f"${scipy_bh_ending_capital:,.0f}")
+        col12.metric("Strategy Advantage", f"${scipy_ending_capital - scipy_bh_ending_capital:+,.0f}")
+
         # ============================================================
         # SCIPY PEAKS CANDLESTICK CHART
         # ============================================================
         st.subheader("Scipy Peaks Trading Chart")
+
+        # Create chart helper for gap-free display
+        chart = ChartHelper(test_df_scipy, interval)
+        x_vals = chart.get_x(test_df_scipy.index)
 
         fig_scipy = make_subplots(
             rows=3, cols=1,
@@ -1466,7 +1808,7 @@ def render_oscillator_predictor_page():
         # Row 1: Candlestick Chart
         fig_scipy.add_trace(
             go.Candlestick(
-                x=test_df_scipy.index,
+                x=x_vals,
                 open=test_df_scipy['open'],
                 high=test_df_scipy['high'],
                 low=test_df_scipy['low'],
@@ -1483,12 +1825,12 @@ def render_oscillator_predictor_page():
         if scipy_entries:
             fig_scipy.add_trace(
                 go.Scatter(
-                    x=[t['date'] for t in scipy_entries],
+                    x=chart.get_x([t['date'] for t in scipy_entries]),
                     y=[t['price'] for t in scipy_entries],
                     mode='markers',
                     marker=dict(symbol='triangle-up', size=15, color='lime', line=dict(width=2, color='darkgreen')),
                     name='BUY (Valley)',
-                    hovertemplate='BUY<br>Date: %{x}<br>Price: $%{y:.2f}<extra></extra>'
+                    hovertemplate='BUY<br>Price: $%{y:.2f}<extra></extra>'
                 ),
                 row=1, col=1
             )
@@ -1497,12 +1839,12 @@ def render_oscillator_predictor_page():
         if scipy_exits:
             fig_scipy.add_trace(
                 go.Scatter(
-                    x=[t['date'] for t in scipy_exits],
+                    x=chart.get_x([t['date'] for t in scipy_exits]),
                     y=[t['price'] for t in scipy_exits],
                     mode='markers',
                     marker=dict(symbol='triangle-down', size=15, color='red', line=dict(width=2, color='darkred')),
                     name='SELL (Peak)',
-                    hovertemplate='SELL<br>Date: %{x}<br>Price: $%{y:.2f}<extra></extra>'
+                    hovertemplate='SELL<br>Price: $%{y:.2f}<extra></extra>'
                 ),
                 row=1, col=1
             )
@@ -1513,7 +1855,7 @@ def render_oscillator_predictor_page():
                 color = 'rgba(0,255,0,0.3)' if trade.get('pnl', 0) > 0 else 'rgba(255,0,0,0.3)'
                 fig_scipy.add_trace(
                     go.Scatter(
-                        x=[trade['entry_date'], trade['date']],
+                        x=chart.get_x([trade['entry_date'], trade['date']]),
                         y=[trade['entry_price'], trade['price']],
                         mode='lines',
                         line=dict(color=color, width=2, dash='dot'),
@@ -1527,7 +1869,7 @@ def render_oscillator_predictor_page():
         osc_col = 'composite_smooth' if 'composite_smooth' in test_df_scipy.columns else 'composite_oscillator'
         fig_scipy.add_trace(
             go.Scatter(
-                x=test_df_scipy.index,
+                x=x_vals,
                 y=test_df_scipy[osc_col],
                 mode='lines',
                 name='Oscillator',
@@ -1546,7 +1888,7 @@ def render_oscillator_predictor_page():
         if len(peaks_df) > 0:
             fig_scipy.add_trace(
                 go.Scatter(
-                    x=peaks_df.index,
+                    x=chart.get_x(peaks_df.index),
                     y=peaks_df[osc_col],
                     mode='markers',
                     marker=dict(symbol='circle', size=10, color='red'),
@@ -1561,7 +1903,7 @@ def render_oscillator_predictor_page():
         if len(valleys_df) > 0:
             fig_scipy.add_trace(
                 go.Scatter(
-                    x=valleys_df.index,
+                    x=chart.get_x(valleys_df.index),
                     y=valleys_df[osc_col],
                     mode='markers',
                     marker=dict(symbol='circle', size=10, color='lime'),
@@ -1574,7 +1916,7 @@ def render_oscillator_predictor_page():
         # Row 3: Cumulative Returns
         fig_scipy.add_trace(
             go.Scatter(
-                x=test_df_scipy.index,
+                x=x_vals,
                 y=test_df_scipy['cum_market'],
                 mode='lines',
                 name='Buy & Hold',
@@ -1584,7 +1926,7 @@ def render_oscillator_predictor_page():
         )
         fig_scipy.add_trace(
             go.Scatter(
-                x=test_df_scipy.index,
+                x=x_vals,
                 y=test_df_scipy['cum_strategy'],
                 mode='lines',
                 name='Scipy Strategy',
@@ -1606,6 +1948,8 @@ def render_oscillator_predictor_page():
         fig_scipy.update_yaxes(title_text="Oscillator", row=2, col=1, range=[-1.2, 1.2])
         fig_scipy.update_yaxes(title_text="Cum. Return", row=3, col=1)
 
+        # Apply formatting for proper date labels (especially for intraday)
+        chart.apply_formatting(fig_scipy)
         st.plotly_chart(fig_scipy, use_container_width=True)
 
         # Trade log expander
@@ -1848,6 +2192,14 @@ def render_oscillator_predictor_page():
             use_extra_indicators = st.checkbox("Extra Indicators", value=True, key="use_extra_ind",
                                                help="RSI, MACD, Bollinger Bands")
 
+        # Show time estimate based on historical data
+        time_estimate = estimate_optimization_time(grid_iterations, n_workers)
+        timing_data = load_optimization_timing()
+        if timing_data.get("avg_trials_per_minute"):
+            st.caption(f"⏱️ **Estimated time: {time_estimate}** ({int(timing_data['avg_trials_per_minute']):,} trials/min avg)")
+        else:
+            st.caption("⏱️ Run an optimization to get time estimates")
+
         if st.button("🚀 Run Smart Optimization", type="primary", key="run_grid"):
           try:
             import optuna
@@ -1934,15 +2286,22 @@ def render_oscillator_predictor_page():
                 trials_per_worker = grid_iterations // n_workers
 
                 # Console output
+                opt_start_date = test_df_grid.index[0].strftime('%Y-%m-%d')
+                opt_end_date = test_df_grid.index[-1].strftime('%Y-%m-%d')
+                opt_period_days = (test_df_grid.index[-1] - test_df_grid.index[0]).days
                 print(f"\n{'='*60}", flush=True)
                 print(f"🚀 VELOCITY OPTIMIZATION STARTING", flush=True)
                 print(f"   Total trials: {grid_iterations:,} ({trials_per_worker:,} per worker)", flush=True)
                 print(f"   Parallel workers: {n_workers}", flush=True)
                 print(f"   Optimizing for: {optimize_metric}", flush=True)
+                print(f"   Date range: {opt_start_date} to {opt_end_date} ({opt_period_days} days, {len(test_df_grid)} bars)", flush=True)
                 print(f"{'='*60}", flush=True)
 
                 # Run parallel studies using joblib with loky backend (uses spawn)
                 status_text.text(f"Starting {n_workers} parallel Optuna studies (see terminal for progress)...")
+
+                # Start timing
+                optimization_start_time = time.time()
 
                 # Each worker gets a different random seed for diversity
                 results_lists = Parallel(n_jobs=n_workers, backend='loky', verbose=0)(
@@ -1952,6 +2311,9 @@ def render_oscillator_predictor_page():
                     for i in range(n_workers)
                 )
 
+                # End timing
+                optimization_duration = time.time() - optimization_start_time
+
                 # Merge all results
                 all_results = []
                 for result_list in results_lists:
@@ -1960,10 +2322,20 @@ def render_oscillator_predictor_page():
                 progress_bar.progress(1.0)
                 status_text.text(f"Completed! Tested {len(all_results):,} parameter combinations.")
 
+                # Save timing data
+                trials_per_min = save_optimization_timing(len(all_results), optimization_duration, n_workers)
+
                 # Console completion summary
                 print(f"\n{'='*60}", flush=True)
                 print(f"✅ OPTIMIZATION COMPLETE", flush=True)
                 print(f"   Total results: {len(all_results):,}", flush=True)
+                # Show date period for the optimization
+                start_date = test_df_grid.index[0].strftime('%Y-%m-%d')
+                end_date = test_df_grid.index[-1].strftime('%Y-%m-%d')
+                period_days = (test_df_grid.index[-1] - test_df_grid.index[0]).days
+                print(f"   Date range: {start_date} to {end_date} ({period_days} days, {len(test_df_grid)} bars)", flush=True)
+                # Show timing info
+                print(f"   Duration: {optimization_duration:.1f}s ({trials_per_min:.0f} trials/min)", flush=True)
                 if all_results:
                     best = max(all_results, key=lambda x: x.get(optimize_metric, 0))
                     print(f"   Best {optimize_metric}: {best.get(optimize_metric, 0):.2f}", flush=True)
@@ -2071,7 +2443,7 @@ def render_oscillator_predictor_page():
                 # Allow selecting which rank to apply
                 apply_rank = st.selectbox("Or select rank to apply:",
                                          options=list(range(1, min(11, len(results_df) + 1))),
-                                         format_func=lambda x: f"#{x} - {results_df.iloc[x-1]['total_return']:.1%} return, {int(results_df.iloc[x-1]['num_trades'])} trades",
+                                         format_func=lambda x: f"#{x} - {results_df.iloc[x-1]['total_return']:.1f}% return, {int(results_df.iloc[x-1]['num_trades'])} trades",
                                          key="apply_rank_select")
 
             with apply_col3:
@@ -2114,95 +2486,9 @@ def render_oscillator_predictor_page():
                 st.write("")  # Spacer
                 st.write("")  # Spacer for alignment
 
-            deploy_col1, deploy_col2, deploy_col3 = st.columns(3)
+            deploy_col1, deploy_col2 = st.columns(2)
 
             with deploy_col1:
-                if st.button("💾 Save Strategy Config", key="save_vel_strat"):
-                    # Get currently applied params or use current UI settings
-                    if 'vel_best_params' in st.session_state and st.session_state['vel_best_params']:
-                        params = st.session_state['vel_best_params']
-                    else:
-                        # Use current slider settings
-                        params = {
-                            'signal_type': signal_type,
-                            'extreme_zone_mult': extreme_zone_mult,
-                            'vel_smoothing': vel_smoothing,
-                            'min_bars_between': min_bars_between,
-                            'require_accel': require_accel_confirm,
-                            'oversold_threshold': oversold_threshold,
-                            'overbought_threshold': overbought_threshold,
-                            'stop_loss_pct': stop_loss_pct,
-                            'take_profit_pct': take_profit_pct,
-                            'exit_on_opposite_signal': exit_on_opposite_signal,
-                            'exit_on_midline_cross': exit_on_midline_cross,
-                            'rsi_filter': rsi_filter,
-                            'rsi_period': rsi_period,
-                            'rsi_oversold': rsi_oversold,
-                            'rsi_overbought': rsi_overbought,
-                            'use_macd_confirm': use_macd_confirm,
-                            'use_bb_filter': use_bb_filter,
-                        }
-
-                    # Helper function to convert numpy types to native Python types
-                    def to_native(val):
-                        if hasattr(val, 'item'):  # numpy scalar
-                            return val.item()
-                        elif isinstance(val, (np.bool_, np.integer, np.floating)):
-                            return val.item()
-                        return val
-
-                    # Create velocity strategy config with native Python types
-                    velocity_config = {
-                        "strategy_type": "velocity",
-                        "strategy_name": str(strategy_name),
-                        "ticker": str(ticker),
-                        "interval": "1d",
-                        "created_at": pd.Timestamp.now().strftime("%Y%m%d_%H%M%S"),
-
-                        # Core velocity parameters
-                        "signal_type": str(params.get('signal_type', 'velocity_crossover_and_zone')),
-                        "vel_smoothing": int(to_native(params.get('vel_smoothing', 3))),
-                        "extreme_zone_mult": float(to_native(params.get('extreme_zone_mult', 1.5))),
-                        "min_bars_between": int(to_native(params.get('min_bars_between', 1))),
-                        "require_accel": bool(to_native(params.get('require_accel', True))),
-
-                        # Threshold parameters
-                        "oversold_threshold": float(to_native(params.get('oversold_threshold', -0.3))),
-                        "overbought_threshold": float(to_native(params.get('overbought_threshold', 0.3))),
-
-                        # Risk management
-                        "stop_loss_pct": float(to_native(params.get('stop_loss_pct', 5.0))),
-                        "take_profit_pct": float(to_native(params.get('take_profit_pct', 10.0))),
-
-                        # Exit strategies
-                        "exit_on_opposite_signal": bool(to_native(params.get('exit_on_opposite_signal', True))),
-                        "exit_on_midline_cross": bool(to_native(params.get('exit_on_midline_cross', False))),
-
-                        # Extra indicator filters
-                        "rsi_filter": str(params.get('rsi_filter', 'none')),
-                        "rsi_period": int(to_native(params.get('rsi_period', 14))),
-                        "rsi_oversold": int(to_native(params.get('rsi_oversold', 30))),
-                        "rsi_overbought": int(to_native(params.get('rsi_overbought', 70))),
-                        "use_macd_confirm": bool(to_native(params.get('use_macd_confirm', False))),
-                        "use_bb_filter": bool(to_native(params.get('use_bb_filter', False))),
-
-                        # Discord webhook (if provided)
-                        "discord_webhook": discord_webhook if discord_webhook else None,
-                    }
-
-                    # Save to strategies folder
-                    strategies_dir = "velocity_strategies"
-                    os.makedirs(strategies_dir, exist_ok=True)
-
-                    config_path = os.path.join(strategies_dir, f"{strategy_name}.json")
-
-                    with open(config_path, 'w') as f:
-                        json.dump(velocity_config, f, indent=4)
-
-                    st.success(f"✅ Strategy saved to: {config_path}")
-                    st.session_state['vel_saved_config_path'] = config_path
-
-            with deploy_col2:
                 if st.button("🚀 Deploy to Discord Bot", type="primary", key="deploy_vel_strat"):
                     if not discord_webhook:
                         st.error("Please enter a Discord Webhook URL to deploy")
@@ -2216,7 +2502,9 @@ def render_oscillator_predictor_page():
                                 'extreme_zone_mult': extreme_zone_mult,
                                 'vel_smoothing': vel_smoothing,
                                 'min_bars_between': min_bars_between,
-                                'require_accel': require_accel_confirm,
+                                'require_accel': require_accel,
+                                'vel_threshold': vel_threshold,
+                                'accel_threshold': accel_threshold,
                                 'oversold_threshold': oversold_threshold,
                                 'overbought_threshold': overbought_threshold,
                                 'stop_loss_pct': stop_loss_pct,
@@ -2244,7 +2532,9 @@ def render_oscillator_predictor_page():
                             "strategy_type": "velocity",
                             "strategy_name": str(strategy_name),
                             "ticker": str(ticker),
-                            "interval": "1d",
+                            "interval": str(interval),
+                            "optimization_period": f"{years}y",
+                            "optimization_bars": len(st.session_state.get('df', [])) if 'df' in st.session_state else None,
                             "polygon_api_key": "",
 
                             # Core velocity parameters
@@ -2291,14 +2581,17 @@ def render_oscillator_predictor_page():
                         with open(prod_config_path, 'w') as f:
                             json.dump(production_config, f, indent=4)
 
-                        # Save the calculated DataFrame for exact matching in live trader
+                        # Save the FULL DataFrame for exact matching in live trader
+                        # IMPORTANT: Save 'df' (full data), NOT 'test_df_vel' (which is only test portion ~20%)
                         try:
-                            if 'test_df_vel' in st.session_state:
+                            if 'df' in st.session_state and len(st.session_state['df']) > 0:
                                 data_path = os.path.join(prod_dir, "velocity_data.parquet")
-                                st.session_state['test_df_vel'].to_parquet(data_path)
-                                st.info(f"📊 Saved {len(st.session_state['test_df_vel'])} bars to: {data_path}")
+                                st.session_state['df'].to_parquet(data_path)
+                                df_start = st.session_state['df'].index[0].strftime('%Y-%m-%d')
+                                df_end = st.session_state['df'].index[-1].strftime('%Y-%m-%d')
+                                st.info(f"📊 Saved {len(st.session_state['df'])} bars ({df_start} to {df_end})")
                             else:
-                                st.warning("No velocity data in session - run backtest first")
+                                st.warning("No data in session - load data first")
                         except Exception as e:
                             st.warning(f"Could not save data: {e}")
 
@@ -2326,8 +2619,8 @@ def render_oscillator_predictor_page():
                         except Exception as e:
                             st.warning(f"Could not send test notification: {e}")
 
-            with deploy_col3:
-                if st.button("📦 Save Permanently", key="save_vel_permanent"):
+            with deploy_col2:
+                if st.button("💾 Save Strategy", key="save_vel_permanent"):
                     # Get currently applied params or use current UI settings
                     if 'vel_best_params' in st.session_state and st.session_state['vel_best_params']:
                         params = st.session_state['vel_best_params']
@@ -2337,7 +2630,9 @@ def render_oscillator_predictor_page():
                             'extreme_zone_mult': extreme_zone_mult,
                             'vel_smoothing': vel_smoothing,
                             'min_bars_between': min_bars_between,
-                            'require_accel': require_accel_confirm,
+                            'require_accel': require_accel,
+                            'vel_threshold': vel_threshold,
+                            'accel_threshold': accel_threshold,
                             'oversold_threshold': oversold_threshold,
                             'overbought_threshold': overbought_threshold,
                             'stop_loss_pct': stop_loss_pct,
@@ -2360,11 +2655,22 @@ def render_oscillator_predictor_page():
                             return val.item()
                         return val
 
-                    # Create bundle directory name
+                    # Create bundle directory name - USE the user's strategy_name
                     timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-                    bundle_name = f"{ticker}_{params.get('signal_type', 'velocity')}_{timestamp}"
+                    # Use user's strategy name, sanitized for filesystem
+                    safe_name = strategy_name.replace(" ", "_").replace("/", "-").replace(":", "-")
+                    bundle_name = f"{safe_name}_{timestamp}"
                     bundle_dir = os.path.join("velocity_strategies", bundle_name)
                     os.makedirs(bundle_dir, exist_ok=True)
+
+                    # Calculate actual data period in days from the dataframe
+                    data_period_days = 365 * years  # Default based on years
+                    if 'df' in st.session_state and len(st.session_state['df']) > 0:
+                        df_temp = st.session_state['df']
+                        data_period_days = (df_temp.index[-1] - df_temp.index[0]).days
+                    elif 'test_df_vel' in st.session_state and len(st.session_state['test_df_vel']) > 0:
+                        df_temp = st.session_state['test_df_vel']
+                        data_period_days = (df_temp.index[-1] - df_temp.index[0]).days
 
                     # Create full config for bundle
                     bundle_config = {
@@ -2372,7 +2678,10 @@ def render_oscillator_predictor_page():
                         "strategy_name": str(strategy_name),
                         "bundle_name": bundle_name,
                         "ticker": str(ticker),
-                        "interval": "1d",
+                        "interval": str(interval),
+                        "optimization_period": f"{years}y",
+                        "data_period_days": int(data_period_days),
+                        "optimization_bars": len(st.session_state.get('df', [])) if 'df' in st.session_state else None,
                         "polygon_api_key": "",
 
                         # Core velocity parameters
@@ -2381,6 +2690,8 @@ def render_oscillator_predictor_page():
                         "extreme_zone_mult": float(to_native(params.get('extreme_zone_mult', 1.5))),
                         "min_bars_between": int(to_native(params.get('min_bars_between', 1))),
                         "require_accel": bool(to_native(params.get('require_accel', True))),
+                        "vel_threshold": float(to_native(params.get('vel_threshold', 0))),
+                        "accel_threshold": float(to_native(params.get('accel_threshold', 0))),
 
                         # Threshold parameters
                         "oversold_threshold": float(to_native(params.get('oversold_threshold', -0.3))),
@@ -2413,6 +2724,17 @@ def render_oscillator_predictor_page():
                     config_path = os.path.join(bundle_dir, "velocity_config.json")
                     with open(config_path, 'w') as f:
                         json.dump(bundle_config, f, indent=4)
+
+                    # Save the FULL dataframe so live trader uses identical data
+                    # IMPORTANT: Save 'df' (full data), NOT 'test_df_vel' (which is only test portion ~20%)
+                    if 'df' in st.session_state and len(st.session_state['df']) > 0:
+                        data_path = os.path.join(bundle_dir, "data.parquet")
+                        st.session_state['df'].to_parquet(data_path)
+                        df_start = st.session_state['df'].index[0].strftime('%Y-%m-%d')
+                        df_end = st.session_state['df'].index[-1].strftime('%Y-%m-%d')
+                        st.info(f"📊 Saved {len(st.session_state['df'])} bars of data ({df_start} to {df_end})")
+                    else:
+                        st.warning("No data in session - load data first")
 
                     st.success(f"✅ Strategy saved permanently to: {bundle_dir}")
                     st.info("📦 This strategy will appear in the live trader's strategy selection menu")
@@ -2924,10 +3246,28 @@ def render_oscillator_predictor_page():
         col11.metric("Best Trade", f"{max(vel_pnls):.2f}%" if vel_pnls else "N/A")
         col12.metric("Worst Trade", f"{min(vel_pnls):.2f}%" if vel_pnls else "N/A")
 
+        # Capital metrics row
+        st.markdown("---")
+        st.markdown("##### 💰 Capital Performance")
+        vel_ending_capital = starting_capital * (1 + vel_total_return / 100)
+        vel_profit_loss = vel_ending_capital - starting_capital
+        bh_ending_capital = starting_capital * (1 + vel_market_return / 100)
+
+        col13, col14, col15, col16 = st.columns(4)
+        col13.metric("Starting Capital", f"${starting_capital:,.0f}")
+        col14.metric("Ending Capital", f"${vel_ending_capital:,.0f}",
+                    delta=f"${vel_profit_loss:+,.0f}")
+        col15.metric("Buy & Hold Capital", f"${bh_ending_capital:,.0f}")
+        col16.metric("Strategy Advantage", f"${vel_ending_capital - bh_ending_capital:+,.0f}")
+
         # ============================================================
         # VELOCITY TRADING CHART
         # ============================================================
         st.subheader("Velocity Trading Chart")
+
+        # Create ChartHelper for gap-free intraday charts
+        chart_vel = ChartHelper(test_df_vel, interval)
+        x_vals_vel = chart_vel.get_x(test_df_vel.index)
 
         fig_vel = make_subplots(
             rows=4, cols=1,
@@ -2945,7 +3285,7 @@ def render_oscillator_predictor_page():
         # Row 1: Candlestick Chart
         fig_vel.add_trace(
             go.Candlestick(
-                x=test_df_vel.index,
+                x=x_vals_vel,
                 open=test_df_vel['open'],
                 high=test_df_vel['high'],
                 low=test_df_vel['low'],
@@ -2961,7 +3301,7 @@ def render_oscillator_predictor_page():
         if vel_entries:
             fig_vel.add_trace(
                 go.Scatter(
-                    x=[t['date'] for t in vel_entries],
+                    x=chart_vel.get_x([t['date'] for t in vel_entries]),
                     y=[t['price'] for t in vel_entries],
                     mode='markers+text',
                     marker=dict(symbol='triangle-up', size=15, color='lime', line=dict(width=2, color='darkgreen')),
@@ -2978,7 +3318,7 @@ def render_oscillator_predictor_page():
         if vel_exits:
             fig_vel.add_trace(
                 go.Scatter(
-                    x=[t['date'] for t in vel_exits],
+                    x=chart_vel.get_x([t['date'] for t in vel_exits]),
                     y=[t['price'] for t in vel_exits],
                     mode='markers+text',
                     marker=dict(symbol='triangle-down', size=15, color='red', line=dict(width=2, color='darkred')),
@@ -2998,7 +3338,7 @@ def render_oscillator_predictor_page():
                 color = 'rgba(0,255,0,0.3)' if trade.get('pnl', 0) > 0 else 'rgba(255,0,0,0.3)'
                 fig_vel.add_trace(
                     go.Scatter(
-                        x=[trade['entry_date'], trade['date']],
+                        x=chart_vel.get_x([trade['entry_date'], trade['date']]),
                         y=[trade['entry_price'], trade['price']],
                         mode='lines',
                         line=dict(color=color, width=2, dash='dot'),
@@ -3011,7 +3351,7 @@ def render_oscillator_predictor_page():
         # Row 2: Oscillator
         fig_vel.add_trace(
             go.Scatter(
-                x=test_df_vel.index,
+                x=x_vals_vel,
                 y=test_df_vel['osc_smooth'],
                 mode='lines',
                 name='Oscillator',
@@ -3030,7 +3370,7 @@ def render_oscillator_predictor_page():
         if len(buy_signals) > 0:
             fig_vel.add_trace(
                 go.Scatter(
-                    x=buy_signals.index,
+                    x=chart_vel.get_x(buy_signals.index),
                     y=buy_signals['osc_smooth'],
                     mode='markers',
                     marker=dict(symbol='circle', size=10, color='lime'),
@@ -3043,7 +3383,7 @@ def render_oscillator_predictor_page():
         if len(sell_signals) > 0:
             fig_vel.add_trace(
                 go.Scatter(
-                    x=sell_signals.index,
+                    x=chart_vel.get_x(sell_signals.index),
                     y=sell_signals['osc_smooth'],
                     mode='markers',
                     marker=dict(symbol='circle', size=10, color='red'),
@@ -3056,7 +3396,7 @@ def render_oscillator_predictor_page():
         # Row 3: Velocity and Acceleration
         fig_vel.add_trace(
             go.Scatter(
-                x=test_df_vel.index,
+                x=x_vals_vel,
                 y=test_df_vel['velocity'],
                 mode='lines',
                 name='Velocity',
@@ -3066,7 +3406,7 @@ def render_oscillator_predictor_page():
         )
         fig_vel.add_trace(
             go.Scatter(
-                x=test_df_vel.index,
+                x=x_vals_vel,
                 y=test_df_vel['acceleration'],
                 mode='lines',
                 name='Acceleration',
@@ -3079,7 +3419,7 @@ def render_oscillator_predictor_page():
         # Row 4: Cumulative Returns
         fig_vel.add_trace(
             go.Scatter(
-                x=test_df_vel.index,
+                x=x_vals_vel,
                 y=test_df_vel['cum_market'],
                 mode='lines',
                 name='Buy & Hold',
@@ -3089,7 +3429,7 @@ def render_oscillator_predictor_page():
         )
         fig_vel.add_trace(
             go.Scatter(
-                x=test_df_vel.index,
+                x=x_vals_vel,
                 y=test_df_vel['cum_strategy'],
                 mode='lines',
                 name='Velocity Strategy',
@@ -3112,6 +3452,8 @@ def render_oscillator_predictor_page():
         fig_vel.update_yaxes(title_text="Vel / Accel", row=3, col=1)
         fig_vel.update_yaxes(title_text="Cum. Return", row=4, col=1)
 
+        # Apply formatting for intraday charts
+        chart_vel.apply_formatting(fig_vel)
         st.plotly_chart(fig_vel, use_container_width=True)
 
         # Trade log with times
@@ -3490,6 +3832,10 @@ def render_oscillator_predictor_page():
         # ============================================================
         st.subheader(f"Trading Chart - {signal_mode}")
 
+        # Create ChartHelper for gap-free intraday charts
+        chart_ml = ChartHelper(test_df, interval)
+        x_vals_ml = chart_ml.get_x(test_df.index)
+
         # Dynamic subplot titles based on mode
         signal_subplot_title = 'Scipy Peak/Valley Signals' if use_scipy else 'ML Predictions'
 
@@ -3506,7 +3852,7 @@ def render_oscillator_predictor_page():
         # Row 1: Candlestick Chart
         fig.add_trace(
             go.Candlestick(
-                x=test_df.index,
+                x=x_vals_ml,
                 open=test_df['open'],
                 high=test_df['high'],
                 low=test_df['low'],
@@ -3525,7 +3871,7 @@ def render_oscillator_predictor_page():
             entry_prices = [t['price'] for t in entries]
             fig.add_trace(
                 go.Scatter(
-                    x=entry_dates,
+                    x=chart_ml.get_x(entry_dates),
                     y=entry_prices,
                     mode='markers',
                     marker=dict(
@@ -3548,7 +3894,7 @@ def render_oscillator_predictor_page():
             exit_pnls = [t.get('pnl', 0) for t in exits]
             fig.add_trace(
                 go.Scatter(
-                    x=exit_dates,
+                    x=chart_ml.get_x(exit_dates),
                     y=exit_prices,
                     mode='markers',
                     marker=dict(
@@ -3570,7 +3916,7 @@ def render_oscillator_predictor_page():
                 color = 'rgba(0,255,0,0.3)' if trade.get('pnl', 0) > 0 else 'rgba(255,0,0,0.3)'
                 fig.add_trace(
                     go.Scatter(
-                        x=[trade['entry_date'], trade['date']],
+                        x=chart_ml.get_x([trade['entry_date'], trade['date']]),
                         y=[trade['entry_price'], trade['price']],
                         mode='lines',
                         line=dict(color=color, width=2, dash='dot'),
@@ -3585,7 +3931,7 @@ def render_oscillator_predictor_page():
         if osc_col in test_df.columns:
             fig.add_trace(
                 go.Scatter(
-                    x=test_df.index,
+                    x=x_vals_ml,
                     y=test_df[osc_col],
                     mode='lines',
                     name='Oscillator',
@@ -3606,7 +3952,7 @@ def render_oscillator_predictor_page():
                 if len(peaks) > 0:
                     fig.add_trace(
                         go.Scatter(
-                            x=peaks.index,
+                            x=chart_ml.get_x(peaks.index),
                             y=peaks[osc_col],
                             mode='markers',
                             marker=dict(symbol='circle', size=8, color='red'),
@@ -3620,7 +3966,7 @@ def render_oscillator_predictor_page():
                 if len(valleys) > 0:
                     fig.add_trace(
                         go.Scatter(
-                            x=valleys.index,
+                            x=chart_ml.get_x(valleys.index),
                             y=valleys[osc_col],
                             mode='markers',
                             marker=dict(symbol='circle', size=8, color='green'),
@@ -3639,7 +3985,7 @@ def render_oscillator_predictor_page():
             signal_colors = scipy_signals.map({-1: 'red', 0: 'gray', 1: 'lime'})
             fig.add_trace(
                 go.Bar(
-                    x=test_df.index,
+                    x=x_vals_ml,
                     y=scipy_signals,
                     marker_color=signal_colors,
                     name='Scipy Signal',
@@ -3652,7 +3998,7 @@ def render_oscillator_predictor_page():
             colors = test_df['prediction'].map({-1: 'red', 0: 'gray', 1: 'lime'})
             fig.add_trace(
                 go.Bar(
-                    x=test_df.index,
+                    x=x_vals_ml,
                     y=test_df['prediction'],
                     marker_color=colors,
                     name='ML Signal',
@@ -3664,7 +4010,7 @@ def render_oscillator_predictor_page():
         # Row 4: Cumulative Returns
         fig.add_trace(
             go.Scatter(
-                x=test_df.index,
+                x=x_vals_ml,
                 y=test_df['cum_market'],
                 mode='lines',
                 name='Buy & Hold',
@@ -3674,7 +4020,7 @@ def render_oscillator_predictor_page():
         )
         fig.add_trace(
             go.Scatter(
-                x=test_df.index,
+                x=x_vals_ml,
                 y=test_df['cum_strategy'],
                 mode='lines',
                 name='Strategy',
@@ -3699,6 +4045,8 @@ def render_oscillator_predictor_page():
                         ticktext=['BUY', 'HOLD', 'SELL'])
         fig.update_yaxes(title_text="Cum. Return", row=4, col=1)
 
+        # Apply formatting for intraday charts
+        chart_ml.apply_formatting(fig)
         st.plotly_chart(fig, use_container_width=True)
 
         # ============================================================
@@ -3814,6 +4162,7 @@ def render_oscillator_predictor_page():
                          help=f"Caught {total_peaks - missed_peaks} of {total_peaks} peaks")
 
             # Create alignment visualization
+            # Use existing chart_ml helper for gap-free intraday charts
             fig_align = make_subplots(
                 rows=2, cols=1,
                 shared_xaxes=True,
@@ -3825,7 +4174,7 @@ def render_oscillator_predictor_page():
             # Row 1: Oscillator with colored markers for prediction quality
             fig_align.add_trace(
                 go.Scatter(
-                    x=test_df.index,
+                    x=x_vals_ml,
                     y=test_df['composite_smooth'],
                     mode='lines',
                     name='Oscillator',
@@ -3838,7 +4187,7 @@ def render_oscillator_predictor_page():
             peak_mask = test_df['is_peak'] == 1
             fig_align.add_trace(
                 go.Scatter(
-                    x=test_df.index[peak_mask],
+                    x=chart_ml.get_x(test_df.index[peak_mask]),
                     y=test_df.loc[peak_mask, 'composite_smooth'],
                     mode='markers',
                     name='Actual Peak',
@@ -3851,7 +4200,7 @@ def render_oscillator_predictor_page():
             valley_mask = test_df['is_valley'] == 1
             fig_align.add_trace(
                 go.Scatter(
-                    x=test_df.index[valley_mask],
+                    x=chart_ml.get_x(test_df.index[valley_mask]),
                     y=test_df.loc[valley_mask, 'composite_smooth'],
                     mode='markers',
                     name='Actual Valley',
@@ -3865,7 +4214,7 @@ def render_oscillator_predictor_page():
             if correct_buy_mask.sum() > 0:
                 fig_align.add_trace(
                     go.Scatter(
-                        x=test_df.index[correct_buy_mask],
+                        x=chart_ml.get_x(test_df.index[correct_buy_mask]),
                         y=test_df.loc[correct_buy_mask, 'composite_smooth'],
                         mode='markers',
                         name=f'Correct BUY ({correct_buy})',
@@ -3879,7 +4228,7 @@ def render_oscillator_predictor_page():
             if false_buy_mask.sum() > 0:
                 fig_align.add_trace(
                     go.Scatter(
-                        x=test_df.index[false_buy_mask],
+                        x=chart_ml.get_x(test_df.index[false_buy_mask]),
                         y=test_df.loc[false_buy_mask, 'composite_smooth'],
                         mode='markers',
                         name=f'False BUY ({false_buy})',
@@ -3893,7 +4242,7 @@ def render_oscillator_predictor_page():
             if correct_sell_mask.sum() > 0:
                 fig_align.add_trace(
                     go.Scatter(
-                        x=test_df.index[correct_sell_mask],
+                        x=chart_ml.get_x(test_df.index[correct_sell_mask]),
                         y=test_df.loc[correct_sell_mask, 'composite_smooth'],
                         mode='markers',
                         name=f'Correct SELL ({correct_sell})',
@@ -3907,7 +4256,7 @@ def render_oscillator_predictor_page():
             if false_sell_mask.sum() > 0:
                 fig_align.add_trace(
                     go.Scatter(
-                        x=test_df.index[false_sell_mask],
+                        x=chart_ml.get_x(test_df.index[false_sell_mask]),
                         y=test_df.loc[false_sell_mask, 'composite_smooth'],
                         mode='markers',
                         name=f'False SELL ({false_sell})',
@@ -3930,7 +4279,7 @@ def render_oscillator_predictor_page():
 
             fig_align.add_trace(
                 go.Bar(
-                    x=test_df.index,
+                    x=x_vals_ml,
                     y=bar_values,
                     marker_color=bar_colors,
                     name='Alignment',
@@ -3953,6 +4302,8 @@ def render_oscillator_predictor_page():
             fig_align.update_yaxes(title_text="Quality", row=2, col=1,
                                    tickvals=[-1, 0, 1], ticktext=['False', 'Hold', 'Correct'])
 
+            # Apply formatting for intraday charts
+            chart_ml.apply_formatting(fig_align)
             st.plotly_chart(fig_align, use_container_width=True)
 
             # Detailed breakdown
@@ -4583,6 +4934,10 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                 from plotly.subplots import make_subplots
                 import plotly.graph_objects as go
 
+                # Create ChartHelper for gap-free intraday charts
+                chart_disc = ChartHelper(engine.data, interval)
+                x_vals_disc = chart_disc.get_x(engine.data.index)
+
                 n_subplots = 2 + len(key_indicators)  # Price, Equity, + indicators
                 row_heights = [0.4] + [0.15] * (len(key_indicators)) + [0.2]
 
@@ -4600,7 +4955,7 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                 # Row 1: Candlestick
                 fig.add_trace(
                     go.Candlestick(
-                        x=engine.data.index,
+                        x=x_vals_disc,
                         open=engine.data['open'],
                         high=engine.data['high'],
                         low=engine.data['low'],
@@ -4619,7 +4974,7 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     if long_entries:
                         fig.add_trace(
                             go.Scatter(
-                                x=[t['entry_date'] for t in long_entries],
+                                x=chart_disc.get_x([t['entry_date'] for t in long_entries]),
                                 y=[t['entry_price'] for t in long_entries],
                                 mode='markers',
                                 marker=dict(symbol='triangle-up', size=14, color='lime', line=dict(width=2, color='darkgreen')),
@@ -4630,7 +4985,7 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                         )
                         fig.add_trace(
                             go.Scatter(
-                                x=[t['exit_date'] for t in long_entries],
+                                x=chart_disc.get_x([t['exit_date'] for t in long_entries]),
                                 y=[t['exit_price'] for t in long_entries],
                                 mode='markers',
                                 marker=dict(symbol='triangle-down', size=14, color='red', line=dict(width=2, color='darkred')),
@@ -4646,7 +5001,7 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     if short_entries:
                         fig.add_trace(
                             go.Scatter(
-                                x=[t['entry_date'] for t in short_entries],
+                                x=chart_disc.get_x([t['entry_date'] for t in short_entries]),
                                 y=[t['entry_price'] for t in short_entries],
                                 mode='markers',
                                 marker=dict(symbol='triangle-down', size=14, color='orange', line=dict(width=2, color='darkorange')),
@@ -4657,7 +5012,7 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                         )
                         fig.add_trace(
                             go.Scatter(
-                                x=[t['exit_date'] for t in short_entries],
+                                x=chart_disc.get_x([t['exit_date'] for t in short_entries]),
                                 y=[t['exit_price'] for t in short_entries],
                                 mode='markers',
                                 marker=dict(symbol='triangle-up', size=14, color='cyan', line=dict(width=2, color='darkcyan')),
@@ -4673,7 +5028,7 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                         color = 'rgba(0,255,0,0.3)' if t['pnl'] > 0 else 'rgba(255,0,0,0.3)'
                         fig.add_trace(
                             go.Scatter(
-                                x=[t['entry_date'], t['exit_date']],
+                                x=chart_disc.get_x([t['entry_date'], t['exit_date']]),
                                 y=[t['entry_price'], t['exit_price']],
                                 mode='lines',
                                 line=dict(color=color, width=2, dash='dot'),
@@ -4706,7 +5061,7 @@ def render_strategy_discovery_section(df: pd.DataFrame):
 
                     fig.add_trace(
                         go.Scatter(
-                            x=engine.indicators.index,
+                            x=chart_disc.get_x(engine.indicators.index),
                             y=ind_data,
                             mode='lines',
                             name=ind_name,
@@ -4722,7 +5077,7 @@ def render_strategy_discovery_section(df: pd.DataFrame):
 
                 fig.add_trace(
                     go.Scatter(
-                        x=equity_df.index,
+                        x=chart_disc.get_x(equity_df.index),
                         y=equity_df['equity'],
                         mode='lines',
                         name='Equity',
@@ -4742,6 +5097,8 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     xaxis_rangeslider_visible=False
                 )
 
+                # Apply formatting for intraday charts
+                chart_disc.apply_formatting(fig)
                 st.plotly_chart(fig, use_container_width=True)
 
                 # Trade log
@@ -4839,6 +5196,1540 @@ def render_strategy_discovery_section(df: pd.DataFrame):
             momentum_features = [f for f in importance_df.head(20)['feature'] if any(x in f.lower() for x in ['rsi', 'macd', 'mom', 'cci'])]
             if momentum_features:
                 st.write(f"- Key momentum features: **{', '.join(momentum_features[:3])}**")
+
+    # ============================================================================
+    # PRICE PREDICTION SUITE
+    # ============================================================================
+
+    if PRICE_PREDICTION_AVAILABLE:
+        st.markdown("---")
+        st.header("Price Prediction Suite")
+
+        # --- Strategy Selector ---
+        def list_saved_strategies_for_predictions():
+            """List saved strategies from strategies/ and velocity_strategies/ directories."""
+            strategies = []
+
+            # Check both strategy directories
+            strategy_dirs = ["strategies", "velocity_strategies"]
+
+            for strategies_dir in strategy_dirs:
+                if not os.path.exists(strategies_dir):
+                    continue
+
+                for item in os.listdir(strategies_dir):
+                    strategy_path = os.path.join(strategies_dir, item)
+
+                    if not os.path.isdir(strategy_path):
+                        continue
+
+                    # Check for strategy_config.json or velocity_config.json
+                    config_file = None
+                    for config_name in ["strategy_config.json", "velocity_config.json"]:
+                        potential_config = os.path.join(strategy_path, config_name)
+                        if os.path.exists(potential_config):
+                            config_file = potential_config
+                            break
+
+                    if config_file:
+                        try:
+                            with open(config_file, 'r') as f:
+                                config = json.load(f)
+
+                            # Get strategy type indicator
+                            strategy_type = "ML" if strategies_dir == "strategies" else "Velocity"
+
+                            strategies.append({
+                                'name': item,
+                                'display_name': f"[{strategy_type}] {config.get('ticker', 'Unknown')} - {config.get('strategy_name', item)}",
+                                'path': strategy_path,
+                                'config_path': config_file,
+                                'config': config,
+                                'ticker': config.get('ticker', 'Unknown'),
+                                'interval': config.get('interval', '1d'),
+                                'strategy_name': config.get('strategy_name', item),
+                                'created': config.get('created_at', config.get('deployed_at', config.get('exported_at', 'Unknown'))),
+                                'polygon_api_key': config.get('polygon_api_key', ''),
+                                'strategy_type': strategy_type
+                            })
+                        except Exception as e:
+                            pass
+
+            # Sort by creation date (newest first)
+            strategies.sort(key=lambda x: x['created'], reverse=True)
+            return strategies
+
+        # Get saved strategies
+        saved_strategies = list_saved_strategies_for_predictions()
+
+        # Strategy selection UI
+        st.markdown("### Data Source")
+        strategy_options = ["Use Current Session Data"]
+        strategy_map = {}
+
+        for strat in saved_strategies:
+            display = f"{strat['display_name']} ({strat['interval']})"
+            strategy_options.append(display)
+            strategy_map[display] = strat
+
+        selected_strategy_option = st.selectbox(
+            "Select Data Source",
+            strategy_options,
+            key="pred_strategy_select",
+            help="Use current session data or load data from a saved strategy"
+        )
+
+        # Determine data source
+        strategy_polygon_key = ''  # Initialize for both cases
+
+        if selected_strategy_option == "Use Current Session Data":
+            if 'df' not in st.session_state:
+                st.warning("No data in current session. Please load data in Step 1 above, or select a saved strategy.")
+                st.stop()
+
+            pred_ticker = st.session_state.get('ticker', 'SPY')
+            pred_interval = st.session_state.get('data_interval', '1d')
+
+            # Refresh button for current session data
+            refresh_col1, refresh_col2 = st.columns([4, 1])
+            with refresh_col1:
+                st.markdown(f"**Data Source:** {pred_ticker} ({pred_interval})")
+            with refresh_col2:
+                refresh_clicked = st.button("🔄 Refresh", key="refresh_session_data", help="Re-fetch latest price data")
+
+            if refresh_clicked:
+                # Re-fetch data for the ticker
+                import yfinance as yf
+                with st.spinner(f"Fetching fresh data for {pred_ticker}..."):
+                    # Check market status to determine if today's bar is complete
+                    # yfinance end is EXCLUSIVE, so we add 1 day to include that date
+                    market_closed = False
+                    if MARKET_UTILS_AVAILABLE:
+                        market_status = is_market_open(pred_ticker)
+                        market_closed = not market_status.get('is_open', True)
+
+                    if market_closed:
+                        # Market closed - today's bar is complete, include it
+                        end_date = datetime.now() + timedelta(days=1)
+                        data_msg = "today's close (market closed)"
+                    else:
+                        # Market open - today's bar is incomplete, exclude it
+                        end_date = datetime.now()
+                        data_msg = "yesterday's close (market open)"
+
+                    start_date = datetime.now() - timedelta(days=500)
+                    fresh_df = yf.download(pred_ticker, start=start_date, end=end_date, interval=pred_interval, progress=False)
+
+                    if not fresh_df.empty:
+                        fresh_df.columns = fresh_df.columns.get_level_values(0) if isinstance(fresh_df.columns, pd.MultiIndex) else fresh_df.columns
+                        fresh_df.columns = fresh_df.columns.str.lower()
+                        st.session_state['df'] = fresh_df
+                        st.success(f"Refreshed with {data_msg}! {len(fresh_df)} bars, last close: ${fresh_df['close'].iloc[-1]:,.2f}")
+                        st.rerun()
+                    else:
+                        st.error("Failed to fetch fresh data")
+
+            pred_df = st.session_state['df'].copy()
+
+            # Show data info with timestamp and market status
+            last_bar_time = pred_df.index[-1]
+            last_close = pred_df['close'].iloc[-1]
+
+            # Check current market status
+            market_status_str = ""
+            if MARKET_UTILS_AVAILABLE:
+                market_status = is_market_open(pred_ticker)
+                if market_status.get('is_open', False):
+                    market_status_str = "OPEN"
+                else:
+                    market_status_str = "CLOSED"
+
+            info_col1, info_col2, info_col3, info_col4 = st.columns(4)
+            with info_col1:
+                st.metric("Bars", f"{len(pred_df)}")
+            with info_col2:
+                st.metric("Last Bar", f"{last_bar_time.strftime('%Y-%m-%d') if hasattr(last_bar_time, 'strftime') else last_bar_time}")
+            with info_col3:
+                st.metric("Last Close", f"${last_close:,.2f}")
+            with info_col4:
+                if market_status_str:
+                    st.metric("Market", market_status_str)
+        else:
+            # Load data for selected strategy
+            selected_strat = strategy_map[selected_strategy_option]
+            pred_ticker = selected_strat['ticker']
+            pred_interval = selected_strat['interval']
+            # Get Polygon API key from strategy config
+            strategy_polygon_key = selected_strat.get('polygon_api_key', '')
+
+            st.info(f"Loading data for **{pred_ticker}** ({pred_interval}) from saved strategy...")
+
+            # Fetch fresh data using yfinance
+            @st.cache_data(ttl=60)  # Cache for 1 minute (reduced from 5)
+            def fetch_strategy_data(ticker: str, interval: str, days: int = 500, include_today: bool = False):
+                """Fetch fresh data for a strategy.
+
+                Args:
+                    include_today: If True, extends end_date to include today's data.
+                                   Should be True when market is closed.
+                """
+                import yfinance as yf
+                # yfinance end is EXCLUSIVE, add 1 day to include today when market is closed
+                if include_today:
+                    end_date = datetime.now() + timedelta(days=1)
+                else:
+                    end_date = datetime.now()
+                fetch_time = datetime.now()  # Track when data was fetched
+
+                # Adjust days based on interval limitations
+                if interval in ["15m", "30m"]:
+                    max_days = min(days, 59)
+                elif interval in ["1h", "4h", "12h"]:
+                    max_days = min(days, 729)
+                else:
+                    max_days = days
+
+                start_date = datetime.now() - timedelta(days=max_days)
+
+                # Map interval to yfinance format
+                yf_interval = interval
+                if interval in ["4h", "12h"]:
+                    yf_interval = "1h"
+
+                df = yf.download(ticker, start=start_date, end=end_date, interval=yf_interval, progress=False)
+
+                if df.empty:
+                    return pd.DataFrame(), None
+
+                df.columns = df.columns.get_level_values(0) if isinstance(df.columns, pd.MultiIndex) else df.columns
+                df.columns = df.columns.str.lower()
+
+                # Resample if needed
+                if interval == "4h" and not df.empty:
+                    df = df.resample('4h').agg({
+                        'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+                    }).dropna()
+                elif interval == "12h" and not df.empty:
+                    df = df.resample('12h').agg({
+                        'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+                    }).dropna()
+
+                return df, fetch_time
+
+            # Check market status to determine if today's bar is complete
+            include_today = False
+            market_status_str = ""
+            if MARKET_UTILS_AVAILABLE:
+                market_status = is_market_open(pred_ticker)
+                include_today = not market_status.get('is_open', True)  # Include today if market closed
+                market_status_str = "CLOSED" if include_today else "OPEN"
+
+            with st.spinner(f"Fetching {pred_ticker} data..."):
+                result = fetch_strategy_data(pred_ticker, pred_interval, include_today=include_today)
+                if isinstance(result, tuple):
+                    pred_df, fetch_time = result
+                else:
+                    pred_df = result
+                    fetch_time = None
+
+            if pred_df.empty:
+                st.error(f"Failed to load data for {pred_ticker}")
+                st.stop()
+
+            # Calculate composite oscillator for exit timing
+            pred_df = create_composite_oscillator(pred_df)
+
+            # Show data info with timestamp and market status
+            last_bar_time = pred_df.index[-1]
+            last_close = pred_df['close'].iloc[-1]
+
+            info_col1, info_col2, info_col3, info_col4 = st.columns(4)
+            with info_col1:
+                st.success(f"**{len(pred_df)}** bars loaded")
+            with info_col2:
+                st.info(f"Last bar: {last_bar_time.strftime('%Y-%m-%d %H:%M') if hasattr(last_bar_time, 'strftime') else last_bar_time}")
+            with info_col3:
+                st.info(f"Last close: **${last_close:,.2f}**")
+            with info_col4:
+                if market_status_str:
+                    st.info(f"Market: **{market_status_str}**")
+
+        # Initialize Polygon manager if API key available
+        # Priority: 1) Strategy config, 2) Environment variable, 3) Hardcoded default
+        polygon_api_key = ''
+        if selected_strategy_option != "Use Current Session Data":
+            polygon_api_key = strategy_polygon_key
+        if not polygon_api_key:
+            polygon_api_key = os.environ.get('POLYGON_API_KEY', '')
+        if not polygon_api_key:
+            # Default key from user's strategies
+            polygon_api_key = ''
+
+        polygon = None
+        if POLYGON_AVAILABLE and polygon_api_key:
+            polygon = PolygonManager(polygon_api_key)
+            st.success(f"Polygon API connected (key: ...{polygon_api_key[-8:]})")
+
+        st.markdown("---")
+
+        pred_tab1, pred_tab2, pred_tab3, pred_tab4 = st.tabs([
+            "Daily Range",
+            "Price Targets",
+            "Exit Timing",
+            "Meta Prediction"
+        ])
+
+        # ==================== TAB 1: DAILY RANGE PREDICTION ====================
+        with pred_tab1:
+            st.subheader("Daily Range Prediction")
+            st.markdown("Predict tomorrow's expected trading range (high/low) using ML and options data.")
+
+            # Current Stats Row
+            current_close = pred_df['close'].iloc[-1]
+            today_high = pred_df['high'].iloc[-1]
+            today_low = pred_df['low'].iloc[-1]
+            today_range = today_high - today_low
+            today_range_pct = (today_range / current_close) * 100
+
+            # Calculate ATR
+            tr = pd.concat([
+                pred_df['high'] - pred_df['low'],
+                abs(pred_df['high'] - pred_df['close'].shift(1)),
+                abs(pred_df['low'] - pred_df['close'].shift(1))
+            ], axis=1).max(axis=1)
+            atr_14 = tr.rolling(14).mean().iloc[-1]
+            atr_14_pct = (atr_14 / current_close) * 100
+
+            # Calculate historical volatility as fallback for crypto
+            returns = pred_df['close'].pct_change().dropna()
+            hist_vol_20d = returns.rolling(20).std().iloc[-1] * np.sqrt(365) * 100  # Annualized
+            hist_vol_5d = returns.rolling(5).std().iloc[-1] * np.sqrt(365) * 100
+            vol_trend = "Expanding" if hist_vol_5d > hist_vol_20d else "Contracting"
+
+            # Check if this is crypto (no options data available)
+            is_crypto = "USD" in pred_ticker or "BTC" in pred_ticker or "ETH" in pred_ticker
+
+            # Display current stats
+            stat_col1, stat_col2, stat_col3, stat_col4, stat_col5 = st.columns(5)
+            with stat_col1:
+                st.metric("Current Price", f"${current_close:,.2f}")
+            with stat_col2:
+                st.metric("Today's Range", f"${today_range:,.2f}", f"{today_range_pct:.2f}%")
+            with stat_col3:
+                st.metric("ATR(14)", f"${atr_14:,.2f}", f"{atr_14_pct:.2f}%")
+            with stat_col4:
+                if is_crypto:
+                    # For crypto, show historical volatility trend
+                    st.metric("Vol Trend", vol_trend, f"5d vs 20d")
+                else:
+                    # Options PCR if available
+                    if polygon:
+                        try:
+                            sentiment = polygon.get_options_sentiment(pred_ticker)
+                            if sentiment.get('status') == 'ok':
+                                pcr = sentiment.get('pcr_volume', 1.0)
+                                st.metric("Put/Call Ratio", f"{pcr:.2f}", sentiment.get('sentiment', 'N/A'))
+                            else:
+                                st.metric("Put/Call Ratio", "N/A", "No data")
+                        except:
+                            st.metric("Put/Call Ratio", "N/A", "API Error")
+                    else:
+                        st.metric("Put/Call Ratio", "N/A", "No API Key")
+            with stat_col5:
+                if is_crypto:
+                    # For crypto, show historical volatility
+                    st.metric("Hist Vol (20d)", f"{hist_vol_20d:.1f}%", vol_trend)
+                else:
+                    # Implied Volatility if available
+                    if polygon:
+                        try:
+                            iv_data = polygon.calculate_aggregate_iv(pred_ticker, current_close)
+                            if iv_data.get('available'):
+                                iv = iv_data.get('iv_weighted', 0)
+                                iv_skew = iv_data.get('iv_skew', 0)
+                                skew_label = "Puts higher" if iv_skew > 0 else "Calls higher"
+                                st.metric("Implied Vol", f"{iv:.1f}%", skew_label if abs(iv_skew) > 1 else "Neutral skew")
+                            else:
+                                st.metric("Implied Vol", "N/A", "No data")
+                        except:
+                            st.metric("Implied Vol", "N/A", "API Error")
+                    else:
+                        st.metric("Implied Vol", "N/A", "No API Key")
+
+            st.markdown("---")
+
+            # Range Predictor Training Section
+            range_predictor_key = f'range_predictor_{pred_ticker}'
+
+            col_train, col_predict = st.columns([1, 2])
+
+            with col_train:
+                st.markdown("**Model Training**")
+
+                # Trials input with presets
+                trial_preset = st.selectbox(
+                    "Trial Presets",
+                    ["Quick (100)", "Standard (500)", "Thorough (1,000)", "Deep (5,000)", "Extreme (10,000)", "Maximum (25,000)", "Ultra (50,000)", "Custom"],
+                    index=1,
+                    key="range_trial_preset"
+                )
+
+                preset_values = {
+                    "Quick (100)": 100,
+                    "Standard (500)": 500,
+                    "Thorough (1,000)": 1000,
+                    "Deep (5,000)": 5000,
+                    "Extreme (10,000)": 10000,
+                    "Maximum (25,000)": 25000,
+                    "Ultra (50,000)": 50000
+                }
+
+                if trial_preset == "Custom":
+                    n_trials_range = st.number_input(
+                        "Custom Trials",
+                        min_value=10,
+                        max_value=50000,
+                        value=500,
+                        step=100,
+                        key="range_trials_custom"
+                    )
+                else:
+                    n_trials_range = preset_values[trial_preset]
+                    st.caption(f"Trials: {n_trials_range:,}")
+
+                # Time estimate
+                est_time = estimate_optimization_time(n_trials_range, N_JOBS_OPTUNA)
+                st.caption(f"Est. time: {est_time} ({N_JOBS_OPTUNA} workers)")
+
+                if st.button("Train Range Model", key="train_range_btn", type="primary"):
+                    # Use container pattern like working Optuna code (lines 3526-3562)
+                    progress_container = st.container()
+                    progress_container.info(f"Training model ({n_trials_range:,} trials, {N_JOBS_OPTUNA} workers)... Check terminal for progress.")
+
+                    try:
+                        start_time = time.time()
+                        print(f"[RANGE MODEL] Starting training at {datetime.now()}")
+
+                        # Initialize predictor
+                        range_predictor = PriceRangePredictor(polygon)
+
+                        # Get options features (or use historical vol for crypto)
+                        if is_crypto:
+                            options_features = {
+                                'pcr_volume': 1.0,
+                                'pcr_oi': 1.0,
+                                'sentiment': 'NEUTRAL',
+                                'iv_weighted': hist_vol_20d,
+                                'iv_call': hist_vol_20d,
+                                'iv_put': hist_vol_20d,
+                                'iv_skew': 0,
+                                'max_pain': None,
+                                'high_call_strike': None,
+                                'high_put_strike': None
+                            }
+                            print(f"[RANGE MODEL] Using crypto fallback: hist_vol_20d={hist_vol_20d:.2f}%")
+                        else:
+                            options_features = range_predictor.get_options_features(pred_ticker, current_close) if polygon else None
+                            print(f"[RANGE MODEL] Options features loaded")
+
+                        # Train model with parallel workers
+                        result = range_predictor.train_range_model(
+                            pred_df,
+                            options_features=options_features,
+                            n_trials=n_trials_range,
+                            n_workers=N_JOBS_OPTUNA
+                        )
+                        print(f"[RANGE MODEL] Training complete, result keys: {result.keys() if result else 'None'}")
+
+                        # Make prediction immediately after training
+                        prediction = range_predictor.predict_daily_range(
+                            pred_df,
+                            options_features=options_features,
+                            confidence_level=0.9
+                        )
+                        print(f"[RANGE MODEL] Prediction made: high=${prediction.get('predicted_high', 0):.2f}, low=${prediction.get('predicted_low', 0):.2f}")
+
+                        duration = time.time() - start_time
+                        save_optimization_timing(n_trials_range, duration, N_JOBS_OPTUNA)
+
+                        # Store RESULTS in session state (CRITICAL for display)
+                        st.session_state['range_prediction'] = prediction
+                        st.session_state['range_model_metrics'] = result.get('metrics', {})
+                        st.session_state['range_model_trained'] = True
+                        st.session_state['range_training_duration'] = duration
+                        st.session_state['range_predictor'] = range_predictor  # Store predictor for later use
+                        print(f"[RANGE MODEL] Stored in session_state, triggering rerun...")
+
+                        # Clear progress message and show success
+                        progress_container.empty()
+                        st.success(f"Training complete in {duration:.1f}s! Model R²: {result.get('metrics', {}).get('r2', 0):.4f}")
+
+                        # Rerun to update col_predict display
+                        st.rerun()
+
+                    except Exception as e:
+                        progress_container.empty()
+                        st.error(f"Training failed: {str(e)}")
+                        print(f"[RANGE MODEL] ERROR: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+                # Display model metrics if trained (outside button block - shows after rerun)
+                if st.session_state.get('range_model_trained'):
+                    metrics = st.session_state.get('range_model_metrics', {})
+                    duration = st.session_state.get('range_training_duration', 0)
+                    st.success(f"Model trained (R²: {metrics.get('r2', 0):.4f}, {duration:.1f}s)")
+
+            with col_predict:
+                st.markdown("**Range Prediction**")
+
+                # Check if prediction exists in session state
+                prediction = st.session_state.get('range_prediction')
+                print(f"[RANGE MODEL] col_predict checking session_state: prediction={'exists' if prediction else 'None'}")
+
+                if prediction is not None and prediction.get('predicted_high', 0) > 0:
+                    # Display prediction card with beautiful styling
+                    st.markdown("### Tomorrow's Predicted Range")
+
+                    # Main prediction display
+                    pred_high = prediction.get('predicted_high', 0)
+                    high_unc = prediction.get('high_uncertainty', 0)
+                    pred_low = prediction.get('predicted_low', 0)
+                    low_unc = prediction.get('low_uncertainty', 0)
+                    pred_range = prediction.get('predicted_range_dollars', 0)
+                    pred_range_pct = prediction.get('predicted_range', 0) * 100
+
+                    # Beautiful prediction cards
+                    st.markdown(f"""
+                    <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                                padding: 20px; border-radius: 15px; margin-bottom: 15px;
+                                border: 1px solid #0f3460;">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <div style="text-align: center; flex: 1;">
+                                <p style="color: #888; margin: 0; font-size: 12px;">PREDICTED HIGH</p>
+                                <p style="color: #00ff88; margin: 5px 0; font-size: 28px; font-weight: bold;">${pred_high:,.2f}</p>
+                                <p style="color: #666; margin: 0; font-size: 11px;">+/- ${high_unc:,.2f}</p>
+                            </div>
+                            <div style="text-align: center; flex: 1; border-left: 1px solid #333; border-right: 1px solid #333; padding: 0 20px;">
+                                <p style="color: #888; margin: 0; font-size: 12px;">EXPECTED RANGE</p>
+                                <p style="color: #00d4ff; margin: 5px 0; font-size: 28px; font-weight: bold;">${pred_range:,.2f}</p>
+                                <p style="color: #666; margin: 0; font-size: 11px;">{pred_range_pct:.2f}% of price</p>
+                            </div>
+                            <div style="text-align: center; flex: 1;">
+                                <p style="color: #888; margin: 0; font-size: 12px;">PREDICTED LOW</p>
+                                <p style="color: #ff6b6b; margin: 5px 0; font-size: 28px; font-weight: bold;">${pred_low:,.2f}</p>
+                                <p style="color: #666; margin: 0; font-size: 11px;">+/- ${low_unc:,.2f}</p>
+                            </div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    # Additional metrics row
+                    met_col1, met_col2, met_col3 = st.columns(3)
+                    with met_col1:
+                        atr_multiple = pred_range / atr_14 if atr_14 > 0 else 0
+                        st.metric("Range vs ATR", f"{atr_multiple:.2f}x ATR")
+                    with met_col2:
+                        r2 = prediction.get('model_r2', 0)
+                        st.metric("Model R²", f"{r2:.4f}")
+                    with met_col3:
+                        conf_level = prediction.get('confidence_level', 0.9)
+                        st.metric("Confidence", f"{conf_level*100:.0f}%")
+
+                    # Chart with predicted range
+                    st.markdown("---")
+
+                    import plotly.graph_objects as go  # Local import for chart
+                    chart_df = pred_df.tail(30).copy()  # Last 30 bars for cleaner view
+
+                    fig_range = go.Figure()
+
+                    # Candlestick with better colors
+                    fig_range.add_trace(go.Candlestick(
+                        x=chart_df.index,
+                        open=chart_df['open'],
+                        high=chart_df['high'],
+                        low=chart_df['low'],
+                        close=chart_df['close'],
+                        name='Price',
+                        increasing_line_color='#26a69a',
+                        decreasing_line_color='#ef5350',
+                        increasing_fillcolor='#26a69a',
+                        decreasing_fillcolor='#ef5350'
+                    ))
+
+                    # Current price line
+                    current_price = chart_df['close'].iloc[-1]
+                    fig_range.add_hline(
+                        y=current_price,
+                        line_dash="dot",
+                        line_color="#ffffff",
+                        line_width=1,
+                        annotation_text=f"Current: ${current_price:,.2f}",
+                        annotation_position="left"
+                    )
+
+                    # Predicted High band (green zone)
+                    fig_range.add_hline(
+                        y=pred_high,
+                        line_dash="dash",
+                        line_color="#00ff88",
+                        line_width=2,
+                        annotation_text=f"HIGH: ${pred_high:,.2f}",
+                        annotation_position="right",
+                        annotation_font_size=14,
+                        annotation_font_color="#00ff88"
+                    )
+
+                    # Predicted Low band (red zone)
+                    fig_range.add_hline(
+                        y=pred_low,
+                        line_dash="dash",
+                        line_color="#ff6b6b",
+                        line_width=2,
+                        annotation_text=f"LOW: ${pred_low:,.2f}",
+                        annotation_position="right",
+                        annotation_font_size=14,
+                        annotation_font_color="#ff6b6b"
+                    )
+
+                    # Shaded prediction zone (subtle)
+                    fig_range.add_hrect(
+                        y0=pred_low,
+                        y1=pred_high,
+                        fillcolor="rgba(100, 100, 100, 0.1)",
+                        layer="below",
+                        line_width=0
+                    )
+
+                    fig_range.update_layout(
+                        title=dict(
+                            text=f"<b>{pred_ticker}</b> - Tomorrow's Predicted Range",
+                            font=dict(size=18, color='white'),
+                            x=0.5
+                        ),
+                        yaxis_title="Price ($)",
+                        xaxis_title="",
+                        height=500,
+                        showlegend=False,
+                        xaxis_rangeslider_visible=False,
+                        plot_bgcolor='#1a1a2e',
+                        paper_bgcolor='#1a1a2e',
+                        font=dict(color='#888'),
+                        yaxis=dict(
+                            gridcolor='rgba(255,255,255,0.1)',
+                            tickformat='$,.0f'
+                        ),
+                        xaxis=dict(
+                            gridcolor='rgba(255,255,255,0.05)'
+                        ),
+                        margin=dict(l=60, r=120, t=60, b=40)
+                    )
+
+                    st.plotly_chart(fig_range, use_container_width=True)
+
+                else:
+                    st.info("Click 'Train Range Model' to generate predictions.")
+                    st.caption("The model will predict tomorrow's expected high/low range based on historical patterns, volatility, and options data (if available).")
+
+        # ==================== TAB 2: PRICE TARGETS ====================
+        with pred_tab2:
+            st.subheader("Price Targets Calculator")
+            st.markdown("Calculate optimal take-profit levels using ATR, Fibonacci, and Support/Resistance.")
+
+            # Initialize target calculator
+            target_calculator = PriceTargetCalculator(polygon)
+
+            # Position input
+            target_col1, target_col2, target_col3 = st.columns(3)
+
+            with target_col1:
+                position_direction = st.selectbox(
+                    "Position Direction",
+                    ["long", "short"],
+                    key="target_direction"
+                )
+
+            with target_col2:
+                entry_price = st.number_input(
+                    "Entry Price ($)",
+                    min_value=0.01,
+                    value=float(current_close),
+                    step=0.01,
+                    key="target_entry"
+                )
+
+            with target_col3:
+                stop_loss = st.number_input(
+                    "Stop Loss ($)",
+                    min_value=0.01,
+                    value=float(current_close * (0.98 if position_direction == 'long' else 1.02)),
+                    step=0.01,
+                    key="target_stop"
+                )
+
+            st.markdown("---")
+
+            if st.button("Calculate Targets", key="calc_targets_btn"):
+                with st.spinner("Calculating price targets..."):
+                    try:
+                        # Get optimal targets
+                        targets = target_calculator.get_optimal_targets(
+                            pred_df,
+                            entry_price,
+                            position_direction,
+                            pred_ticker
+                        )
+
+                        # Display target levels
+                        st.markdown("### Target Levels")
+
+                        recommendations = targets.get('recommendations', {})
+
+                        tgt_col1, tgt_col2, tgt_col3 = st.columns(3)
+
+                        # Conservative target
+                        with tgt_col1:
+                            if 'conservative' in recommendations and recommendations['conservative']:
+                                cons = recommendations['conservative']
+                                cons_price = cons.get('price', 0)
+                                cons_pct = cons.get('pct_gain', 0)
+                                risk = abs(entry_price - stop_loss)
+                                reward = abs(cons_price - entry_price)
+                                rr_ratio = reward / risk if risk > 0 else 0
+
+                                st.markdown("**Conservative (1x ATR)**")
+                                st.metric("Target 1", f"${cons_price:.2f}", f"+{cons_pct:.2f}%")
+                                st.caption(f"R:R = 1:{rr_ratio:.1f}")
+
+                        # Moderate target
+                        with tgt_col2:
+                            if 'moderate' in recommendations and recommendations['moderate']:
+                                mod = recommendations['moderate']
+                                mod_price = mod.get('price', 0)
+                                mod_pct = mod.get('pct_gain', 0)
+                                risk = abs(entry_price - stop_loss)
+                                reward = abs(mod_price - entry_price)
+                                rr_ratio = reward / risk if risk > 0 else 0
+
+                                st.markdown("**Moderate (1.5x ATR)**")
+                                st.metric("Target 2", f"${mod_price:.2f}", f"+{mod_pct:.2f}%")
+                                st.caption(f"R:R = 1:{rr_ratio:.1f}")
+
+                        # Aggressive target
+                        with tgt_col3:
+                            if 'aggressive' in recommendations and recommendations['aggressive']:
+                                agg = recommendations['aggressive']
+                                agg_price = agg.get('price', 0)
+                                agg_pct = agg.get('pct_gain', 0)
+                                risk = abs(entry_price - stop_loss)
+                                reward = abs(agg_price - entry_price)
+                                rr_ratio = reward / risk if risk > 0 else 0
+
+                                st.markdown("**Aggressive (2x ATR)**")
+                                st.metric("Target 3", f"${agg_price:.2f}", f"+{agg_pct:.2f}%")
+                                st.caption(f"R:R = 1:{rr_ratio:.1f}")
+
+                        # Support/Resistance levels
+                        st.markdown("---")
+                        st.markdown("### Support & Resistance Levels")
+
+                        sr_levels = targets.get('support_resistance', {})
+
+                        sr_col1, sr_col2 = st.columns(2)
+
+                        with sr_col1:
+                            st.markdown("**Resistance Levels**")
+                            for i in range(1, 4):
+                                r_key = f'resistance_{i}'
+                                if sr_levels.get(r_key):
+                                    r_price = sr_levels[r_key]
+                                    pct_away = ((r_price - current_close) / current_close) * 100
+                                    st.write(f"R{i}: ${r_price:.2f} ({pct_away:+.2f}%)")
+
+                        with sr_col2:
+                            st.markdown("**Support Levels**")
+                            for i in range(1, 4):
+                                s_key = f'support_{i}'
+                                if sr_levels.get(s_key):
+                                    s_price = sr_levels[s_key]
+                                    pct_away = ((s_price - current_close) / current_close) * 100
+                                    st.write(f"S{i}: ${s_price:.2f} ({pct_away:+.2f}%)")
+
+                        # Options-based levels (if available)
+                        options_data = targets.get('options_data', {})
+                        if options_data.get('available'):
+                            st.markdown("---")
+                            st.markdown("### Options-Based Levels")
+
+                            opt_col1, opt_col2, opt_col3, opt_col4 = st.columns(4)
+
+                            with opt_col1:
+                                pcr = options_data.get('pcr_volume', 1.0)
+                                sentiment = options_data.get('sentiment', 'NEUTRAL')
+                                st.metric("Put/Call Ratio", f"{pcr:.2f}", sentiment)
+
+                            with opt_col2:
+                                max_pain = options_data.get('max_pain')
+                                if max_pain:
+                                    pct_from_price = ((max_pain - current_close) / current_close) * 100
+                                    st.metric("Max Pain", f"${max_pain:.2f}", f"{pct_from_price:+.2f}%")
+                                else:
+                                    st.metric("Max Pain", "N/A")
+
+                            with opt_col3:
+                                high_call = options_data.get('high_call_oi_strike')
+                                if high_call:
+                                    pct_from_price = ((high_call - current_close) / current_close) * 100
+                                    st.metric("High Call OI", f"${high_call:.2f}", f"{pct_from_price:+.2f}%")
+                                else:
+                                    st.metric("High Call OI", "N/A")
+
+                            with opt_col4:
+                                high_put = options_data.get('high_put_oi_strike')
+                                if high_put:
+                                    pct_from_price = ((high_put - current_close) / current_close) * 100
+                                    st.metric("High Put OI", f"${high_put:.2f}", f"{pct_from_price:+.2f}%")
+                                else:
+                                    st.metric("High Put OI", "N/A")
+
+                        # Chart with targets
+                        st.markdown("---")
+                        st.markdown("### Price Chart with Targets")
+
+                        chart_df = pred_df.tail(60).copy()
+
+                        fig_targets = go.Figure()
+
+                        # Candlestick
+                        fig_targets.add_trace(go.Candlestick(
+                            x=chart_df.index,
+                            open=chart_df['open'],
+                            high=chart_df['high'],
+                            low=chart_df['low'],
+                            close=chart_df['close'],
+                            name='Price'
+                        ))
+
+                        # Entry line
+                        fig_targets.add_hline(
+                            y=entry_price,
+                            line_dash="solid",
+                            line_color="blue",
+                            annotation_text=f"Entry: ${entry_price:.2f}"
+                        )
+
+                        # Stop loss line
+                        fig_targets.add_hline(
+                            y=stop_loss,
+                            line_dash="dash",
+                            line_color="red",
+                            annotation_text=f"Stop: ${stop_loss:.2f}"
+                        )
+
+                        # Target lines
+                        colors = ["lightgreen", "green", "darkgreen"]
+                        for i, (level, data) in enumerate(recommendations.items()):
+                            if data:
+                                fig_targets.add_hline(
+                                    y=data['price'],
+                                    line_dash="dash",
+                                    line_color=colors[i] if i < len(colors) else "green",
+                                    annotation_text=f"T{i+1}: ${data['price']:.2f}"
+                                )
+
+                        fig_targets.update_layout(
+                            title=f"{pred_ticker} - Price Targets ({position_direction.upper()})",
+                            yaxis_title="Price",
+                            xaxis_title="Date",
+                            height=400,
+                            showlegend=False,
+                            xaxis_rangeslider_visible=False
+                        )
+
+                        st.plotly_chart(fig_targets, use_container_width=True)
+
+                    except Exception as e:
+                        st.error(f"Target calculation error: {e}")
+
+        # ==================== TAB 3: EXIT TIMING ====================
+        with pred_tab3:
+            st.subheader("Exit Timing Prediction")
+            st.markdown("Predict optimal exit timing based on oscillator momentum analysis.")
+
+            # Initialize exit predictor
+            exit_predictor = ExitTimingPredictor()
+
+            # Position input
+            exit_col1, exit_col2 = st.columns(2)
+
+            with exit_col1:
+                exit_position = st.selectbox(
+                    "Current Position",
+                    ["long", "short"],
+                    key="exit_position"
+                )
+
+            with exit_col2:
+                osc_column = st.selectbox(
+                    "Oscillator to Use",
+                    ['composite_smooth', 'composite_oscillator'],
+                    key="exit_osc_col"
+                )
+
+            st.markdown("---")
+
+            # Check if oscillator column exists
+            if osc_column in pred_df.columns:
+                try:
+                    # Get exit timing prediction
+                    exit_timing = exit_predictor.predict_exit_timing(
+                        pred_df,
+                        position=exit_position,
+                        osc_column=osc_column
+                    )
+
+                    # Display exit timing card
+                    st.markdown("### Exit Timing Analysis")
+
+                    urgency = exit_timing.get('urgency', {})
+                    timing = exit_timing.get('timing', {})
+                    indicators = exit_timing.get('indicators', {})
+
+                    # Urgency display
+                    urgency_col1, urgency_col2, urgency_col3 = st.columns(3)
+
+                    with urgency_col1:
+                        urgency_score = urgency.get('urgency_score', 0)
+                        urgency_level = urgency.get('urgency_level', 'LOW')
+
+                        # Color based on urgency
+                        if urgency_level == 'HIGH':
+                            st.error(f"Exit Urgency: {urgency_level}")
+                        elif urgency_level == 'MEDIUM':
+                            st.warning(f"Exit Urgency: {urgency_level}")
+                        else:
+                            st.success(f"Exit Urgency: {urgency_level}")
+
+                        st.progress(urgency_score / 100, text=f"Score: {urgency_score}/100")
+
+                    with urgency_col2:
+                        est_bars = timing.get('estimated_bars', 0)
+                        bars_range = timing.get('bars_range', (0, 0))
+                        confidence = timing.get('confidence', 0)
+
+                        st.metric(
+                            "Predicted Exit Window",
+                            f"{est_bars} bars",
+                            f"Range: {bars_range[0]}-{bars_range[1]} bars"
+                        )
+                        st.caption(f"Confidence: {confidence}%")
+
+                    with urgency_col3:
+                        recommendation = exit_timing.get('recommendation', 'HOLD')
+
+                        if recommendation == 'EXIT NOW':
+                            st.error(f"Action: {recommendation}")
+                        elif recommendation == 'PREPARE EXIT':
+                            st.warning(f"Action: {recommendation}")
+                        else:
+                            st.success(f"Action: {recommendation}")
+
+                        st.caption(timing.get('note', ''))
+
+                    # Reasons for urgency
+                    reasons = urgency.get('reasons', [])
+                    if reasons:
+                        st.markdown("---")
+                        st.markdown("**Exit Urgency Factors:**")
+                        for reason in reasons:
+                            st.write(f"- {reason}")
+
+                    # Momentum Indicators
+                    st.markdown("---")
+                    st.markdown("### Momentum Indicators")
+
+                    ind_col1, ind_col2, ind_col3, ind_col4 = st.columns(4)
+
+                    with ind_col1:
+                        osc_val = indicators.get('oscillator', 0)
+                        st.metric("Oscillator", f"{osc_val:.3f}")
+
+                    with ind_col2:
+                        velocity = indicators.get('velocity', 0)
+                        vel_direction = "bullish" if velocity > 0 else "bearish"
+                        st.metric("Velocity", f"{velocity:.4f}", vel_direction)
+
+                    with ind_col3:
+                        accel = indicators.get('acceleration', 0)
+                        accel_direction = "increasing" if accel > 0 else "decreasing"
+                        st.metric("Acceleration", f"{accel:.4f}", accel_direction)
+
+                    with ind_col4:
+                        bars_in_zone = indicators.get('bars_in_zone', 0)
+                        st.metric("Bars in Zone", f"{int(bars_in_zone)}")
+
+                    # Oscillator Chart with Momentum
+                    st.markdown("---")
+                    st.markdown("### Oscillator with Momentum Indicators")
+
+                    chart_df = pred_df.tail(100).copy()
+
+                    # Calculate momentum features for chart
+                    momentum_df = exit_predictor.calculate_momentum_features(chart_df, osc_column)
+
+                    fig_exit = make_subplots(
+                        rows=3, cols=1,
+                        shared_xaxes=True,
+                        vertical_spacing=0.05,
+                        row_heights=[0.5, 0.25, 0.25],
+                        subplot_titles=['Price', 'Oscillator', 'Velocity']
+                    )
+
+                    # Price chart
+                    fig_exit.add_trace(go.Candlestick(
+                        x=chart_df.index,
+                        open=chart_df['open'],
+                        high=chart_df['high'],
+                        low=chart_df['low'],
+                        close=chart_df['close'],
+                        name='Price'
+                    ), row=1, col=1)
+
+                    # Oscillator
+                    fig_exit.add_trace(go.Scatter(
+                        x=chart_df.index,
+                        y=chart_df[osc_column],
+                        name='Oscillator',
+                        line=dict(color='purple')
+                    ), row=2, col=1)
+
+                    # Overbought/oversold zones
+                    fig_exit.add_hline(y=0.6, line_dash="dash", line_color="red", row=2, col=1)
+                    fig_exit.add_hline(y=-0.6, line_dash="dash", line_color="green", row=2, col=1)
+                    fig_exit.add_hline(y=0, line_dash="solid", line_color="gray", row=2, col=1)
+
+                    # Velocity
+                    if 'velocity_smooth' in momentum_df.columns:
+                        vel_colors = ['green' if v > 0 else 'red' for v in momentum_df['velocity_smooth'].fillna(0)]
+                        fig_exit.add_trace(go.Bar(
+                            x=momentum_df.index,
+                            y=momentum_df['velocity_smooth'],
+                            name='Velocity',
+                            marker_color=vel_colors
+                        ), row=3, col=1)
+
+                    fig_exit.update_layout(
+                        title=f"{pred_ticker} - Exit Timing Analysis ({exit_position.upper()})",
+                        height=600,
+                        showlegend=False,
+                        xaxis_rangeslider_visible=False
+                    )
+
+                    st.plotly_chart(fig_exit, use_container_width=True)
+
+                except Exception as e:
+                    st.error(f"Exit timing error: {e}")
+            else:
+                st.warning(f"Oscillator column '{osc_column}' not found in data. Please ensure the oscillator is calculated first.")
+
+        # ==================== TAB 4: META PREDICTION ====================
+        with pred_tab4:
+            import plotly.graph_objects as go  # Local import for charts
+
+            st.subheader("Meta Prediction - Combined Analysis")
+            st.markdown("Unified forecast with baseline comparisons and deep model analysis.")
+
+            # Check what predictions are available
+            range_prediction = st.session_state.get('range_prediction')
+            range_metrics = st.session_state.get('range_model_metrics', {})
+            has_range = range_prediction is not None
+
+            # Get current price info
+            current_close = pred_df['close'].iloc[-1]
+            today_high = pred_df['high'].iloc[-1]
+            today_low = pred_df['low'].iloc[-1]
+            today_range = today_high - today_low
+
+            # Calculate ATR for baseline
+            tr = pd.concat([
+                pred_df['high'] - pred_df['low'],
+                abs(pred_df['high'] - pred_df['close'].shift(1)),
+                abs(pred_df['low'] - pred_df['close'].shift(1))
+            ], axis=1).max(axis=1)
+            atr_14 = tr.rolling(14).mean().iloc[-1]
+            atr_7 = tr.rolling(7).mean().iloc[-1]
+
+            # Historical volatility
+            returns = pred_df['close'].pct_change().dropna()
+            hist_vol_20d = returns.rolling(20).std().iloc[-1] * np.sqrt(252) * 100
+
+            if has_range:
+                # Get range predictions
+                pred_high = range_prediction.get('predicted_high', 0)
+                pred_low = range_prediction.get('predicted_low', 0)
+                pred_range = range_prediction.get('predicted_range_dollars', 0)
+                high_unc = range_prediction.get('high_uncertainty', 0)
+                low_unc = range_prediction.get('low_uncertainty', 0)
+                model_r2 = range_prediction.get('model_r2', 0)
+
+                # Get confidence bounds (new)
+                high_lower = range_prediction.get('high_lower', pred_high - high_unc)
+                high_upper = range_prediction.get('high_upper', pred_high + high_unc)
+                low_lower = range_prediction.get('low_lower', pred_low - low_unc)
+                low_upper = range_prediction.get('low_upper', pred_low + low_unc)
+                conf_method = range_prediction.get('confidence_method', 'rmse')
+                conf_level = range_prediction.get('confidence_level', 0.9)
+
+                # Calculate percentage moves
+                high_pct = ((pred_high - current_close) / current_close) * 100
+                low_pct = ((current_close - pred_low) / current_close) * 100
+
+                # ============================================================
+                # SECTION 1: FORECAST SUMMARY
+                # ============================================================
+                st.markdown("### Tomorrow's Forecast")
+
+                # Use Streamlit metrics instead of complex HTML
+                forecast_col1, forecast_col2, forecast_col3 = st.columns(3)
+
+                with forecast_col1:
+                    st.metric(
+                        "Predicted High",
+                        f"${pred_high:,.2f}",
+                        f"+{high_pct:.2f}%",
+                        delta_color="normal"
+                    )
+                    st.caption(f"CI: ${high_lower:,.2f} - ${high_upper:,.2f}")
+
+                with forecast_col2:
+                    st.metric(
+                        "Current Close",
+                        f"${current_close:,.2f}",
+                        f"Range: ${pred_range:,.2f}"
+                    )
+                    # Show confidence method
+                    if conf_method == 'conformal':
+                        st.caption(f"{conf_level*100:.0f}% Conformal CI")
+                    else:
+                        st.caption(f"{conf_level*100:.0f}% CI (RMSE)")
+
+                with forecast_col3:
+                    st.metric(
+                        "Predicted Low",
+                        f"${pred_low:,.2f}",
+                        f"-{low_pct:.2f}%",
+                        delta_color="inverse"
+                    )
+                    st.caption(f"CI: ${low_lower:,.2f} - ${low_upper:,.2f}")
+
+                # ============================================================
+                # SECTION 2: BASELINE COMPARISONS
+                # ============================================================
+                st.markdown("---")
+                st.markdown("### Model vs Baseline Comparisons")
+                st.caption("Compare ML model against simple baselines to understand if ML adds value")
+
+                # Calculate baselines
+                # Baseline 1: Simple ATR
+                atr_baseline_high = current_close + (atr_14 * 0.55)
+                atr_baseline_low = current_close - (atr_14 * 0.45)
+                atr_baseline_range = atr_14
+
+                # Baseline 2: IV-weighted ATR (if IV available)
+                iv_weighted = None
+                if not is_crypto and polygon:
+                    try:
+                        iv_data = polygon.calculate_aggregate_iv(pred_ticker, current_close)
+                        if iv_data.get('available'):
+                            iv_weighted = iv_data.get('iv_weighted', 0) / 100  # Convert from % to decimal
+                    except:
+                        pass
+
+                if iv_weighted is None:
+                    # Use historical vol as proxy
+                    iv_weighted = hist_vol_20d / 100
+
+                # IV-weighted adjustment: scale ATR by IV/HistVol ratio
+                iv_ratio = iv_weighted / (hist_vol_20d / 100) if hist_vol_20d > 0 else 1.0
+                iv_adjusted_range = atr_14 * iv_ratio
+                iv_baseline_high = current_close + (iv_adjusted_range * 0.55)
+                iv_baseline_low = current_close - (iv_adjusted_range * 0.45)
+
+                # Baseline 3: Recent range average
+                recent_ranges = (pred_df['high'] - pred_df['low']).tail(10)
+                avg_recent_range = recent_ranges.mean()
+                recent_baseline_high = current_close + (avg_recent_range * 0.55)
+                recent_baseline_low = current_close - (avg_recent_range * 0.45)
+
+                # Display comparison table
+                baseline_data = {
+                    'Model': ['ML Model', 'ATR(14) Baseline', 'IV-Weighted ATR', 'Recent Avg Range'],
+                    'Pred High': [f"${pred_high:,.2f}", f"${atr_baseline_high:,.2f}", f"${iv_baseline_high:,.2f}", f"${recent_baseline_high:,.2f}"],
+                    'Pred Low': [f"${pred_low:,.2f}", f"${atr_baseline_low:,.2f}", f"${iv_baseline_low:,.2f}", f"${recent_baseline_low:,.2f}"],
+                    'Pred Range': [f"${pred_range:,.2f}", f"${atr_baseline_range:,.2f}", f"${iv_adjusted_range:,.2f}", f"${avg_recent_range:,.2f}"],
+                    'Range/ATR': [f"{pred_range/atr_14:.2f}x", "1.00x", f"{iv_ratio:.2f}x", f"{avg_recent_range/atr_14:.2f}x"]
+                }
+                baseline_df = pd.DataFrame(baseline_data)
+                st.dataframe(baseline_df, use_container_width=True, hide_index=True)
+
+                # ============================================================
+                # SECTION 3: DEEP MODEL ANALYSIS
+                # ============================================================
+                st.markdown("---")
+                st.markdown("### Deep Model Analysis")
+
+                analysis_tab1, analysis_tab2, analysis_tab3 = st.tabs([
+                    "Model Metrics",
+                    "Feature Importance",
+                    "Backtesting"
+                ])
+
+                with analysis_tab1:
+                    st.markdown("#### Model Performance Metrics")
+
+                    met_col1, met_col2, met_col3, met_col4 = st.columns(4)
+
+                    with met_col1:
+                        r2_val = range_metrics.get('r2', 0)
+                        r2_status = "POOR" if r2_val < 0 else "WEAK" if r2_val < 0.3 else "MODERATE" if r2_val < 0.6 else "GOOD"
+                        st.metric("R² Score", f"{r2_val:.4f}")
+                        st.caption(f"Status: {r2_status}")
+
+                    with met_col2:
+                        rmse = range_metrics.get('rmse', 0)
+                        st.metric("RMSE", f"{rmse:.6f}")
+                        st.caption(f"~{rmse*current_close:.2f}$ error")
+
+                    with met_col3:
+                        mae = range_metrics.get('mae', 0)
+                        st.metric("MAE", f"{mae:.6f}")
+                        st.caption(f"~{mae*current_close:.2f}$ avg error")
+
+                    with met_col4:
+                        train_samples = range_metrics.get('train_samples', 0)
+                        test_samples = range_metrics.get('test_samples', 0)
+                        st.metric("Data Split", f"{train_samples}/{test_samples}")
+                        st.caption("Train/Test samples")
+
+                    # R² Interpretation
+                    st.markdown("#### R² Score Interpretation")
+                    if r2_val < 0:
+                        st.error(f"""
+                        **R² = {r2_val:.4f} (NEGATIVE)** - Model performs WORSE than predicting the mean.
+
+                        This means:
+                        - The model's predictions have higher error than simply using the average range
+                        - Features may not be predictive of future range
+                        - Model may be overfitting to noise
+
+                        **Recommendations:**
+                        1. Try classification instead (High/Normal/Low volatility)
+                        2. Use simpler baseline (ATR or IV-weighted ATR)
+                        3. Add more predictive features (VIX changes, earnings dates)
+                        4. Use longer training history
+                        """)
+                    elif r2_val < 0.3:
+                        st.warning(f"""
+                        **R² = {r2_val:.4f} (WEAK)** - Model explains {r2_val*100:.1f}% of variance.
+
+                        The model captures some signal but predictions have high uncertainty.
+                        Consider using baselines for comparison.
+                        """)
+                    else:
+                        st.success(f"""
+                        **R² = {r2_val:.4f} (ACCEPTABLE)** - Model explains {r2_val*100:.1f}% of variance.
+                        """)
+
+                    # Best params
+                    if 'best_params' in range_metrics:
+                        with st.expander("View Best Hyperparameters"):
+                            st.json(range_metrics['best_params'])
+
+                with analysis_tab2:
+                    st.markdown("#### Feature Importance Analysis")
+
+                    # Get feature importance from stored predictor
+                    range_predictor = st.session_state.get('range_predictor')
+                    if range_predictor and hasattr(range_predictor, 'range_model') and range_predictor.range_model is not None:
+                        # Use selected_feature_names (after filtering) to match model's feature_importances_
+                        feature_names_for_importance = (
+                            range_predictor.selected_feature_names
+                            if range_predictor.selected_feature_names is not None
+                            else range_predictor.feature_names
+                        )
+                        importance_df = pd.DataFrame({
+                            'Feature': feature_names_for_importance,
+                            'Importance': range_predictor.range_model.feature_importances_
+                        }).sort_values('Importance', ascending=False)
+
+                        # Top 15 features
+                        top_features = importance_df.head(15)
+
+                        # Bar chart
+                        fig_imp = go.Figure(go.Bar(
+                            x=top_features['Importance'],
+                            y=top_features['Feature'],
+                            orientation='h',
+                            marker_color='#00d4ff'
+                        ))
+                        fig_imp.update_layout(
+                            title="Top 15 Features by Importance",
+                            xaxis_title="Importance Score",
+                            yaxis_title="",
+                            height=450,
+                            yaxis=dict(autorange="reversed"),
+                            plot_bgcolor='#1a1a2e',
+                            paper_bgcolor='#1a1a2e',
+                            font=dict(color='white')
+                        )
+                        st.plotly_chart(fig_imp, use_container_width=True)
+
+                        # Analysis of top features
+                        st.markdown("#### Feature Analysis")
+                        top_3 = top_features.head(3)['Feature'].tolist()
+
+                        st.write(f"**Top 3 Features:** {', '.join(top_3)}")
+
+                        # Check if options features are being used
+                        options_features = ['pcr_volume', 'pcr_oi', 'iv_weighted', 'iv_skew', 'max_pain_distance']
+                        used_options = [f for f in options_features if f in top_features.head(10)['Feature'].tolist()]
+
+                        if used_options:
+                            st.success(f"Options features being used: {', '.join(used_options)}")
+                        else:
+                            st.warning("Options features are not in top 10. IV/PCR may not be adding value.")
+
+                        # Full table
+                        with st.expander("View All Feature Importances"):
+                            st.dataframe(importance_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.warning("Feature importance not available. Retrain the model.")
+
+                with analysis_tab3:
+                    st.markdown("#### Historical Backtest Analysis")
+                    st.caption("How well would the model have predicted past ranges?")
+
+                    # Calculate historical accuracy
+                    historical_ranges = (pred_df['high'] - pred_df['low']).tail(30)
+                    historical_range_pct = historical_ranges / pred_df['close'].tail(30) * 100
+
+                    # Compare predicted range to historical distribution
+                    pred_range_pct = pred_range / current_close * 100
+                    percentile = (historical_range_pct < pred_range_pct).mean() * 100
+
+                    st.write(f"**Predicted Range:** {pred_range_pct:.2f}% of price")
+                    st.write(f"**Historical Percentile:** {percentile:.0f}th percentile (last 30 days)")
+
+                    if percentile > 80:
+                        st.warning("Model predicts unusually HIGH volatility compared to recent history")
+                    elif percentile < 20:
+                        st.warning("Model predicts unusually LOW volatility compared to recent history")
+                    else:
+                        st.success("Prediction is within normal historical range")
+
+                    # Historical range distribution
+                    fig_hist = go.Figure()
+                    fig_hist.add_trace(go.Histogram(
+                        x=historical_range_pct,
+                        nbinsx=20,
+                        name='Historical Ranges',
+                        marker_color='#00d4ff',
+                        opacity=0.7
+                    ))
+                    fig_hist.add_vline(
+                        x=pred_range_pct,
+                        line_dash="dash",
+                        line_color="red",
+                        line_width=2,
+                        annotation_text=f"Predicted: {pred_range_pct:.2f}%"
+                    )
+                    fig_hist.update_layout(
+                        title="Historical Range Distribution vs Prediction",
+                        xaxis_title="Daily Range (% of close)",
+                        yaxis_title="Frequency",
+                        height=350,
+                        plot_bgcolor='#1a1a2e',
+                        paper_bgcolor='#1a1a2e',
+                        font=dict(color='white')
+                    )
+                    st.plotly_chart(fig_hist, use_container_width=True)
+
+                    # ATR baseline accuracy (would ATR have been better?)
+                    st.markdown("#### ATR Baseline Comparison")
+
+                    # Calculate how well ATR predicted historical ranges
+                    atr_predictions = tr.rolling(14).mean().shift(1).tail(30)  # Previous day's ATR
+                    actual_ranges = (pred_df['high'] - pred_df['low']).tail(30)
+
+                    # Remove NaN
+                    valid_mask = ~(atr_predictions.isna() | actual_ranges.isna())
+                    atr_pred_valid = atr_predictions[valid_mask]
+                    actual_valid = actual_ranges[valid_mask]
+
+                    if len(atr_pred_valid) > 5:
+                        from sklearn.metrics import mean_squared_error, r2_score
+                        atr_rmse = np.sqrt(mean_squared_error(actual_valid, atr_pred_valid))
+                        atr_r2 = r2_score(actual_valid, atr_pred_valid)
+
+                        compare_col1, compare_col2 = st.columns(2)
+                        with compare_col1:
+                            st.metric("ATR Baseline R²", f"{atr_r2:.4f}")
+                        with compare_col2:
+                            st.metric("ATR Baseline RMSE", f"${atr_rmse:.2f}")
+
+                        model_r2_val = range_metrics.get('r2', 0)
+                        if model_r2_val > atr_r2:
+                            st.success(f"ML Model ({model_r2_val:.4f}) beats ATR Baseline ({atr_r2:.4f})")
+                        else:
+                            st.error(f"ATR Baseline ({atr_r2:.4f}) beats ML Model ({model_r2_val:.4f}). Consider using ATR instead.")
+
+                # ============================================================
+                # SECTION 4: VISUAL FORECAST
+                # ============================================================
+                st.markdown("---")
+                st.markdown("### Visual Forecast")
+
+                chart_df = pred_df.tail(30).copy()
+
+                # Calculate tomorrow's date
+                last_date = chart_df.index[-1]
+                if hasattr(last_date, 'date'):
+                    tomorrow = last_date + pd.Timedelta(days=1)
+                    # Skip weekends for stocks
+                    while tomorrow.weekday() >= 5:  # 5=Sat, 6=Sun
+                        tomorrow += pd.Timedelta(days=1)
+                else:
+                    tomorrow = last_date
+
+                fig_meta = go.Figure()
+
+                # Candlestick for historical data
+                fig_meta.add_trace(go.Candlestick(
+                    x=chart_df.index,
+                    open=chart_df['open'],
+                    high=chart_df['high'],
+                    low=chart_df['low'],
+                    close=chart_df['close'],
+                    name='Price',
+                    increasing_line_color='#26a69a',
+                    decreasing_line_color='#ef5350'
+                ))
+
+                # Get confidence bounds if available
+                high_lower = prediction.get('high_lower', pred_high - 1)
+                high_upper = prediction.get('high_upper', pred_high + 1)
+                low_lower = prediction.get('low_lower', pred_low - 1)
+                low_upper = prediction.get('low_upper', pred_low + 1)
+                conf_method = prediction.get('confidence_method', 'rmse')
+                conf_level = prediction.get('confidence_level', 0.9)
+
+                # Add TOMORROW's predicted candle as a box/bar
+                # ML Prediction - show as a vertical bar at tomorrow's position
+                fig_meta.add_trace(go.Candlestick(
+                    x=[tomorrow],
+                    open=[current_close],
+                    high=[pred_high],
+                    low=[pred_low],
+                    close=[(pred_high + pred_low) / 2],  # Midpoint
+                    name='ML Prediction',
+                    increasing_line_color='#00d4ff',
+                    increasing_fillcolor='rgba(0, 212, 255, 0.5)',
+                    decreasing_line_color='#00d4ff',
+                    decreasing_fillcolor='rgba(0, 212, 255, 0.5)',
+                ))
+
+                # Confidence bounds as error bars / shaded region at tomorrow
+                fig_meta.add_trace(go.Scatter(
+                    x=[tomorrow, tomorrow, tomorrow, tomorrow, tomorrow],
+                    y=[high_upper, high_lower, None, low_upper, low_lower],
+                    mode='lines',
+                    line=dict(color='rgba(0, 212, 255, 0.3)', width=8),
+                    name=f'{conf_level*100:.0f}% CI ({conf_method})',
+                    showlegend=True
+                ))
+
+                # ATR Baseline prediction bar at tomorrow
+                fig_meta.add_trace(go.Candlestick(
+                    x=[tomorrow],
+                    open=[current_close],
+                    high=[atr_baseline_high],
+                    low=[atr_baseline_low],
+                    close=[(atr_baseline_high + atr_baseline_low) / 2],
+                    name='ATR Baseline',
+                    increasing_line_color='#ffc107',
+                    increasing_fillcolor='rgba(255, 193, 7, 0.3)',
+                    decreasing_line_color='#ffc107',
+                    decreasing_fillcolor='rgba(255, 193, 7, 0.3)',
+                ))
+
+                # Current close line
+                fig_meta.add_hline(y=current_close, line_dash="dot", line_color="white", line_width=1,
+                                   annotation_text=f"Current: ${current_close:,.2f}", annotation_position="right")
+
+                # Add annotations for predictions
+                fig_meta.add_annotation(
+                    x=tomorrow, y=pred_high,
+                    text=f"ML High: ${pred_high:,.2f}",
+                    showarrow=True, arrowhead=2, arrowsize=1, arrowcolor="#00ff88",
+                    font=dict(color="#00ff88", size=11),
+                    ax=40, ay=-20
+                )
+                fig_meta.add_annotation(
+                    x=tomorrow, y=pred_low,
+                    text=f"ML Low: ${pred_low:,.2f}",
+                    showarrow=True, arrowhead=2, arrowsize=1, arrowcolor="#ff6b6b",
+                    font=dict(color="#ff6b6b", size=11),
+                    ax=40, ay=20
+                )
+
+                fig_meta.update_layout(
+                    title=dict(text=f"<b>{pred_ticker}</b> - Tomorrow's Forecast", font=dict(size=18, color='white'), x=0.5),
+                    yaxis_title="Price ($)",
+                    height=500,
+                    showlegend=True,
+                    legend=dict(x=0.02, y=0.98, bgcolor='rgba(0,0,0,0.5)', font=dict(size=10)),
+                    xaxis_rangeslider_visible=False,
+                    plot_bgcolor='#1a1a2e',
+                    paper_bgcolor='#1a1a2e',
+                    font=dict(color='#888'),
+                    yaxis=dict(gridcolor='rgba(255,255,255,0.1)', tickformat='$,.0f'),
+                    xaxis=dict(gridcolor='rgba(255,255,255,0.05)'),
+                    margin=dict(l=60, r=100, t=60, b=40)
+                )
+
+                st.plotly_chart(fig_meta, use_container_width=True)
+
+                # Caption with confidence info
+                if conf_method == 'conformal':
+                    st.caption(f"Blue bar = ML prediction | Yellow bar = ATR baseline | Shaded = {conf_level*100:.0f}% Conformal Prediction Interval")
+                else:
+                    st.caption(f"Blue bar = ML prediction | Yellow bar = ATR baseline | Shaded = {conf_level*100:.0f}% CI (RMSE-based)")
+
+            else:
+                # No predictions available yet
+                st.markdown("""
+                <div style="text-align: center; padding: 60px 20px; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                            border-radius: 20px; margin: 20px 0; border: 1px dashed #0f3460;">
+                    <h2 style="color: #666; margin-bottom: 20px;">No Predictions Available Yet</h2>
+                    <p style="color: #888; font-size: 16px; max-width: 500px; margin: 0 auto;">
+                        Train the Range Model in the "Daily Range" tab first to see the combined meta prediction.
+                    </p>
+                    <div style="margin-top: 30px;">
+                        <p style="color: #555; font-size: 14px;">Steps:</p>
+                        <p style="color: #666; font-size: 13px;">
+                            1. Go to "Daily Range" tab<br>
+                            2. Select trial preset (Standard recommended)<br>
+                            3. Click "Train Range Model"<br>
+                            4. Return here for combined analysis
+                        </p>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+    elif not PRICE_PREDICTION_AVAILABLE:
+        st.markdown("---")
+        st.info("Price Prediction Suite not available. Ensure price_prediction.py is in the project directory.")
 
 
 # ============================================================================
