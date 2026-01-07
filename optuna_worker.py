@@ -646,7 +646,8 @@ def run_velocity_study(data_path, n_trials, seed, optimize_metric='total_return'
 
 
 # ============================================================================
-# RANGE MODEL OPTIMIZATION (for price range prediction)
+# RANGE MODEL OPTIMIZATION (for daily range prediction)
+# SIMPLE VERSION - no feature group selection, just XGBoost hyperparameters
 # ============================================================================
 
 _RANGE_DATA_PATH = None
@@ -654,30 +655,19 @@ _RANGE_CACHED_DATA = None
 
 
 def set_range_shared_data(X_train_scaled, y_train, feature_names=None):
-    """
-    Save range model training data to a temp file for parallel workers.
-    Returns the path to the temp file.
-
-    Args:
-        X_train_scaled: Scaled training features (numpy array or DataFrame)
-        y_train: Training targets
-        feature_names: List of feature names (required for feature group selection)
-    """
+    """Save range model data to temp file for parallel workers."""
     global _RANGE_DATA_PATH, _RANGE_CACHED_DATA
-
     _RANGE_CACHED_DATA = None
 
     fd, path = tempfile.mkstemp(suffix='.joblib', prefix='range_optuna_')
     os.close(fd)
 
-    # Convert to numpy arrays for efficient pickling
     data = {
-        'X_train_scaled': np.array(X_train_scaled) if hasattr(X_train_scaled, 'values') else X_train_scaled,
-        'y_train': np.array(y_train) if hasattr(y_train, 'values') else y_train,
-        'feature_names': list(feature_names) if feature_names is not None else None,
+        'X_train_scaled': X_train_scaled,
+        'y_train': y_train,
+        'feature_names': feature_names
     }
     joblib.dump(data, path)
-
     _RANGE_DATA_PATH = path
     return path
 
@@ -685,47 +675,20 @@ def set_range_shared_data(X_train_scaled, y_train, feature_names=None):
 def clear_range_shared_data():
     """Clean up range model shared data file."""
     global _RANGE_DATA_PATH, _RANGE_CACHED_DATA
-
     if _RANGE_DATA_PATH and os.path.exists(_RANGE_DATA_PATH):
         try:
             os.remove(_RANGE_DATA_PATH)
         except:
             pass
-
     _RANGE_DATA_PATH = None
     _RANGE_CACHED_DATA = None
 
 
 class RangeModelObjective:
     """
-    Picklable objective class for range model XGBoost optimization.
-    Each worker loads data from file and runs cross-validation.
-
-    Features:
-    - Optuna selects which feature GROUPS to include (Hurst, HAR, CARR, etc.)
-    - SelectKBest picks top N features from selected groups
-    - XGBoost hyperparameters are tuned
+    SIMPLE Optuna objective for range model XGBoost optimization.
+    Uses ALL features, optimizes for MSE.
     """
-
-    # Define feature groups by name patterns
-    FEATURE_GROUPS = {
-        'hurst': ['hurst_'],
-        'har': ['har_rv_', 'har_weekly_', 'har_monthly_'],
-        'range_estimators': ['garman_klass', 'rogers_satchell', 'gk_parkinson', 'rs_parkinson'],
-        'carr': ['carr_'],
-        'entropy': ['vol_entropy'],
-        'iv_rv': ['iv_rv_'],
-        'range_efficiency': ['range_efficiency', 'low_efficiency'],
-        'novel_indicators': ['arwo', 'dco', 'vcmo', 'ics', 'mji', 'prf', 'ewaf', 'kfif'],
-        'composite_osc': ['composite_osc', 'composite_velocity', 'composite_accel'],
-        'vix': ['vix'],
-        'options': ['pcr_', 'sentiment_', 'iv_weighted', 'iv_call', 'iv_put', 'iv_skew', 'max_pain', 'high_call', 'high_put'],
-    }
-
-    # Core features always included (basic price/range features)
-    CORE_FEATURES = ['atr_', 'range_', 'volatility_', 'returns', 'roc_', 'rsi_', 'day_of_week', 'month',
-                     'is_monday', 'is_friday', 'is_month_end', 'gap', 'sma_', 'price_vs_', 'bb_width',
-                     'keltner_', 'hvol_', 'parkinson_vol', 'vol_weighted']
 
     def __init__(self, data_path):
         self.data_path = data_path
@@ -736,77 +699,26 @@ class RangeModelObjective:
             self._cached_data = joblib.load(self.data_path)
         return self._cached_data
 
-    def _get_feature_mask(self, feature_names, selected_groups):
-        """Get boolean mask for features to include based on selected groups."""
-        mask = []
-        for fname in feature_names:
-            # Always include core features
-            is_core = any(core in fname for core in self.CORE_FEATURES)
-            if is_core:
-                mask.append(True)
-                continue
-
-            # Check if feature belongs to a selected group
-            included = False
-            for group_name, patterns in self.FEATURE_GROUPS.items():
-                if group_name in selected_groups:
-                    if any(pattern in fname for pattern in patterns):
-                        included = True
-                        break
-            mask.append(included)
-        return np.array(mask)
-
-    def _detect_available_groups(self, feature_names):
-        """Detect which feature groups actually have features in the data."""
-        available = {}
-        for group_name, patterns in self.FEATURE_GROUPS.items():
-            # Check if any feature matches this group's patterns
-            has_features = any(
-                any(pattern in fname for pattern in patterns)
-                for fname in feature_names
-            )
-            available[group_name] = has_features
-        return available
-
     def __call__(self, trial):
         from xgboost import XGBRegressor
         from sklearn.model_selection import TimeSeriesSplit
         from sklearn.metrics import mean_squared_error
-        from sklearn.feature_selection import SelectKBest, f_regression
 
         data = self._load_data()
-        X_train_scaled = data['X_train_scaled']
-        y_train = data['y_train']
-        feature_names = data.get('feature_names')
+        X = data['X_train_scaled']
+        y = data['y_train']
 
-        # --- SIMPLIFIED: Skip feature group selection, just use SelectKBest ---
-        # Feature group selection was causing inconsistent results between workers
-        # Instead, let SelectKBest automatically pick the best features
-        selected_groups = []  # Empty - not using group selection
-
-        # --- Step 1: SelectKBest (pick top N features from ALL available) ---
-        n_features = X_train_scaled.shape[1]
-        if n_features > 10:
-            # Let Optuna decide how many top features to keep
-            k_ratio = trial.suggest_float('selectk_ratio', 0.2, 1.0)
-            k = max(5, int(n_features * k_ratio))
-            selector = SelectKBest(f_regression, k=k)
-            X_selected = selector.fit_transform(X_train_scaled, y_train)
-        else:
-            X_selected = X_train_scaled
-
-        # --- Step 3: XGBoost Hyperparameters (expanded ranges) ---
+        # Simple XGBoost hyperparameters
         params = {
-            'n_estimators': trial.suggest_int('n_estimators', 50, 1000),
-            'max_depth': trial.suggest_int('max_depth', 2, 12),
-            'learning_rate': trial.suggest_float('learning_rate', 0.001, 0.3, log=True),
-            'subsample': trial.suggest_float('subsample', 0.4, 1.0),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.2, 1.0),
-            'colsample_bylevel': trial.suggest_float('colsample_bylevel', 0.2, 1.0),
-            'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 100, log=True),
-            'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 100, log=True),
-            'min_child_weight': trial.suggest_int('min_child_weight', 1, 50),
-            'gamma': trial.suggest_float('gamma', 0, 10),
+            'n_estimators': trial.suggest_int('n_estimators', 50, 500),
+            'max_depth': trial.suggest_int('max_depth', 3, 8),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+            'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
+            'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
+            'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+            'gamma': trial.suggest_float('gamma', 0, 1),
             'n_jobs': 1,
             'objective': 'reg:squarederror',
             'verbosity': 0
@@ -814,101 +726,46 @@ class RangeModelObjective:
 
         model = XGBRegressor(**params)
 
-        # --- Step 4: Time Series Cross-Validation ---
+        # Time Series Cross-Validation
         tscv = TimeSeriesSplit(n_splits=3)
         mse_scores = []
-        r2_scores = []
-        for train_idx, val_idx in tscv.split(X_selected):
-            model.fit(X_selected[train_idx], y_train[train_idx])
-            pred = model.predict(X_selected[val_idx])
-            mse = mean_squared_error(y_train[val_idx], pred)
+        for train_idx, val_idx in tscv.split(X):
+            model.fit(X[train_idx], y[train_idx])
+            pred = model.predict(X[val_idx])
+            mse = mean_squared_error(y[val_idx], pred)
             mse_scores.append(mse)
 
-            # Calculate R² for this fold
-            y_val = y_train[val_idx]
-            ss_res = np.sum((y_val - pred) ** 2)
-            ss_tot = np.sum((y_val - np.mean(y_val)) ** 2)
-            r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-            r2_scores.append(r2)
-
-        mse_mean = np.mean(mse_scores)
-        r2_mean = np.mean(r2_scores)
-        n_features_used = X_selected.shape[1]
-
-        # Store metrics for analysis
-        trial.set_user_attr('mse', mse_mean)
-        trial.set_user_attr('r2', r2_mean)
-        trial.set_user_attr('n_features', n_features_used)
-        trial.set_user_attr('selected_groups', selected_groups)
-
-        # --- Primary: R² (higher is better) ---
-        # --- Secondary Tie-Breaker: MSE (lower is better) ---
-        # Since we MAXIMIZE, higher R² wins
-        # When R² is equal, lower MSE wins (subtract small MSE penalty)
-        # MSE is typically ~0.0001-0.001, so 1e-3 factor keeps it as tie-breaker
-        mse_penalty = mse_mean * 1e-3
-
-        composite_score = r2_mean - mse_penalty
-
-        return composite_score
-
-
-def create_range_objective(data_path):
-    """Create a picklable range model objective function."""
-    return RangeModelObjective(data_path)
+        return np.mean(mse_scores)  # Minimize MSE
 
 
 def run_range_study(data_path, n_trials, seed, worker_id=0):
-    """
-    Run a single Optuna study for range model optimization.
-    Designed to be called from joblib for parallel execution.
-    Returns the best trial info.
-    """
+    """Run Optuna study for range model optimization."""
     import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     objective = RangeModelObjective(data_path)
 
     study = optuna.create_study(
-        direction='maximize',  # Optimizing for R² (higher is better)
-        sampler=optuna.samplers.TPESampler(seed=seed, n_startup_trials=min(10, n_trials // 5)),
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1)  # Prune bad trials early
+        direction='minimize',  # Minimize MSE
+        sampler=optuna.samplers.TPESampler(seed=seed, n_startup_trials=min(10, n_trials // 5))
     )
 
-    # Progress callback
-    log_interval = max(10, n_trials // 10)  # Log every 10%
+    log_interval = max(10, n_trials // 10)
 
     def progress_callback(study, trial):
         n_complete = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
         if n_complete % log_interval == 0 or n_complete == n_trials:
-            best_val = study.best_value if study.best_trial else 0.0
-            best_r2 = study.best_trial.user_attrs.get('r2', best_val) if study.best_trial else 0.0
-            print(f"[Worker {worker_id}] Trial {n_complete}/{n_trials} | Best R²: {best_r2:.4f}", flush=True)
+            best_val = study.best_value if study.best_trial else float('inf')
+            print(f"[Worker {worker_id}] Trial {n_complete}/{n_trials} | Best MSE: {best_val:.6f}", flush=True)
 
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False, n_jobs=1, callbacks=[progress_callback])
 
-    best_val = study.best_value if study.best_trial else float('-inf')  # Maximizing, so -inf is worst
+    best_val = study.best_value if study.best_trial else float('inf')
     best_params = study.best_params if study.best_trial else {}
-
-    # Extract additional metrics from best trial
-    best_mse = float('inf')
-    best_r2 = 0.0
-    best_n_features = 0
-    best_groups = []
-    if study.best_trial:
-        best_mse = study.best_trial.user_attrs.get('mse', best_val)
-        best_r2 = study.best_trial.user_attrs.get('r2', 0)
-        best_n_features = study.best_trial.user_attrs.get('n_features', 0)
-        best_groups = study.best_trial.user_attrs.get('selected_groups', [])
-
-    print(f"[Worker {worker_id}] Done! Best MSE: {best_mse:.6f}, R²: {best_r2:.4f}, Features: {best_n_features}", flush=True)
+    print(f"[Worker {worker_id}] Done! Best MSE: {best_val:.6f}", flush=True)
 
     return {
-        'best_value': best_val,  # Composite score (for comparison)
-        'best_mse': best_mse,    # Pure MSE (for display)
-        'best_r2': best_r2,      # R² as tie-breaker
-        'best_n_features': best_n_features,
-        'best_groups': best_groups,
+        'best_value': best_val,
         'best_params': best_params,
         'n_trials': len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
     }

@@ -5472,11 +5472,12 @@ def render_strategy_discovery_section(df: pd.DataFrame):
 
         st.markdown("---")
 
-        pred_tab1, pred_tab2, pred_tab3, pred_tab4 = st.tabs([
+        pred_tab1, pred_tab2, pred_tab3, pred_tab4, pred_tab5 = st.tabs([
             "Daily Range",
             "Price Targets",
             "Exit Timing",
-            "Meta Prediction"
+            "Meta Prediction",
+            "Walk Forward Analysis"
         ])
 
         # ==================== TAB 1: DAILY RANGE PREDICTION ====================
@@ -6726,6 +6727,436 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
+
+        # ==================== TAB 5: WALK FORWARD ANALYSIS ====================
+        with pred_tab5:
+            st.subheader("Walk Forward Analysis")
+            st.markdown("Robust out-of-sample testing: train on historical data, predict each day, compare to actual.")
+
+            # User inputs for test range
+            wf_col1, wf_col2, wf_col3 = st.columns([1, 1, 1])
+
+            with wf_col1:
+                wf_test_days = st.number_input(
+                    "Test Period (days)",
+                    min_value=10,
+                    max_value=252,
+                    value=60,
+                    help="Number of recent days to test. Model trains on all data before each test day."
+                )
+
+            with wf_col2:
+                wf_min_train_days = st.number_input(
+                    "Minimum Training Days",
+                    min_value=60,
+                    max_value=500,
+                    value=180,
+                    help="Minimum historical days required to train the model."
+                )
+
+            with wf_col3:
+                wf_retrain_freq = st.selectbox(
+                    "Retrain Frequency",
+                    options=["Every Day", "Weekly", "Monthly"],
+                    index=1,
+                    help="How often to retrain the model. Less frequent = faster but less adaptive."
+                )
+
+            # Optuna settings
+            wf_col4, wf_col5 = st.columns(2)
+            with wf_col4:
+                wf_n_trials = st.number_input(
+                    "Optuna Trials per Training",
+                    min_value=10,
+                    max_value=1000,
+                    value=30,
+                    help="More trials = better hyperparameters but slower."
+                )
+            with wf_col5:
+                wf_n_workers = st.number_input(
+                    "Parallel Workers",
+                    min_value=1,
+                    max_value=32,
+                    value=min(16, max(1, (os.cpu_count() or 4) - 1)),
+                    help="CPU cores for parallel Optuna optimization."
+                )
+
+            st.markdown("---")
+
+            # Run button
+            if st.button("Run Walk Forward Analysis", type="primary", use_container_width=True):
+                if len(pred_df) < wf_min_train_days + wf_test_days:
+                    st.error(f"Insufficient data. Need at least {wf_min_train_days + wf_test_days} days, have {len(pred_df)}.")
+                else:
+                    # Calculate test range
+                    test_start_idx = len(pred_df) - wf_test_days
+                    test_dates = pred_df.index[test_start_idx:]
+
+                    # Determine retrain schedule
+                    if wf_retrain_freq == "Every Day":
+                        retrain_interval = 1
+                    elif wf_retrain_freq == "Weekly":
+                        retrain_interval = 5
+                    else:  # Monthly
+                        retrain_interval = 21
+
+                    st.info(f"Testing {wf_test_days} days from {test_dates[0].strftime('%Y-%m-%d')} to {test_dates[-1].strftime('%Y-%m-%d')}")
+
+                    # Storage for results
+                    wf_results = []
+                    wf_feature_importances = []  # Track feature importance from each training
+                    wf_feature_names = None  # Store feature names
+                    current_model = None
+                    current_scaler = None
+                    last_train_idx = -999  # Force initial training
+
+                    # Progress tracking
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    metrics_placeholder = st.empty()
+
+                    # Walk forward loop
+                    for i, test_idx in enumerate(range(test_start_idx, len(pred_df))):
+                        test_date = pred_df.index[test_idx]
+                        progress = (i + 1) / wf_test_days
+
+                        # Check if we need to retrain
+                        days_since_train = test_idx - last_train_idx
+                        need_retrain = (current_model is None) or (days_since_train >= retrain_interval)
+
+                        if need_retrain:
+                            status_text.text(f"Training model for {test_date.strftime('%Y-%m-%d')}... ({i+1}/{wf_test_days})")
+
+                            # Get training data (all data before test_idx)
+                            train_df = pred_df.iloc[:test_idx].copy()
+
+                            if len(train_df) >= wf_min_train_days:
+                                try:
+                                    # Create fresh predictor and train
+                                    wf_predictor = PriceRangePredictor(polygon if polygon_api_key else None)
+
+                                    # Get options features if available
+                                    wf_options = None
+                                    if polygon_api_key:
+                                        try:
+                                            wf_options = wf_predictor.get_options_features(
+                                                st.session_state.get('ticker', 'SPY'), train_df['close'].iloc[-1]
+                                            )
+                                        except:
+                                            pass
+
+                                    # Train with reduced output
+                                    with st.spinner(f"Training on {len(train_df)} days..."):
+                                        train_result = wf_predictor.train_range_model(
+                                            train_df,
+                                            options_features=wf_options,
+                                            n_trials=wf_n_trials,
+                                            n_workers=wf_n_workers
+                                        )
+
+                                    current_model = wf_predictor
+                                    last_train_idx = test_idx
+
+                                except Exception as train_err:
+                                    st.warning(f"Training failed at {test_date}: {train_err}")
+                                    continue
+                        else:
+                            status_text.text(f"Predicting {test_date.strftime('%Y-%m-%d')}... ({i+1}/{wf_test_days})")
+
+                        # Make prediction for this day (using data up to previous day)
+                        if current_model is not None:
+                            try:
+                                # Use data up to the day BEFORE test_date for prediction
+                                pred_input_df = pred_df.iloc[:test_idx].copy()
+
+                                # Get prediction
+                                prediction = current_model.predict_daily_range(pred_input_df)
+
+                                # Get actual values for test_date
+                                actual_high = pred_df['high'].iloc[test_idx]
+                                actual_low = pred_df['low'].iloc[test_idx]
+                                actual_close = pred_df['close'].iloc[test_idx]
+                                actual_open = pred_df['open'].iloc[test_idx]
+                                actual_range = actual_high - actual_low
+
+                                # Store result
+                                wf_results.append({
+                                    'date': test_date,
+                                    'predicted_high': prediction['predicted_high'],
+                                    'predicted_low': prediction['predicted_low'],
+                                    'predicted_range': prediction['predicted_range_dollars'],
+                                    'high_lower': prediction['high_lower'],
+                                    'high_upper': prediction['high_upper'],
+                                    'low_lower': prediction['low_lower'],
+                                    'low_upper': prediction['low_upper'],
+                                    'actual_high': actual_high,
+                                    'actual_low': actual_low,
+                                    'actual_open': actual_open,
+                                    'actual_close': actual_close,
+                                    'actual_range': actual_range,
+                                    'model_r2': prediction.get('model_r2', 0),
+                                    'retrained': need_retrain
+                                })
+
+                            except Exception as pred_err:
+                                st.warning(f"Prediction failed at {test_date}: {pred_err}")
+
+                        progress_bar.progress(progress)
+
+                        # Update live metrics every 10 days
+                        if len(wf_results) > 0 and len(wf_results) % 10 == 0:
+                            temp_df = pd.DataFrame(wf_results)
+                            temp_high_in_range = ((temp_df['actual_high'] >= temp_df['high_lower']) &
+                                                  (temp_df['actual_high'] <= temp_df['high_upper'])).mean() * 100
+                            temp_low_in_range = ((temp_df['actual_low'] >= temp_df['low_lower']) &
+                                                 (temp_df['actual_low'] <= temp_df['low_upper'])).mean() * 100
+                            metrics_placeholder.markdown(f"**Running Metrics:** High in range: {temp_high_in_range:.1f}% | Low in range: {temp_low_in_range:.1f}%")
+
+                    progress_bar.progress(1.0)
+                    status_text.text("Walk forward analysis complete!")
+
+                    # Store results in session state
+                    if wf_results:
+                        st.session_state['wf_results'] = pd.DataFrame(wf_results)
+                        st.success(f"Completed {len(wf_results)} predictions!")
+                    else:
+                        st.error("No predictions were generated.")
+
+            st.markdown("---")
+
+            # Display results if available
+            if 'wf_results' in st.session_state and len(st.session_state['wf_results']) > 0:
+                wf_df = st.session_state['wf_results']
+
+                # Calculate metrics
+                st.subheader("Performance Metrics")
+
+                # High/Low containment
+                high_in_range = ((wf_df['actual_high'] >= wf_df['high_lower']) &
+                                 (wf_df['actual_high'] <= wf_df['high_upper'])).mean() * 100
+                low_in_range = ((wf_df['actual_low'] >= wf_df['low_lower']) &
+                                (wf_df['actual_low'] <= wf_df['low_upper'])).mean() * 100
+
+                # Directional accuracy (did price stay within predicted range?)
+                price_contained = ((wf_df['actual_high'] <= wf_df['high_upper']) &
+                                   (wf_df['actual_low'] >= wf_df['low_lower'])).mean() * 100
+
+                # Range prediction accuracy
+                range_mae = np.abs(wf_df['predicted_range'] - wf_df['actual_range']).mean()
+                range_mape = (np.abs(wf_df['predicted_range'] - wf_df['actual_range']) / wf_df['actual_range']).mean() * 100
+
+                # High/Low prediction errors
+                high_error = (wf_df['predicted_high'] - wf_df['actual_high']).mean()
+                low_error = (wf_df['predicted_low'] - wf_df['actual_low']).mean()
+                high_mae = np.abs(wf_df['predicted_high'] - wf_df['actual_high']).mean()
+                low_mae = np.abs(wf_df['predicted_low'] - wf_df['actual_low']).mean()
+
+                # Display metrics in cards
+                met_col1, met_col2, met_col3, met_col4 = st.columns(4)
+
+                with met_col1:
+                    st.metric("High in Confidence Range", f"{high_in_range:.1f}%",
+                              help="% of days where actual high fell within predicted confidence interval")
+                with met_col2:
+                    st.metric("Low in Confidence Range", f"{low_in_range:.1f}%",
+                              help="% of days where actual low fell within predicted confidence interval")
+                with met_col3:
+                    st.metric("Full Containment", f"{price_contained:.1f}%",
+                              help="% of days where entire candle was within predicted bounds")
+                with met_col4:
+                    st.metric("Range MAPE", f"{range_mape:.1f}%",
+                              help="Mean Absolute Percentage Error of range prediction")
+
+                met_col5, met_col6, met_col7, met_col8 = st.columns(4)
+
+                with met_col5:
+                    st.metric("High MAE", f"${high_mae:.2f}",
+                              help="Mean Absolute Error of high prediction")
+                with met_col6:
+                    st.metric("Low MAE", f"${low_mae:.2f}",
+                              help="Mean Absolute Error of low prediction")
+                with met_col7:
+                    st.metric("High Bias", f"${high_error:+.2f}",
+                              help="Average prediction bias (+ = overpredict)")
+                with met_col8:
+                    st.metric("Low Bias", f"${low_error:+.2f}",
+                              help="Average prediction bias (+ = overpredict)")
+
+                st.markdown("---")
+
+                # Candlestick chart with predicted bands
+                st.subheader("Predictions vs Actuals")
+
+                import plotly.graph_objects as go
+                from plotly.subplots import make_subplots
+
+                fig = make_subplots(
+                    rows=2, cols=1,
+                    shared_xaxes=True,
+                    vertical_spacing=0.05,
+                    row_heights=[0.7, 0.3],
+                    subplot_titles=("Price with Predicted Range Bands", "Prediction Errors")
+                )
+
+                # Candlestick chart
+                fig.add_trace(
+                    go.Candlestick(
+                        x=wf_df['date'],
+                        open=wf_df['actual_open'],
+                        high=wf_df['actual_high'],
+                        low=wf_df['actual_low'],
+                        close=wf_df['actual_close'],
+                        name='Actual Price',
+                        increasing_line_color='#26a69a',
+                        decreasing_line_color='#ef5350'
+                    ),
+                    row=1, col=1
+                )
+
+                # Predicted high band (confidence interval)
+                fig.add_trace(
+                    go.Scatter(
+                        x=wf_df['date'],
+                        y=wf_df['high_upper'],
+                        mode='lines',
+                        line=dict(color='rgba(255, 152, 0, 0.3)', width=0),
+                        showlegend=False,
+                        hoverinfo='skip'
+                    ),
+                    row=1, col=1
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=wf_df['date'],
+                        y=wf_df['high_lower'],
+                        mode='lines',
+                        line=dict(color='rgba(255, 152, 0, 0.3)', width=0),
+                        fill='tonexty',
+                        fillcolor='rgba(255, 152, 0, 0.15)',
+                        name='Predicted High Range'
+                    ),
+                    row=1, col=1
+                )
+
+                # Predicted low band (confidence interval)
+                fig.add_trace(
+                    go.Scatter(
+                        x=wf_df['date'],
+                        y=wf_df['low_upper'],
+                        mode='lines',
+                        line=dict(color='rgba(33, 150, 243, 0.3)', width=0),
+                        showlegend=False,
+                        hoverinfo='skip'
+                    ),
+                    row=1, col=1
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=wf_df['date'],
+                        y=wf_df['low_lower'],
+                        mode='lines',
+                        line=dict(color='rgba(33, 150, 243, 0.3)', width=0),
+                        fill='tonexty',
+                        fillcolor='rgba(33, 150, 243, 0.15)',
+                        name='Predicted Low Range'
+                    ),
+                    row=1, col=1
+                )
+
+                # Predicted high/low lines (point estimates)
+                fig.add_trace(
+                    go.Scatter(
+                        x=wf_df['date'],
+                        y=wf_df['predicted_high'],
+                        mode='lines',
+                        line=dict(color='#ff9800', width=1.5, dash='dash'),
+                        name='Predicted High'
+                    ),
+                    row=1, col=1
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=wf_df['date'],
+                        y=wf_df['predicted_low'],
+                        mode='lines',
+                        line=dict(color='#2196f3', width=1.5, dash='dash'),
+                        name='Predicted Low'
+                    ),
+                    row=1, col=1
+                )
+
+                # Mark retrain days
+                retrain_days = wf_df[wf_df['retrained']]
+                if len(retrain_days) > 0:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=retrain_days['date'],
+                            y=retrain_days['actual_high'] * 1.002,
+                            mode='markers',
+                            marker=dict(symbol='triangle-down', size=8, color='purple'),
+                            name='Model Retrained'
+                        ),
+                        row=1, col=1
+                    )
+
+                # Error subplot
+                high_errors = wf_df['predicted_high'] - wf_df['actual_high']
+                low_errors = wf_df['predicted_low'] - wf_df['actual_low']
+
+                fig.add_trace(
+                    go.Bar(
+                        x=wf_df['date'],
+                        y=high_errors,
+                        name='High Error',
+                        marker_color=['#ef5350' if e > 0 else '#26a69a' for e in high_errors],
+                        opacity=0.6
+                    ),
+                    row=2, col=1
+                )
+
+                fig.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
+
+                fig.update_layout(
+                    height=700,
+                    xaxis_rangeslider_visible=False,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    margin=dict(l=50, r=50, t=80, b=50)
+                )
+
+                fig.update_yaxes(title_text="Price ($)", row=1, col=1)
+                fig.update_yaxes(title_text="Error ($)", row=2, col=1)
+
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Detailed results table
+                with st.expander("View Detailed Results"):
+                    display_df = wf_df.copy()
+                    display_df['date'] = display_df['date'].dt.strftime('%Y-%m-%d')
+                    display_df['high_error'] = display_df['predicted_high'] - display_df['actual_high']
+                    display_df['low_error'] = display_df['predicted_low'] - display_df['actual_low']
+                    display_df['high_in_range'] = ((display_df['actual_high'] >= display_df['high_lower']) &
+                                                    (display_df['actual_high'] <= display_df['high_upper']))
+                    display_df['low_in_range'] = ((display_df['actual_low'] >= display_df['low_lower']) &
+                                                   (display_df['actual_low'] <= display_df['low_upper']))
+
+                    st.dataframe(
+                        display_df[['date', 'predicted_high', 'actual_high', 'high_error', 'high_in_range',
+                                   'predicted_low', 'actual_low', 'low_error', 'low_in_range', 'retrained']].round(2),
+                        use_container_width=True,
+                        height=400
+                    )
+
+                    # Download button
+                    csv = display_df.to_csv(index=False)
+                    st.download_button(
+                        "Download Results CSV",
+                        csv,
+                        file_name=f"walk_forward_{st.session_state.get('ticker', 'SPY')}_{wf_df['date'].iloc[0].strftime('%Y%m%d')}_{wf_df['date'].iloc[-1].strftime('%Y%m%d')}.csv",
+                        mime="text/csv"
+                    )
+
+            else:
+                st.info("Run walk forward analysis to see results here.")
 
     elif not PRICE_PREDICTION_AVAILABLE:
         st.markdown("---")

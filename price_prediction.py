@@ -89,26 +89,6 @@ class PriceRangePredictor:
     - Market regime indicators
     """
 
-    # Feature groups for Optuna selection (must match optuna_worker.py)
-    FEATURE_GROUPS = {
-        'hurst': ['hurst_'],
-        'har': ['har_rv_', 'har_weekly_', 'har_monthly_'],
-        'range_estimators': ['garman_klass', 'rogers_satchell', 'gk_parkinson', 'rs_parkinson'],
-        'carr': ['carr_'],
-        'entropy': ['vol_entropy'],
-        'iv_rv': ['iv_rv_'],
-        'range_efficiency': ['range_efficiency', 'low_efficiency'],
-        'novel_indicators': ['arwo', 'dco', 'vcmo', 'ics', 'mji', 'prf', 'ewaf', 'kfif'],
-        'composite_osc': ['composite_osc', 'composite_velocity', 'composite_accel'],
-        'vix': ['vix'],
-        'options': ['pcr_', 'sentiment_', 'iv_weighted', 'iv_call', 'iv_put', 'iv_skew', 'max_pain', 'high_call', 'high_put'],
-    }
-
-    # Core features always included (basic price/range features)
-    CORE_FEATURES = ['atr_', 'range_', 'volatility_', 'returns', 'roc_', 'rsi_', 'day_of_week', 'month',
-                     'is_monday', 'is_friday', 'is_month_end', 'gap', 'sma_', 'price_vs_', 'bb_width',
-                     'keltner_', 'hvol_', 'parkinson_vol', 'vol_weighted']
-
     def __init__(self, polygon_manager=None):
         """
         Initialize the range predictor.
@@ -125,94 +105,6 @@ class PriceRangePredictor:
         self.model_metrics = {}
         self._vix_cache = None
         self._vix_cache_date = None
-
-        # Feature selection state (set during training)
-        self.selected_feature_mask = None  # Boolean mask for feature groups
-        self.selectk_selector = None  # SelectKBest selector
-        self.selected_feature_names = None  # Final feature names after selection
-
-    def _get_feature_group_mask(self, feature_names, selected_groups):
-        """
-        Get boolean mask for features to include based on selected groups.
-
-        Args:
-            feature_names: List of all feature names
-            selected_groups: List of group names to include (e.g., ['hurst', 'har', 'carr'])
-
-        Returns:
-            numpy array of boolean mask
-        """
-        mask = []
-        for fname in feature_names:
-            # Always include core features
-            is_core = any(core in fname for core in self.CORE_FEATURES)
-            if is_core:
-                mask.append(True)
-                continue
-
-            # Check if feature belongs to a selected group
-            included = False
-            for group_name, patterns in self.FEATURE_GROUPS.items():
-                if group_name in selected_groups:
-                    if any(pattern in fname for pattern in patterns):
-                        included = True
-                        break
-            mask.append(included)
-        return np.array(mask)
-
-    def _apply_feature_selection(self, X, y, best_params, feature_names, fit=True):
-        """
-        Apply SelectKBest feature selection based on best_params.
-        SIMPLIFIED: No longer using feature group selection.
-
-        Args:
-            X: Feature matrix (scaled)
-            y: Target values
-            best_params: Dict with selectk_ratio
-            feature_names: List of feature names
-            fit: If True, fit the selector. If False, use existing selector.
-
-        Returns:
-            X_selected: Filtered feature matrix
-            selected_names: List of selected feature names
-        """
-        from sklearn.feature_selection import SelectKBest, f_regression
-
-        # SIMPLIFIED: Skip feature group selection, just use SelectKBest on all features
-        n_features = X.shape[1]
-        selectk_ratio = best_params.get('selectk_ratio', 1.0)
-
-        print(f"[DEBUG] Total features: {n_features}, selectk_ratio: {selectk_ratio:.2f}")
-
-        if n_features > 10 and selectk_ratio < 1.0:
-            k = max(5, int(n_features * selectk_ratio))
-            print(f"[DEBUG] SelectKBest: keeping {k} of {n_features} features")
-
-            if fit:
-                self.selectk_selector = SelectKBest(f_regression, k=k)
-                X_selected = self.selectk_selector.fit_transform(X, y)
-                # Get selected feature names
-                selected_mask = self.selectk_selector.get_support()
-                selected_names = [n for n, m in zip(feature_names, selected_mask) if m]
-                self.selected_feature_mask = selected_mask  # Store for consistency
-            else:
-                X_selected = self.selectk_selector.transform(X)
-                selected_mask = self.selectk_selector.get_support()
-                selected_names = [n for n, m in zip(feature_names, selected_mask) if m]
-        else:
-            X_selected = X
-            selected_names = list(feature_names)
-            if fit:
-                self.selectk_selector = None
-                self.selected_feature_mask = np.ones(n_features, dtype=bool)
-
-        if fit:
-            self.selected_feature_names = selected_names
-
-        print(f"[DEBUG] Final features after SelectKBest: {X_selected.shape[1]}")
-        print(f"[DEBUG] Top selected features: {selected_names[:5]}")
-
-        return X_selected, selected_names
 
     def fetch_vix_data(self, start_date: str = None, end_date: str = None) -> pd.DataFrame:
         """
@@ -987,54 +879,30 @@ class PriceRangePredictor:
 
         total_time = time_module.time() - start_opt
 
-        # Find best result across all workers (MAXIMIZE R²)
-        best_result = max(results_list, key=lambda x: x['best_value'])
+        # Find best result across all workers (MINIMIZE MSE)
+        best_result = min(results_list, key=lambda x: x['best_value'])
         total_completed = sum(r['n_trials'] for r in results_list)
 
-        # Display optimization results with tie-breaker metrics
-        best_mse = best_result.get('best_mse', 0)
-        best_r2 = best_result.get('best_r2', best_result['best_value'])
-        best_n_features = best_result.get('best_n_features', 0)
-        best_groups = best_result.get('best_groups', [])
-
+        best_mse = best_result['best_value']
         print(f"Optimization complete!")
-        print(f"   Best R²: {best_r2:.4f} | Best MSE: {best_mse:.6f}")
-        print(f"   Features used: {best_n_features}")
-        print(f"   Selected groups: {best_groups}")
+        print(f"   Best MSE: {best_mse:.6f}")
+        print(f"   Features used: {X_train_scaled.shape[1]} (all)")
         print(f"   Total time: {total_time:.1f}s ({total_completed/total_time:.1f} trials/sec)")
 
-        # Use best params from the winning worker
+        # Use best params from the winning worker (just XGBoost params)
         best_params = best_result['best_params']
+        print(f"[DEBUG] Best params: {best_params}")
 
-        # Train final model with best params
-        print(f"[DEBUG] Best params from worker: {best_params}")
+        # Add required XGBoost params
+        best_params['n_jobs'] = 1
+        best_params['objective'] = 'reg:squarederror'
+        best_params['verbosity'] = 0
 
-        # === APPLY FEATURE SELECTION (same as Optuna used) ===
-        print("[DEBUG] Applying feature selection to match Optuna trial...")
-        feature_names = list(X_train.columns) if hasattr(X_train, 'columns') else self.feature_names
-
-        # Apply feature group filtering + SelectKBest
-        X_train_selected, selected_names = self._apply_feature_selection(
-            X_train_scaled, y_train.values if hasattr(y_train, 'values') else y_train,
-            best_params, feature_names, fit=True
-        )
-        X_test_selected, _ = self._apply_feature_selection(
-            X_test_scaled, y_test.values if hasattr(y_test, 'values') else y_test,
-            best_params, feature_names, fit=False
-        )
-
-        # Extract only XGBoost params (remove feature selection params)
-        xgb_params = {k: v for k, v in best_params.items()
-                      if not k.startswith('use_') and k != 'selectk_ratio'}
-        xgb_params['n_jobs'] = 1  # Single core for final fit
-        xgb_params['objective'] = 'reg:squarederror'
-        xgb_params['verbosity'] = 0
-        print(f"[DEBUG] XGBoost params: {xgb_params}")
-
+        # Train final model with ALL features (no feature selection)
         print("[DEBUG] Creating final XGBRegressor...")
-        self.range_model = xgb.XGBRegressor(**xgb_params)
-        print(f"[DEBUG] Fitting final model on {X_train_selected.shape[1]} selected features...")
-        self.range_model.fit(X_train_selected, y_train)
+        self.range_model = xgb.XGBRegressor(**best_params)
+        print(f"[DEBUG] Fitting final model on {X_train_scaled.shape[1]} features...")
+        self.range_model.fit(X_train_scaled, y_train)
         print("[DEBUG] Model fitted successfully")
 
         # Wrap with MAPIE for conformal prediction intervals
@@ -1044,11 +912,11 @@ class PriceRangePredictor:
                 print("[DEBUG] Fitting conformal prediction model (MAPIE)...")
                 self.conformal_model = MapieRegressor(
                     estimator=self.range_model,
-                    method="plus",  # Split conformal with cross-validation
+                    method="plus",
                     cv=5,
                     n_jobs=1
                 )
-                self.conformal_model.fit(X_train_selected, y_train)
+                self.conformal_model.fit(X_train_scaled, y_train)
                 print("[DEBUG] Conformal model fitted successfully")
             except Exception as mapie_err:
                 print(f"[DEBUG] MAPIE fitting failed: {mapie_err}")
@@ -1056,7 +924,7 @@ class PriceRangePredictor:
 
         # Evaluate on test set
         print("[DEBUG] Predicting on test set...")
-        y_pred = self.range_model.predict(X_test_selected)
+        y_pred = self.range_model.predict(X_test_scaled)
         print(f"[DEBUG] Predictions shape: {y_pred.shape}")
 
         print("[DEBUG] Calculating metrics...")
@@ -1066,16 +934,15 @@ class PriceRangePredictor:
             'r2': r2_score(y_test, y_pred),
             'train_samples': len(X_train),
             'test_samples': len(X_test),
-            'n_features_selected': X_train_selected.shape[1],
+            'n_features': X_train_scaled.shape[1],
             'best_params': best_params
         }
         print(f"[DEBUG] Metrics: R2={self.model_metrics['r2']:.4f}, RMSE={self.model_metrics['rmse']:.6f}")
-        print(f"[DEBUG] Features used: {X_train_selected.shape[1]} of {X_train_scaled.shape[1]}")
 
-        # Feature importance (only for selected features)
+        # Feature importance (all features)
         print("[DEBUG] Creating feature importance...")
         importance = pd.DataFrame({
-            'feature': self.selected_feature_names,
+            'feature': self.feature_names,
             'importance': self.range_model.feature_importances_
         }).sort_values('importance', ascending=False)
         print(f"[DEBUG] Top 3 features: {importance.head(3)['feature'].tolist()}")
@@ -1119,24 +986,7 @@ class PriceRangePredictor:
 
         print("[DEBUG predict] Scaling features...")
         X_scaled = self.scaler.transform(X)
-
-        # === APPLY SAME FEATURE SELECTION AS TRAINING ===
-        # This is critical: the model expects the same features it was trained on
-        if self.selected_feature_mask is not None or self.selectk_selector is not None:
-            print("[DEBUG predict] Applying feature selection to match training...")
-            feature_names = list(X.columns) if hasattr(X, 'columns') else self.feature_names
-
-            # Use the best_params stored in model_metrics to apply same selection
-            best_params = self.model_metrics.get('best_params', {})
-            X_selected, _ = self._apply_feature_selection(
-                X_scaled, None,  # y is not needed for transform
-                best_params, feature_names, fit=False
-            )
-            print(f"[DEBUG predict] Features after selection: {X_selected.shape[1]} (model expects {len(self.selected_feature_names) if self.selected_feature_names else 'unknown'})")
-        else:
-            # No feature selection was applied during training
-            X_selected = X_scaled
-            print("[DEBUG predict] No feature selection applied")
+        print(f"[DEBUG predict] Using all {X_scaled.shape[1]} features")
 
         # Get current close
         current_close = df['close'].iloc[-1]
@@ -1154,7 +1004,7 @@ class PriceRangePredictor:
         if self.conformal_model is not None and MAPIE_AVAILABLE:
             try:
                 print("[DEBUG predict] Using conformal prediction (MAPIE)...")
-                y_pred, y_pis = self.conformal_model.predict(X_selected, alpha=alpha)
+                y_pred, y_pis = self.conformal_model.predict(X_scaled, alpha=alpha)
                 predicted_range = y_pred[0]
 
                 # y_pis shape: (n_samples, 2, 1) -> [lower, upper]
@@ -1169,10 +1019,10 @@ class PriceRangePredictor:
                 print(f"[DEBUG predict] Conformal bounds: [{range_lower:.6f}, {range_upper:.6f}]")
             except Exception as conf_err:
                 print(f"[DEBUG predict] Conformal prediction failed: {conf_err}, using point estimate")
-                predicted_range = self.range_model.predict(X_selected)[0]
+                predicted_range = self.range_model.predict(X_scaled)[0]
         else:
             print("[DEBUG predict] Making point prediction...")
-            predicted_range = self.range_model.predict(X_selected)[0]
+            predicted_range = self.range_model.predict(X_scaled)[0]
 
         print(f"[DEBUG predict] Predicted range (fraction): {predicted_range:.6f}")
 
