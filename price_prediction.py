@@ -160,8 +160,12 @@ class PriceRangePredictor:
         """
         Extract comprehensive options-based features for range prediction.
 
+        ENHANCED: Now uses get_full_options_analysis for maximum data extraction
+        including ATM IV, term structure, Greeks, and unusual activity.
+
         Returns:
-            dict with pcr_volume, pcr_oi, sentiment, iv_weighted, max_pain, high_oi_strikes
+            dict with pcr_volume, pcr_oi, sentiment, iv_weighted, max_pain, high_oi_strikes,
+            plus new fields: atm_iv, term_structure_slope, net_gamma, activity_bias
         """
         default_features = {
             'pcr_volume': 1.0,
@@ -174,7 +178,19 @@ class PriceRangePredictor:
             'iv_skew': None,
             'max_pain': None,
             'high_call_strike': None,
-            'high_put_strike': None
+            'high_put_strike': None,
+            # NEW enhanced fields
+            'atm_iv': None,
+            'atm_skew': None,
+            'term_structure_slope': None,
+            'term_structure_type': None,
+            'near_term_iv': None,
+            'far_term_iv': None,
+            'net_delta': None,
+            'net_gamma': None,
+            'gamma_interpretation': None,
+            'activity_bias': None,
+            'unusual_contracts_count': None
         }
 
         if self.polygon is None:
@@ -183,34 +199,77 @@ class PriceRangePredictor:
         features = default_features.copy()
 
         try:
-            # 1. Get PCR and sentiment
-            sentiment_data = self.polygon.get_options_sentiment(ticker)
-            if sentiment_data.get('status') == 'ok':
-                features['pcr_volume'] = sentiment_data.get('pcr_volume', 1.0)
-                features['pcr_oi'] = sentiment_data.get('pcr_oi', 1.0)
-                features['sentiment'] = sentiment_data.get('sentiment', 'NEUTRAL')
-                features['total_volume'] = sentiment_data.get('total_volume', 0)
+            # Use comprehensive analysis to get ALL available data
+            full_analysis = self.polygon.get_full_options_analysis(ticker)
 
-            # 2. Get Implied Volatility
-            iv_data = self.polygon.calculate_aggregate_iv(ticker, current_price)
-            if iv_data.get('available'):
-                features['iv_weighted'] = iv_data.get('iv_weighted')
-                features['iv_call'] = iv_data.get('iv_call')
-                features['iv_put'] = iv_data.get('iv_put')
-                features['iv_skew'] = iv_data.get('iv_skew')
+            if full_analysis.get('available'):
+                # Core sentiment
+                features['pcr_volume'] = full_analysis.get('pcr_volume', 1.0)
+                features['pcr_oi'] = full_analysis.get('pcr_oi', 1.0)
+                features['sentiment'] = full_analysis.get('sentiment', 'NEUTRAL')
 
-            # 3. Get Max Pain
-            max_pain_data = self.polygon.get_max_pain(ticker)
-            if max_pain_data.get('available'):
-                features['max_pain'] = max_pain_data.get('max_pain')
+                # Implied Volatility (multiple measures)
+                features['iv_weighted'] = full_analysis.get('iv_weighted')
+                features['iv_call'] = full_analysis.get('iv_call')
+                features['iv_put'] = full_analysis.get('iv_put')
+                features['iv_skew'] = full_analysis.get('iv_skew')
 
-            # 4. Get High OI Strikes
-            high_oi_data = self.polygon.get_high_oi_strikes(ticker)
-            if high_oi_data.get('available'):
-                features['high_call_strike'] = high_oi_data.get('highest_call_strike')
-                features['high_put_strike'] = high_oi_data.get('highest_put_strike')
+                # ATM IV (most relevant for range prediction!)
+                features['atm_iv'] = full_analysis.get('atm_iv')
+                features['atm_skew'] = full_analysis.get('atm_skew')
 
-            print(f"   Options features loaded: PCR={features['pcr_volume']:.2f}, IV={features.get('iv_weighted', 'N/A')}, MaxPain={features.get('max_pain', 'N/A')}")
+                # Term Structure (contango = normal, backwardation = fear)
+                features['term_structure_slope'] = full_analysis.get('term_structure_slope')
+                features['term_structure_type'] = full_analysis.get('term_structure_type')
+                features['near_term_iv'] = full_analysis.get('near_term_iv')
+                features['far_term_iv'] = full_analysis.get('far_term_iv')
+
+                # Key Levels
+                features['max_pain'] = full_analysis.get('max_pain')
+                features['high_call_strike'] = full_analysis.get('highest_call_oi_strike')
+                features['high_put_strike'] = full_analysis.get('highest_put_oi_strike')
+
+                # Greeks (market maker positioning)
+                features['net_delta'] = full_analysis.get('net_delta')
+                features['net_gamma'] = full_analysis.get('net_gamma')
+                features['gamma_interpretation'] = full_analysis.get('gamma_interpretation')
+
+                # Unusual Activity
+                features['activity_bias'] = full_analysis.get('activity_bias')
+                features['unusual_contracts_count'] = full_analysis.get('unusual_contracts_count')
+
+                print(f"   Options features loaded (ENHANCED):")
+                print(f"     PCR={features['pcr_volume']:.2f}, Sentiment={features['sentiment']}")
+                print(f"     IV Weighted={features.get('iv_weighted', 'N/A')}, ATM IV={features.get('atm_iv', 'N/A')}")
+                print(f"     Term Structure: {features.get('term_structure_type', 'N/A')} (slope={features.get('term_structure_slope', 'N/A')}%)")
+                print(f"     Max Pain=${features.get('max_pain', 'N/A')}")
+                print(f"     Net Gamma={features.get('net_gamma', 'N/A')} ({features.get('gamma_interpretation', 'N/A')})")
+                print(f"     Activity Bias={features.get('activity_bias', 'N/A')}, Unusual={features.get('unusual_contracts_count', 0)} contracts")
+            else:
+                # Fallback to individual calls if full analysis fails
+                print(f"   Full analysis unavailable, using fallback methods...")
+
+                sentiment_data = self.polygon.get_options_sentiment(ticker)
+                if sentiment_data.get('status') == 'ok':
+                    features['pcr_volume'] = sentiment_data.get('pcr_volume', 1.0)
+                    features['pcr_oi'] = sentiment_data.get('pcr_oi', 1.0)
+                    features['sentiment'] = sentiment_data.get('sentiment', 'NEUTRAL')
+
+                iv_data = self.polygon.calculate_aggregate_iv(ticker, current_price)
+                if iv_data.get('available'):
+                    features['iv_weighted'] = iv_data.get('iv_weighted')
+                    features['iv_call'] = iv_data.get('iv_call')
+                    features['iv_put'] = iv_data.get('iv_put')
+                    features['iv_skew'] = iv_data.get('iv_skew')
+
+                max_pain_data = self.polygon.get_max_pain(ticker)
+                if max_pain_data.get('available'):
+                    features['max_pain'] = max_pain_data.get('max_pain')
+
+                high_oi_data = self.polygon.get_high_oi_strikes(ticker)
+                if high_oi_data.get('available'):
+                    features['high_call_strike'] = high_oi_data.get('highest_call_strike')
+                    features['high_put_strike'] = high_oi_data.get('highest_put_strike')
 
         except Exception as e:
             print(f"   Options data error: {e}")
@@ -283,6 +342,138 @@ class PriceRangePredictor:
         features['volatility_5d'] = features['returns'].rolling(5).std() * np.sqrt(252) * 100
         features['volatility_20d'] = features['returns'].rolling(20).std() * np.sqrt(252) * 100
         features['vol_ratio'] = features['volatility_5d'] / features['volatility_20d']
+
+        # --- Volume features (with derivatives) ---
+        volume = df['volume']
+        volume_sma = volume.rolling(20).mean()
+        features['volume_rel'] = volume / volume_sma  # Relative volume
+
+        # Volume velocity (1st derivative)
+        features['volume_velocity'] = volume.diff()
+        features['volume_velocity_5d'] = volume.rolling(5).mean().diff()
+        features['volume_rel_velocity'] = features['volume_rel'].diff()
+
+        # Volume acceleration (2nd derivative)
+        features['volume_accel'] = features['volume_velocity'].diff()
+        features['volume_accel_5d'] = features['volume_velocity_5d'].diff()
+
+        # Normalized volume velocity
+        vol_std = volume.rolling(20).std()
+        features['volume_velocity_norm'] = features['volume_velocity'] / (vol_std + 1)
+
+        # =================================================================
+        # ENHANCED VOLUME FEATURES (Based on analysis findings)
+        # Volume showed high correlation but underused importance
+        # =================================================================
+        # Volume Z-score (identify abnormal volume days)
+        features['volume_zscore'] = (volume - volume.rolling(20).mean()) / (volume.rolling(20).std() + 1)
+
+        # Volume trend (is volume increasing or decreasing over time?)
+        features['volume_trend_5d'] = volume.rolling(5).mean() / volume.rolling(20).mean()
+        features['volume_trend_10d'] = volume.rolling(10).mean() / volume.rolling(20).mean()
+
+        # Volume-price divergence (high volume but small price move = important)
+        price_change = abs(df['close'].pct_change())
+        features['vol_price_divergence'] = features['volume_rel'] / (price_change * 100 + 0.1)
+
+        # Volume spike detection
+        features['volume_spike'] = (features['volume_zscore'] > 2.0).astype(int)
+
+        # Volume percentile (where is today's volume in recent history?)
+        features['volume_percentile'] = volume.rolling(60).apply(
+            lambda x: (x.iloc[-1] - x.min()) / (x.max() - x.min()) if x.max() != x.min() else 0.5
+        )
+
+        # Volume momentum (rate of change in volume)
+        features['volume_momentum'] = volume.pct_change(5)
+
+        # =================================================================
+        # INTERACTION TERMS (Based on correlation analysis findings)
+        # These capture non-linear relationships between top features
+        # =================================================================
+
+        # 1. Range-Momentum Interaction (range * ROC)
+        # High ROC with expanding range = strong directional move
+        features['range_momentum'] = features['daily_range'] * features.get('roc_5', df['close'].pct_change(5) * 100).abs() / 100
+
+        # 2. Volume-Regime Interaction (volume * volatility regime)
+        # High volume during high vol regime = significant
+        features['vol_regime_interaction'] = features['volume_rel'] * features['volatility_20d'] / 20
+
+        # 3. ATR Breakout Interaction (current range vs ATR - identifies breakout days)
+        features['atr_breakout'] = features['daily_range'] / (features['atr_14'] / df['close'] + 0.001)
+        features['atr_breakout_zscore'] = (features['atr_breakout'] - features['atr_breakout'].rolling(20).mean()) / (features['atr_breakout'].rolling(20).std() + 0.001)
+
+        # 4. Trend Dislocation (price vs trend * volatility - identifies reversal setups)
+        trend_deviation = (df['close'] - df['close'].rolling(20).mean()) / df['close'].rolling(20).mean()
+        features['trend_dislocation'] = trend_deviation * features['volatility_20d'] / 20
+
+        # 5. Volatility Compression (ATR ratio near 1 = low vol, breakout coming)
+        features['vol_compression'] = 1 - abs(1 - features['atr_ratio_7_21'])
+        features['vol_compression_signal'] = (features['vol_compression'] > 0.9).astype(int)
+
+        # 6. Range Mean Reversion Signal (extreme ranges tend to revert)
+        features['range_reversion_signal'] = -features['range_zscore'] * features['range_percentile_20d']
+
+        # =================================================================
+        # TREND-AWARE FEATURES (To fix downtrend prediction bias)
+        # Analysis showed model predicts highs better than lows
+        # =================================================================
+
+        # Trend direction and strength
+        features['trend_direction'] = np.sign(df['close'] - df['close'].rolling(20).mean())
+        features['trend_strength'] = abs(df['close'] - df['close'].rolling(20).mean()) / df['close'].rolling(20).std()
+
+        # Downtrend indicator (more weight on low prediction)
+        features['is_downtrend'] = (features['trend_direction'] < 0).astype(int)
+        features['is_uptrend'] = (features['trend_direction'] > 0).astype(int)
+
+        # Trend-adjusted range components (helps with asymmetric prediction)
+        features['upside_potential'] = (df['high'].rolling(5).max() - df['close']) / df['close']
+        features['downside_potential'] = (df['close'] - df['low'].rolling(5).min()) / df['close']
+        features['range_asymmetry'] = features['upside_potential'] - features['downside_potential']
+
+        # Trend momentum (acceleration of trend)
+        sma_20_change = df['close'].rolling(20).mean().pct_change(5)
+        features['trend_momentum'] = sma_20_change * 100
+
+        # Price position in recent range (where is close relative to high-low?)
+        features['price_position'] = (df['close'] - df['low'].rolling(20).min()) / (df['high'].rolling(20).max() - df['low'].rolling(20).min() + 0.001)
+
+        # Consecutive down/up days
+        features['consecutive_up'] = (df['close'] > df['close'].shift(1)).astype(int).groupby((df['close'] <= df['close'].shift(1)).cumsum()).cumsum()
+        features['consecutive_down'] = (df['close'] < df['close'].shift(1)).astype(int).groupby((df['close'] >= df['close'].shift(1)).cumsum()).cumsum()
+
+        # Recent low/high relative to ATR (identifies stretched moves)
+        features['low_stretch'] = (df['close'] - df['low'].rolling(10).min()) / features['atr_14']
+        features['high_stretch'] = (df['high'].rolling(10).max() - df['close']) / features['atr_14']
+
+        # =================================================================
+        # DOWNTREND INTERACTION TERMS (Critical for fixing low prediction bias)
+        # Analysis showed features flip in downtrends - need specific interactions
+        # =================================================================
+
+        # Downtrend-specific volume (volume matters more in downtrends)
+        features['downtrend_volume'] = features['is_downtrend'] * features['volume_rel']
+
+        # Downtrend ATR (ATR more predictive in downtrends)
+        features['downtrend_atr'] = features['is_downtrend'] * features['atr_7']
+        features['downtrend_atr_14'] = features['is_downtrend'] * features['atr_14']
+
+        # Downtrend momentum (ROC stronger signal in downtrends)
+        features['downtrend_roc_5'] = features['is_downtrend'] * abs(df['close'].pct_change(5) * 100)
+        features['downtrend_roc_10'] = features['is_downtrend'] * abs(df['close'].pct_change(10) * 100)
+
+        # Uptrend-specific features (for symmetric treatment)
+        features['uptrend_volume'] = features['is_uptrend'] * features['volume_rel']
+        features['uptrend_atr'] = features['is_uptrend'] * features['atr_14']
+        features['uptrend_momentum'] = features['is_uptrend'] * abs(df['close'].pct_change(5) * 100)
+
+        # Range lagged interactions (yesterday's range predicts today's)
+        features['range_lag_x_mean'] = features.get('range_lag_1', features['daily_range'].shift(1)) * features['range_mean_5d']
+
+        # ATR lagged interaction
+        features['atr_lag_x_current'] = features.get('atr_14_lag_1', features['atr_14'].shift(1)) * features['atr_14']
 
         # --- Momentum features ---
         features['roc_5'] = df['close'].pct_change(5) * 100
@@ -360,6 +551,69 @@ class PriceRangePredictor:
                 features['high_put_oi_distance'] = (current_close - high_put) / current_close
             else:
                 features['high_put_oi_distance'] = 0
+
+            # =================================================================
+            # NEW ENHANCED OPTIONS FEATURES (from get_full_options_analysis)
+            # =================================================================
+
+            # ATM IV (most relevant for daily range prediction!)
+            atm_iv = options_features.get('atm_iv')
+            if atm_iv is not None:
+                features['atm_iv'] = atm_iv
+                features['atm_skew'] = options_features.get('atm_skew', 0)
+                # ATM IV vs historical volatility spread
+                features['atm_iv_rv_spread'] = atm_iv - features['volatility_20d']
+            else:
+                features['atm_iv'] = features['volatility_20d']
+                features['atm_skew'] = 0
+                features['atm_iv_rv_spread'] = 0
+
+            # Term Structure (contango/backwardation)
+            term_slope = options_features.get('term_structure_slope')
+            if term_slope is not None:
+                features['term_structure_slope'] = term_slope
+                features['term_structure_backwardation'] = 1 if term_slope < -5 else 0
+                features['term_structure_contango'] = 1 if term_slope > 5 else 0
+                # Near vs far term IV spread
+                near_iv = options_features.get('near_term_iv', 0)
+                far_iv = options_features.get('far_term_iv', 0)
+                features['near_term_iv'] = near_iv
+                features['far_term_iv'] = far_iv
+                features['iv_term_spread'] = near_iv - far_iv  # Positive = backwardation
+            else:
+                features['term_structure_slope'] = 0
+                features['term_structure_backwardation'] = 0
+                features['term_structure_contango'] = 0
+                features['near_term_iv'] = 0
+                features['far_term_iv'] = 0
+                features['iv_term_spread'] = 0
+
+            # Greeks (market maker positioning)
+            net_gamma = options_features.get('net_gamma')
+            if net_gamma is not None:
+                # Normalize gamma by price for comparability
+                features['net_gamma_normalized'] = net_gamma / (current_close * 1000000) if current_close > 0 else 0
+                features['gamma_long'] = 1 if options_features.get('gamma_interpretation') == 'long gamma' else 0
+                features['gamma_short'] = 1 if options_features.get('gamma_interpretation') == 'short gamma' else 0
+            else:
+                features['net_gamma_normalized'] = 0
+                features['gamma_long'] = 0
+                features['gamma_short'] = 0
+
+            net_delta = options_features.get('net_delta')
+            if net_delta is not None:
+                # Normalize delta
+                features['net_delta_normalized'] = net_delta / 1000000 if net_delta else 0
+            else:
+                features['net_delta_normalized'] = 0
+
+            # Unusual Activity
+            activity_bias = options_features.get('activity_bias', 'NEUTRAL')
+            features['unusual_activity_bullish'] = 1 if activity_bias == 'BULLISH' else 0
+            features['unusual_activity_bearish'] = 1 if activity_bias == 'BEARISH' else 0
+            unusual_count = options_features.get('unusual_contracts_count', 0)
+            features['unusual_activity_count'] = unusual_count if unusual_count else 0
+
         else:
             features['pcr_volume'] = 1.0
             features['pcr_oi'] = 1.0
@@ -372,6 +626,44 @@ class PriceRangePredictor:
             features['max_pain_distance'] = 0
             features['high_call_oi_distance'] = 0
             features['high_put_oi_distance'] = 0
+            # Enhanced options features defaults
+            features['atm_iv'] = features['volatility_20d']
+            features['atm_skew'] = 0
+            features['atm_iv_rv_spread'] = 0
+            features['term_structure_slope'] = 0
+            features['term_structure_backwardation'] = 0
+            features['term_structure_contango'] = 0
+            features['near_term_iv'] = 0
+            features['far_term_iv'] = 0
+            features['iv_term_spread'] = 0
+            features['net_gamma_normalized'] = 0
+            features['gamma_long'] = 0
+            features['gamma_short'] = 0
+            features['net_delta_normalized'] = 0
+            features['unusual_activity_bullish'] = 0
+            features['unusual_activity_bearish'] = 0
+            features['unusual_activity_count'] = 0
+
+        # =================================================================
+        # IV FEATURE DEBUG LOGGING (To diagnose 0-importance IV features)
+        # Analysis showed IV features have high correlation but 0 importance
+        # This is likely because they're just copies of volatility_20d
+        # =================================================================
+        iv_unique = features['iv_weighted'].nunique() if 'iv_weighted' in features else 0
+        vol20_unique = features['volatility_20d'].nunique() if 'volatility_20d' in features else 0
+        iv_vol_match = 0.0
+        if 'iv_weighted' in features and 'volatility_20d' in features:
+            try:
+                iv_vol_match = (features['iv_weighted'] == features['volatility_20d']).mean() * 100
+            except:
+                pass
+        print(f"   IV Features Debug:")
+        print(f"     iv_weighted unique values: {iv_unique}")
+        print(f"     volatility_20d unique values: {vol20_unique}")
+        print(f"     iv_weighted == volatility_20d: {iv_vol_match:.1f}%")
+        if iv_vol_match > 95:
+            print(f"     WARNING: IV features appear to be fallback values (same as volatility_20d)")
+            print(f"     This explains why IV has high correlation but 0 model importance!")
 
         # --- VIX Features (CRITICAL for volatility prediction!) ---
         vix_df = self.fetch_vix_data()
@@ -407,17 +699,35 @@ class PriceRangePredictor:
                 features['vix_regime_low'] = (features['vix'] < vix_20_pct).astype(int)
                 features['vix_regime_high'] = (features['vix'] > vix_80_pct).astype(int)
 
-                print(f"   VIX features added: current VIX={features['vix'].iloc[-1]:.2f}")
+                # VIX Velocity (1st derivative) - rate of change in VIX
+                features['vix_velocity'] = features['vix'].diff()
+                features['vix_velocity_3d'] = features['vix'].rolling(3).mean().diff()
+                features['vix_velocity_5d'] = features['vix'].rolling(5).mean().diff()
+
+                # VIX Acceleration (2nd derivative) - change in rate of change
+                features['vix_accel'] = features['vix_velocity'].diff()
+                features['vix_accel_3d'] = features['vix_velocity_3d'].diff()
+                features['vix_accel_5d'] = features['vix_velocity_5d'].diff()
+
+                # Normalized VIX velocity (relative to recent volatility of VIX itself)
+                vix_std = features['vix'].rolling(20).std()
+                features['vix_velocity_norm'] = features['vix_velocity'] / (vix_std + 0.01)
+
+                print(f"   VIX features added: current VIX={features['vix'].iloc[-1]:.2f}, velocity={features['vix_velocity'].iloc[-1]:.2f}")
             except Exception as e:
                 print(f"   VIX feature error: {e}")
                 # Add placeholder VIX features
                 for col in ['vix', 'vix_change_1d', 'vix_change_5d', 'vix_sma_10', 'vix_vs_sma',
-                           'vix_percentile', 'vix_zscore', 'vix_regime_low', 'vix_regime_high']:
+                           'vix_percentile', 'vix_zscore', 'vix_regime_low', 'vix_regime_high',
+                           'vix_velocity', 'vix_velocity_3d', 'vix_velocity_5d',
+                           'vix_accel', 'vix_accel_3d', 'vix_accel_5d', 'vix_velocity_norm']:
                     features[col] = 0
         else:
             # Add placeholder VIX features if not available
             for col in ['vix', 'vix_change_1d', 'vix_change_5d', 'vix_sma_10', 'vix_vs_sma',
-                       'vix_percentile', 'vix_zscore', 'vix_regime_low', 'vix_regime_high']:
+                       'vix_percentile', 'vix_zscore', 'vix_regime_low', 'vix_regime_high',
+                       'vix_velocity', 'vix_velocity_3d', 'vix_velocity_5d',
+                       'vix_accel', 'vix_accel_3d', 'vix_accel_5d', 'vix_velocity_norm']:
                 features[col] = 0
 
         # --- Novel Indicators (Advanced composite indicators) ---
@@ -778,14 +1088,21 @@ class PriceRangePredictor:
         Create target variables for training.
 
         Returns DataFrame with:
-        - next_range: Next day's (high-low)/close
+        - next_range: Next day's (high-low)/close as FRACTION (0.01 = 1%)
+        - next_range_pct: Next day's range as PERCENTAGE (1.0 = 1%) - USE THIS FOR TRAINING
         - next_high_pct: Next day's high as % above current close
         - next_low_pct: Next day's low as % below current close
+
+        IMPORTANT: XGBoost struggles with tiny target values (0.01-0.03).
+        Use next_range_pct for training and divide by 100 for prediction.
         """
         targets = pd.DataFrame(index=df.index)
 
-        # Next day's range
+        # Next day's range as fraction
         targets['next_range'] = ((df['high'].shift(-1) - df['low'].shift(-1)) / df['close']).shift(0)
+
+        # Next day's range as PERCENTAGE (scaled up for better XGBoost learning)
+        targets['next_range_pct'] = targets['next_range'] * 100
 
         # Next day's high/low relative to current close
         targets['next_high_pct'] = ((df['high'].shift(-1) - df['close']) / df['close']) * 100
@@ -822,8 +1139,9 @@ class PriceRangePredictor:
         targets = self.create_targets(df)
 
         # Align and clean
+        # IMPORTANT: Use next_range_pct (percentage) for training - XGBoost struggles with tiny values
         X = features[self.feature_names].copy()
-        y = targets['next_range'].copy()
+        y = targets['next_range_pct'].copy()  # Use PERCENTAGE target (1.0 = 1%), not fraction (0.01)
 
         # Remove NaN
         valid_idx = X.dropna().index.intersection(y.dropna().index)
@@ -929,15 +1247,18 @@ class PriceRangePredictor:
 
         print("[DEBUG] Calculating metrics...")
         self.model_metrics = {
-            'rmse': np.sqrt(mean_squared_error(y_test, y_pred)),
-            'mae': mean_absolute_error(y_test, y_pred),
+            # NOTE: RMSE/MAE are in PERCENTAGE since target was scaled. Convert back to fraction for downstream use.
+            'rmse': np.sqrt(mean_squared_error(y_test, y_pred)) / 100.0,  # Convert % to fraction
+            'rmse_pct': np.sqrt(mean_squared_error(y_test, y_pred)),  # Keep % version for display
+            'mae': mean_absolute_error(y_test, y_pred) / 100.0,  # Convert % to fraction
+            'mae_pct': mean_absolute_error(y_test, y_pred),  # Keep % version for display
             'r2': r2_score(y_test, y_pred),
             'train_samples': len(X_train),
             'test_samples': len(X_test),
             'n_features': X_train_scaled.shape[1],
             'best_params': best_params
         }
-        print(f"[DEBUG] Metrics: R2={self.model_metrics['r2']:.4f}, RMSE={self.model_metrics['rmse']:.6f}")
+        print(f"[DEBUG] Metrics: R2={self.model_metrics['r2']:.4f}, RMSE={self.model_metrics['rmse_pct']:.3f}%")
 
         # Feature importance (all features)
         print("[DEBUG] Creating feature importance...")
@@ -1000,31 +1321,36 @@ class PriceRangePredictor:
         alpha = 1 - confidence_level  # e.g., 0.9 confidence -> 0.1 alpha
 
         # Use conformal prediction if available, otherwise fall back to point prediction
+        # IMPORTANT: Model was trained on PERCENTAGE target (1.0 = 1%), must convert back to fraction
         conformal_bounds = None
         if self.conformal_model is not None and MAPIE_AVAILABLE:
             try:
                 print("[DEBUG predict] Using conformal prediction (MAPIE)...")
                 y_pred, y_pis = self.conformal_model.predict(X_scaled, alpha=alpha)
-                predicted_range = y_pred[0]
+                predicted_range_pct = y_pred[0]
 
                 # y_pis shape: (n_samples, 2, 1) -> [lower, upper]
-                range_lower = y_pis[0, 0, 0]  # Lower bound
-                range_upper = y_pis[0, 1, 0]  # Upper bound
+                range_lower_pct = y_pis[0, 0, 0]  # Lower bound (percentage)
+                range_upper_pct = y_pis[0, 1, 0]  # Upper bound (percentage)
 
+                # Convert from percentage to fraction
+                predicted_range = predicted_range_pct / 100.0
                 conformal_bounds = {
-                    'range_lower': range_lower,
-                    'range_upper': range_upper,
+                    'range_lower': range_lower_pct / 100.0,
+                    'range_upper': range_upper_pct / 100.0,
                     'method': 'conformal'
                 }
-                print(f"[DEBUG predict] Conformal bounds: [{range_lower:.6f}, {range_upper:.6f}]")
+                print(f"[DEBUG predict] Conformal bounds (pct): [{range_lower_pct:.3f}%, {range_upper_pct:.3f}%]")
             except Exception as conf_err:
                 print(f"[DEBUG predict] Conformal prediction failed: {conf_err}, using point estimate")
-                predicted_range = self.range_model.predict(X_scaled)[0]
+                predicted_range_pct = self.range_model.predict(X_scaled)[0]
+                predicted_range = predicted_range_pct / 100.0  # Convert to fraction
         else:
             print("[DEBUG predict] Making point prediction...")
-            predicted_range = self.range_model.predict(X_scaled)[0]
+            predicted_range_pct = self.range_model.predict(X_scaled)[0]
+            predicted_range = predicted_range_pct / 100.0  # Convert from percentage to fraction
 
-        print(f"[DEBUG predict] Predicted range (fraction): {predicted_range:.6f}")
+        print(f"[DEBUG predict] Predicted range: {predicted_range_pct:.3f}% ({predicted_range:.6f} fraction)")
 
         # Calculate predicted high/low
         predicted_high = current_close * (1 + predicted_range * high_ratio)
@@ -1078,6 +1404,226 @@ class PriceRangePredictor:
         print(f"[DEBUG predict] DONE! Predicted High: ${result['predicted_high']:.2f}, Low: ${result['predicted_low']:.2f}")
         print(f"[DEBUG predict] Confidence bounds ({confidence_level*100:.0f}%): High=[${high_lower:.2f}, ${high_upper:.2f}], Low=[${low_lower:.2f}, ${low_upper:.2f}]")
         return result
+
+
+# =============================================================================
+# REGIME-SWITCHING RANGE PREDICTOR
+# Based on analysis finding that feature importance varies dramatically by regime
+# =============================================================================
+
+class RegimeSwitchingRangePredictor:
+    """
+    Use different models based on current volatility regime.
+
+    Analysis showed:
+    - In HIGH volatility: range_std_5d, volatility_5d, atr_14_pct are 50-64% more predictive
+    - In LOW volatility: roc_5, atr_ratio_7_21 work better
+    - Feature importance has high variance because predictive power is regime-dependent
+
+    This class trains separate models for each regime and routes predictions accordingly.
+    """
+
+    def __init__(self, polygon_manager=None):
+        self.polygon = polygon_manager
+        self.high_vol_predictor = None
+        self.low_vol_predictor = None
+        self.vol_threshold = None
+        self.is_trained = False
+
+        # Regime-specific feature weights (boost important features for each regime)
+        self.high_vol_feature_boost = {
+            'range_std_5d': 2.0,
+            'volatility_5d': 2.0,
+            'atr_14_pct': 1.5,
+            'parkinson_vol': 1.5,
+            'range_lag_1': 1.3,
+            'atr_14': 1.3
+        }
+
+        self.low_vol_feature_boost = {
+            'roc_5': 1.5,
+            'roc_10': 1.3,
+            'atr_ratio_7_21': 1.5,
+            'price_vs_sma50': 1.3,
+            'price_vs_sma20': 1.3,
+            'vol_compression': 1.5
+        }
+
+    def _calculate_volatility_regime(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Calculate volatility regime for each row.
+        Returns Series with 'high', 'low', or 'normal' for each row.
+        """
+        # Annualized volatility (20-day rolling)
+        returns = df['close'].pct_change()
+        vol_20d = returns.rolling(20).std() * np.sqrt(252) * 100  # As percentage
+
+        # Calculate regime thresholds based on historical distribution
+        vol_25_pct = vol_20d.quantile(0.25)
+        vol_75_pct = vol_20d.quantile(0.75)
+
+        regime = pd.Series(index=df.index, data='normal')
+        regime[vol_20d < vol_25_pct] = 'low'
+        regime[vol_20d > vol_75_pct] = 'high'
+
+        return regime, vol_20d
+
+    def _calculate_trend_regime(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Calculate trend regime for each row.
+        Returns Series with 'uptrend', 'downtrend', or 'sideways'.
+        """
+        # 20-day trend
+        trend_20d = df['close'].pct_change(20)
+
+        regime = pd.Series(index=df.index, data='sideways')
+        regime[trend_20d > 0.02] = 'uptrend'  # >2% over 20 days
+        regime[trend_20d < -0.02] = 'downtrend'
+
+        return regime
+
+    def train(self, df: pd.DataFrame, options_features: Dict = None,
+              n_trials: int = 50, n_jobs: int = 1) -> Dict:
+        """
+        Train separate models for high-vol and low-vol regimes.
+
+        Returns:
+            Dict with training metrics for both models
+        """
+        print("=" * 60)
+        print("REGIME-SWITCHING MODEL TRAINING")
+        print("=" * 60)
+
+        # Calculate regimes
+        vol_regime, vol_20d = self._calculate_volatility_regime(df)
+
+        # Store threshold for prediction time
+        self.vol_threshold = vol_20d.median()
+        print(f"Volatility threshold: {self.vol_threshold:.2f}%")
+
+        # Count samples in each regime
+        high_vol_count = (vol_regime == 'high').sum()
+        low_vol_count = (vol_regime == 'low').sum()
+        normal_count = (vol_regime == 'normal').sum()
+
+        print(f"Regime distribution: High={high_vol_count}, Normal={normal_count}, Low={low_vol_count}")
+
+        # Split data by regime
+        high_vol_mask = vol_regime == 'high'
+        low_vol_mask = vol_regime == 'low'
+
+        # For training, combine 'normal' with whichever has fewer samples to balance
+        if high_vol_count < low_vol_count:
+            # Add some normal samples to high vol training
+            high_vol_mask = (vol_regime == 'high') | (vol_regime == 'normal')
+        else:
+            # Add some normal samples to low vol training
+            low_vol_mask = (vol_regime == 'low') | (vol_regime == 'normal')
+
+        # Create predictors
+        self.high_vol_predictor = PriceRangePredictor(self.polygon)
+        self.low_vol_predictor = PriceRangePredictor(self.polygon)
+
+        # Train high-vol model
+        print("\n" + "-" * 40)
+        print("Training HIGH VOLATILITY model...")
+        print("-" * 40)
+        df_high_vol = df[high_vol_mask].copy()
+        if len(df_high_vol) >= 60:  # Need minimum samples
+            high_vol_results = self.high_vol_predictor.train_range_model(
+                df_high_vol,
+                options_features=options_features,
+                n_trials=n_trials,
+                n_jobs=n_jobs
+            )
+            print(f"High-vol model R²: {high_vol_results.get('r2', 0):.4f}")
+        else:
+            print(f"WARNING: Not enough high-vol samples ({len(df_high_vol)}), using full model")
+            high_vol_results = self.high_vol_predictor.train_range_model(
+                df, options_features=options_features, n_trials=n_trials, n_jobs=n_jobs
+            )
+
+        # Train low-vol model
+        print("\n" + "-" * 40)
+        print("Training LOW VOLATILITY model...")
+        print("-" * 40)
+        df_low_vol = df[low_vol_mask].copy()
+        if len(df_low_vol) >= 60:
+            low_vol_results = self.low_vol_predictor.train_range_model(
+                df_low_vol,
+                options_features=options_features,
+                n_trials=n_trials,
+                n_jobs=n_jobs
+            )
+            print(f"Low-vol model R²: {low_vol_results.get('r2', 0):.4f}")
+        else:
+            print(f"WARNING: Not enough low-vol samples ({len(df_low_vol)}), using full model")
+            low_vol_results = self.low_vol_predictor.train_range_model(
+                df, options_features=options_features, n_trials=n_trials, n_jobs=n_jobs
+            )
+
+        self.is_trained = True
+
+        print("\n" + "=" * 60)
+        print("REGIME-SWITCHING TRAINING COMPLETE")
+        print("=" * 60)
+
+        return {
+            'high_vol_r2': high_vol_results.get('r2', 0),
+            'low_vol_r2': low_vol_results.get('r2', 0),
+            'high_vol_samples': len(df_high_vol),
+            'low_vol_samples': len(df_low_vol),
+            'vol_threshold': self.vol_threshold
+        }
+
+    def predict_daily_range(self, df: pd.DataFrame, options_features: Dict = None,
+                            confidence_level: float = 0.9) -> Dict:
+        """
+        Predict range using the appropriate regime model.
+
+        Automatically detects current volatility regime and routes to the right model.
+        """
+        if not self.is_trained:
+            raise ValueError("Model not trained. Call train() first.")
+
+        # Determine current regime
+        vol_regime, vol_20d = self._calculate_volatility_regime(df)
+        current_vol = vol_20d.iloc[-1]
+        current_regime = vol_regime.iloc[-1]
+
+        print(f"Current volatility: {current_vol:.2f}% (Regime: {current_regime.upper()})")
+
+        # Route to appropriate model
+        if current_regime == 'high' or current_vol > self.vol_threshold:
+            print("Using HIGH VOLATILITY model")
+            result = self.high_vol_predictor.predict_daily_range(
+                df, options_features=options_features, confidence_level=confidence_level
+            )
+            result['regime_used'] = 'high_volatility'
+        else:
+            print("Using LOW VOLATILITY model")
+            result = self.low_vol_predictor.predict_daily_range(
+                df, options_features=options_features, confidence_level=confidence_level
+            )
+            result['regime_used'] = 'low_volatility'
+
+        result['current_volatility'] = current_vol
+        result['volatility_threshold'] = self.vol_threshold
+
+        return result
+
+    def get_regime_info(self, df: pd.DataFrame) -> Dict:
+        """Get current regime information without making a prediction."""
+        vol_regime, vol_20d = self._calculate_volatility_regime(df)
+        trend_regime = self._calculate_trend_regime(df)
+
+        return {
+            'volatility_regime': vol_regime.iloc[-1],
+            'trend_regime': trend_regime.iloc[-1],
+            'current_volatility': vol_20d.iloc[-1],
+            'volatility_threshold': self.vol_threshold,
+            'volatility_percentile': (vol_20d.iloc[-1] - vol_20d.min()) / (vol_20d.max() - vol_20d.min()) if vol_20d.max() != vol_20d.min() else 0.5
+        }
 
 
 class PriceTargetCalculator:

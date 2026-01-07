@@ -5317,7 +5317,10 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                         end_date = datetime.now()
                         data_msg = "yesterday's close (market open)"
 
-                    start_date = datetime.now() - timedelta(days=500)
+                    # Use the same years setting from session state (default 5 years for range prediction)
+                    years_setting = st.session_state.get('years', 5)
+                    days_to_fetch = years_setting * 365
+                    start_date = datetime.now() - timedelta(days=days_to_fetch)
                     fresh_df = yf.download(pred_ticker, start=start_date, end=end_date, interval=pred_interval, progress=False)
 
                     if not fresh_df.empty:
@@ -5366,10 +5369,11 @@ def render_strategy_discovery_section(df: pd.DataFrame):
 
             # Fetch fresh data using yfinance
             @st.cache_data(ttl=60)  # Cache for 1 minute (reduced from 5)
-            def fetch_strategy_data(ticker: str, interval: str, days: int = 500, include_today: bool = False):
+            def fetch_strategy_data(ticker: str, interval: str, days: int = 1825, include_today: bool = False):
                 """Fetch fresh data for a strategy.
 
                 Args:
+                    days: Number of days of data to fetch (default 1825 = 5 years for daily)
                     include_today: If True, extends end_date to include today's data.
                                    Should be True when market is closed.
                 """
@@ -5465,10 +5469,14 @@ def render_strategy_discovery_section(df: pd.DataFrame):
             # Default key from user's strategies
             polygon_api_key = ''
 
+        # Reuse PolygonManager instance across Streamlit reruns (preserves in-memory cache)
         polygon = None
         if POLYGON_AVAILABLE and polygon_api_key:
-            polygon = PolygonManager(polygon_api_key)
-            st.success(f"Polygon API connected (key: ...{polygon_api_key[-8:]})")
+            cache_key = f"polygon_manager_{polygon_api_key[-8:]}"
+            if cache_key not in st.session_state:
+                st.session_state[cache_key] = PolygonManager(polygon_api_key)
+                st.success(f"Polygon API connected (key: ...{polygon_api_key[-8:]})")
+            polygon = st.session_state[cache_key]
 
         st.markdown("---")
 
@@ -5634,9 +5642,12 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                             print(f"[RANGE MODEL] Options features loaded")
 
                         # Train model with parallel workers
+                        # IMPORTANT: Don't pass options_features to training!
+                        # Options data is point-in-time, not historical.
+                        # Use volatility_20d as IV proxy during training.
                         result = range_predictor.train_range_model(
                             pred_df,
-                            options_features=options_features,
+                            options_features=None,  # Don't use options for training!
                             n_trials=n_trials_range,
                             n_workers=N_JOBS_OPTUNA
                         )
@@ -6453,12 +6464,8 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     # Get feature importance from stored predictor
                     range_predictor = st.session_state.get('range_predictor')
                     if range_predictor and hasattr(range_predictor, 'range_model') and range_predictor.range_model is not None:
-                        # Use selected_feature_names (after filtering) to match model's feature_importances_
-                        feature_names_for_importance = (
-                            range_predictor.selected_feature_names
-                            if range_predictor.selected_feature_names is not None
-                            else range_predictor.feature_names
-                        )
+                        # Use feature_names to match model's feature_importances_
+                        feature_names_for_importance = range_predictor.feature_names
                         importance_df = pd.DataFrame({
                             'Feature': feature_names_for_importance,
                             'Importance': range_predictor.range_model.feature_importances_
@@ -6768,9 +6775,9 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                 wf_n_trials = st.number_input(
                     "Optuna Trials per Training",
                     min_value=10,
-                    max_value=1000,
-                    value=30,
-                    help="More trials = better hyperparameters but slower."
+                    max_value=50000,
+                    value=100,
+                    help="More trials = better hyperparameters but slower. No hard limit, but diminishing returns after ~1000."
                 )
             with wf_col5:
                 wf_n_workers = st.number_input(
@@ -6827,8 +6834,10 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                         if need_retrain:
                             status_text.text(f"Training model for {test_date.strftime('%Y-%m-%d')}... ({i+1}/{wf_test_days})")
 
-                            # Get training data (all data before test_idx)
-                            train_df = pred_df.iloc[:test_idx].copy()
+                            # Get training data (ROLLING window - only last N days before test)
+                            # This matches comprehensive_walkforward_test.py and keeps model focused on recent data
+                            train_start_idx = max(0, test_idx - wf_min_train_days)
+                            train_df = pred_df.iloc[train_start_idx:test_idx].copy()
 
                             if len(train_df) >= wf_min_train_days:
                                 try:
@@ -6846,16 +6855,28 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                             pass
 
                                     # Train with reduced output
+                                    # IMPORTANT: Do NOT pass options_features to training!
+                                    # Options data is point-in-time, not historical.
+                                    # Passing it makes all IV features constant, breaking the model.
                                     with st.spinner(f"Training on {len(train_df)} days..."):
                                         train_result = wf_predictor.train_range_model(
                                             train_df,
-                                            options_features=wf_options,
+                                            options_features=None,  # Don't use options for training!
                                             n_trials=wf_n_trials,
                                             n_workers=wf_n_workers
                                         )
 
                                     current_model = wf_predictor
                                     last_train_idx = test_idx
+
+                                    # Store feature importances for analysis
+                                    if train_result and 'feature_importance' in train_result:
+                                        imp_df = train_result['feature_importance'].copy()
+                                        imp_df['train_date'] = test_date
+                                        imp_df['train_idx'] = test_idx
+                                        wf_feature_importances.append(imp_df)
+                                        if wf_feature_names is None:
+                                            wf_feature_names = train_result.get('feature_names', [])
 
                                 except Exception as train_err:
                                     st.warning(f"Training failed at {test_date}: {train_err}")
@@ -6918,6 +6939,10 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     # Store results in session state
                     if wf_results:
                         st.session_state['wf_results'] = pd.DataFrame(wf_results)
+                        st.session_state['wf_feature_importances'] = wf_feature_importances
+                        st.session_state['wf_feature_names'] = wf_feature_names
+                        st.session_state['wf_pred_df'] = pred_df  # Store for feature analysis
+                        st.session_state['wf_current_model'] = current_model  # Store trained model for predictions
                         st.success(f"Completed {len(wf_results)} predictions!")
                     else:
                         st.error("No predictions were generated.")
@@ -7154,6 +7179,848 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                         file_name=f"walk_forward_{st.session_state.get('ticker', 'SPY')}_{wf_df['date'].iloc[0].strftime('%Y%m%d')}_{wf_df['date'].iloc[-1].strftime('%Y%m%d')}.csv",
                         mime="text/csv"
                     )
+
+                # ==================== PREDICT TOMORROW'S RANGE ====================
+                st.markdown("---")
+                st.subheader("Predict Tomorrow's Range")
+
+                # Check if we have a trained model from the walk-forward analysis
+                wf_current_model = st.session_state.get('wf_current_model')
+
+                if wf_current_model is not None:
+                    pred_col1, pred_col2 = st.columns([3, 1])
+
+                    with pred_col2:
+                        predict_tomorrow_btn = st.button(
+                            "🔮 Predict Tomorrow's Range",
+                            type="primary",
+                            use_container_width=True,
+                            help="Use the trained model to predict tomorrow's high/low range"
+                        )
+
+                    if predict_tomorrow_btn or st.session_state.get('wf_tomorrow_prediction') is not None:
+                        with st.spinner("Generating prediction..."):
+                            try:
+                                # Get options features for enhanced prediction
+                                wf_options = None
+                                if polygon:
+                                    try:
+                                        wf_options = wf_current_model.get_options_features(
+                                            st.session_state.get('ticker', 'SPY'),
+                                            pred_df['close'].iloc[-1]
+                                        )
+                                    except:
+                                        pass
+
+                                # Make prediction using the trained model
+                                if predict_tomorrow_btn:
+                                    tomorrow_pred = wf_current_model.predict_daily_range(
+                                        pred_df,
+                                        options_features=wf_options
+                                    )
+                                    st.session_state['wf_tomorrow_prediction'] = tomorrow_pred
+                                else:
+                                    tomorrow_pred = st.session_state['wf_tomorrow_prediction']
+
+                                # Display prediction stats
+                                with pred_col1:
+                                    st.markdown("**Tomorrow's Predicted Range**")
+
+                                pred_stat_col1, pred_stat_col2, pred_stat_col3, pred_stat_col4 = st.columns(4)
+
+                                current_close = pred_df['close'].iloc[-1]
+                                pred_high = tomorrow_pred['predicted_high']
+                                pred_low = tomorrow_pred['predicted_low']
+                                pred_range = tomorrow_pred['predicted_range_dollars']
+                                pred_range_pct = tomorrow_pred['predicted_range'] * 100
+
+                                with pred_stat_col1:
+                                    high_change = ((pred_high - current_close) / current_close) * 100
+                                    st.metric("Predicted High", f"${pred_high:.2f}", f"{high_change:+.2f}%")
+                                with pred_stat_col2:
+                                    low_change = ((pred_low - current_close) / current_close) * 100
+                                    st.metric("Predicted Low", f"${pred_low:.2f}", f"{low_change:+.2f}%")
+                                with pred_stat_col3:
+                                    st.metric("Predicted Range", f"${pred_range:.2f}", f"{pred_range_pct:.2f}%")
+                                with pred_stat_col4:
+                                    confidence = tomorrow_pred.get('confidence_level', 0.9) * 100
+                                    st.metric("Confidence", f"{confidence:.0f}%")
+
+                                # Confidence bounds
+                                st.markdown("**Confidence Bounds (90%)**")
+                                bounds_col1, bounds_col2, bounds_col3, bounds_col4 = st.columns(4)
+
+                                with bounds_col1:
+                                    st.metric("High Lower", f"${tomorrow_pred['high_lower']:.2f}")
+                                with bounds_col2:
+                                    st.metric("High Upper", f"${tomorrow_pred['high_upper']:.2f}")
+                                with bounds_col3:
+                                    st.metric("Low Lower", f"${tomorrow_pred['low_lower']:.2f}")
+                                with bounds_col4:
+                                    st.metric("Low Upper", f"${tomorrow_pred['low_upper']:.2f}")
+
+                                # Create candlestick chart with prediction
+                                st.markdown("---")
+                                st.markdown("**Chart: Recent Price Action + Tomorrow's Predicted Range**")
+
+                                # Get last 30 days of data for the chart
+                                chart_df = pred_df.tail(30).copy()
+
+                                import plotly.graph_objects as go
+                                from plotly.subplots import make_subplots
+
+                                fig_pred = make_subplots(
+                                    rows=1, cols=1,
+                                    subplot_titles=("Price with Tomorrow's Predicted Range",)
+                                )
+
+                                # Candlestick for historical data
+                                fig_pred.add_trace(
+                                    go.Candlestick(
+                                        x=chart_df.index,
+                                        open=chart_df['open'],
+                                        high=chart_df['high'],
+                                        low=chart_df['low'],
+                                        close=chart_df['close'],
+                                        name='Price',
+                                        increasing_line_color='#26a69a',
+                                        decreasing_line_color='#ef5350'
+                                    )
+                                )
+
+                                # Calculate next trading day
+                                last_date = chart_df.index[-1]
+                                if hasattr(last_date, 'date'):
+                                    # Add 1 day, skip weekends
+                                    next_date = last_date + pd.Timedelta(days=1)
+                                    while next_date.weekday() >= 5:  # Saturday=5, Sunday=6
+                                        next_date += pd.Timedelta(days=1)
+                                else:
+                                    next_date = last_date
+
+                                # Prediction candle (using predicted values)
+                                fig_pred.add_trace(
+                                    go.Candlestick(
+                                        x=[next_date],
+                                        open=[current_close],
+                                        high=[pred_high],
+                                        low=[pred_low],
+                                        close=[(pred_high + pred_low) / 2],  # Midpoint as "close"
+                                        name='Predicted',
+                                        increasing_line_color='#00d4ff',
+                                        decreasing_line_color='#00d4ff'
+                                    )
+                                )
+
+                                # High confidence band (shaded area)
+                                fig_pred.add_trace(
+                                    go.Scatter(
+                                        x=[next_date, next_date],
+                                        y=[tomorrow_pred['high_lower'], tomorrow_pred['high_upper']],
+                                        mode='lines',
+                                        line=dict(color='rgba(255, 152, 0, 0.8)', width=3),
+                                        name='High Range (90%)'
+                                    )
+                                )
+
+                                # Low confidence band
+                                fig_pred.add_trace(
+                                    go.Scatter(
+                                        x=[next_date, next_date],
+                                        y=[tomorrow_pred['low_lower'], tomorrow_pred['low_upper']],
+                                        mode='lines',
+                                        line=dict(color='rgba(33, 150, 243, 0.8)', width=3),
+                                        name='Low Range (90%)'
+                                    )
+                                )
+
+                                # Add horizontal lines for predicted high/low extending from last bar
+                                fig_pred.add_hline(
+                                    y=pred_high,
+                                    line_dash="dash",
+                                    line_color="orange",
+                                    annotation_text=f"Pred High: ${pred_high:.2f}",
+                                    annotation_position="right"
+                                )
+                                fig_pred.add_hline(
+                                    y=pred_low,
+                                    line_dash="dash",
+                                    line_color="blue",
+                                    annotation_text=f"Pred Low: ${pred_low:.2f}",
+                                    annotation_position="right"
+                                )
+
+                                fig_pred.update_layout(
+                                    height=500,
+                                    xaxis_rangeslider_visible=False,
+                                    showlegend=True,
+                                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                                    yaxis_title="Price ($)"
+                                )
+
+                                st.plotly_chart(fig_pred, use_container_width=True)
+
+                                # Model info
+                                st.markdown("---")
+                                model_r2 = tomorrow_pred.get('model_r2', 0)
+                                st.caption(f"Model R²: {model_r2:.4f} | Method: {tomorrow_pred.get('confidence_method', 'rmse')} | "
+                                          f"Last trained on walk-forward data")
+
+                            except Exception as pred_err:
+                                st.error(f"Prediction failed: {pred_err}")
+                                import traceback
+                                st.code(traceback.format_exc())
+                else:
+                    st.info("Run walk-forward analysis first to train a model for predictions.")
+
+                # ==================== FEATURE ANALYSIS SECTION ====================
+                st.markdown("---")
+                st.subheader("Feature Analysis & Discovery")
+
+                # Check if we have feature importances
+                wf_importances = st.session_state.get('wf_feature_importances', [])
+                wf_feat_names = st.session_state.get('wf_feature_names', [])
+                wf_analysis_df = st.session_state.get('wf_pred_df', pred_df)
+
+                if wf_importances and len(wf_importances) > 0:
+                    # Aggregate feature importances across all trainings
+                    all_imp = pd.concat(wf_importances, ignore_index=True)
+
+                    # Calculate mean and std importance per feature
+                    agg_importance = all_imp.groupby('feature')['importance'].agg(['mean', 'std', 'count']).reset_index()
+                    agg_importance.columns = ['feature', 'mean_importance', 'std_importance', 'train_count']
+                    agg_importance['consistency'] = agg_importance['mean_importance'] / (agg_importance['std_importance'] + 1e-10)
+                    agg_importance = agg_importance.sort_values('mean_importance', ascending=False)
+
+                    # Feature analysis tabs
+                    feat_tab1, feat_tab2, feat_tab3, feat_tab4 = st.tabs([
+                        "Importance Ranking",
+                        "Correlation Analysis",
+                        "SHAP Analysis",
+                        "Feature Discovery"
+                    ])
+
+                    # === TAB 1: IMPORTANCE RANKING ===
+                    with feat_tab1:
+                        st.markdown("**Aggregated Feature Importance** (across all walk-forward trainings)")
+
+                        # Top features
+                        top_n = min(20, len(agg_importance))
+                        top_features = agg_importance.head(top_n)
+
+                        # Bar chart
+                        import plotly.express as px
+                        fig_imp = px.bar(
+                            top_features,
+                            x='mean_importance',
+                            y='feature',
+                            orientation='h',
+                            error_x='std_importance',
+                            title=f'Top {top_n} Features by Mean Importance',
+                            labels={'mean_importance': 'Mean Importance', 'feature': 'Feature'}
+                        )
+                        fig_imp.update_layout(height=500, yaxis={'categoryorder': 'total ascending'})
+                        st.plotly_chart(fig_imp, use_container_width=True)
+
+                        # Dead features (consistently low importance)
+                        importance_threshold = agg_importance['mean_importance'].quantile(0.25)
+                        dead_features = agg_importance[agg_importance['mean_importance'] < importance_threshold]
+
+                        col_top, col_dead = st.columns(2)
+
+                        with col_top:
+                            st.markdown("**Top 10 Most Important Features:**")
+                            for i, row in agg_importance.head(10).iterrows():
+                                st.markdown(f"- `{row['feature']}`: {row['mean_importance']:.4f} (±{row['std_importance']:.4f})")
+
+                        with col_dead:
+                            st.markdown(f"**Dead Features** (below {importance_threshold:.4f}):")
+                            dead_list = dead_features['feature'].tolist()[:15]
+                            if dead_list:
+                                for f in dead_list:
+                                    st.markdown(f"- `{f}`")
+                                if len(dead_features) > 15:
+                                    st.markdown(f"*...and {len(dead_features) - 15} more*")
+                            else:
+                                st.markdown("*No consistently dead features found*")
+
+                    # === TAB 2: CORRELATION ANALYSIS ===
+                    with feat_tab2:
+                        st.markdown("**Feature-Target Correlation Analysis**")
+
+                        # Create features and target for correlation
+                        try:
+                            # Use PriceRangePredictor to create features
+                            corr_predictor = PriceRangePredictor()
+                            corr_features = corr_predictor.create_range_features(wf_analysis_df)
+                            corr_targets = corr_predictor.create_targets(wf_analysis_df)
+
+                            if 'next_range' in corr_targets.columns:
+                                # Calculate correlations
+                                feature_cols = [c for c in corr_features.columns if c in corr_predictor.feature_names]
+                                correlations = []
+
+                                for col in feature_cols:
+                                    valid_idx = corr_features[col].dropna().index.intersection(corr_targets['next_range'].dropna().index)
+                                    if len(valid_idx) > 30:
+                                        corr = corr_features.loc[valid_idx, col].corr(corr_targets.loc[valid_idx, 'next_range'])
+                                        correlations.append({'feature': col, 'correlation': corr, 'abs_corr': abs(corr)})
+
+                                corr_df = pd.DataFrame(correlations).sort_values('abs_corr', ascending=False)
+
+                                # Correlation bar chart
+                                top_corr = corr_df.head(25)
+                                fig_corr = px.bar(
+                                    top_corr,
+                                    x='correlation',
+                                    y='feature',
+                                    orientation='h',
+                                    title='Top 25 Features by Correlation with Next Day Range',
+                                    color='correlation',
+                                    color_continuous_scale='RdBu_r',
+                                    range_color=[-0.5, 0.5]
+                                )
+                                fig_corr.update_layout(height=600, yaxis={'categoryorder': 'total ascending'})
+                                st.plotly_chart(fig_corr, use_container_width=True)
+
+                                # Show high correlation features
+                                col_pos, col_neg = st.columns(2)
+                                with col_pos:
+                                    st.markdown("**Positive Correlations** (higher value → larger range):")
+                                    pos_corr = corr_df[corr_df['correlation'] > 0.1].head(10)
+                                    for _, row in pos_corr.iterrows():
+                                        st.markdown(f"- `{row['feature']}`: {row['correlation']:.3f}")
+
+                                with col_neg:
+                                    st.markdown("**Negative Correlations** (higher value → smaller range):")
+                                    neg_corr = corr_df[corr_df['correlation'] < -0.1].head(10)
+                                    for _, row in neg_corr.iterrows():
+                                        st.markdown(f"- `{row['feature']}`: {row['correlation']:.3f}")
+
+                                # Correlation vs Importance comparison
+                                st.markdown("---")
+                                st.markdown("**Correlation vs Importance Comparison**")
+                                merged = agg_importance.merge(corr_df[['feature', 'correlation', 'abs_corr']], on='feature', how='inner')
+                                if len(merged) > 0:
+                                    fig_compare = px.scatter(
+                                        merged,
+                                        x='abs_corr',
+                                        y='mean_importance',
+                                        hover_data=['feature'],
+                                        title='Feature Correlation vs Model Importance',
+                                        labels={'abs_corr': 'Absolute Correlation', 'mean_importance': 'Model Importance'}
+                                    )
+                                    fig_compare.update_layout(height=400)
+                                    st.plotly_chart(fig_compare, use_container_width=True)
+
+                                    # Undervalued features (high correlation, low importance)
+                                    merged['corr_rank'] = merged['abs_corr'].rank(ascending=False)
+                                    merged['imp_rank'] = merged['mean_importance'].rank(ascending=False)
+                                    merged['rank_diff'] = merged['corr_rank'] - merged['imp_rank']
+                                    undervalued = merged[merged['rank_diff'] < -10].sort_values('rank_diff')
+
+                                    if len(undervalued) > 0:
+                                        st.markdown("**Potentially Undervalued Features** (high correlation but low importance):")
+                                        for _, row in undervalued.head(5).iterrows():
+                                            st.markdown(f"- `{row['feature']}`: corr={row['correlation']:.3f}, imp={row['mean_importance']:.4f}")
+
+                        except Exception as corr_err:
+                            st.warning(f"Could not compute correlations: {corr_err}")
+
+                    # === TAB 3: SHAP ANALYSIS ===
+                    with feat_tab3:
+                        st.markdown("**SHAP Value Analysis**")
+                        st.info("SHAP analysis shows HOW each feature affects predictions, not just importance.")
+
+                        try:
+                            import shap
+                            import matplotlib.pyplot as plt
+                            SHAP_AVAILABLE = True
+                        except ImportError:
+                            SHAP_AVAILABLE = False
+                            st.warning("SHAP library not installed. Run: `pip install shap`")
+
+                        if SHAP_AVAILABLE:
+                            if st.button("Run SHAP Analysis", help="This may take a minute to compute"):
+                                with st.spinner("Computing SHAP values..."):
+                                    try:
+                                        # Train a model on full data for SHAP
+                                        shap_predictor = PriceRangePredictor()
+                                        shap_features = shap_predictor.create_range_features(wf_analysis_df)
+                                        shap_targets = shap_predictor.create_targets(wf_analysis_df)
+
+                                        X_shap = shap_features[shap_predictor.feature_names].dropna()
+                                        y_shap = shap_targets.loc[X_shap.index, 'next_range'].dropna()
+                                        common_idx = X_shap.index.intersection(y_shap.index)
+                                        X_shap = X_shap.loc[common_idx]
+                                        y_shap = y_shap.loc[common_idx]
+
+                                        # Scale and train
+                                        from sklearn.preprocessing import StandardScaler
+                                        scaler = StandardScaler()
+                                        X_scaled = scaler.fit_transform(X_shap)
+
+                                        # Train simple XGBoost
+                                        import xgboost as xgb
+                                        model = xgb.XGBRegressor(n_estimators=100, max_depth=5, learning_rate=0.1, verbosity=0)
+                                        model.fit(X_scaled, y_shap)
+
+                                        # Compute SHAP values (use sample for speed)
+                                        sample_size = min(500, len(X_scaled))
+                                        X_sample = X_scaled[:sample_size]
+
+                                        explainer = shap.TreeExplainer(model)
+                                        shap_values = explainer.shap_values(X_sample)
+
+                                        # SHAP summary plot
+                                        st.markdown("**SHAP Summary Plot**")
+                                        fig_shap, ax = plt.subplots(figsize=(10, 8))
+                                        shap.summary_plot(shap_values, X_shap.iloc[:sample_size], feature_names=shap_predictor.feature_names, show=False, max_display=20)
+                                        st.pyplot(fig_shap)
+                                        plt.close()
+
+                                        # Mean absolute SHAP values
+                                        mean_shap = np.abs(shap_values).mean(axis=0)
+                                        shap_importance = pd.DataFrame({
+                                            'feature': shap_predictor.feature_names,
+                                            'shap_importance': mean_shap
+                                        }).sort_values('shap_importance', ascending=False)
+
+                                        st.session_state['shap_importance'] = shap_importance
+
+                                        st.markdown("**Top SHAP Features:**")
+                                        for i, row in shap_importance.head(10).iterrows():
+                                            st.markdown(f"- `{row['feature']}`: {row['shap_importance']:.4f}")
+
+                                    except Exception as shap_err:
+                                        st.error(f"SHAP analysis failed: {shap_err}")
+
+                            # Show stored SHAP results if available
+                            if 'shap_importance' in st.session_state:
+                                shap_imp = st.session_state['shap_importance']
+                                fig_shap_bar = px.bar(
+                                    shap_imp.head(20),
+                                    x='shap_importance',
+                                    y='feature',
+                                    orientation='h',
+                                    title='Top 20 Features by Mean |SHAP|'
+                                )
+                                fig_shap_bar.update_layout(height=500, yaxis={'categoryorder': 'total ascending'})
+                                st.plotly_chart(fig_shap_bar, use_container_width=True)
+
+                    # === TAB 4: FEATURE DISCOVERY ===
+                    with feat_tab4:
+                        st.markdown("**Feature Discovery Tools**")
+                        st.markdown("Generate and test new features based on top performers.")
+
+                        # Get top features for discovery
+                        top_10_features = agg_importance.head(10)['feature'].tolist()
+
+                        discovery_tab1, discovery_tab2, discovery_tab3, discovery_tab4, discovery_tab5 = st.tabs([
+                            "Lag Analysis",
+                            "Interaction Terms",
+                            "Rolling Windows",
+                            "Regime Features",
+                            "Volume Analysis"
+                        ])
+
+                        # --- LAG ANALYSIS ---
+                        with discovery_tab1:
+                            st.markdown("**Lag Analysis** - Test different lag periods for top features")
+
+                            lag_feature = st.selectbox("Select feature to analyze lags:", top_10_features[:5] if len(top_10_features) >= 5 else top_10_features)
+                            max_lag = st.slider("Maximum lag (days):", 1, 20, 10)
+
+                            if st.button("Run Lag Analysis"):
+                                with st.spinner("Analyzing lags..."):
+                                    try:
+                                        lag_predictor = PriceRangePredictor()
+                                        lag_features = lag_predictor.create_range_features(wf_analysis_df)
+                                        lag_targets = lag_predictor.create_targets(wf_analysis_df)
+
+                                        if lag_feature in lag_features.columns and 'next_range' in lag_targets.columns:
+                                            lag_results = []
+                                            base_series = lag_features[lag_feature]
+                                            target_series = lag_targets['next_range']
+
+                                            for lag in range(0, max_lag + 1):
+                                                lagged = base_series.shift(lag)
+                                                valid_idx = lagged.dropna().index.intersection(target_series.dropna().index)
+                                                if len(valid_idx) > 30:
+                                                    corr = lagged.loc[valid_idx].corr(target_series.loc[valid_idx])
+                                                    lag_results.append({'lag': lag, 'correlation': corr, 'abs_corr': abs(corr)})
+
+                                            lag_df = pd.DataFrame(lag_results)
+                                            best_lag = lag_df.loc[lag_df['abs_corr'].idxmax()]
+
+                                            fig_lag = px.line(lag_df, x='lag', y='correlation', markers=True,
+                                                            title=f'Correlation of {lag_feature} at Different Lags')
+                                            fig_lag.add_hline(y=0, line_dash="dash", line_color="gray")
+                                            st.plotly_chart(fig_lag, use_container_width=True)
+
+                                            st.success(f"**Best lag: {int(best_lag['lag'])} days** (correlation: {best_lag['correlation']:.3f})")
+
+                                            if best_lag['lag'] > 0:
+                                                st.markdown(f"**Suggestion:** Add `{lag_feature}_lag{int(best_lag['lag'])}` to your features")
+
+                                    except Exception as lag_err:
+                                        st.error(f"Lag analysis failed: {lag_err}")
+
+                        # --- INTERACTION TERMS ---
+                        with discovery_tab2:
+                            st.markdown("**Interaction Terms** - Combine top features")
+
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                feat1 = st.selectbox("Feature 1:", top_10_features, key="int_feat1")
+                            with col2:
+                                feat2 = st.selectbox("Feature 2:", [f for f in top_10_features if f != feat1], key="int_feat2")
+
+                            interaction_type = st.selectbox("Interaction type:", ["Multiply", "Divide", "Add", "Subtract"])
+
+                            if st.button("Test Interaction"):
+                                with st.spinner("Testing interaction..."):
+                                    try:
+                                        int_predictor = PriceRangePredictor()
+                                        int_features = int_predictor.create_range_features(wf_analysis_df)
+                                        int_targets = int_predictor.create_targets(wf_analysis_df)
+
+                                        if feat1 in int_features.columns and feat2 in int_features.columns:
+                                            s1 = int_features[feat1]
+                                            s2 = int_features[feat2]
+
+                                            if interaction_type == "Multiply":
+                                                interaction = s1 * s2
+                                                name = f"{feat1}_x_{feat2}"
+                                            elif interaction_type == "Divide":
+                                                interaction = s1 / (s2 + 1e-10)
+                                                name = f"{feat1}_div_{feat2}"
+                                            elif interaction_type == "Add":
+                                                interaction = s1 + s2
+                                                name = f"{feat1}_plus_{feat2}"
+                                            else:
+                                                interaction = s1 - s2
+                                                name = f"{feat1}_minus_{feat2}"
+
+                                            # Calculate correlation
+                                            valid_idx = interaction.dropna().index.intersection(int_targets['next_range'].dropna().index)
+                                            if len(valid_idx) > 30:
+                                                int_corr = interaction.loc[valid_idx].corr(int_targets.loc[valid_idx, 'next_range'])
+
+                                                # Compare to individual features
+                                                corr1 = s1.loc[valid_idx].corr(int_targets.loc[valid_idx, 'next_range'])
+                                                corr2 = s2.loc[valid_idx].corr(int_targets.loc[valid_idx, 'next_range'])
+
+                                                st.markdown(f"**Results:**")
+                                                st.markdown(f"- `{feat1}` correlation: {corr1:.3f}")
+                                                st.markdown(f"- `{feat2}` correlation: {corr2:.3f}")
+                                                st.markdown(f"- **`{name}` correlation: {int_corr:.3f}**")
+
+                                                if abs(int_corr) > max(abs(corr1), abs(corr2)):
+                                                    st.success(f"Interaction `{name}` is better than individual features!")
+                                                else:
+                                                    st.info("Interaction doesn't improve over individual features.")
+
+                                    except Exception as int_err:
+                                        st.error(f"Interaction test failed: {int_err}")
+
+                        # --- ROLLING WINDOWS ---
+                        with discovery_tab3:
+                            st.markdown("**Rolling Window Analysis** - Test different lookback periods")
+
+                            base_metric = st.selectbox("Base metric:", ["range_pct", "volatility_5", "atr_14", "returns_1d"])
+                            windows_to_test = st.multiselect("Window sizes to test:", [3, 5, 7, 10, 14, 21, 30, 50], default=[5, 10, 21])
+
+                            if st.button("Test Rolling Windows") and windows_to_test:
+                                with st.spinner("Testing windows..."):
+                                    try:
+                                        roll_predictor = PriceRangePredictor()
+                                        roll_features = roll_predictor.create_range_features(wf_analysis_df)
+                                        roll_targets = roll_predictor.create_targets(wf_analysis_df)
+
+                                        # Get base data
+                                        if 'range_pct' in wf_analysis_df.columns:
+                                            base_data = wf_analysis_df['range_pct']
+                                        else:
+                                            base_data = (wf_analysis_df['high'] - wf_analysis_df['low']) / wf_analysis_df['close']
+
+                                        window_results = []
+                                        for w in windows_to_test:
+                                            # Mean
+                                            rolled_mean = base_data.rolling(w).mean()
+                                            valid_idx = rolled_mean.dropna().index.intersection(roll_targets['next_range'].dropna().index)
+                                            if len(valid_idx) > 30:
+                                                corr_mean = rolled_mean.loc[valid_idx].corr(roll_targets.loc[valid_idx, 'next_range'])
+                                                window_results.append({'window': w, 'aggregation': 'mean', 'correlation': corr_mean})
+
+                                            # Std
+                                            rolled_std = base_data.rolling(w).std()
+                                            valid_idx = rolled_std.dropna().index.intersection(roll_targets['next_range'].dropna().index)
+                                            if len(valid_idx) > 30:
+                                                corr_std = rolled_std.loc[valid_idx].corr(roll_targets.loc[valid_idx, 'next_range'])
+                                                window_results.append({'window': w, 'aggregation': 'std', 'correlation': corr_std})
+
+                                        window_df = pd.DataFrame(window_results)
+
+                                        fig_window = px.bar(
+                                            window_df,
+                                            x='window',
+                                            y='correlation',
+                                            color='aggregation',
+                                            barmode='group',
+                                            title='Correlation by Rolling Window Size'
+                                        )
+                                        st.plotly_chart(fig_window, use_container_width=True)
+
+                                        best_window = window_df.loc[window_df['correlation'].abs().idxmax()]
+                                        st.success(f"**Best window:** {int(best_window['window'])} days ({best_window['aggregation']}) with correlation {best_window['correlation']:.3f}")
+
+                                    except Exception as roll_err:
+                                        st.error(f"Rolling window test failed: {roll_err}")
+
+                        # --- REGIME FEATURES ---
+                        with discovery_tab4:
+                            st.markdown("**Regime-Specific Analysis** - Feature importance in different market conditions")
+
+                            regime_metric = st.selectbox("Regime split metric:", ["volatility", "trend", "range_size"])
+
+                            if st.button("Analyze Regime Features"):
+                                with st.spinner("Analyzing regimes..."):
+                                    try:
+                                        reg_predictor = PriceRangePredictor()
+                                        reg_features = reg_predictor.create_range_features(wf_analysis_df)
+                                        reg_targets = reg_predictor.create_targets(wf_analysis_df)
+
+                                        # Define regime
+                                        if regime_metric == "volatility":
+                                            if 'volatility_20' in reg_features.columns:
+                                                regime_series = reg_features['volatility_20']
+                                            else:
+                                                regime_series = wf_analysis_df['close'].pct_change().rolling(20).std()
+                                        elif regime_metric == "trend":
+                                            regime_series = wf_analysis_df['close'].pct_change(20)
+                                        else:  # range_size
+                                            regime_series = (wf_analysis_df['high'] - wf_analysis_df['low']) / wf_analysis_df['close']
+
+                                        median_val = regime_series.median()
+                                        high_regime_idx = regime_series[regime_series > median_val].index
+                                        low_regime_idx = regime_series[regime_series <= median_val].index
+
+                                        # Calculate correlations in each regime
+                                        feature_cols = [c for c in reg_features.columns if c in reg_predictor.feature_names][:30]
+
+                                        regime_results = []
+                                        for col in feature_cols:
+                                            # High regime
+                                            high_idx = reg_features[col].dropna().index.intersection(reg_targets['next_range'].dropna().index).intersection(high_regime_idx)
+                                            if len(high_idx) > 20:
+                                                corr_high = reg_features.loc[high_idx, col].corr(reg_targets.loc[high_idx, 'next_range'])
+                                            else:
+                                                corr_high = 0
+
+                                            # Low regime
+                                            low_idx = reg_features[col].dropna().index.intersection(reg_targets['next_range'].dropna().index).intersection(low_regime_idx)
+                                            if len(low_idx) > 20:
+                                                corr_low = reg_features.loc[low_idx, col].corr(reg_targets.loc[low_idx, 'next_range'])
+                                            else:
+                                                corr_low = 0
+
+                                            regime_results.append({
+                                                'feature': col,
+                                                f'high_{regime_metric}': corr_high,
+                                                f'low_{regime_metric}': corr_low,
+                                                'diff': abs(corr_high) - abs(corr_low)
+                                            })
+
+                                        regime_df = pd.DataFrame(regime_results)
+
+                                        # Features better in high regime
+                                        high_better = regime_df.sort_values('diff', ascending=False).head(10)
+                                        low_better = regime_df.sort_values('diff', ascending=True).head(10)
+
+                                        col1, col2 = st.columns(2)
+                                        with col1:
+                                            st.markdown(f"**Better in High {regime_metric.title()}:**")
+                                            for _, row in high_better.iterrows():
+                                                st.markdown(f"- `{row['feature']}`: high={row[f'high_{regime_metric}']:.3f}, low={row[f'low_{regime_metric}']:.3f}")
+
+                                        with col2:
+                                            st.markdown(f"**Better in Low {regime_metric.title()}:**")
+                                            for _, row in low_better.iterrows():
+                                                st.markdown(f"- `{row['feature']}`: high={row[f'high_{regime_metric}']:.3f}, low={row[f'low_{regime_metric}']:.3f}")
+
+                                        # Scatter plot
+                                        fig_regime = px.scatter(
+                                            regime_df,
+                                            x=f'low_{regime_metric}',
+                                            y=f'high_{regime_metric}',
+                                            hover_data=['feature'],
+                                            title=f'Feature Correlation: High vs Low {regime_metric.title()} Regime'
+                                        )
+                                        fig_regime.add_shape(type="line", x0=-0.5, y0=-0.5, x1=0.5, y1=0.5, line=dict(dash="dash", color="gray"))
+                                        st.plotly_chart(fig_regime, use_container_width=True)
+
+                                        st.markdown("*Points above the diagonal work better in high regime, below work better in low regime*")
+
+                                    except Exception as reg_err:
+                                        st.error(f"Regime analysis failed: {reg_err}")
+
+                        # --- VOLUME ANALYSIS ---
+                        with discovery_tab5:
+                            st.markdown("**Volume Derivatives Analysis**")
+                            st.markdown("Test volume and its derivatives (velocity, acceleration) as predictive features.")
+
+                            vol_windows = st.multiselect(
+                                "Smoothing windows for derivatives:",
+                                [1, 3, 5, 7, 10, 14, 21],
+                                default=[1, 5, 14],
+                                help="Test different smoothing windows for volume derivatives"
+                            )
+
+                            if st.button("Analyze Volume Features"):
+                                with st.spinner("Analyzing volume features..."):
+                                    try:
+                                        vol_predictor = PriceRangePredictor()
+                                        vol_features = vol_predictor.create_range_features(wf_analysis_df)
+                                        vol_targets = vol_predictor.create_targets(wf_analysis_df)
+
+                                        # Get volume data
+                                        volume = wf_analysis_df['volume'].copy()
+
+                                        # Normalize volume (relative to 20-day average)
+                                        volume_norm = volume / volume.rolling(20).mean()
+
+                                        vol_results = []
+
+                                        for window in vol_windows:
+                                            # Smooth volume
+                                            if window > 1:
+                                                vol_smooth = volume.rolling(window).mean()
+                                                vol_norm_smooth = volume_norm.rolling(window).mean()
+                                            else:
+                                                vol_smooth = volume
+                                                vol_norm_smooth = volume_norm
+
+                                            # Volume (raw and normalized)
+                                            valid_idx = vol_smooth.dropna().index.intersection(vol_targets['next_range'].dropna().index)
+                                            if len(valid_idx) > 30:
+                                                corr_vol = vol_smooth.loc[valid_idx].corr(vol_targets.loc[valid_idx, 'next_range'])
+                                                vol_results.append({
+                                                    'feature': f'volume_smooth{window}',
+                                                    'type': 'Volume',
+                                                    'window': window,
+                                                    'correlation': corr_vol
+                                                })
+
+                                            valid_idx = vol_norm_smooth.dropna().index.intersection(vol_targets['next_range'].dropna().index)
+                                            if len(valid_idx) > 30:
+                                                corr_vol_norm = vol_norm_smooth.loc[valid_idx].corr(vol_targets.loc[valid_idx, 'next_range'])
+                                                vol_results.append({
+                                                    'feature': f'volume_rel_smooth{window}',
+                                                    'type': 'Volume (Relative)',
+                                                    'window': window,
+                                                    'correlation': corr_vol_norm
+                                                })
+
+                                            # Velocity (1st derivative)
+                                            vol_velocity = vol_smooth.diff()
+                                            valid_idx = vol_velocity.dropna().index.intersection(vol_targets['next_range'].dropna().index)
+                                            if len(valid_idx) > 30:
+                                                corr_vel = vol_velocity.loc[valid_idx].corr(vol_targets.loc[valid_idx, 'next_range'])
+                                                vol_results.append({
+                                                    'feature': f'volume_velocity_w{window}',
+                                                    'type': 'Velocity (dV/dt)',
+                                                    'window': window,
+                                                    'correlation': corr_vel
+                                                })
+
+                                            # Acceleration (2nd derivative)
+                                            vol_accel = vol_velocity.diff()
+                                            valid_idx = vol_accel.dropna().index.intersection(vol_targets['next_range'].dropna().index)
+                                            if len(valid_idx) > 30:
+                                                corr_acc = vol_accel.loc[valid_idx].corr(vol_targets.loc[valid_idx, 'next_range'])
+                                                vol_results.append({
+                                                    'feature': f'volume_accel_w{window}',
+                                                    'type': 'Acceleration (d²V/dt²)',
+                                                    'window': window,
+                                                    'correlation': corr_acc
+                                                })
+
+                                            # Normalized velocity
+                                            vol_norm_velocity = vol_norm_smooth.diff()
+                                            valid_idx = vol_norm_velocity.dropna().index.intersection(vol_targets['next_range'].dropna().index)
+                                            if len(valid_idx) > 30:
+                                                corr_norm_vel = vol_norm_velocity.loc[valid_idx].corr(vol_targets.loc[valid_idx, 'next_range'])
+                                                vol_results.append({
+                                                    'feature': f'volume_rel_velocity_w{window}',
+                                                    'type': 'Rel. Velocity',
+                                                    'window': window,
+                                                    'correlation': corr_norm_vel
+                                                })
+
+                                        # Volume-Price divergence
+                                        price_change = wf_analysis_df['close'].pct_change(5)
+                                        vol_change = volume.pct_change(5)
+                                        divergence = price_change - vol_change  # If price up but volume down = bearish divergence
+                                        valid_idx = divergence.dropna().index.intersection(vol_targets['next_range'].dropna().index)
+                                        if len(valid_idx) > 30:
+                                            corr_div = divergence.loc[valid_idx].corr(vol_targets.loc[valid_idx, 'next_range'])
+                                            vol_results.append({
+                                                'feature': 'price_volume_divergence_5d',
+                                                'type': 'Divergence',
+                                                'window': 5,
+                                                'correlation': corr_div
+                                            })
+
+                                        vol_df = pd.DataFrame(vol_results)
+                                        vol_df['abs_corr'] = vol_df['correlation'].abs()
+                                        vol_df = vol_df.sort_values('abs_corr', ascending=False)
+
+                                        # Display results
+                                        fig_vol = px.bar(
+                                            vol_df,
+                                            x='correlation',
+                                            y='feature',
+                                            color='type',
+                                            orientation='h',
+                                            title='Volume Feature Correlations with Next Day Range',
+                                            color_discrete_sequence=px.colors.qualitative.Set2
+                                        )
+                                        fig_vol.update_layout(height=500, yaxis={'categoryorder': 'total ascending'})
+                                        st.plotly_chart(fig_vol, use_container_width=True)
+
+                                        # Best features
+                                        st.markdown("**Top Volume Features:**")
+                                        for _, row in vol_df.head(5).iterrows():
+                                            direction = "+" if row['correlation'] > 0 else ""
+                                            st.markdown(f"- `{row['feature']}`: {direction}{row['correlation']:.3f}")
+
+                                        # Suggestions
+                                        best_vol = vol_df.iloc[0]
+                                        st.success(f"**Best volume feature:** `{best_vol['feature']}` with correlation {best_vol['correlation']:.3f}")
+
+                                        if best_vol['correlation'] > 0.05:
+                                            st.markdown("**Suggestion:** Add these volume derivatives to your feature set in `price_prediction.py`:")
+                                            st.code(f"""
+# In create_range_features():
+volume = df['volume']
+volume_norm = volume / volume.rolling(20).mean()
+
+# Volume velocity (1st derivative)
+features['volume_velocity'] = volume.rolling({best_vol['window']}).mean().diff()
+
+# Volume acceleration (2nd derivative)
+features['volume_accel'] = features['volume_velocity'].diff()
+
+# Relative volume velocity
+features['volume_rel_velocity'] = volume_norm.diff()
+""", language='python')
+
+                                    except Exception as vol_err:
+                                        st.error(f"Volume analysis failed: {vol_err}")
+
+                else:
+                    st.info("Run walk forward analysis first to enable feature analysis.")
 
             else:
                 st.info("Run walk forward analysis to see results here.")

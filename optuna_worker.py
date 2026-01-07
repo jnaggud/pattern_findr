@@ -708,17 +708,20 @@ class RangeModelObjective:
         X = data['X_train_scaled']
         y = data['y_train']
 
-        # Simple XGBoost hyperparameters
+        # XGBoost hyperparameters with CONSERVATIVE regularization ranges
+        # NOTE: High regularization (reg_alpha/lambda > 1, min_child_weight > 5, gamma > 0.3)
+        # can cause model collapse with small target values (~0.01-0.03 range)
+        # NOTE: max_depth < 5 with many features can also cause constant predictions
         params = {
-            'n_estimators': trial.suggest_int('n_estimators', 50, 500),
-            'max_depth': trial.suggest_int('max_depth', 3, 8),
-            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
-            'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
-            'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
-            'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
-            'gamma': trial.suggest_float('gamma', 0, 1),
+            'n_estimators': trial.suggest_int('n_estimators', 100, 400),
+            'max_depth': trial.suggest_int('max_depth', 5, 8),  # Increased min from 3 to 5
+            'learning_rate': trial.suggest_float('learning_rate', 0.02, 0.15, log=True),
+            'subsample': trial.suggest_float('subsample', 0.7, 0.95),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 0.9),
+            'reg_alpha': trial.suggest_float('reg_alpha', 1e-6, 0.1, log=True),  # Tighter range
+            'reg_lambda': trial.suggest_float('reg_lambda', 0.1, 2.0, log=True),  # Higher min to prevent overfitting
+            'min_child_weight': trial.suggest_int('min_child_weight', 1, 3),  # Reduced max for better splits
+            'gamma': trial.suggest_float('gamma', 0, 0.1),  # Reduced max
             'n_jobs': 1,
             'objective': 'reg:squarederror',
             'verbosity': 0
