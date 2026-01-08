@@ -1,5 +1,5 @@
 {
-  "locked_at": "2026-01-06T08:16:44.113295",
+  "locked_at": "2026-01-08T09:09:50.424701",
   "entries": [
     {
       "date": "2025-06-26 00:00:00",
@@ -59,6 +59,11 @@
     {
       "date": "2025-12-22 00:00:00",
       "price": 684.8300170898438,
+      "position": "long"
+    },
+    {
+      "date": "2026-01-06 00:00:00",
+      "price": 691.8099975585938,
       "position": "long"
     }
   ],
@@ -158,11 +163,19 @@
       "reason": "Midline Cross",
       "entry_price": 684.8300170898438,
       "entry_date": "2025-12-22 00:00:00"
+    },
+    {
+      "date": "2026-01-07 00:00:00",
+      "price": 689.5800170898438,
+      "pnl": -0.3223400177244662,
+      "reason": "Midline Cross",
+      "entry_price": 691.8099975585938,
+      "entry_date": "2026-01-06 00:00:00"
     }
   ],
   "current_position": null,
-  "num_trades": 12,
-  "win_rate": 100.0,
-  "total_return": 8.582535448171424,
-  "profit_factor": Infinity
+  "num_trades": 13,
+  "win_rate": 92.3076923076923,
+  "total_return": 8.232530484162126,
+  "profit_factor": 25.7773649898976
 }

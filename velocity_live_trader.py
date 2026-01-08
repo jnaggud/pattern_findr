@@ -1212,11 +1212,29 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
 
     # Add NEW exits from fresh backtest (only exits AFTER latest exit date)
     new_exits_added = 0
+    skipped_same_day = 0
+    skipped_duplicate = 0
     for exit_trade in backtest.get('exits', []):
         exit_date_str = str(exit_trade['date'])[:10]
+        entry_date_str = str(exit_trade.get('entry_date', ''))[:10]
 
         # Only add exits AFTER the latest exit in locked backtest
         if latest_exit_date and exit_date_str <= latest_exit_date:
+            continue
+
+        # VALIDATION 1: Reject same-day entry+exit (can't trade on same bar)
+        if exit_date_str == entry_date_str:
+            skipped_same_day += 1
+            continue
+
+        # VALIDATION 2: Reject duplicate exits (entry already has an exit)
+        entry_already_exited = any(
+            str(e.get('entry_date', ''))[:10] == entry_date_str and
+            abs(e.get('entry_price', 0) - exit_trade.get('entry_price', 0)) < 0.01
+            for e in locked["exits"]
+        )
+        if entry_already_exited:
+            skipped_duplicate += 1
             continue
 
         locked["exits"].append({
@@ -1231,6 +1249,10 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
 
     if new_exits_added > 0:
         print(f"   ➕ Added {new_exits_added} new exits (after {latest_exit_date})")
+    if skipped_same_day > 0:
+        print(f"   ⚠️ Skipped {skipped_same_day} same-day entry+exit (invalid)")
+    if skipped_duplicate > 0:
+        print(f"   ⚠️ Skipped {skipped_duplicate} duplicate exits (entry already closed)")
 
     # Handle tracked position - add or update
     if trade_state and trade_state.get('position') and trade_state.get('entry_price'):
@@ -1909,18 +1931,13 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 result = "✅" if t['pnl'] > 0 else "❌"
                 print(f"   {result} {t['entry_date']} → {t['date']}: {t['pnl']:+.2f}% ({t['reason']})")
 
-        # Current position
+        # Current position from bundled data (may be stale - fresh data check below)
         if backtest['current_position']:
             pos = backtest['current_position']
-            print(f"\n{'='*60}")
-            print("🔵 OPEN POSITION DETECTED")
-            print(f"{'='*60}")
-            print(f"Entry: ${pos['entry_price']:.2f} on {pos['entry_date']}")
-            print(f"Current: ${pos['current_price']:.2f}")
-            print(f"Unrealized P&L: {pos['unrealized_pnl']:+.2f}%")
-            print(f"{'='*60}")
+            print(f"\n📊 Bundled data shows open position (will verify with fresh data below)")
+            print(f"   Entry: ${pos['entry_price']:.2f} on {pos['entry_date']}")
         else:
-            print(f"\n📭 No open position")
+            print(f"\n📊 Bundled data shows no open position")
 
         print()
 
@@ -1950,15 +1967,22 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             bundled_pos = backtest.get('current_position') if backtest else None
 
             print(f"   Fresh data range: {fresh_df.index[0].strftime('%Y-%m-%d')} to {fresh_df.index[-1].strftime('%Y-%m-%d')}")
-            if fresh_pos:
-                print(f"   Fresh backtest position: LONG @ ${fresh_pos['entry_price']:.2f} on {fresh_pos['entry_date']}")
-            else:
-                print(f"   Fresh backtest position: None")
 
-            # Check if bundled and fresh differ
-            if bundled_pos and fresh_pos:
-                if abs(bundled_pos['entry_price'] - fresh_pos['entry_price']) > 1:
-                    print(f"   ⚠️  Bundled data is STALE! Using fresh data for sync.")
+            # Show ACTUAL current position status (from fresh data)
+            if fresh_pos:
+                print(f"\n{'='*60}")
+                print(f"🔵 CURRENT POSITION (verified with fresh data)")
+                print(f"{'='*60}")
+                print(f"   LONG @ ${fresh_pos['entry_price']:.2f} on {fresh_pos['entry_date']}")
+                print(f"{'='*60}")
+            else:
+                print(f"\n📭 No open position (verified with fresh data)")
+
+            # Note if bundled data was stale
+            if bundled_pos and not fresh_pos:
+                print(f"   ℹ️  Bundled data showed position, but it has since closed.")
+            elif bundled_pos and fresh_pos and abs(bundled_pos['entry_price'] - fresh_pos['entry_price']) > 1:
+                print(f"   ℹ️  Bundled data was stale - fresh data has different position.")
     except Exception as e:
         print(f"   ⚠️ Could not fetch fresh data: {e}")
         fresh_backtest = backtest  # Fall back to bundled
@@ -1995,11 +2019,21 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
         # Find and record the missed trade from backtest exits
         missed_trade = None
         if sync_backtest and sync_backtest.get('exits'):
+            # Parse entry time for date comparison
+            entry_date_str = str(old_time)[:10] if old_time else None
+
             for exit_trade in sync_backtest['exits']:
                 # Match by entry price (within 0.5% tolerance)
                 if abs(exit_trade.get('entry_price', 0) - old_entry) / old_entry < 0.005:
-                    missed_trade = exit_trade
-                    break
+                    # ALSO validate exit date is AFTER entry date
+                    exit_date_str = str(exit_trade.get('date', ''))[:10]
+                    if entry_date_str and exit_date_str and exit_date_str >= entry_date_str:
+                        missed_trade = exit_trade
+                        break
+                    elif not entry_date_str:
+                        # If we can't parse entry date, accept the match (legacy behavior)
+                        missed_trade = exit_trade
+                        break
 
         if missed_trade:
             # Record the missed trade to history
@@ -2064,11 +2098,21 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             # Find and record the missed trade from backtest exits
             missed_trade = None
             if sync_backtest and sync_backtest.get('exits'):
+                # Parse entry time for date comparison
+                entry_date_str = str(state_time)[:10] if state_time else None
+
                 for exit_trade in sync_backtest['exits']:
                     # Match by entry price (within 0.5% tolerance)
                     if abs(exit_trade.get('entry_price', 0) - state_entry) / state_entry < 0.005:
-                        missed_trade = exit_trade
-                        break
+                        # ALSO validate exit date is AFTER entry date
+                        exit_date_str = str(exit_trade.get('date', ''))[:10]
+                        if entry_date_str and exit_date_str and exit_date_str >= entry_date_str:
+                            missed_trade = exit_trade
+                            break
+                        elif not entry_date_str:
+                            # If we can't parse entry date, accept the match (legacy behavior)
+                            missed_trade = exit_trade
+                            break
 
             if missed_trade:
                 # Record the missed trade to history
@@ -2570,9 +2614,26 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     exit_backtest = None
                     try:
                         exit_backtest = run_historical_backtest(df, config)
-                        # Use locked backtest for markers to prevent repainting
+
+                        # Create a copy of locked_backtest with the current exit included
+                        # so it shows on the chart (before we officially append it)
+                        import copy
+                        locked_backtest_with_exit = copy.deepcopy(locked_backtest) if locked_backtest else {'entries': [], 'exits': []}
+                        if 'exits' not in locked_backtest_with_exit:
+                            locked_backtest_with_exit['exits'] = []
+                        locked_backtest_with_exit['exits'].append({
+                            'date': current_time,
+                            'price': current_price,
+                            'pnl': pnl_pct,
+                            'reason': exit_reason,
+                            'entry_price': entry_price,
+                        })
+                        # Clear current_position since we're exiting
+                        locked_backtest_with_exit['current_position'] = None
+
+                        # Use locked backtest WITH current exit for markers
                         exit_chart = generate_velocity_chart(df, exit_backtest, config, ticker,
-                                                            locked_backtest=locked_backtest)
+                                                            locked_backtest=locked_backtest_with_exit)
                     except Exception as e:
                         print(f"Could not generate exit chart: {e}")
 

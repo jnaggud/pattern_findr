@@ -1,0 +1,14 @@
+[
+  {
+    "id": 1,
+    "ticker": "SPY",
+    "type": "SHORT",
+    "entry_price": 87989.2265625,
+    "exit_price": 680.5900268554688,
+    "entry_time": "2025-12-21 00:00:00+00:00",
+    "exit_time": "2025-12-19 00:00:00",
+    "exit_reason": "Take Profit (99.23%)",
+    "pnl_pct": 99.22650754706653,
+    "pnl_dollars": 9922.650754706654
+  }
+]

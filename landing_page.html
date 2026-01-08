@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JD Trading Signals - Professional Trading Alerts</title>
+    <meta name="description" content="Get real-time professional trading signals for SPY and BTC. Proven strategies with transparent performance tracking.">
+
+    <!-- Open Graph for social sharing -->
+    <meta property="og:title" content="JD Trading Signals">
+    <meta property="og:description" content="Professional trading signals with proven track record. Join our Discord for real-time alerts.">
+    <meta property="og:type" content="website">
+
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #0a0a1a 0%, #1a1a2e 50%, #16213e 100%);
+            color: #fff;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+
+        /* Hero Section */
+        .hero {
+            padding: 80px 0;
+            text-align: center;
+        }
+
+        .hero h1 {
+            font-size: 3.5rem;
+            margin-bottom: 20px;
+            background: linear-gradient(90deg, #00ff88, #00d4ff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .hero p {
+            font-size: 1.4rem;
+            color: #a0a0a0;
+            max-width: 600px;
+            margin: 0 auto 40px;
+        }
+
+        .cta-button {
+            display: inline-block;
+            padding: 18px 50px;
+            font-size: 1.2rem;
+            font-weight: bold;
+            color: #0a0a1a;
+            background: linear-gradient(90deg, #00ff88, #00d4ff);
+            border: none;
+            border-radius: 50px;
+            text-decoration: none;
+            transition: transform 0.3s, box-shadow 0.3s;
+            cursor: pointer;
+        }
+
+        .cta-button:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 40px rgba(0, 255, 136, 0.3);
+        }
+
+        /* Stats Section */
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 30px;
+            padding: 60px 0;
+        }
+
+        .stat-card {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 20px;
+            padding: 40px 20px;
+            text-align: center;
+            transition: transform 0.3s;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-5px);
+        }
+
+        .stat-number {
+            font-size: 3rem;
+            font-weight: bold;
+            color: #00ff88;
+            margin-bottom: 10px;
+        }
+
+        .stat-label {
+            color: #a0a0a0;
+            font-size: 1rem;
+        }
+
+        /* Features Section */
+        .features {
+            padding: 80px 0;
+        }
+
+        .features h2 {
+            text-align: center;
+            font-size: 2.5rem;
+            margin-bottom: 60px;
+        }
+
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 40px;
+        }
+
+        .feature-card {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 20px;
+            padding: 40px;
+        }
+
+        .feature-icon {
+            font-size: 3rem;
+            margin-bottom: 20px;
+        }
+
+        .feature-card h3 {
+            font-size: 1.5rem;
+            margin-bottom: 15px;
+        }
+
+        .feature-card p {
+            color: #a0a0a0;
+            line-height: 1.6;
+        }
+
+        /* Pricing Section */
+        .pricing {
+            padding: 80px 0;
+        }
+
+        .pricing h2 {
+            text-align: center;
+            font-size: 2.5rem;
+            margin-bottom: 60px;
+        }
+
+        .pricing-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 30px;
+        }
+
+        .pricing-card {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 20px;
+            padding: 50px 40px;
+            text-align: center;
+            transition: transform 0.3s, border-color 0.3s;
+        }
+
+        .pricing-card:hover {
+            transform: translateY(-5px);
+        }
+
+        .pricing-card.featured {
+            border-color: #00ff88;
+            background: rgba(0, 255, 136, 0.05);
+        }
+
+        .pricing-card h3 {
+            font-size: 1.5rem;
+            margin-bottom: 10px;
+        }
+
+        .price {
+            font-size: 3.5rem;
+            font-weight: bold;
+            margin: 20px 0;
+        }
+
+        .price span {
+            font-size: 1rem;
+            color: #a0a0a0;
+        }
+
+        .pricing-features {
+            list-style: none;
+            margin: 30px 0;
+            text-align: left;
+        }
+
+        .pricing-features li {
+            padding: 10px 0;
+            color: #a0a0a0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .pricing-features li::before {
+            content: "✓ ";
+            color: #00ff88;
+        }
+
+        .pricing-button {
+            display: block;
+            width: 100%;
+            padding: 15px;
+            font-size: 1.1rem;
+            font-weight: bold;
+            color: #0a0a1a;
+            background: #00ff88;
+            border: none;
+            border-radius: 10px;
+            text-decoration: none;
+            transition: background 0.3s;
+            cursor: pointer;
+        }
+
+        .pricing-button:hover {
+            background: #00d4ff;
+        }
+
+        .pricing-button.outline {
+            background: transparent;
+            color: #00ff88;
+            border: 2px solid #00ff88;
+        }
+
+        .pricing-button.outline:hover {
+            background: rgba(0, 255, 136, 0.1);
+        }
+
+        /* Strategies Section */
+        .strategies {
+            padding: 80px 0;
+            background: rgba(0, 0, 0, 0.2);
+        }
+
+        .strategies h2 {
+            text-align: center;
+            font-size: 2.5rem;
+            margin-bottom: 60px;
+        }
+
+        .strategy-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 30px;
+        }
+
+        .strategy-card {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 20px;
+            padding: 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .strategy-info h4 {
+            font-size: 1.3rem;
+            margin-bottom: 5px;
+        }
+
+        .strategy-info p {
+            color: #a0a0a0;
+        }
+
+        .strategy-stats {
+            text-align: right;
+        }
+
+        .strategy-return {
+            font-size: 2rem;
+            font-weight: bold;
+            color: #00ff88;
+        }
+
+        /* Disclaimer */
+        .disclaimer {
+            padding: 60px 0;
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        .disclaimer-content {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 40px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 20px;
+            font-size: 0.9rem;
+            color: #888;
+            line-height: 1.8;
+        }
+
+        .disclaimer-content h3 {
+            color: #ff6b6b;
+            margin-bottom: 20px;
+        }
+
+        .disclaimer-content strong {
+            color: #aaa;
+        }
+
+        /* Footer */
+        footer {
+            padding: 40px 0;
+            text-align: center;
+            color: #666;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .hero h1 {
+                font-size: 2.5rem;
+            }
+
+            .stats,
+            .features-grid,
+            .pricing-grid,
+            .strategy-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .stat-card {
+                padding: 30px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Hero Section -->
+    <section class="hero">
+        <div class="container">
+            <h1>JD Trading Signals</h1>
+            <p>Professional trading alerts powered by proprietary JD algorithms. Real-time signals for SPY & BTC delivered straight to Discord.</p>
+            <a href="YOUR_DISCORD_INVITE_LINK" class="cta-button">Join Discord - Free Access</a>
+        </div>
+    </section>
+
+    <!-- Stats Section -->
+    <section class="container">
+        <div class="stats">
+            <div class="stat-card">
+                <div class="stat-number">6</div>
+                <div class="stat-label">Active Strategies</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number">75%+</div>
+                <div class="stat-label">Average Win Rate</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number">24/7</div>
+                <div class="stat-label">Automated Monitoring</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number">Real-Time</div>
+                <div class="stat-label">Signal Delivery</div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Features Section -->
+    <section class="features">
+        <div class="container">
+            <h2>Why Choose Our Signals?</h2>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">📊</div>
+                    <h3>Algorithmic Precision</h3>
+                    <p>Our signals are generated by proprietary algorithms analyzing multiple market indicators. No emotions, just data-driven decisions.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">⚡</div>
+                    <h3>Instant Alerts</h3>
+                    <p>Receive buy/sell signals the moment they trigger. Discord notifications ensure you never miss an opportunity.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">📈</div>
+                    <h3>Full Transparency</h3>
+                    <p>Every trade is tracked and reported. View historical performance, equity curves, and detailed statistics anytime.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🎯</div>
+                    <h3>Multiple Timeframes</h3>
+                    <p>Choose strategies optimized for 1-year, 2-year, or 5-year periods. Different market conditions, different approaches.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🛡️</div>
+                    <h3>Risk Management</h3>
+                    <p>Built-in stop-loss and take-profit levels for every signal. Protect your capital while maximizing gains.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">📱</div>
+                    <h3>Mobile Ready</h3>
+                    <p>Discord works on any device. Get alerts on your phone, tablet, or desktop wherever you are.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Strategies Section -->
+    <section class="strategies">
+        <div class="container">
+            <h2>Active Strategies</h2>
+            <div class="strategy-grid">
+                <div class="strategy-card">
+                    <div class="strategy-info">
+                        <h4>SPY 5-Year</h4>
+                        <p>S&P 500 ETF • Long-term optimized</p>
+                    </div>
+                    <div class="strategy-stats">
+                        <div class="strategy-return">+1,763%</div>
+                        <div style="color: #a0a0a0;">Backtest Return</div>
+                    </div>
+                </div>
+                <div class="strategy-card">
+                    <div class="strategy-info">
+                        <h4>SPY 2-Year</h4>
+                        <p>S&P 500 ETF • Medium-term optimized</p>
+                    </div>
+                    <div class="strategy-stats">
+                        <div class="strategy-return">+197%</div>
+                        <div style="color: #a0a0a0;">Backtest Return</div>
+                    </div>
+                </div>
+                <div class="strategy-card">
+                    <div class="strategy-info">
+                        <h4>BTC 5-Year</h4>
+                        <p>Bitcoin • Long-term optimized</p>
+                    </div>
+                    <div class="strategy-stats">
+                        <div class="strategy-return">+313,891%</div>
+                        <div style="color: #a0a0a0;">Backtest Return</div>
+                    </div>
+                </div>
+                <div class="strategy-card">
+                    <div class="strategy-info">
+                        <h4>BTC 2-Year</h4>
+                        <p>Bitcoin • Medium-term optimized</p>
+                    </div>
+                    <div class="strategy-stats">
+                        <div class="strategy-return">+4,332%</div>
+                        <div style="color: #a0a0a0;">Backtest Return</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Pricing Section -->
+    <section class="pricing">
+        <div class="container">
+            <h2>Choose Your Plan</h2>
+            <div class="pricing-grid">
+                <div class="pricing-card">
+                    <h3>Free</h3>
+                    <div class="price">$0<span>/month</span></div>
+                    <ul class="pricing-features">
+                        <li>1 Strategy (24hr delayed)</li>
+                        <li>Daily summary updates</li>
+                        <li>Community chat access</li>
+                        <li>Performance dashboard</li>
+                    </ul>
+                    <a href="YOUR_DISCORD_INVITE_LINK" class="pricing-button outline">Get Started</a>
+                </div>
+                <div class="pricing-card featured">
+                    <h3>Pro</h3>
+                    <div class="price">$49<span>/month</span></div>
+                    <ul class="pricing-features">
+                        <li>All SPY Strategies (3)</li>
+                        <li>Real-time signals</li>
+                        <li>Entry & exit alerts</li>
+                        <li>Priority Discord support</li>
+                        <li>Weekly market analysis</li>
+                    </ul>
+                    <a href="YOUR_PAYMENT_LINK" class="pricing-button">Subscribe Now</a>
+                </div>
+                <div class="pricing-card">
+                    <h3>Premium</h3>
+                    <div class="price">$99<span>/month</span></div>
+                    <ul class="pricing-features">
+                        <li>All 6 Strategies</li>
+                        <li>SPY + BTC signals</li>
+                        <li>Real-time alerts</li>
+                        <li>1-on-1 support</li>
+                        <li>Strategy customization</li>
+                        <li>Early access to new features</li>
+                    </ul>
+                    <a href="YOUR_PAYMENT_LINK" class="pricing-button">Subscribe Now</a>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Disclaimer Section -->
+    <section class="disclaimer">
+        <div class="container">
+            <div class="disclaimer-content">
+                <h3>⚠️ Important Disclaimer</h3>
+                <p><strong>NOT FINANCIAL ADVICE:</strong> The information provided through JD Trading Signals is for educational and informational purposes only. It should not be considered as financial, investment, or trading advice. We are not registered investment advisors, brokers, or financial planners.</p>
+
+                <p><strong>RISK WARNING:</strong> Trading stocks, ETFs, cryptocurrencies, and other financial instruments involves substantial risk of loss and is not suitable for all investors. The value of your investment can go down as well as up, and you may lose some or all of your invested capital. Past performance does not guarantee future results.</p>
+
+                <p><strong>HYPOTHETICAL PERFORMANCE:</strong> Many of the performance results displayed are based on backtested or hypothetical performance results that have certain inherent limitations. Unlike actual trading records, backtested results do not represent actual trading. Also, since the trades have not been executed, the results may have under-or-over compensated for the impact of certain market factors, such as lack of liquidity.</p>
+
+                <p><strong>NO GUARANTEES:</strong> We make no representations, warranties, or guarantees about the accuracy, completeness, or timeliness of the signals, information, or materials provided. Trading signals may be delayed or unavailable due to technical issues.</p>
+
+                <p><strong>INDEPENDENT DECISIONS:</strong> You are solely responsible for your own investment decisions and should perform your own due diligence. Consider consulting with a qualified, licensed financial advisor before making any investment decisions. By using our service, you acknowledge that you understand these risks and agree to our terms of service.</p>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer>
+        <div class="container">
+            <p>&copy; 2024 JD Trading Signals. All rights reserved.</p>
+            <p style="margin-top: 10px;">
+                <a href="#" style="color: #666; margin: 0 10px;">Terms of Service</a> |
+                <a href="#" style="color: #666; margin: 0 10px;">Privacy Policy</a> |
+                <a href="#" style="color: #666; margin: 0 10px;">Contact</a>
+            </p>
+        </div>
+    </footer>
+</body>
+</html>

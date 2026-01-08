@@ -85,7 +85,7 @@ st.title("📈 Pattern_FindR - Professional Trading Strategy Discovery")
 # === NEW PAGE NAVIGATION SYSTEM ===
 page = st.selectbox(
     "📋 Select Page:",
-    ["Strategy Optimization", "🤖 ML Trading Signals", "🎯 Peak/Valley ML Signals", "🆕 Peak/Valley ML v2 (Clean)", "📊 Oscillator Predictor"],
+    ["Strategy Optimization", "🤖 ML Trading Signals", "🎯 Peak/Valley ML Signals", "🆕 Peak/Valley ML v2 (Clean)", "📊 Oscillator Predictor", "🧪 Oscillator Predictor Testing"],
     index=0
 )
 
@@ -110,6 +110,12 @@ if page == "🆕 Peak/Valley ML v2 (Clean)":
 if page == "📊 Oscillator Predictor":
     from oscillator_predictor_page import render_oscillator_predictor_page
     render_oscillator_predictor_page()
+    st.stop()
+
+# === OSCILLATOR PREDICTOR TESTING (Strategy Validation Suite) ===
+if page == "🧪 Oscillator Predictor Testing":
+    from oscillator_predictor_testing_page import render_oscillator_predictor_testing_page
+    render_oscillator_predictor_testing_page()
     st.stop()
 
 # === EXISTING STRATEGY OPTIMIZATION PAGE ===

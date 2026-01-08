@@ -71,6 +71,41 @@ except ImportError:
     OPTUNA_WORKER_AVAILABLE = False
     print("Warning: optuna_worker not available, parallel optimization may be slow")
 
+# Import the main composite oscillator (source of truth - 15 components)
+try:
+    from oscillator_predictor_page import create_composite_oscillator
+    MAIN_COMPOSITE_AVAILABLE = True
+except ImportError:
+    MAIN_COMPOSITE_AVAILABLE = False
+    print("Warning: create_composite_oscillator not available, using simplified version")
+
+
+# =============================================================================
+# FEATURE GROUP CONFIGURATION
+# Toggle feature groups on/off to optimize performance and reduce noise
+# Based on feature importance analysis, these groups contribute <5% combined
+# =============================================================================
+FEATURE_CONFIG = {
+    # Core features (HIGH importance - always enabled)
+    'atr_features': True,           # ATR 7/14/21, ratios - TOP predictors
+    'range_features': True,         # Daily range, percentiles - core target
+    'volatility_features': True,    # Realized vol, BB width - HIGH importance
+    'vix_features': True,           # VIX and derivatives - HIGH importance
+
+    # Medium importance features
+    'volume_features': True,        # Volume velocity, momentum - MEDIUM importance
+    'trend_features': True,         # Trend direction, strength - MEDIUM importance
+    'composite_osc': True,          # Main 15-component oscillator - MEDIUM importance
+
+    # Low importance features (can disable to improve speed)
+    'temporal_features': True,      # Day of week, month - LOW importance (<2%)
+    'options_features': True,       # PCR, IV, max pain - LOW when no real data
+    'lag_features': False,          # ATR/range lags - LOW importance, adds ~20 features
+    'interaction_features': False,  # uptrend_atr, downtrend_volume - LOW importance
+    'scientific_features': False,   # Hurst exponent - VERY LOW, slow to compute
+    'novel_indicators': False,      # ARWO, DCO, etc - disabled by default
+}
+
 
 class PriceRangePredictor:
     """
@@ -89,6 +124,10 @@ class PriceRangePredictor:
     - Market regime indicators
     """
 
+    # Class-level VIX cache (shared across all instances)
+    _class_vix_cache = None
+    _class_vix_cache_date = None
+
     def __init__(self, polygon_manager=None):
         """
         Initialize the range predictor.
@@ -103,6 +142,7 @@ class PriceRangePredictor:
         self.scaler = StandardScaler() if SKLEARN_AVAILABLE else None
         self.feature_names = []
         self.model_metrics = {}
+        # Instance cache references class cache for backwards compatibility
         self._vix_cache = None
         self._vix_cache_date = None
 
@@ -122,10 +162,11 @@ class PriceRangePredictor:
             return pd.DataFrame()
 
         try:
-            # Use cache if recent
+            # Use CLASS-LEVEL cache if recent (shared across all instances)
             today = datetime.now().date()
-            if self._vix_cache is not None and self._vix_cache_date == today:
-                return self._vix_cache
+            if PriceRangePredictor._class_vix_cache is not None and PriceRangePredictor._class_vix_cache_date == today:
+                # Return cached data without printing (avoid log spam in walk-forward)
+                return PriceRangePredictor._class_vix_cache
 
             if end_date is None:
                 end_date = datetime.now().strftime('%Y-%m-%d')
@@ -145,9 +186,9 @@ class PriceRangePredictor:
 
             vix.columns = vix.columns.str.lower()
 
-            # Cache the result
-            self._vix_cache = vix
-            self._vix_cache_date = today
+            # Cache at CLASS level (shared across all instances)
+            PriceRangePredictor._class_vix_cache = vix
+            PriceRangePredictor._class_vix_cache_date = today
 
             print(f"   VIX data loaded: {len(vix)} bars, current VIX={vix['close'].iloc[-1]:.2f}")
             return vix
@@ -449,31 +490,31 @@ class PriceRangePredictor:
         features['high_stretch'] = (df['high'].rolling(10).max() - df['close']) / features['atr_14']
 
         # =================================================================
-        # DOWNTREND INTERACTION TERMS (Critical for fixing low prediction bias)
+        # DOWNTREND INTERACTION TERMS (configurable - low importance)
         # Analysis showed features flip in downtrends - need specific interactions
         # =================================================================
+        if FEATURE_CONFIG.get('interaction_features', False):
+            # Downtrend-specific volume (volume matters more in downtrends)
+            features['downtrend_volume'] = features['is_downtrend'] * features['volume_rel']
 
-        # Downtrend-specific volume (volume matters more in downtrends)
-        features['downtrend_volume'] = features['is_downtrend'] * features['volume_rel']
+            # Downtrend ATR (ATR more predictive in downtrends)
+            features['downtrend_atr'] = features['is_downtrend'] * features['atr_7']
+            features['downtrend_atr_14'] = features['is_downtrend'] * features['atr_14']
 
-        # Downtrend ATR (ATR more predictive in downtrends)
-        features['downtrend_atr'] = features['is_downtrend'] * features['atr_7']
-        features['downtrend_atr_14'] = features['is_downtrend'] * features['atr_14']
+            # Downtrend momentum (ROC stronger signal in downtrends)
+            features['downtrend_roc_5'] = features['is_downtrend'] * abs(df['close'].pct_change(5) * 100)
+            features['downtrend_roc_10'] = features['is_downtrend'] * abs(df['close'].pct_change(10) * 100)
 
-        # Downtrend momentum (ROC stronger signal in downtrends)
-        features['downtrend_roc_5'] = features['is_downtrend'] * abs(df['close'].pct_change(5) * 100)
-        features['downtrend_roc_10'] = features['is_downtrend'] * abs(df['close'].pct_change(10) * 100)
+            # Uptrend-specific features (for symmetric treatment)
+            features['uptrend_volume'] = features['is_uptrend'] * features['volume_rel']
+            features['uptrend_atr'] = features['is_uptrend'] * features['atr_14']
+            features['uptrend_momentum'] = features['is_uptrend'] * abs(df['close'].pct_change(5) * 100)
 
-        # Uptrend-specific features (for symmetric treatment)
-        features['uptrend_volume'] = features['is_uptrend'] * features['volume_rel']
-        features['uptrend_atr'] = features['is_uptrend'] * features['atr_14']
-        features['uptrend_momentum'] = features['is_uptrend'] * abs(df['close'].pct_change(5) * 100)
+            # Range lagged interactions (yesterday's range predicts today's)
+            features['range_lag_x_mean'] = features.get('range_lag_1', features['daily_range'].shift(1)) * features['range_mean_5d']
 
-        # Range lagged interactions (yesterday's range predicts today's)
-        features['range_lag_x_mean'] = features.get('range_lag_1', features['daily_range'].shift(1)) * features['range_mean_5d']
-
-        # ATR lagged interaction
-        features['atr_lag_x_current'] = features.get('atr_14_lag_1', features['atr_14'].shift(1)) * features['atr_14']
+            # ATR lagged interaction
+            features['atr_lag_x_current'] = features.get('atr_14_lag_1', features['atr_14'].shift(1)) * features['atr_14']
 
         # --- Momentum features ---
         features['roc_5'] = df['close'].pct_change(5) * 100
@@ -731,8 +772,8 @@ class PriceRangePredictor:
                 features[col] = 0
 
         # --- Novel Indicators (Advanced composite indicators) ---
-        USE_NOVEL_INDICATORS = False  # Disabled - testing simpler features
-        if USE_NOVEL_INDICATORS and NOVEL_INDICATORS_AVAILABLE:
+        # Novel indicators controlled by FEATURE_CONFIG
+        if FEATURE_CONFIG.get('novel_indicators', False) and NOVEL_INDICATORS_AVAILABLE:
             try:
                 print("   Calculating novel indicators...")
 
@@ -771,43 +812,53 @@ class PriceRangePredictor:
                 # Don't add placeholder columns - they cause issues with feature selection
         else:
             # Novel indicators disabled - don't add placeholder columns
-            print("   Novel indicators DISABLED (USE_NOVEL_INDICATORS = False)")
+            print("   Novel indicators DISABLED (FEATURE_CONFIG['novel_indicators'] = False)")
 
         # --- Composite Oscillator Features ---
-        # Create a composite oscillator similar to the main app
+        # Use the MAIN composite oscillator (15 components) for consistency with velocity trading
         try:
-            # RSI
-            delta = df['close'].diff()
-            gain = delta.where(delta > 0, 0).rolling(14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-            rs = gain / (loss + 1e-10)
-            rsi = 100 - (100 / (1 + rs))
-            rsi_norm = (rsi - 50) / 50  # Normalize to -1 to +1
+            if MAIN_COMPOSITE_AVAILABLE:
+                # Use the full 15-component composite from oscillator_predictor_page.py
+                df_with_osc = create_composite_oscillator(df)
+                features['composite_osc'] = df_with_osc['composite_oscillator']
+                features['composite_osc_smooth'] = df_with_osc['composite_smooth']
 
-            # Stochastic
-            low_14 = df['low'].rolling(14).min()
-            high_14 = df['high'].rolling(14).max()
-            stoch_k = 100 * (df['close'] - low_14) / (high_14 - low_14 + 1e-10)
-            stoch_norm = (stoch_k - 50) / 50  # Normalize to -1 to +1
+                # Add individual normalized components for feature importance analysis
+                norm_cols = [c for c in df_with_osc.columns if c.endswith('_norm') or c in ['bb_position', 'adx_trend']]
+                for col in norm_cols:
+                    if col in df_with_osc.columns:
+                        features[col] = df_with_osc[col]
 
-            # Williams %R
-            williams_r = -100 * (high_14 - df['close']) / (high_14 - low_14 + 1e-10)
-            williams_norm = (williams_r + 50) / 50  # Normalize to -1 to +1
+                print(f"   Main composite oscillator (15 components): {features['composite_osc_smooth'].iloc[-1]:.3f}")
+            else:
+                # Fallback to simplified 4-component version
+                delta = df['close'].diff()
+                gain = delta.where(delta > 0, 0).rolling(14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                rs = gain / (loss + 1e-10)
+                rsi = 100 - (100 / (1 + rs))
+                rsi_norm = (rsi - 50) / 50
 
-            # CCI
-            typical_price = (df['high'] + df['low'] + df['close']) / 3
-            cci = (typical_price - typical_price.rolling(20).mean()) / (0.015 * typical_price.rolling(20).std())
-            cci_norm = (cci / 100).clip(-1, 1)  # Normalize to -1 to +1
+                low_14 = df['low'].rolling(14).min()
+                high_14 = df['high'].rolling(14).max()
+                stoch_k = 100 * (df['close'] - low_14) / (high_14 - low_14 + 1e-10)
+                stoch_norm = (stoch_k - 50) / 50
 
-            # Composite oscillator (weighted average)
-            features['composite_osc'] = (rsi_norm * 0.3 + stoch_norm * 0.25 + williams_norm * 0.25 + cci_norm * 0.2)
-            features['composite_osc_smooth'] = features['composite_osc'].rolling(3).mean().fillna(features['composite_osc'])
+                williams_r = -100 * (high_14 - df['close']) / (high_14 - low_14 + 1e-10)
+                williams_norm = (williams_r + 50) / 50
 
-            # Composite velocity and acceleration
+                typical_price = (df['high'] + df['low'] + df['close']) / 3
+                cci = (typical_price - typical_price.rolling(20).mean()) / (0.015 * typical_price.rolling(20).std())
+                cci_norm = (cci / 100).clip(-1, 1)
+
+                features['composite_osc'] = (rsi_norm * 0.3 + stoch_norm * 0.25 + williams_norm * 0.25 + cci_norm * 0.2)
+                features['composite_osc_smooth'] = features['composite_osc'].rolling(3).mean().fillna(features['composite_osc'])
+                print(f"   Fallback composite oscillator (4 components): {features['composite_osc'].iloc[-1]:.3f}")
+
+            # Composite velocity and acceleration (always calculated)
             features['composite_velocity'] = features['composite_osc_smooth'].diff()
             features['composite_accel'] = features['composite_velocity'].diff()
 
-            print(f"   Composite oscillator added: {features['composite_osc'].iloc[-1]:.3f}")
         except Exception as comp_err:
             print(f"   Composite oscillator error: {comp_err}")
             features['composite_osc'] = 0
@@ -847,11 +898,9 @@ class PriceRangePredictor:
         # =================================================================
         # RESEARCH-BACKED SCIENTIFIC INDICATORS
         # Based on academic papers for volatility/range prediction
-        # NOTE: Set USE_SCIENTIFIC_INDICATORS = False to disable
+        # Controlled by FEATURE_CONFIG['scientific_features'] - slow, low importance
         # =================================================================
-        USE_SCIENTIFIC_INDICATORS = False  # Disabled - was causing lower R² than simpler features
-
-        if USE_SCIENTIFIC_INDICATORS:
+        if FEATURE_CONFIG.get('scientific_features', False):
             print("   Calculating research-backed scientific indicators...")
 
             # --- 1. HURST EXPONENT (Regime Detection) ---
@@ -1063,17 +1112,18 @@ class PriceRangePredictor:
 
             print("   Research-backed indicators complete.")
         else:
-            print("   Scientific indicators DISABLED (USE_SCIENTIFIC_INDICATORS = False)")
+            print("   Scientific indicators DISABLED (FEATURE_CONFIG['scientific_features'] = False)")
 
-        # --- Lagged features ---
-        for lag in [1, 2, 3]:
-            features[f'range_lag_{lag}'] = features['daily_range'].shift(lag)
-            features[f'atr_14_lag_{lag}'] = features['atr_14'].shift(lag)
+        # --- Lagged features (configurable - adds ~12 features, low importance) ---
+        if FEATURE_CONFIG.get('lag_features', False):
+            for lag in [1, 2, 3]:
+                features[f'range_lag_{lag}'] = features['daily_range'].shift(lag)
+                features[f'atr_14_lag_{lag}'] = features['atr_14'].shift(lag)
 
-        # VIX lagged features (if available)
-        if 'vix' in features.columns and features['vix'].notna().any():
-            for lag in [1, 2]:
-                features[f'vix_lag_{lag}'] = features['vix'].shift(lag)
+            # VIX lagged features (if available)
+            if 'vix' in features.columns and features['vix'].notna().any():
+                for lag in [1, 2]:
+                    features[f'vix_lag_{lag}'] = features['vix'].shift(lag)
 
         # Store feature names (excluding target-related columns)
         self.feature_names = [col for col in features.columns
@@ -1404,6 +1454,100 @@ class PriceRangePredictor:
         print(f"[DEBUG predict] DONE! Predicted High: ${result['predicted_high']:.2f}, Low: ${result['predicted_low']:.2f}")
         print(f"[DEBUG predict] Confidence bounds ({confidence_level*100:.0f}%): High=[${high_lower:.2f}, ${high_upper:.2f}], Low=[${low_lower:.2f}, ${low_upper:.2f}]")
         return result
+
+    def save_predictions(self, predictions: dict, ticker: str, path: str = None) -> str:
+        """
+        Save walk-forward predictions to JSON for use in Options Builder.
+
+        Args:
+            predictions: Dictionary of prediction results from predict_daily_range()
+            ticker: Stock ticker symbol
+            path: Optional custom path for saving
+
+        Returns:
+            Path where predictions were saved
+        """
+        import json
+        import os
+
+        if path is None:
+            # Create predictions directory if needed
+            os.makedirs('predictions', exist_ok=True)
+            path = f"predictions/{ticker}_range_predictions.json"
+
+        save_data = {
+            'ticker': ticker,
+            'timestamp': datetime.now().isoformat(),
+            'model_r2': predictions.get('model_r2', self.model_metrics.get('r2', 0)),
+            'model_metrics': self.model_metrics,
+            'predictions': {
+                'current_close': predictions.get('current_close'),
+                'predicted_high': predictions.get('predicted_high'),
+                'predicted_low': predictions.get('predicted_low'),
+                'predicted_range': predictions.get('predicted_range'),
+                'predicted_range_dollars': predictions.get('predicted_range_dollars'),
+                'confidence_level': predictions.get('confidence_level', 0.9),
+                'ci_high_upper': predictions.get('high_upper'),
+                'ci_high_lower': predictions.get('high_lower'),
+                'ci_low_upper': predictions.get('low_upper'),
+                'ci_low_lower': predictions.get('low_lower'),
+                'high_uncertainty': predictions.get('high_uncertainty'),
+                'low_uncertainty': predictions.get('low_uncertainty'),
+                'prediction_date': str(predictions.get('prediction_date', '')),
+                'atr_14': predictions.get('atr_14'),
+            },
+            'feature_names': self.feature_names[:20] if self.feature_names else [],  # Top 20 features
+        }
+
+        with open(path, 'w') as f:
+            json.dump(save_data, f, indent=2, default=str)
+
+        print(f"   Predictions saved to {path}")
+        return path
+
+    @staticmethod
+    def load_predictions(path: str) -> Optional[dict]:
+        """
+        Load saved predictions from JSON.
+
+        Args:
+            path: Path to the saved predictions file
+
+        Returns:
+            Dictionary of saved predictions or None if file doesn't exist
+        """
+        import json
+        import os
+
+        if not os.path.exists(path):
+            print(f"   Warning: Predictions file not found: {path}")
+            return None
+
+        try:
+            with open(path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"   Error loading predictions: {e}")
+            return None
+
+    @staticmethod
+    def list_saved_predictions(directory: str = 'predictions') -> List[str]:
+        """
+        List all saved prediction files.
+
+        Args:
+            directory: Directory to search for prediction files
+
+        Returns:
+            List of prediction file paths
+        """
+        import os
+        import glob
+
+        if not os.path.exists(directory):
+            return []
+
+        return sorted(glob.glob(os.path.join(directory, '*_range_predictions.json')))
 
 
 # =============================================================================

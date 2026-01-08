@@ -1,8 +1,8 @@
 {
-    "status": "FLAT",
+    "status": "LONG",
     "ticker": "BTC-USD",
-    "entry_price": 89594.7734375,
-    "entry_date": "2025-12-15 00:00:00",
+    "entry_price": 88875.296875,
+    "entry_date": "2025-12-22 00:00:00",
     "highest_price": 0.0,
     "strategy_id": null,
     "pnl": 0.0,

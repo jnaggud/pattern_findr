@@ -11,50 +11,5 @@
     "exit_reason": "Midline Cross (0.46%)",
     "pnl_pct": 0.45704843606495577,
     "pnl_dollars": 45.70484360649558
-  },
-  {
-    "id": 2,
-    "ticker": "SPY",
-    "strategy_name": "velocity_SPY_1y",
-    "type": "short",
-    "entry_price": 687.010009765625,
-    "exit_price": 687.9600219726562,
-    "entry_time": "2025-12-30 00:00:00",
-    "exit_time": "2025-12-23 00:00:00",
-    "entry_signal_bar": "2025-12-30 00:00:00",
-    "exit_signal_bar": "2025-12-23 00:00:00",
-    "exit_reason": "[SYNC] Midline Cross",
-    "pnl_pct": 0.45704843606495577,
-    "pnl_dollars": 45.70484360649558
-  },
-  {
-    "id": 3,
-    "ticker": "SPY",
-    "strategy_name": "velocity_SPY_1y",
-    "type": "short",
-    "entry_price": 681.9199829101562,
-    "exit_price": 681.3666381835938,
-    "entry_time": "2025-12-31 00:00:00",
-    "exit_time": "2025-11-12 00:00:00",
-    "entry_signal_bar": "2025-12-30 00:00:00",
-    "exit_signal_bar": "2025-11-12 00:00:00",
-    "exit_reason": "[SYNC] Midline Cross",
-    "pnl_pct": 0.05564068664264115,
-    "pnl_dollars": 5.564068664264115
-  },
-  {
-    "id": 4,
-    "ticker": "SPY",
-    "strategy_name": "velocity_SPY_1y",
-    "type": "short",
-    "entry_price": 681.9199829101562,
-    "exit_price": 681.3666381835938,
-    "entry_time": "2025-12-31 00:00:00",
-    "exit_time": "2025-11-12 00:00:00",
-    "entry_signal_bar": "2025-12-30 00:00:00",
-    "exit_signal_bar": "2025-11-12 00:00:00",
-    "exit_reason": "[SYNC] Midline Cross",
-    "pnl_pct": 0.05564068664264115,
-    "pnl_dollars": 5.564068664264115
   }
 ]

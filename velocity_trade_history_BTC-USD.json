@@ -1,0 +1,26 @@
+[
+  {
+    "id": 1,
+    "ticker": "BTC-USD",
+    "type": "LONG",
+    "entry_price": 671.4000244140625,
+    "exit_price": 87859.375,
+    "entry_time": "2025-12-17 00:00:00",
+    "exit_time": "2025-12-21 00:00:00",
+    "exit_reason": "Take Profit (12986.00%)",
+    "pnl_pct": 12985.995204822306,
+    "pnl_dollars": 1298599.5204822305
+  },
+  {
+    "id": 2,
+    "ticker": "BTC-USD",
+    "type": "LONG",
+    "entry_price": 87859.375,
+    "exit_price": 87989.2265625,
+    "entry_time": "2025-12-21 00:00:00+00:00",
+    "exit_time": "2025-12-21 00:00:00",
+    "exit_reason": "Opposite Signal (0.15%)",
+    "pnl_pct": 0.14779477147430198,
+    "pnl_dollars": 14.779477147430198
+  }
+]

@@ -27,8 +27,26 @@ except ImportError:
     YFINANCE_AVAILABLE = False
     print("Warning: yfinance not installed. Charts will not be generated.")
 
+# Import the SAME chart generator and backtest functions as the paid channels
+try:
+    from velocity_live_trader import (
+        generate_velocity_chart,
+        run_historical_backtest,
+        calculate_composite_oscillator,
+        calculate_velocity_signals,
+        load_config,
+        load_locked_backtest
+    )
+    VELOCITY_CHARTS_AVAILABLE = True
+except ImportError as e:
+    VELOCITY_CHARTS_AVAILABLE = False
+    print(f"Warning: Could not import velocity charts: {e}")
+
 # Discord webhook for FREE tier delayed signals channel
 FREE_TIER_WEBHOOK = ""
+
+# Secondary webhook for Haus Hedge server (delayed signals)
+HAUS_HEDGE_DELAYED_WEBHOOK = ""
 
 # Delay in hours before posting signals to free tier
 SIGNAL_DELAY_HOURS = 24
@@ -106,8 +124,92 @@ def get_ticker_from_strategy(strategy_name: str) -> str:
     return 'SPY'
 
 
+def find_strategy_config(strategy_name: str) -> dict:
+    """Find and load the config for a given strategy name."""
+    strategies_dir = "velocity_strategies"
+
+    if not os.path.exists(strategies_dir):
+        return None
+
+    # Search for matching strategy directory
+    for item in os.listdir(strategies_dir):
+        strategy_path = os.path.join(strategies_dir, item)
+        config_file = os.path.join(strategy_path, "velocity_config.json")
+
+        if os.path.isdir(strategy_path) and os.path.exists(config_file):
+            try:
+                with open(config_file, 'r') as f:
+                    config = json.load(f)
+                # Match by strategy_name in config
+                if config.get('strategy_name') == strategy_name:
+                    return config
+            except:
+                pass
+
+    return None
+
+
 def generate_trade_chart(trade: dict, strategy_name: str) -> io.BytesIO:
-    """Generate a simple chart showing the trade entry/exit."""
+    """Generate professional velocity chart matching paid channels."""
+
+    # Try to use velocity charts if available
+    if VELOCITY_CHARTS_AVAILABLE:
+        try:
+            ticker = get_ticker_from_strategy(strategy_name)
+            label = get_strategy_label(strategy_name)
+
+            # Find strategy config
+            config = find_strategy_config(strategy_name)
+            if not config:
+                print(f"   ⚠️ Could not find config for {strategy_name}, using simple chart")
+                return generate_simple_chart(trade, strategy_name)
+
+            # Load the locked backtest (prevents repainting - uses same markers as live trader)
+            locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
+            if locked_backtest:
+                print(f"   🔒 Using locked backtest for consistent markers")
+
+            # Fetch data (200 days for full chart context)
+            print(f"   📊 Fetching {ticker} data for professional chart...")
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=200)
+
+            df = yf.download(ticker, start=start_date, end=end_date, interval='1d', progress=False)
+            if df.empty:
+                return generate_simple_chart(trade, strategy_name)
+
+            # Handle MultiIndex columns
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df.columns = df.columns.str.lower()
+
+            # Calculate oscillators and run backtest for stats
+            df = calculate_composite_oscillator(df, config)
+            backtest = run_historical_backtest(df, config)
+
+            # Generate the SAME professional chart as paid channels
+            # Use locked_backtest for markers to prevent repainting
+            chart_buf = generate_velocity_chart(
+                df, backtest, config, ticker,
+                title_suffix=f" - {label} (24hr Delayed)",
+                locked_backtest=locked_backtest
+            )
+
+            print(f"   ✅ Professional velocity chart generated")
+            return chart_buf
+
+        except Exception as e:
+            print(f"   ⚠️ Velocity chart failed: {e}, falling back to simple chart")
+            import traceback
+            traceback.print_exc()
+            return generate_simple_chart(trade, strategy_name)
+
+    # Fallback to simple chart
+    return generate_simple_chart(trade, strategy_name)
+
+
+def generate_simple_chart(trade: dict, strategy_name: str) -> io.BytesIO:
+    """Generate a simple fallback chart showing the trade entry/exit."""
     if not YFINANCE_AVAILABLE:
         return None
 
@@ -189,7 +291,51 @@ def generate_trade_chart(trade: dict, strategy_name: str) -> io.BytesIO:
 
 
 def get_strategy_stats(strategy_name: str) -> dict:
-    """Get cumulative stats for a strategy from trade history."""
+    """Get cumulative stats for a strategy from FULL BACKTEST (not just live trades)."""
+
+    # Try to get full backtest stats (much more impressive for FOMO)
+    if VELOCITY_CHARTS_AVAILABLE:
+        try:
+            config = find_strategy_config(strategy_name)
+            if config:
+                ticker = config.get('ticker', 'SPY')
+
+                # Fetch full historical data for backtest
+                end_date = datetime.now()
+                start_date = end_date - timedelta(days=config.get('data_period_days', 365))
+
+                df = yf.download(ticker, start=start_date, end=end_date, interval='1d', progress=False)
+                if not df.empty:
+                    # Handle MultiIndex columns
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                    df.columns = df.columns.str.lower()
+
+                    # Run full backtest
+                    df = calculate_composite_oscillator(df, config)
+                    backtest = run_historical_backtest(df, config)
+
+                    # Stats are directly in backtest dict (not under 'stats' key)
+                    num_trades = backtest.get('num_trades', 0)
+                    if num_trades > 0:
+                        # Calculate avg win/loss from exits
+                        exits = backtest.get('exits', [])
+                        winners = [e for e in exits if e.get('pnl', 0) > 0]
+                        losers = [e for e in exits if e.get('pnl', 0) < 0]
+                        avg_win = sum(e['pnl'] for e in winners) / len(winners) if winners else 0
+                        avg_loss = sum(e['pnl'] for e in losers) / len(losers) if losers else 0
+
+                        return {
+                            'total_trades': num_trades,
+                            'win_rate': backtest.get('win_rate', 0),
+                            'total_pnl': backtest.get('total_return', 0),
+                            'avg_win': avg_win,
+                            'avg_loss': avg_loss,
+                        }
+        except Exception as e:
+            print(f"   ⚠️ Could not get backtest stats: {e}")
+
+    # Fallback to live trade history
     history = load_trade_history(strategy_name)
 
     if not history:
@@ -205,6 +351,39 @@ def get_strategy_stats(strategy_name: str) -> dict:
         'win_rate': win_rate,
         'total_pnl': total_pnl,
     }
+
+
+def find_latest_signal() -> dict:
+    """Find the most recent completed trade across all strategies (for startup post)."""
+    strategies = [
+        'velocity_SPY_5y',
+        'velocity_SPY_2y',
+        'velocity_SPY_1y',
+    ]
+
+    latest = None
+    latest_time = None
+
+    for strategy_name in strategies:
+        history = load_trade_history(strategy_name)
+
+        for trade in history:
+            exit_time_str = trade.get('exit_time', '')
+            if exit_time_str:
+                try:
+                    exit_time = datetime.strptime(exit_time_str[:19], '%Y-%m-%d %H:%M:%S')
+                    if latest_time is None or exit_time > latest_time:
+                        latest_time = exit_time
+                        latest = {
+                            'signal_id': f"{strategy_name}_{trade.get('entry_time', '')}_{exit_time_str}",
+                            'trade': trade,
+                            'strategy_name': strategy_name,
+                            'label': get_strategy_label(strategy_name),
+                        }
+                except:
+                    pass
+
+    return latest
 
 
 def find_delayed_signals() -> list:
@@ -253,7 +432,7 @@ def find_delayed_signals() -> list:
 
 
 def format_signal_message(signal: dict) -> str:
-    """Format a delayed signal for Discord."""
+    """Format a delayed signal for Discord with FOMO messaging."""
     trade = signal['trade']
     label = signal['label']
     strategy_name = signal['strategy_name']
@@ -264,22 +443,61 @@ def format_signal_message(signal: dict) -> str:
     exit_time = trade.get('exit_time', '')[:16] if trade.get('exit_time') else 'N/A'
     pnl = trade.get('pnl_pct', 0)
     exit_reason = trade.get('exit_reason', 'Signal Exit')
+    pnl_dollars = trade.get('pnl_dollars', pnl * 100)  # Assume $10k position if not specified
 
     pnl_emoji = "✅" if pnl > 0 else "❌"
 
-    # Get strategy stats
+    # Calculate missed profit messaging
+    if pnl > 0:
+        missed_msg = (
+            f"💸 **You missed +{pnl:.2f}% profit!**\n"
+            f"_Pro members got this signal 24 hours ago and captured this gain._\n"
+        )
+    else:
+        missed_msg = (
+            f"⚠️ **Pro members exited this trade 24 hours ago.**\n"
+            f"_Real-time signals help cut losses faster._\n"
+        )
+
+    # Get strategy stats for cumulative missed profits (FULL BACKTEST)
     stats = get_strategy_stats(strategy_name)
     stats_section = ""
     if stats:
-        stats_section = (
-            f"---\n"
-            f"📊 **Strategy Performance:**\n"
-            f"• Trades: {stats['total_trades']} | Win Rate: {stats['win_rate']:.0f}%\n"
-            f"• Total Return: {stats['total_pnl']:.1f}%\n"
-        )
+        # Determine backtest period from strategy name
+        if '5y' in strategy_name.lower():
+            period_label = "5-Year"
+        elif '2y' in strategy_name.lower():
+            period_label = "2-Year"
+        elif '1y' in strategy_name.lower():
+            period_label = "1-Year"
+        else:
+            period_label = "Historical"
 
-    message = f"""⏰ **[DELAYED 24hr] JD Signal Result - {label}**
+        # Calculate what they would have made with paid signals
+        missed_total = stats['total_pnl']
+        avg_win = stats.get('avg_win', 0)
+        avg_loss = stats.get('avg_loss', 0)
 
+        if missed_total > 0:
+            stats_section = (
+                f"---\n"
+                f"📊 **{period_label} Backtest Performance:**\n"
+                f"• **{stats['total_trades']} Trades** | **{stats['win_rate']:.0f}% Win Rate**\n"
+                f"• Avg Win: +{avg_win:.1f}% | Avg Loss: {avg_loss:.1f}%\n"
+                f"• **Total Return: +{missed_total:.1f}%** 💰\n"
+                f"• _On a $100,000 account: **+${missed_total * 1000:,.0f} profit**_\n"
+            )
+        else:
+            stats_section = (
+                f"---\n"
+                f"📊 **{period_label} Backtest Performance:**\n"
+                f"• {stats['total_trades']} Trades | {stats['win_rate']:.0f}% Win Rate\n"
+                f"• Total Return: {missed_total:.1f}%\n"
+            )
+
+    message = f"""⏰ **[DELAYED 24hr] Signal Result - {label}**
+
+{missed_msg}
 📈 **Entry:** ${entry_price:.2f}
 📅 **Entry Time:** {entry_time}
 
@@ -287,42 +505,56 @@ def format_signal_message(signal: dict) -> str:
 📅 **Exit Time:** {exit_time}
 
 💰 **Result:** {pnl:+.2f}% {pnl_emoji}
-📋 **Reason:** {exit_reason}
+📋 **Exit Reason:** {exit_reason}
 {stats_section}
 ---
-_🔔 Want real-time signals? Upgrade to Pro for instant alerts!_
+🚀 **Stop watching from the sidelines!**
+_Upgrade to Pro for REAL-TIME signals and never miss another trade._
 {LEGAL_DISCLAIMER}"""
 
     return message
 
 
 def send_to_discord(message: str, chart_buf: io.BytesIO = None) -> bool:
-    """Send message to Discord webhook with optional chart."""
+    """Send message to Discord webhook with optional chart. Posts to both servers."""
     if not FREE_TIER_WEBHOOK or FREE_TIER_WEBHOOK == "YOUR_FREE_TIER_WEBHOOK_HERE":
         print(f"⚠️  No webhook configured. Would post:")
         print(message[:200] + "...")
         return True  # Return True to mark as "posted" for testing
 
-    try:
-        if chart_buf:
-            # Send with image
-            chart_buf.seek(0)
-            files = {'file': ('trade_chart.png', chart_buf, 'image/png')}
-            payload = {'content': message}
-            response = requests.post(FREE_TIER_WEBHOOK, data=payload, files=files)
-        else:
-            # Send text only
-            payload = {"content": message}
-            response = requests.post(FREE_TIER_WEBHOOK, json=payload)
+    def post_to_webhook(url: str, msg: str, chart: io.BytesIO = None) -> bool:
+        """Helper to post to a single webhook."""
+        try:
+            if chart:
+                chart.seek(0)
+                files = {'file': ('trade_chart.png', chart, 'image/png')}
+                payload = {'content': msg}
+                response = requests.post(url, data=payload, files=files)
+            else:
+                payload = {"content": msg}
+                response = requests.post(url, json=payload)
 
-        if response.status_code in [200, 204]:
-            return True
-        else:
-            print(f"❌ Discord error: {response.status_code}")
+            if response.status_code in [200, 204]:
+                return True
+            else:
+                print(f"❌ Discord error: {response.status_code}")
+                return False
+        except Exception as e:
+            print(f"❌ Error: {e}")
             return False
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        return False
+
+    # Send to primary webhook (your server)
+    primary_success = post_to_webhook(FREE_TIER_WEBHOOK, message, chart_buf)
+
+    # Send to secondary webhook (Haus Hedge server)
+    if HAUS_HEDGE_DELAYED_WEBHOOK:
+        if chart_buf:
+            chart_buf.seek(0)
+        secondary_success = post_to_webhook(HAUS_HEDGE_DELAYED_WEBHOOK, message, chart_buf)
+        if secondary_success:
+            print(f"   📤 Also posted to Haus Hedge server")
+
+    return primary_success
 
 
 def run_delayed_bot():
@@ -331,6 +563,37 @@ def run_delayed_bot():
     print(f"   Delay: {SIGNAL_DELAY_HOURS} hours")
     print(f"   Check interval: {CHECK_INTERVAL} seconds")
     print(f"   Webhook: {'Configured' if FREE_TIER_WEBHOOK != 'YOUR_FREE_TIER_WEBHOOK_HERE' else 'NOT SET'}")
+    print()
+
+    # Send startup message to both servers
+    startup_msg = f"""**Delayed Signal Bot Online**
+
+This channel receives trading signals with a 24-hour delay.
+Signals are from our velocity-based strategies monitoring SPY and BTC.
+
+Want real-time signals? Upgrade to premium!
+
+_Bot started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} EST_"""
+
+    send_to_discord(startup_msg)
+    print("   📤 Startup message sent to both servers")
+
+    # Post the most recent signal as an example
+    try:
+        latest_signal = find_latest_signal()
+        if latest_signal:
+            print(f"   📊 Posting latest signal: {latest_signal['label']}")
+            message = format_signal_message(latest_signal)
+            chart_buf = None
+            try:
+                chart_buf = generate_trade_chart(latest_signal['trade'], latest_signal['strategy_name'])
+            except Exception as e:
+                print(f"   ⚠️ Chart generation failed: {e}")
+            send_to_discord(message, chart_buf)
+            print(f"   ✅ Latest signal posted")
+    except Exception as e:
+        print(f"   ⚠️ Could not post latest signal: {e}")
+
     print()
 
     while True:

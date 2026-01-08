@@ -372,6 +372,24 @@ def create_composite_oscillator(data: pd.DataFrame, weights: dict = None) -> pd.
     if 'volume' in df.columns and df['volume'].sum() > 0:
         components['mfi_norm'] = calculate_mfi(df['high'], df['low'], df['close'], df['volume'], 14)
 
+        # Volume Velocity (1st derivative) - normalized to -1 to +1
+        # These showed #2 and #5 importance in walk-forward analysis
+        volume = df['volume']
+        volume_sma = volume.rolling(20).mean()
+        volume_rel = volume / volume_sma  # Relative volume
+
+        # Volume velocity (5-day smoothed)
+        volume_velocity_raw = volume_rel.rolling(5).mean().diff()
+        vol_vel_std = volume_velocity_raw.rolling(60).std()
+        # Normalize to roughly -1 to +1 using z-score and clip
+        components['volume_velocity_norm'] = (volume_velocity_raw / (vol_vel_std + 0.01)).clip(-3, 3) / 3
+
+        # Volume momentum (5-day rate of change)
+        volume_momentum_raw = volume.pct_change(5)
+        vol_mom_std = volume_momentum_raw.rolling(60).std()
+        # Normalize to roughly -1 to +1
+        components['volume_momentum_norm'] = (volume_momentum_raw / (vol_mom_std + 0.01)).clip(-3, 3) / 3
+
     # Add all components to dataframe
     for name, series in components.items():
         df[name] = series
@@ -5737,16 +5755,59 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     """, unsafe_allow_html=True)
 
                     # Additional metrics row
-                    met_col1, met_col2, met_col3 = st.columns(3)
+                    met_col1, met_col2, met_col3, met_col4 = st.columns(4)
                     with met_col1:
-                        atr_multiple = pred_range / atr_14 if atr_14 > 0 else 0
-                        st.metric("Range vs ATR", f"{atr_multiple:.2f}x ATR")
-                    with met_col2:
                         r2 = prediction.get('model_r2', 0)
-                        st.metric("Model R²", f"{r2:.4f}")
+                        r2_color = "normal" if r2 > 0 else "off"
+                        st.metric("Model R²", f"{r2:.4f}", help="Model fit quality. >0 means better than baseline, <0 means worse than just using average.")
+                    with met_col2:
+                        # Calculate simple backtest accuracy: how often was actual range within predicted bounds?
+                        historical_ranges = (pred_df['high'] - pred_df['low']).tail(20)
+                        predicted_range_val = pred_range
+                        range_tolerance = predicted_range_val * 0.3  # 30% tolerance
+                        within_range = ((historical_ranges >= predicted_range_val - range_tolerance) &
+                                       (historical_ranges <= predicted_range_val + range_tolerance)).mean() * 100
+                        st.metric("Backtest Acc", f"{within_range:.0f}%", help="% of last 20 days where actual range was within 30% of today's predicted range")
                     with met_col3:
+                        atr_multiple = pred_range / atr_14 if atr_14 > 0 else 0
+                        st.metric("Range vs ATR", f"{atr_multiple:.2f}x", help="Predicted range as multiple of 14-day ATR")
+                    with met_col4:
                         conf_level = prediction.get('confidence_level', 0.9)
-                        st.metric("Confidence", f"{conf_level*100:.0f}%")
+                        st.metric("CI Level", f"{conf_level*100:.0f}%", help="Confidence Interval level for prediction bounds (not model accuracy)")
+
+                    # Save prediction with custom name
+                    save_dr_col1, save_dr_col2, save_dr_col3 = st.columns([2, 2, 2])
+                    with save_dr_col1:
+                        # Generate default name with timestamp
+                        from datetime import datetime as dt_save
+                        default_name = f"{pred_ticker}_daily_range_{dt_save.now().strftime('%Y%m%d_%H%M')}"
+                        dr_save_name = st.text_input("Prediction Name", value=default_name, key="dr_save_name")
+
+                    with save_dr_col2:
+                        if st.button("Save for Options Builder", key="save_daily_range_btn"):
+                            try:
+                                # Get stored predictor from session state
+                                stored_predictor = st.session_state.get('range_predictor')
+                                # Use custom name for save path
+                                custom_path = f"predictions/{dr_save_name}.json"
+                                if stored_predictor:
+                                    save_path = stored_predictor.save_predictions(prediction, pred_ticker, path=custom_path)
+                                    st.success(f"Saved to {save_path}!")
+                                else:
+                                    # Fallback: create new predictor
+                                    new_predictor = PriceRangePredictor()
+                                    new_predictor.model_metrics = st.session_state.get('range_model_metrics', {})
+                                    save_path = new_predictor.save_predictions(prediction, pred_ticker, path=custom_path)
+                                    st.success(f"Saved to {save_path}!")
+                            except Exception as save_err:
+                                st.error(f"Save failed: {save_err}")
+
+                    with save_dr_col3:
+                        # Show existing predictions for this ticker
+                        import glob as glob_dr
+                        existing_preds = glob_dr.glob(f"predictions/{pred_ticker}*.json")
+                        if existing_preds:
+                            st.caption(f"{len(existing_preds)} saved predictions for {pred_ticker}")
 
                     # Chart with predicted range
                     st.markdown("---")
@@ -6844,15 +6905,8 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                     # Create fresh predictor and train
                                     wf_predictor = PriceRangePredictor(polygon if polygon_api_key else None)
 
-                                    # Get options features if available
-                                    wf_options = None
-                                    if polygon_api_key:
-                                        try:
-                                            wf_options = wf_predictor.get_options_features(
-                                                st.session_state.get('ticker', 'SPY'), train_df['close'].iloc[-1]
-                                            )
-                                        except:
-                                            pass
+                                    # NOTE: Options features are NOT used for training (point-in-time data)
+                                    # VIX data is now cached at CLASS level, so no redundant fetches
 
                                     # Train with reduced output
                                     # IMPORTANT: Do NOT pass options_features to training!
@@ -7006,6 +7060,56 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                 with met_col8:
                     st.metric("Low Bias", f"${low_error:+.2f}",
                               help="Average prediction bias (+ = overpredict)")
+
+                # Save predictions button for Options Builder
+                st.markdown("---")
+                save_col1, save_col2, save_col3 = st.columns([2, 2, 2])
+                with save_col1:
+                    # Custom prediction name
+                    from datetime import datetime as dt_wf
+                    wf_default_name = f"{pred_ticker}_walkforward_{dt_wf.now().strftime('%Y%m%d_%H%M')}"
+                    wf_save_name = st.text_input("Prediction Name", value=wf_default_name, key="wf_save_name")
+
+                with save_col2:
+                    if st.button("Save Predictions", key="save_wf_predictions_btn", type="primary"):
+                        # Get the latest prediction from walk forward
+                        latest_row = wf_df.iloc[-1]
+                        current_model = st.session_state.get('wf_current_model')
+
+                        # Build prediction dict matching PriceRangePredictor.predict_daily_range() output
+                        save_data = {
+                            'current_close': float(latest_row['actual_close']),
+                            'predicted_high': float(latest_row['predicted_high']),
+                            'predicted_low': float(latest_row['predicted_low']),
+                            'predicted_range': float(latest_row['predicted_range']),
+                            'predicted_range_dollars': float(latest_row['predicted_range']),
+                            'high_upper': float(latest_row['high_upper']),
+                            'high_lower': float(latest_row['high_lower']),
+                            'low_upper': float(latest_row['low_upper']),
+                            'low_lower': float(latest_row['low_lower']),
+                            'high_uncertainty': float((latest_row['high_upper'] - latest_row['high_lower']) / 2),
+                            'low_uncertainty': float((latest_row['low_upper'] - latest_row['low_lower']) / 2),
+                            'confidence_level': 0.9,
+                            'model_r2': current_model.model_metrics.get('r2', 0) if current_model else 0,
+                        }
+
+                        # Save using PriceRangePredictor with custom path
+                        try:
+                            predictor = PriceRangePredictor()
+                            predictor.model_metrics = current_model.model_metrics if current_model else {}
+                            predictor.feature_names = current_model.feature_names if current_model else []
+                            custom_path = f"predictions/{wf_save_name}.json"
+                            save_path = predictor.save_predictions(save_data, pred_ticker, path=custom_path)
+                            st.success(f"Saved to {save_path}!")
+                        except Exception as save_err:
+                            st.error(f"Save failed: {save_err}")
+
+                with save_col3:
+                    # Show count of existing predictions
+                    import glob as glob_wf
+                    existing_wf_preds = glob_wf.glob(f"predictions/{pred_ticker}*.json")
+                    if existing_wf_preds:
+                        st.caption(f"{len(existing_wf_preds)} saved predictions for {pred_ticker}")
 
                 st.markdown("---")
 
@@ -7244,10 +7348,10 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                     st.metric("Predicted Range", f"${pred_range:.2f}", f"{pred_range_pct:.2f}%")
                                 with pred_stat_col4:
                                     confidence = tomorrow_pred.get('confidence_level', 0.9) * 100
-                                    st.metric("Confidence", f"{confidence:.0f}%")
+                                    st.metric("CI Level", f"{confidence:.0f}%", help="Confidence Interval level")
 
                                 # Confidence bounds
-                                st.markdown("**Confidence Bounds (90%)**")
+                                st.markdown("**Prediction Bounds (90% CI)**")
                                 bounds_col1, bounds_col2, bounds_col3, bounds_col4 = st.columns(4)
 
                                 with bounds_col1:
@@ -8028,6 +8132,1411 @@ features['volume_rel_velocity'] = volume_norm.diff()
     elif not PRICE_PREDICTION_AVAILABLE:
         st.markdown("---")
         st.info("Price Prediction Suite not available. Ensure price_prediction.py is in the project directory.")
+
+    # ============================================================================
+    # OPTIONS TRADING BUILDER SECTION
+    # ============================================================================
+    try:
+        from options_builder import (
+            OptionsStrategyEngine, TradeTracker,
+            format_recommendation_for_display, create_payoff_data
+        )
+        OPTIONS_BUILDER_AVAILABLE = True
+    except ImportError:
+        OPTIONS_BUILDER_AVAILABLE = False
+
+    if OPTIONS_BUILDER_AVAILABLE:
+        st.markdown("---")
+        st.header("Options Trading Builder")
+
+        # Show data requirements status
+        st.markdown("""
+        <div style="background: #1e1e2e; padding: 15px; border-radius: 10px; margin-bottom: 20px; border-left: 4px solid #f39c12;">
+            <p style="margin: 0; font-size: 14px; color: #ccc;">
+                <strong style="color: #f39c12;">Required Data Sources:</strong><br>
+                <span style="color: #888;">1. <strong>Velocity Strategy</strong> (Step 5c) → Direction, TP/SL targets, Hold time</span><br>
+                <span style="color: #888;">2. <strong>Range Prediction</strong> (Daily Range or Walk Forward) → Expected move, High/Low</span><br>
+                <span style="color: #888;">Both are needed for optimal options trade recommendations.</span>
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Initialize session state for options builder
+        if 'options_recommendations' not in st.session_state:
+            st.session_state.options_recommendations = []
+        if 'options_trade_tracker' not in st.session_state:
+            st.session_state.options_trade_tracker = TradeTracker()
+
+        # Create tabs
+        opt_tab1, opt_tab2, opt_tab3, opt_tab4, opt_tab5 = st.tabs([
+            "Strategy Builder",
+            "Trade Recommendations",
+            "Position Tracker",
+            "Performance",
+            "Backtest"
+        ])
+
+        # ======================
+        # TAB 1: STRATEGY BUILDER
+        # ======================
+        with opt_tab1:
+            st.subheader("Build Options Strategy")
+
+            # Get all velocity strategies with metadata (same logic as Backtest tab)
+            import glob
+            all_opt_strategy_dirs = sorted(glob.glob("velocity_strategies/*"), reverse=True)
+            all_opt_strategy_dirs = [d for d in all_opt_strategy_dirs if os.path.isdir(d)]
+
+            opt_strategy_info = []
+            for d in all_opt_strategy_dirs:
+                dir_name = os.path.basename(d)
+                config_path = os.path.join(d, 'velocity_config.json')
+                ticker = "Unknown"
+                signal = "unknown"
+                created = ""
+
+                if os.path.exists(config_path):
+                    try:
+                        with open(config_path, 'r') as f:
+                            cfg = json.load(f)
+                        ticker = cfg.get('ticker', 'Unknown')
+                        signal = cfg.get('signal_mode', cfg.get('signal_type', 'unknown'))
+                    except:
+                        pass
+
+                # Extract date from directory name
+                parts = dir_name.split('_')
+                for i, part in enumerate(parts):
+                    if len(part) == 8 and part.isdigit():
+                        try:
+                            date_str = part
+                            time_str = parts[i+1] if i+1 < len(parts) and len(parts[i+1]) == 6 and parts[i+1].isdigit() else "000000"
+                            created = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]} {time_str[:2]}:{time_str[2:4]}"
+                        except:
+                            pass
+                        break
+
+                opt_strategy_info.append({
+                    'dir': dir_name,
+                    'ticker': ticker,
+                    'signal': signal,
+                    'created': created,
+                    'display': f"{dir_name} | {ticker} | {created}" if created else dir_name
+                })
+
+            # Input row
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                num_contracts = st.number_input("Contracts", min_value=1, max_value=100, value=1, key="opt_contracts")
+            with col2:
+                # All strategies dropdown with metadata
+                opt_strat_options = ["None"] + [s['display'] for s in opt_strategy_info]
+                opt_strat_idx = st.selectbox("Load Velocity Strategy", range(len(opt_strat_options)),
+                                             format_func=lambda i: opt_strat_options[i], key="opt_strategy_select")
+
+                if opt_strat_idx > 0:
+                    selected_strategy = opt_strategy_info[opt_strat_idx - 1]['dir']
+                    opt_ticker = opt_strategy_info[opt_strat_idx - 1]['ticker']
+                    st.caption(f"Ticker: {opt_ticker} | Signal: {opt_strategy_info[opt_strat_idx - 1]['signal']}")
+                else:
+                    selected_strategy = "None"
+                    opt_ticker = "SPY"
+
+            # Second row for range prediction selection
+            pred_col1, pred_col2 = st.columns([3, 2])
+            with pred_col1:
+                # Find all range predictions (not filtered by ticker)
+                prediction_files = sorted(glob.glob("predictions/*.json"), reverse=True)
+                prediction_options = ["None"] + [os.path.basename(f) for f in prediction_files]
+                selected_prediction = st.selectbox("Load Range Prediction", prediction_options, key="opt_prediction_select")
+            with pred_col2:
+                st.caption("Save predictions from Daily Range or Walk Forward Analysis tabs above")
+
+            # Data Readiness Status
+            has_strategy = selected_strategy != "None"
+            has_prediction = selected_prediction != "None" and len(prediction_files) > 0
+            prediction_path = f"predictions/{selected_prediction}" if has_prediction else None
+
+            status_col1, status_col2, status_col3 = st.columns([1, 1, 2])
+            with status_col1:
+                if has_strategy:
+                    st.success("Velocity Strategy: Ready")
+                else:
+                    st.warning("Velocity Strategy: Missing")
+                    if len(all_opt_strategy_dirs) == 0:
+                        st.caption("No saved strategies. Go to Step 5c to create one.")
+            with status_col2:
+                if has_prediction:
+                    st.success("Range Prediction: Ready")
+                else:
+                    st.warning("Range Prediction: Missing")
+                    st.caption("Run Daily Range or Walk Forward, then save.")
+            with status_col3:
+                if has_strategy and has_prediction:
+                    st.info("All data ready! Generate recommendations below.")
+                elif has_strategy or has_prediction:
+                    st.warning("Partial data - recommendations will use defaults for missing values.")
+                else:
+                    st.error("No data loaded - complete Step 5c and Price Prediction Suite first.")
+
+            st.markdown("---")
+
+            # Load saved data
+            col1, col2 = st.columns(2)
+
+            velocity_strategy = None
+            range_prediction = None
+
+            with col1:
+                st.markdown("**Velocity Strategy**")
+                if selected_strategy != "None":
+                    strategy_path = f"velocity_strategies/{selected_strategy}"
+                    engine = OptionsStrategyEngine()
+                    velocity_strategy = engine.load_velocity_strategy(strategy_path)
+
+                    if velocity_strategy:
+                        st.success(f"Loaded: {velocity_strategy['strategy_id']}")
+                        params = velocity_strategy.get('parameters', {})
+                        direction = velocity_strategy.get('direction', 'neutral')
+
+                        st.metric("Direction", direction.upper())
+
+                        m1, m2 = st.columns(2)
+                        with m1:
+                            tp = params.get('take_profit_pct', 0)
+                            st.metric("Take Profit", f"{tp:.1f}%")
+                        with m2:
+                            sl = params.get('stop_loss_pct', 0)
+                            st.metric("Stop Loss", f"{sl:.1f}%")
+
+                        avg_hold = velocity_strategy.get('avg_hold_days', 10)
+                        st.metric("Avg Hold", f"~{avg_hold:.0f} days")
+                    else:
+                        st.warning("Could not load strategy config")
+                else:
+                    st.info("Select a saved strategy to load")
+
+            with col2:
+                st.markdown("**Range Prediction**")
+                # Use selected prediction from dropdown (prediction_path set earlier)
+                if prediction_path and os.path.exists(prediction_path):
+                    # Use module-level import (don't import locally - causes scoping issues)
+                    range_prediction = PriceRangePredictor.load_predictions(prediction_path)
+
+                    if range_prediction:
+                        preds = range_prediction.get('predictions', {})
+                        st.success(f"Loaded: {range_prediction.get('timestamp', '')[:10]}")
+
+                        m1, m2 = st.columns(2)
+                        with m1:
+                            pred_high = preds.get('predicted_high', 0)
+                            st.metric("Pred High", f"${pred_high:.2f}")
+                        with m2:
+                            pred_low = preds.get('predicted_low', 0)
+                            st.metric("Pred Low", f"${pred_low:.2f}")
+
+                        current = preds.get('current_close', 0)
+                        if current > 0 and pred_high > 0:
+                            exp_move = ((pred_high - pred_low) / current) * 100
+                            st.metric("Expected Move", f"{exp_move:.2f}%")
+
+                        r2 = range_prediction.get('model_r2', 0)
+                        st.metric("Model R²", f"{r2:.4f}")
+                else:
+                    st.info("Select a saved prediction from dropdown above")
+                    st.caption("Or run Walk-Forward Analysis and save predictions first")
+
+            st.markdown("---")
+
+            # Market Context (get current price)
+            st.markdown("**Market Context**")
+
+            # Get current price
+            try:
+                import yfinance as yf
+                ticker_data = yf.Ticker(opt_ticker)
+                current_price = ticker_data.info.get('regularMarketPrice') or ticker_data.info.get('previousClose', 0)
+                if current_price == 0:
+                    hist = ticker_data.history(period="1d")
+                    if not hist.empty:
+                        current_price = hist['Close'].iloc[-1]
+            except:
+                current_price = 0
+
+            if current_price > 0:
+                mc1, mc2, mc3, mc4 = st.columns(4)
+                with mc1:
+                    st.metric("Current Price", f"${current_price:.2f}")
+                with mc2:
+                    # Try to get IV from Polygon
+                    iv_rank = "N/A"
+                    if 'polygon_manager' in dir() and polygon_manager:
+                        try:
+                            iv_data = polygon_manager.get_atm_iv(opt_ticker)
+                            if iv_data:
+                                iv_rank = f"{iv_data.get('iv_rank', 0):.0f}%"
+                        except:
+                            pass
+                    st.metric("IV Rank", iv_rank)
+                with mc3:
+                    st.metric("IV %ile", "N/A")
+                with mc4:
+                    regime = "Unknown"
+                    st.metric("Regime", regime)
+            else:
+                st.warning(f"Could not fetch current price for {opt_ticker}")
+
+            st.markdown("---")
+
+            # DTE Selection
+            st.markdown("**DTE Selection**")
+
+            # Calculate suggested DTE based on strategy's avg hold time
+            suggested_dte = 21  # Default
+            dte_reasoning = "Default: No strategy loaded"
+
+            if velocity_strategy:
+                avg_hold = velocity_strategy.get('avg_hold_days', 10)
+                # DTE = avg_hold * 1.5 (buffer for theta decay), clamped to 7-45
+                suggested_dte = min(45, max(7, int(avg_hold * 1.5)))
+                dte_reasoning = f"Based on {avg_hold:.1f} day avg hold time × 1.5 buffer"
+
+                # Show prominent suggestion
+                dte_col1, dte_col2 = st.columns([1, 2])
+                with dte_col1:
+                    st.metric("Suggested DTE", f"{suggested_dte} days", delta=f"{avg_hold:.0f}d hold × 1.5")
+                with dte_col2:
+                    st.info(f"**Reasoning:** {dte_reasoning}")
+                    st.caption("Formula: hold_days × 1.5 = buffer for theta decay (range: 7-45 DTE)")
+            else:
+                st.warning("Load a velocity strategy to get DTE suggestion based on historical hold times")
+
+            # DTE options with suggested value highlighted
+            dte_options = [7, 14, 21, 30, 45, 60]
+
+            # Find closest match in options or add suggested
+            if suggested_dte not in dte_options:
+                dte_options = sorted(dte_options + [suggested_dte])
+
+            default_idx = dte_options.index(suggested_dte) if suggested_dte in dte_options else 2
+
+            selected_dte = st.selectbox(
+                "Select DTE",
+                dte_options,
+                index=default_idx,
+                key="opt_dte_select",
+                format_func=lambda x: f"{x} DTE {'⭐ (Suggested)' if x == suggested_dte else ''}"
+            )
+
+            custom_dte = st.number_input("Or enter custom DTE", min_value=1, max_value=365, value=selected_dte, key="opt_custom_dte")
+            if custom_dte != selected_dte:
+                selected_dte = custom_dte
+
+            # Strategy Type Selection
+            st.markdown("---")
+            st.markdown("**Strategy Type**")
+
+            # Get strategy recommendation
+            recommended_strategy = "vertical_spread"
+            recommendation_reason = ""
+
+            if velocity_strategy or range_prediction:
+                engine = OptionsStrategyEngine()
+                context = {
+                    'ticker': opt_ticker,
+                    'current_price': current_price,
+                    'iv_rank': 50,  # Default if not available
+                }
+                recommended_strategy, recommendation_reason = engine.select_optimal_strategy(
+                    context, velocity_strategy, range_prediction
+                )
+
+            if recommendation_reason:
+                st.info(f"Recommended: **{recommended_strategy.replace('_', ' ').title()}** - {recommendation_reason}")
+
+            strategy_options = {
+                'Single Leg (Call/Put)': 'single_leg',
+                'Vertical Spread': 'vertical_spread',
+                'Straddle': 'straddle',
+                'Strangle': 'strangle',
+                'Calendar Spread': 'calendar_spread'
+            }
+
+            # Find default index
+            default_idx = list(strategy_options.values()).index(recommended_strategy) if recommended_strategy in strategy_options.values() else 1
+
+            selected_strategy_type = st.selectbox(
+                "Strategy Type",
+                list(strategy_options.keys()),
+                index=default_idx,
+                key="opt_strategy_type"
+            )
+            strategy_type = strategy_options[selected_strategy_type]
+
+            # Target/Stop inputs
+            st.markdown("---")
+            col1, col2 = st.columns(2)
+            with col1:
+                # Calculate target from strategy or prediction
+                default_target = current_price * 1.02  # 2% default
+                if velocity_strategy:
+                    tp_pct = velocity_strategy.get('parameters', {}).get('take_profit_pct', 2)
+                    direction = velocity_strategy.get('direction', 'long')
+                    if direction in ['long', 'bullish']:
+                        default_target = current_price * (1 + tp_pct/100)
+                    else:
+                        default_target = current_price * (1 - tp_pct/100)
+
+                target_price = st.number_input("Target Price", value=float(default_target), format="%.2f", key="opt_target")
+
+            with col2:
+                # Calculate stop from strategy
+                default_stop = current_price * 0.98  # 2% default
+                if velocity_strategy:
+                    sl_pct = velocity_strategy.get('parameters', {}).get('stop_loss_pct', 5)
+                    direction = velocity_strategy.get('direction', 'long')
+                    if direction in ['long', 'bullish']:
+                        default_stop = current_price * (1 - sl_pct/100)
+                    else:
+                        default_stop = current_price * (1 + sl_pct/100)
+
+                stop_price = st.number_input("Stop Price", value=float(default_stop), format="%.2f", key="opt_stop")
+
+            # Generate button
+            st.markdown("---")
+            if st.button("Generate Recommendations", type="primary", key="generate_options_btn"):
+                if current_price <= 0:
+                    st.error("Cannot generate recommendations without current price")
+                else:
+                    engine = OptionsStrategyEngine()
+                    direction = 'long'
+                    if velocity_strategy:
+                        direction = velocity_strategy.get('direction', 'long')
+                    elif target_price < current_price:
+                        direction = 'short'
+
+                    # Get expected hold days
+                    expected_hold = 10
+                    if velocity_strategy:
+                        expected_hold = velocity_strategy.get('avg_hold_days', 10)
+
+                    recommendations = engine.generate_recommendations(
+                        ticker=opt_ticker,
+                        strategy_type=strategy_type,
+                        direction=direction,
+                        current_price=current_price,
+                        target_price=target_price,
+                        stop_price=stop_price,
+                        dte=selected_dte,
+                        num_contracts=num_contracts,
+                        expected_hold_days=expected_hold
+                    )
+
+                    if recommendations:
+                        st.session_state.options_recommendations = recommendations
+                        st.success(f"Generated {len(recommendations)} recommendation(s). See 'Trade Recommendations' tab.")
+                    else:
+                        st.warning("No recommendations generated. Try different parameters.")
+
+        # ==============================
+        # TAB 2: TRADE RECOMMENDATIONS
+        # ==============================
+        with opt_tab2:
+            st.subheader("Trade Recommendations")
+
+            if not st.session_state.options_recommendations:
+                st.info("No recommendations yet. Use 'Strategy Builder' tab to generate recommendations.")
+            else:
+                recommendations = st.session_state.options_recommendations
+
+                for i, rec in enumerate(recommendations):
+                    is_alternative = rec.get('alternative', False)
+                    label = "TOP PICK" if i == 0 and not is_alternative else "ALTERNATIVE"
+
+                    with st.expander(f"{label}: {rec.get('strategy_name', 'Unknown')}", expanded=(i == 0)):
+                        # Strategy details
+                        col1, col2 = st.columns([2, 1])
+
+                        with col1:
+                            st.markdown(f"**{rec.get('strategy_name', '')}**")
+                            st.markdown(f"Ticker: {rec.get('ticker', '')} | Direction: {rec.get('direction', '').upper()}")
+
+                            # Legs
+                            st.markdown("**Legs:**")
+                            for leg in rec.get('legs', []):
+                                action = leg.get('action', '').upper()
+                                opt_type = leg.get('type', '').upper()
+                                strike = leg.get('strike', 0)
+                                exp = leg.get('expiration', 'N/A')
+                                contracts = leg.get('contracts', 1)
+                                premium = leg.get('premium', 0)
+                                st.markdown(f"- {action} {contracts}x ${strike} {opt_type} @ ${premium:.2f} (Exp: {exp})")
+
+                        with col2:
+                            # Key metrics
+                            entry_cost = rec.get('entry_cost', 0)
+                            if entry_cost < 0:
+                                st.metric("Credit Received", f"${abs(entry_cost):.2f}")
+                            else:
+                                st.metric("Entry Cost", f"${entry_cost:.2f}")
+
+                            max_profit = rec.get('max_profit', 'N/A')
+                            if isinstance(max_profit, (int, float)):
+                                st.metric("Max Profit", f"${max_profit:.2f}")
+                            else:
+                                st.metric("Max Profit", str(max_profit))
+
+                            max_loss = rec.get('max_loss_dollars', rec.get('max_loss', 'N/A'))
+                            if isinstance(max_loss, (int, float)):
+                                st.metric("Max Loss", f"${max_loss:.2f}")
+                            else:
+                                st.metric("Max Loss", str(max_loss))
+
+                        # Additional metrics row
+                        m1, m2, m3, m4 = st.columns(4)
+                        with m1:
+                            if 'break_even' in rec:
+                                st.metric("Break-even", f"${rec['break_even']:.2f}")
+                            elif 'break_even_up' in rec:
+                                st.metric("BE Up", f"${rec['break_even_up']:.2f}")
+                        with m2:
+                            if 'break_even_down' in rec:
+                                st.metric("BE Down", f"${rec['break_even_down']:.2f}")
+                            elif 'prob_profit' in rec:
+                                st.metric("Prob Profit", f"{rec['prob_profit']:.1f}%")
+                        with m3:
+                            if 'risk_reward' in rec:
+                                st.metric("R:R Ratio", f"1:{rec['risk_reward']:.2f}")
+                            elif 'spread_width' in rec:
+                                st.metric("Spread Width", f"${rec['spread_width']:.0f}")
+                        with m4:
+                            st.metric("DTE", f"{rec.get('dte', 'N/A')}")
+
+                        # Notes
+                        if rec.get('notes'):
+                            st.info(rec['notes'])
+
+                        # Risk warning for unlimited risk strategies
+                        if rec.get('risk_warning'):
+                            st.error(rec['risk_warning'])
+
+                        # Payoff diagram
+                        st.markdown("**Payoff at Expiration:**")
+                        try:
+                            payoff_df = create_payoff_data(rec)
+                            if not payoff_df.empty:
+                                import plotly.graph_objects as go
+                                fig = go.Figure()
+                                fig.add_trace(go.Scatter(
+                                    x=payoff_df['price'],
+                                    y=payoff_df['payoff'],
+                                    mode='lines',
+                                    name='P&L',
+                                    line=dict(color='blue', width=2)
+                                ))
+                                fig.add_hline(y=0, line_dash="dash", line_color="gray")
+
+                                # Add break-even lines
+                                if 'break_even' in rec:
+                                    fig.add_vline(x=rec['break_even'], line_dash="dot", line_color="orange",
+                                                 annotation_text="BE")
+                                if 'break_even_up' in rec:
+                                    fig.add_vline(x=rec['break_even_up'], line_dash="dot", line_color="orange",
+                                                 annotation_text="BE Up")
+                                if 'break_even_down' in rec:
+                                    fig.add_vline(x=rec['break_even_down'], line_dash="dot", line_color="orange",
+                                                 annotation_text="BE Down")
+
+                                fig.update_layout(
+                                    title="Payoff Diagram",
+                                    xaxis_title="Stock Price at Expiration",
+                                    yaxis_title="Profit/Loss ($)",
+                                    height=300,
+                                    showlegend=False
+                                )
+                                st.plotly_chart(fig, use_container_width=True)
+                        except Exception as e:
+                            st.warning(f"Could not generate payoff diagram: {e}")
+
+                        # Action buttons
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            if st.button(f"Save Trade", key=f"save_trade_{i}"):
+                                tracker = st.session_state.options_trade_tracker
+                                trade_id = tracker.save_recommendation(rec)
+                                st.success(f"Saved! Trade ID: {trade_id}")
+                        with col2:
+                            # Copy to clipboard (as text)
+                            trade_text = format_recommendation_for_display(rec)
+                            st.code(trade_text, language=None)
+                        with col3:
+                            pass  # Placeholder for future actions
+
+        # ==========================
+        # TAB 3: POSITION TRACKER
+        # ==========================
+        with opt_tab3:
+            st.subheader("Position Tracker")
+
+            tracker = st.session_state.options_trade_tracker
+
+            # Open Positions
+            st.markdown("### Open Positions")
+            open_positions = tracker.get_open_positions()
+
+            if not open_positions:
+                st.info("No open positions. Execute a saved recommendation to track it.")
+            else:
+                for pos in open_positions:
+                    with st.expander(f"{pos.get('ticker', '')} - {pos.get('strategy_name', '')}", expanded=True):
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            exec_info = pos.get('execution', {})
+                            st.metric("Entry Price", f"${exec_info.get('fill_price', pos.get('entry_cost', 0)):.2f}")
+                        with col2:
+                            # Would need live price to calculate current P&L
+                            st.metric("Status", "OPEN")
+                        with col3:
+                            st.metric("DTE Remaining", f"{pos.get('dte', 'N/A')}")
+
+                        # Close position
+                        close_price = st.number_input(f"Close Price", value=0.0, format="%.2f",
+                                                      key=f"close_price_{pos['trade_id']}")
+                        if st.button(f"Mark Closed", key=f"close_{pos['trade_id']}"):
+                            if close_price > 0:
+                                tracker.mark_closed(pos['trade_id'], {
+                                    'close_price': close_price,
+                                    'underlying_price': 0,
+                                    'notes': 'Closed via Position Tracker'
+                                })
+                                st.success("Position closed!")
+                                st.rerun()
+                            else:
+                                st.warning("Enter close price first")
+
+            # Saved Recommendations (not executed)
+            st.markdown("---")
+            st.markdown("### Saved Recommendations")
+            saved_recs = tracker.get_saved_recommendations()
+
+            if not saved_recs:
+                st.info("No saved recommendations. Save trades from the 'Trade Recommendations' tab.")
+            else:
+                for rec in saved_recs:
+                    with st.expander(f"{rec.get('ticker', '')} - {rec.get('strategy_name', '')} ({rec['trade_id']})"):
+                        st.markdown(f"**Created:** {rec.get('created_at', '')[:16]}")
+
+                        # Show legs summary
+                        for leg in rec.get('legs', []):
+                            st.markdown(f"- {leg.get('action', '').upper()} {leg.get('contracts', 1)}x ${leg.get('strike', 0)} {leg.get('type', '').upper()}")
+
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            fill_price = st.number_input("Fill Price", value=float(rec.get('entry_cost', 0)),
+                                                         format="%.2f", key=f"fill_{rec['trade_id']}")
+                            if st.button("Execute", key=f"exec_{rec['trade_id']}"):
+                                tracker.mark_executed(rec['trade_id'], {
+                                    'fill_price': fill_price,
+                                    'underlying_price': 0,
+                                    'notes': ''
+                                })
+                                st.success("Marked as executed!")
+                                st.rerun()
+                        with col2:
+                            if st.button("Delete", key=f"del_{rec['trade_id']}"):
+                                tracker.delete_trade(rec['trade_id'])
+                                st.success("Deleted!")
+                                st.rerun()
+
+            # Manual Trade Entry
+            st.markdown("---")
+            st.markdown("### Add Manual Trade")
+            with st.expander("Enter a trade executed outside the system"):
+                m_ticker = st.text_input("Ticker", key="manual_ticker")
+                m_type = st.selectbox("Strategy Type", ["single_leg", "vertical_spread", "straddle", "strangle", "calendar_spread"], key="manual_type")
+                m_direction = st.selectbox("Direction", ["bullish", "bearish", "neutral"], key="manual_direction")
+                m_entry = st.number_input("Entry Cost/Credit", value=0.0, format="%.2f", key="manual_entry")
+                m_contracts = st.number_input("Contracts", min_value=1, value=1, key="manual_contracts")
+                m_notes = st.text_area("Notes", key="manual_notes")
+
+                if st.button("Add Manual Trade", key="add_manual"):
+                    if m_ticker:
+                        manual_trade = {
+                            'ticker': m_ticker.upper(),
+                            'strategy_type': m_type,
+                            'strategy_name': f"Manual {m_type.replace('_', ' ').title()}",
+                            'direction': m_direction,
+                            'entry_cost': m_entry,
+                            'legs': [{'contracts': m_contracts}],
+                            'notes': m_notes
+                        }
+                        trade_id = tracker.save_recommendation(manual_trade)
+                        tracker.mark_executed(trade_id, {'fill_price': m_entry})
+                        st.success(f"Added trade {trade_id}")
+                        st.rerun()
+                    else:
+                        st.warning("Enter ticker symbol")
+
+        # ======================
+        # TAB 4: PERFORMANCE
+        # ======================
+        with opt_tab4:
+            st.subheader("Performance Analytics")
+
+            tracker = st.session_state.options_trade_tracker
+            stats = tracker.get_performance_stats()
+
+            if stats['total_trades'] == 0:
+                st.info("No closed trades yet. Close some positions to see performance analytics.")
+            else:
+                # Summary metrics
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Total Trades", stats['total_trades'])
+                with col2:
+                    st.metric("Win Rate", f"{stats['win_rate']:.1f}%")
+                with col3:
+                    st.metric("Avg P&L", f"${stats['avg_pnl']:.2f}")
+                with col4:
+                    total_color = "green" if stats['total_pnl'] >= 0 else "red"
+                    st.metric("Total P&L", f"${stats['total_pnl']:.2f}")
+
+                # Best/Worst
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Best Trade", f"${stats['best_trade']:.2f}")
+                with col2:
+                    st.metric("Worst Trade", f"${stats['worst_trade']:.2f}")
+
+                # Performance by Strategy Type
+                st.markdown("---")
+                st.markdown("### Performance by Strategy Type")
+
+                by_strategy = stats.get('by_strategy', {})
+                if by_strategy:
+                    strat_data = []
+                    for strat, data in by_strategy.items():
+                        win_rate = (data['wins'] / data['trades'] * 100) if data['trades'] > 0 else 0
+                        strat_data.append({
+                            'Strategy': strat.replace('_', ' ').title(),
+                            'Trades': data['trades'],
+                            'Win Rate': f"{win_rate:.1f}%",
+                            'Total P&L': f"${data['pnl']:.2f}"
+                        })
+                    st.dataframe(pd.DataFrame(strat_data), use_container_width=True)
+
+                # Performance by Ticker
+                st.markdown("### Performance by Ticker")
+
+                by_ticker = stats.get('by_ticker', {})
+                if by_ticker:
+                    ticker_data = []
+                    for tick, data in by_ticker.items():
+                        win_rate = (data['wins'] / data['trades'] * 100) if data['trades'] > 0 else 0
+                        ticker_data.append({
+                            'Ticker': tick,
+                            'Trades': data['trades'],
+                            'Win Rate': f"{win_rate:.1f}%",
+                            'Total P&L': f"${data['pnl']:.2f}"
+                        })
+                    st.dataframe(pd.DataFrame(ticker_data), use_container_width=True)
+
+                # Equity Curve
+                st.markdown("---")
+                st.markdown("### Equity Curve")
+
+                closed_trades = tracker.get_closed_trades()
+                if closed_trades:
+                    # Build equity curve
+                    equity = [0]
+                    dates = ['Start']
+                    for trade in sorted(closed_trades, key=lambda x: x.get('close', {}).get('date', '')):
+                        pnl = trade.get('pnl', {}).get('total', 0)
+                        equity.append(equity[-1] + pnl)
+                        close_date = trade.get('close', {}).get('date', '')[:10]
+                        dates.append(close_date)
+
+                    import plotly.graph_objects as go
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=list(range(len(equity))),
+                        y=equity,
+                        mode='lines+markers',
+                        name='Equity',
+                        line=dict(color='green' if equity[-1] >= 0 else 'red', width=2)
+                    ))
+                    fig.add_hline(y=0, line_dash="dash", line_color="gray")
+                    fig.update_layout(
+                        title="Cumulative P&L",
+                        xaxis_title="Trade #",
+                        yaxis_title="Cumulative P&L ($)",
+                        height=350
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                # Trade History Table
+                st.markdown("---")
+                st.markdown("### Trade History")
+
+                if closed_trades:
+                    history_data = []
+                    for trade in reversed(closed_trades):  # Most recent first
+                        pnl = trade.get('pnl', {})
+                        history_data.append({
+                            'Trade ID': trade['trade_id'],
+                            'Ticker': trade.get('ticker', ''),
+                            'Strategy': trade.get('strategy_type', '').replace('_', ' ').title(),
+                            'Direction': trade.get('direction', ''),
+                            'Entry': f"${trade.get('execution', {}).get('fill_price', trade.get('entry_cost', 0)):.2f}",
+                            'Exit': f"${trade.get('close', {}).get('close_price', 0):.2f}",
+                            'P&L': f"${pnl.get('total', 0):.2f}",
+                            'Return': f"{pnl.get('pct_return', 0):.1f}%",
+                            'Closed': trade.get('close', {}).get('date', '')[:10]
+                        })
+                    st.dataframe(pd.DataFrame(history_data), use_container_width=True)
+
+        # ======================
+        # TAB 5: BACKTEST
+        # ======================
+        with opt_tab5:
+            st.subheader("Options Strategy Backtest")
+            st.caption("Simulate historical options trades based on velocity signals")
+
+            # Input selectors - Find ALL velocity strategies with metadata
+            import glob
+            from datetime import datetime as dt
+
+            # Get all strategy directories
+            all_strategy_dirs = sorted(glob.glob("velocity_strategies/*"), reverse=True)
+            all_strategy_dirs = [d for d in all_strategy_dirs if os.path.isdir(d)]
+
+            # Build strategy info list with ticker, signal, and date
+            strategy_info = []
+            for d in all_strategy_dirs:
+                dir_name = os.path.basename(d)
+                config_path = os.path.join(d, 'velocity_config.json')
+                ticker = "Unknown"
+                signal = "unknown"
+                created = ""
+
+                # Try to load config for metadata
+                if os.path.exists(config_path):
+                    try:
+                        with open(config_path, 'r') as f:
+                            cfg = json.load(f)
+                        ticker = cfg.get('ticker', 'Unknown')
+                        signal = cfg.get('signal_mode', cfg.get('signal_type', 'unknown'))
+                    except:
+                        pass
+
+                # Extract date from directory name (format: *_YYYYMMDD_HHMMSS)
+                parts = dir_name.split('_')
+                for i, part in enumerate(parts):
+                    if len(part) == 8 and part.isdigit():  # Date part
+                        try:
+                            date_str = part
+                            time_str = parts[i+1] if i+1 < len(parts) and len(parts[i+1]) == 6 and parts[i+1].isdigit() else "000000"
+                            created = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]} {time_str[:2]}:{time_str[2:4]}"
+                        except:
+                            pass
+                        break
+
+                strategy_info.append({
+                    'dir': dir_name,
+                    'ticker': ticker,
+                    'signal': signal,
+                    'created': created,
+                    'display': f"{dir_name} | {ticker} | {created}" if created else dir_name
+                })
+
+            bt_col1, bt_col2 = st.columns(2)
+
+            with bt_col1:
+                # Strategy selector showing all strategies with metadata
+                bt_strategy_options = ["Select Strategy..."] + [s['display'] for s in strategy_info]
+                bt_selected_idx = st.selectbox("Velocity Strategy", range(len(bt_strategy_options)),
+                                               format_func=lambda i: bt_strategy_options[i], key="bt_strategy_idx")
+
+                # Get actual directory name from selection
+                if bt_selected_idx > 0:
+                    bt_selected_strategy = strategy_info[bt_selected_idx - 1]['dir']
+                    bt_ticker = strategy_info[bt_selected_idx - 1]['ticker']
+                    st.caption(f"Ticker: {bt_ticker} | Signal: {strategy_info[bt_selected_idx - 1]['signal']}")
+                else:
+                    bt_selected_strategy = "Select Strategy..."
+                    bt_ticker = "SPY"
+
+            with bt_col2:
+                # Find range predictions (show all, not filtered by ticker)
+                bt_prediction_files = sorted(glob.glob("predictions/*.json"), reverse=True)
+                bt_prediction_options = ["Select Prediction..."] + [os.path.basename(f) for f in bt_prediction_files]
+                bt_selected_prediction = st.selectbox("Range Prediction", bt_prediction_options, key="bt_prediction")
+
+            # Load velocity config for DTE suggestion
+            suggested_dte = 21  # Default
+            avg_hold_days = None
+            if bt_selected_idx > 0:
+                strat_config_path = f"velocity_strategies/{bt_selected_strategy}/velocity_config.json"
+                if os.path.exists(strat_config_path):
+                    try:
+                        with open(strat_config_path, 'r') as f:
+                            strat_cfg = json.load(f)
+                        # Get avg hold days from backtest metrics or calculate from TP/SL
+                        avg_hold_days = strat_cfg.get('backtest_metrics', {}).get('avg_hold_days')
+                        if not avg_hold_days:
+                            avg_hold_days = strat_cfg.get('avg_hold_days')
+                        if avg_hold_days:
+                            # Suggested DTE = avg_hold * 1.5 (buffer for theta), min 14, max 45
+                            suggested_dte = min(45, max(14, int(avg_hold_days * 1.5)))
+                    except:
+                        pass
+
+            # Parameters row
+            bt_param_col1, bt_param_col2, bt_param_col3 = st.columns(3)
+            with bt_param_col1:
+                bt_contracts = st.number_input("Contracts per Trade", min_value=1, max_value=10, value=1, key="bt_contracts")
+            with bt_param_col2:
+                st.markdown("**DTE Selection**")
+                st.caption("Dynamic per trade: hold_days × 1.5")
+                st.caption("Range: 7-45 DTE based on actual hold time")
+            with bt_param_col3:
+                bt_capital = st.number_input("Starting Capital ($)", min_value=1000, max_value=100000, value=10000, key="bt_capital")
+
+            # Strategy types to evaluate
+            ALL_STRATEGY_TYPES = ["vertical_spread", "single_leg", "straddle", "strangle"]
+            st.caption("System evaluates all strategy types and recommends the best one")
+
+            st.markdown("---")
+
+            # Run Backtest button
+            if st.button("Run Options Backtest", type="primary", key="run_bt"):
+                if bt_selected_strategy == "Select Strategy..." :
+                    st.error("Please select a velocity strategy")
+                else:
+                    with st.spinner("Running options backtest..."):
+                        # Also check for strategies directory config
+                        strategy_config_path = f"velocity_strategies/{bt_selected_strategy}/velocity_config.json"
+                        locked_backtest = None
+                        velocity_config = None
+
+                        # Load strategy config FIRST to get strategy_name for locked backtest lookup
+                        if os.path.exists(strategy_config_path):
+                            try:
+                                with open(strategy_config_path, 'r') as f:
+                                    velocity_config = json.load(f)
+                                st.success(f"Loaded velocity config: TP={velocity_config.get('take_profit_pct', 0):.1f}%, SL={velocity_config.get('stop_loss_pct', 0):.1f}%")
+                            except Exception as e:
+                                st.warning(f"Could not load velocity config: {e}")
+
+                        # Get the strategy_name from config (used for locked backtest filename)
+                        # Locked backtests use short names like "velocity_BTC_5y" not full dir names
+                        strategy_name = None
+                        if velocity_config:
+                            strategy_name = velocity_config.get('strategy_name') or velocity_config.get('bundle_name')
+
+                        # Build list of possible locked backtest paths
+                        possible_paths = []
+
+                        # 1. If strategy_name from config (most accurate)
+                        if strategy_name:
+                            possible_paths.append(f"velocity_locked_backtest_{strategy_name}.json")
+
+                        # 2. Try extracting base name by removing timestamp (YYYYMMDD_HHMMSS)
+                        import re
+                        base_name_match = re.match(r'^(.*?)_\d{8}_\d{6}$', bt_selected_strategy)
+                        if base_name_match:
+                            base_name = base_name_match.group(1)
+                            possible_paths.append(f"velocity_locked_backtest_{base_name}.json")
+
+                        # 3. Try full directory name
+                        possible_paths.append(f"velocity_locked_backtest_{bt_selected_strategy}.json")
+
+                        # 4. Try with velocity_ prefix variations
+                        if bt_ticker:
+                            # Pattern like: velocity_locked_backtest_velocity_BTC_5y.json
+                            for timeframe in ['1y', '2y', '5y', '1d', '4h']:
+                                possible_paths.append(f"velocity_locked_backtest_velocity_{bt_ticker}_{timeframe}.json")
+                                # Also try without "velocity_" prefix
+                                possible_paths.append(f"velocity_locked_backtest_{bt_ticker}_{timeframe}.json")
+
+                        # Try to find locked backtest
+                        for path in possible_paths:
+                            if path and os.path.exists(path):
+                                try:
+                                    with open(path, 'r') as f:
+                                        locked_backtest = json.load(f)
+                                    st.info(f"Loaded locked backtest: {len(locked_backtest.get('exits', []))} historical trades")
+                                    break
+                                except:
+                                    pass
+
+                        # Also try loading from the strategy bundle data
+                        bundle_data_path = f"velocity_strategies/{bt_selected_strategy}/data.parquet"
+                        if os.path.exists(bundle_data_path):
+                            try:
+                                bt_df = pd.read_parquet(bundle_data_path)
+                                st.info(f"Loaded price data: {len(bt_df)} bars")
+                            except:
+                                bt_df = None
+                        else:
+                            bt_df = None
+
+                        # Load range prediction if selected
+                        range_pred = None
+                        if bt_selected_prediction != "Select Prediction...":
+                            pred_path = f"predictions/{bt_selected_prediction}"
+                            if os.path.exists(pred_path):
+                                try:
+                                    with open(pred_path, 'r') as f:
+                                        range_pred = json.load(f)
+                                    st.success(f"Loaded range prediction (R²={range_pred.get('model_r2', 0):.3f})")
+                                except:
+                                    pass
+
+                        # If no locked backtest, run fresh backtest on bundled data
+                        if not locked_backtest or not locked_backtest.get('exits'):
+                            if bt_df is not None and velocity_config:
+                                st.info("No locked backtest found. Running fresh backtest on bundled data...")
+                                try:
+                                    # Import backtest function from testing page
+                                    from oscillator_predictor_testing_page import run_velocity_backtest
+
+                                    # Build params dict from velocity config
+                                    backtest_params = {
+                                        'signal_type': velocity_config.get('signal_type', 'any_reversal'),
+                                        'vel_smoothing': velocity_config.get('vel_smoothing', 4),
+                                        'oversold_threshold': velocity_config.get('oversold_threshold', -0.1),
+                                        'overbought_threshold': velocity_config.get('overbought_threshold', 0.1),
+                                        'stop_loss_pct': velocity_config.get('stop_loss_pct', 5.0),
+                                        'take_profit_pct': velocity_config.get('take_profit_pct', 10.0),
+                                        'min_bars_between': velocity_config.get('min_bars_between', 2),
+                                        'extreme_zone_mult': velocity_config.get('extreme_zone_mult', 2.0),
+                                        'exit_on_opposite_signal': velocity_config.get('exit_on_opposite_signal', True),
+                                        'exit_on_midline_cross': velocity_config.get('exit_on_midline_cross', False),
+                                        'rsi_filter': velocity_config.get('rsi_filter', 'none'),
+                                        'rsi_period': velocity_config.get('rsi_period', 14),
+                                        'rsi_oversold': velocity_config.get('rsi_oversold', 30),
+                                        'rsi_overbought': velocity_config.get('rsi_overbought', 70),
+                                        'use_macd_confirm': velocity_config.get('use_macd_confirm', False),
+                                        'use_bb_filter': velocity_config.get('use_bb_filter', False),
+                                        'require_accel': velocity_config.get('require_accel', False),
+                                    }
+
+                                    # Run backtest
+                                    backtest_result = run_velocity_backtest(bt_df, backtest_params)
+
+                                    # Convert trades format to exits format (matching locked backtest schema)
+                                    if backtest_result and backtest_result.get('trades'):
+                                        exits = []
+                                        for trade in backtest_result['trades']:
+                                            exits.append({
+                                                'date': str(trade.get('exit_date', '')),
+                                                'price': trade.get('exit_price', 0),
+                                                'pnl': trade.get('pnl', 0),
+                                                'reason': trade.get('exit_reason', 'Unknown'),
+                                                'entry_price': trade.get('entry_price', 0),
+                                                'entry_date': str(trade.get('entry_date', ''))
+                                            })
+                                        locked_backtest = {
+                                            'exits': exits,
+                                            'num_trades': len(exits),
+                                            'win_rate': backtest_result.get('win_rate', 0),
+                                            'total_return': backtest_result.get('total_return', 0),
+                                            'profit_factor': backtest_result.get('profit_factor', 0)
+                                        }
+                                        st.success(f"Generated backtest: {len(exits)} trades from bundled data")
+                                    else:
+                                        st.warning("Backtest generated no trades with current parameters")
+                                except Exception as e:
+                                    st.error(f"Could not run backtest: {e}")
+
+                        # Run the backtest simulation for ALL strategy types
+                        if locked_backtest and locked_backtest.get('exits'):
+                            exits = locked_backtest['exits']
+                            tp_pct = velocity_config.get('take_profit_pct', 2.0) if velocity_config else 2.0
+                            sl_pct = velocity_config.get('stop_loss_pct', 5.0) if velocity_config else 5.0
+
+                            # Function to simulate a single strategy type
+                            def simulate_strategy(strategy_type, exits, bt_contracts):
+                                from datetime import datetime
+                                results = []
+                                total_pnl = 0
+                                wins = 0
+                                losses = 0
+
+                                for exit_trade in exits:
+                                    entry_price = exit_trade.get('entry_price', 0)
+                                    exit_price = exit_trade.get('price', 0)
+                                    underlying_pnl_pct = exit_trade.get('pnl', 0)
+                                    entry_date = exit_trade.get('entry_date', '')
+                                    exit_date = exit_trade.get('date', '')
+                                    exit_reason = exit_trade.get('reason', '')
+
+                                    if entry_price <= 0:
+                                        continue
+
+                                    # Calculate dynamic DTE based on actual hold time
+                                    # DTE = hold_days * 1.5 (buffer for theta), min 7, max 45
+                                    try:
+                                        entry_dt = datetime.strptime(str(entry_date)[:10], '%Y-%m-%d')
+                                        exit_dt = datetime.strptime(str(exit_date)[:10], '%Y-%m-%d')
+                                        hold_days = max(1, (exit_dt - entry_dt).days)
+                                        # DTE should be hold_days * 1.5 to give buffer, but at least 7 days
+                                        trade_dte = min(45, max(7, int(hold_days * 1.5)))
+                                    except:
+                                        hold_days = 5
+                                        trade_dte = 14  # Default fallback
+
+                                    direction = 'bullish'
+                                    atm_premium_pct = 0.025 * (trade_dte / 21) ** 0.5
+                                    atm_premium = entry_price * atm_premium_pct
+
+                                    if strategy_type == 'single_leg':
+                                        underlying_move = exit_price - entry_price
+                                        delta = 0.50
+                                        if underlying_pnl_pct > 2:
+                                            delta = 0.65
+                                        elif underlying_pnl_pct < -2:
+                                            delta = 0.35
+                                        option_value_change = delta * underlying_move * 100 * bt_contracts
+                                        option_cost = atm_premium * 100 * bt_contracts
+                                        option_pnl = max(-option_cost, option_value_change - (option_cost * 0.3))
+                                        max_loss = option_cost
+
+                                    elif strategy_type == 'vertical_spread':
+                                        spread_width = 5.0
+                                        debit = spread_width * 0.45
+                                        short_strike = entry_price + spread_width
+                                        if exit_price >= short_strike:
+                                            option_pnl = (spread_width - debit) * 100 * bt_contracts
+                                        elif exit_price <= entry_price:
+                                            option_pnl = -debit * 100 * bt_contracts
+                                        else:
+                                            intrinsic = exit_price - entry_price
+                                            option_pnl = (intrinsic - debit) * 100 * bt_contracts
+                                        max_loss = debit * 100 * bt_contracts
+
+                                    elif strategy_type == 'straddle':
+                                        total_premium = entry_price * 0.045 * (trade_dte / 21) ** 0.5
+                                        abs_move = abs(exit_price - entry_price)
+                                        if abs_move > total_premium:
+                                            option_pnl = (abs_move - total_premium) * 100 * bt_contracts
+                                        else:
+                                            option_pnl = max(-(total_premium - abs_move) * 100 * bt_contracts, -total_premium * 100 * bt_contracts)
+                                        max_loss = total_premium * 100 * bt_contracts
+
+                                    elif strategy_type == 'strangle':
+                                        total_premium = entry_price * 0.030 * (trade_dte / 21) ** 0.5
+                                        abs_move = abs(exit_price - entry_price)
+                                        if abs_move > total_premium:
+                                            option_pnl = (abs_move - total_premium) * 100 * bt_contracts
+                                        else:
+                                            option_pnl = max(-(total_premium - abs_move) * 100 * bt_contracts, -total_premium * 100 * bt_contracts)
+                                        max_loss = total_premium * 100 * bt_contracts
+                                    else:
+                                        option_pnl = 0
+                                        max_loss = 0
+
+                                    total_pnl += option_pnl
+                                    if option_pnl > 0:
+                                        wins += 1
+                                    else:
+                                        losses += 1
+
+                                    results.append({
+                                        'entry_date': entry_date[:10] if entry_date else '',
+                                        'exit_date': exit_date[:10] if exit_date else '',
+                                        'hold_days': hold_days,
+                                        'dte_used': trade_dte,
+                                        'entry_price': entry_price,
+                                        'exit_price': exit_price,
+                                        'underlying_pnl': underlying_pnl_pct,
+                                        'option_pnl': option_pnl,
+                                        'max_loss': max_loss,
+                                        'exit_reason': exit_reason,
+                                        'strategy': strategy_type
+                                    })
+
+                                return {
+                                    'results': results,
+                                    'total_pnl': total_pnl,
+                                    'wins': wins,
+                                    'losses': losses,
+                                    'win_rate': (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0,
+                                    'num_trades': wins + losses
+                                }
+
+                            # Run backtest for ALL strategy types
+                            all_results = {}
+                            for strat_type in ALL_STRATEGY_TYPES:
+                                all_results[strat_type] = simulate_strategy(strat_type, exits, bt_contracts)
+
+                            # Find the best strategy (highest total P&L)
+                            best_strategy = max(all_results.keys(), key=lambda k: all_results[k]['total_pnl'])
+                            best_by_winrate = max(all_results.keys(), key=lambda k: all_results[k]['win_rate'])
+                            best_by_risk_adj = max(all_results.keys(), key=lambda k: all_results[k]['total_pnl'] / max(1, sum(r['max_loss'] for r in all_results[k]['results'])))
+
+                            # Store all results in session state
+                            st.session_state.bt_all_results = all_results
+                            st.session_state.bt_best_strategy = best_strategy
+                            st.session_state.bt_results = all_results[best_strategy]['results']
+                            st.session_state.bt_total_pnl = all_results[best_strategy]['total_pnl']
+                            st.session_state.bt_wins = all_results[best_strategy]['wins']
+                            st.session_state.bt_losses = all_results[best_strategy]['losses']
+                            st.session_state.bt_starting_capital = bt_capital
+
+                            st.success(f"Backtest complete! Evaluated {len(ALL_STRATEGY_TYPES)} strategy types across {len(exits)} trades.")
+                        else:
+                            st.error("No historical trade data found. Run velocity_live_trader first to generate trade history.")
+
+            # Display results if available
+            if 'bt_results' in st.session_state and st.session_state.bt_results:
+                results = st.session_state.bt_results
+                total_pnl = st.session_state.bt_total_pnl
+                wins = st.session_state.bt_wins
+                losses = st.session_state.bt_losses
+                starting_capital = st.session_state.get('bt_starting_capital', 10000)
+
+                st.markdown("---")
+
+                # STRATEGY COMPARISON TABLE (if all results available)
+                if 'bt_all_results' in st.session_state:
+                    all_results = st.session_state.bt_all_results
+                    best_strategy = st.session_state.get('bt_best_strategy', 'vertical_spread')
+
+                    st.markdown("### Strategy Comparison")
+                    st.caption("All 4 strategy types evaluated on the same historical trades")
+
+                    # Build comparison dataframe
+                    comparison_data = []
+                    for strat, data in all_results.items():
+                        pnl_return = (data['total_pnl'] / starting_capital * 100) if starting_capital > 0 else 0
+                        avg_pnl = data['total_pnl'] / data['num_trades'] if data['num_trades'] > 0 else 0
+                        is_best = strat == best_strategy
+                        comparison_data.append({
+                            'Strategy': f"{'⭐ ' if is_best else ''}{strat.replace('_', ' ').title()}",
+                            'Total P&L': f"${data['total_pnl']:,.2f}",
+                            'Return': f"{pnl_return:.1f}%",
+                            'Win Rate': f"{data['win_rate']:.1f}%",
+                            'Trades': data['num_trades'],
+                            'Wins': data['wins'],
+                            'Losses': data['losses'],
+                            'Avg P&L': f"${avg_pnl:.2f}",
+                            '_pnl_sort': data['total_pnl']  # Hidden sort column
+                        })
+
+                    comp_df = pd.DataFrame(comparison_data)
+                    comp_df = comp_df.sort_values('_pnl_sort', ascending=False).drop('_pnl_sort', axis=1)
+                    st.dataframe(comp_df, use_container_width=True, hide_index=True)
+
+                    # Recommendation box
+                    best_data = all_results[best_strategy]
+                    best_return = (best_data['total_pnl'] / starting_capital * 100) if starting_capital > 0 else 0
+
+                    st.markdown(f"""
+                    <div style="background: linear-gradient(135deg, #1a472a 0%, #2d5a3d 100%); padding: 20px; border-radius: 10px; margin: 15px 0; border-left: 4px solid #00d4aa;">
+                        <h4 style="color: #00d4aa; margin: 0 0 10px 0;">⭐ Recommended: {best_strategy.replace('_', ' ').title()}</h4>
+                        <p style="color: #ccc; margin: 0;">
+                            Highest Total P&L: <strong style="color: #00d4aa;">${best_data['total_pnl']:,.2f}</strong> ({best_return:.1f}% return)<br>
+                            Win Rate: <strong>{best_data['win_rate']:.1f}%</strong> |
+                            {best_data['wins']} wins, {best_data['losses']} losses
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    # Strategy selector for detailed view
+                    st.markdown("---")
+                    selected_view_strat = st.selectbox(
+                        "View detailed results for:",
+                        list(all_results.keys()),
+                        index=list(all_results.keys()).index(best_strategy),
+                        format_func=lambda x: f"{'⭐ ' if x == best_strategy else ''}{x.replace('_', ' ').title()}",
+                        key="bt_view_strategy"
+                    )
+
+                    # Update displayed results based on selection
+                    results = all_results[selected_view_strat]['results']
+                    total_pnl = all_results[selected_view_strat]['total_pnl']
+                    wins = all_results[selected_view_strat]['wins']
+                    losses = all_results[selected_view_strat]['losses']
+
+                st.markdown(f"### Detailed Results: {selected_view_strat.replace('_', ' ').title() if 'bt_all_results' in st.session_state else 'Selected Strategy'}")
+
+                # Summary metrics
+                total_trades = wins + losses
+                win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+                total_return = (total_pnl / starting_capital * 100) if starting_capital > 0 else 0
+                avg_pnl = total_pnl / total_trades if total_trades > 0 else 0
+
+                metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+                with metric_col1:
+                    st.metric("Total Trades", total_trades)
+                with metric_col2:
+                    st.metric("Win Rate", f"{win_rate:.1f}%")
+                with metric_col3:
+                    st.metric("Total P&L", f"${total_pnl:,.2f}", delta=f"{total_return:.1f}%")
+                with metric_col4:
+                    st.metric("Avg Trade P&L", f"${avg_pnl:.2f}")
+
+                # Additional stats
+                if results:
+                    winners = [r['option_pnl'] for r in results if r['option_pnl'] > 0]
+                    losers = [r['option_pnl'] for r in results if r['option_pnl'] <= 0]
+
+                    stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
+                    with stat_col1:
+                        avg_win = sum(winners) / len(winners) if winners else 0
+                        st.metric("Avg Winner", f"${avg_win:.2f}")
+                    with stat_col2:
+                        avg_loss = sum(losers) / len(losers) if losers else 0
+                        st.metric("Avg Loser", f"${avg_loss:.2f}")
+                    with stat_col3:
+                        best = max([r['option_pnl'] for r in results]) if results else 0
+                        st.metric("Best Trade", f"${best:.2f}")
+                    with stat_col4:
+                        worst = min([r['option_pnl'] for r in results]) if results else 0
+                        st.metric("Worst Trade", f"${worst:.2f}")
+
+                # Equity Curve
+                st.markdown("---")
+                st.markdown("### Equity Curve")
+
+                equity = [starting_capital]
+                dates = ['Start']
+                for r in results:
+                    equity.append(equity[-1] + r['option_pnl'])
+                    dates.append(r['exit_date'])
+
+                import plotly.graph_objects as go
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=list(range(len(equity))),
+                    y=equity,
+                    mode='lines+markers',
+                    name='Equity',
+                    line=dict(color='#00d4aa' if equity[-1] >= starting_capital else '#ff6b6b', width=2),
+                    hovertemplate='Trade %{x}<br>Equity: $%{y:,.2f}<extra></extra>'
+                ))
+                fig.add_hline(y=starting_capital, line_dash="dash", line_color="gray",
+                             annotation_text="Starting Capital")
+                fig.update_layout(
+                    title=f"Options Backtest Equity Curve ({selected_view_strat.replace('_', ' ').title()})",
+                    xaxis_title="Trade #",
+                    yaxis_title="Account Value ($)",
+                    height=400,
+                    template="plotly_dark"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                # P&L Distribution
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.markdown("### P&L Distribution")
+                    pnls = [r['option_pnl'] for r in results]
+                    fig_hist = go.Figure()
+                    fig_hist.add_trace(go.Histogram(
+                        x=pnls,
+                        nbinsx=20,
+                        marker_color=['#00d4aa' if p > 0 else '#ff6b6b' for p in sorted(pnls)]
+                    ))
+                    fig_hist.add_vline(x=0, line_dash="dash", line_color="white")
+                    fig_hist.update_layout(
+                        xaxis_title="P&L ($)",
+                        yaxis_title="Count",
+                        height=300,
+                        template="plotly_dark"
+                    )
+                    st.plotly_chart(fig_hist, use_container_width=True)
+
+                with col2:
+                    st.markdown("### Underlying vs Options P&L")
+                    underlying_pnls = [r['underlying_pnl'] for r in results]
+                    option_pnls = [r['option_pnl'] for r in results]
+
+                    fig_scatter = go.Figure()
+                    fig_scatter.add_trace(go.Scatter(
+                        x=underlying_pnls,
+                        y=option_pnls,
+                        mode='markers',
+                        marker=dict(
+                            size=10,
+                            color=['#00d4aa' if p > 0 else '#ff6b6b' for p in option_pnls]
+                        ),
+                        hovertemplate='Underlying: %{x:.2f}%<br>Options: $%{y:.2f}<extra></extra>'
+                    ))
+                    fig_scatter.add_hline(y=0, line_dash="dash", line_color="gray")
+                    fig_scatter.add_vline(x=0, line_dash="dash", line_color="gray")
+                    fig_scatter.update_layout(
+                        xaxis_title="Underlying P&L (%)",
+                        yaxis_title="Options P&L ($)",
+                        height=300,
+                        template="plotly_dark"
+                    )
+                    st.plotly_chart(fig_scatter, use_container_width=True)
+
+                # Trade Details Table
+                st.markdown("---")
+                st.markdown("### Trade Details")
+
+                trade_df = pd.DataFrame(results)
+                trade_df['option_pnl'] = trade_df['option_pnl'].apply(lambda x: f"${x:,.2f}")
+                trade_df['underlying_pnl'] = trade_df['underlying_pnl'].apply(lambda x: f"{x:.2f}%")
+                trade_df['entry_price'] = trade_df['entry_price'].apply(lambda x: f"${x:.2f}")
+                trade_df['exit_price'] = trade_df['exit_price'].apply(lambda x: f"${x:.2f}")
+                trade_df['max_loss'] = trade_df['max_loss'].apply(lambda x: f"${x:.2f}")
+
+                trade_df = trade_df.rename(columns={
+                    'entry_date': 'Entry Date',
+                    'exit_date': 'Exit Date',
+                    'hold_days': 'Hold',
+                    'dte_used': 'DTE',
+                    'entry_price': 'Entry $',
+                    'exit_price': 'Exit $',
+                    'underlying_pnl': 'Stock P&L',
+                    'option_pnl': 'Options P&L',
+                    'max_loss': 'Max Risk',
+                    'exit_reason': 'Exit Reason',
+                    'strategy': 'Strategy'
+                })
+
+                # Reorder columns to show Hold and DTE prominently
+                col_order = ['Entry Date', 'Exit Date', 'Hold', 'DTE', 'Entry $', 'Exit $', 'Stock P&L', 'Options P&L', 'Max Risk', 'Exit Reason', 'Strategy']
+                trade_df = trade_df[[c for c in col_order if c in trade_df.columns]]
+
+                st.dataframe(trade_df, use_container_width=True, hide_index=True)
+
+                # Comparison to underlying
+                st.markdown("---")
+                st.markdown("### Options vs Stock Comparison")
+
+                underlying_total = sum([r['underlying_pnl'] for r in results])
+                underlying_capital_result = starting_capital * (1 + underlying_total / 100)
+
+                comp_col1, comp_col2, comp_col3 = st.columns(3)
+                with comp_col1:
+                    st.metric(
+                        "Stock-Only Return",
+                        f"${underlying_capital_result - starting_capital:,.2f}",
+                        f"{underlying_total:.1f}%"
+                    )
+                with comp_col2:
+                    st.metric(
+                        "Options Return",
+                        f"${total_pnl:,.2f}",
+                        f"{total_return:.1f}%"
+                    )
+                with comp_col3:
+                    leverage = total_return / underlying_total if underlying_total != 0 else 0
+                    st.metric(
+                        "Effective Leverage",
+                        f"{leverage:.2f}x",
+                        "vs buying stock"
+                    )
+
+    else:
+        st.markdown("---")
+        st.info("Options Trading Builder not available. Ensure options_builder.py is in the project directory.")
 
 
 # ============================================================================

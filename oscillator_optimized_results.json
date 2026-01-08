@@ -1,0 +1,27 @@
+{
+  "ticker": "SPY",
+  "test_period": "2025-01-06 to 2026-01-06",
+  "test_days": 251,
+  "total_trades": 4,
+  "winning_trades": 3,
+  "losing_trades": 1,
+  "win_rate": 75.0,
+  "avg_win_pct": 2.89,
+  "avg_loss_pct": -0.16,
+  "profit_factor": 52.7,
+  "total_return_pct": 8.68,
+  "max_drawdown_pct": -6.49,
+  "sharpe_ratio": 3.65,
+  "avg_hold_days": 19.5,
+  "final_capital": 108677.64,
+  "optimized_params": {
+    "vel_smoothing": 5,
+    "oversold_threshold": -0.1134545413541343,
+    "overbought_threshold": 0.10076797426419665,
+    "extreme_zone_mult": 2.492221128872388,
+    "require_accel": false
+  },
+  "optuna_trials": 500,
+  "optuna_best_score": 21.357,
+  "timestamp": "2026-01-07T08:21:54.572795"
+}

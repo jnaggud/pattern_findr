@@ -1,0 +1,18 @@
+{
+  "ticker": "SPY",
+  "test_period": "2025-01-03 to 2026-01-06",
+  "test_days": 252,
+  "total_trades": 3,
+  "winning_trades": 2,
+  "losing_trades": 1,
+  "win_rate": 66.67,
+  "avg_win_pct": 3.3,
+  "avg_loss_pct": -3.99,
+  "profit_factor": 1.65,
+  "total_return_pct": 2.44,
+  "max_drawdown_pct": -16.15,
+  "sharpe_ratio": 0.71,
+  "avg_hold_days": 31.7,
+  "final_capital": 102444.88,
+  "timestamp": "2026-01-07T08:05:09.098027"
+}

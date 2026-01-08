@@ -1,0 +1,49 @@
+{
+  "ticker": "SPY",
+  "test_period": "2025-01-07 to 2026-01-06",
+  "trials_per_test": 50000,
+  "without_volume": {
+    "total_return": 33.83440024991112,
+    "win_rate": 100.0,
+    "profit_factor": 29853.703154536368,
+    "sharpe_ratio": 2.3956710470545644,
+    "max_drawdown": -4.5143234955382905,
+    "num_trades": 12,
+    "params": {
+      "signal_type": "velocity_crossover_or_zone",
+      "vel_smoothing": 1,
+      "oversold_threshold": -0.13160807261629545,
+      "overbought_threshold": 0.0689720624110481,
+      "stop_loss_pct": 6.1329807195984944,
+      "take_profit_pct": 1.2204326189251216,
+      "min_bars_between": 14,
+      "require_accel": false,
+      "extreme_zone_mult": 1.8156875937447763,
+      "exit_on_opposite_signal": false,
+      "exit_on_midline_cross": false
+    }
+  },
+  "with_volume": {
+    "total_return": 39.81990791237756,
+    "win_rate": 100.0,
+    "profit_factor": 34122.71907065743,
+    "sharpe_ratio": 2.4923201036363505,
+    "max_drawdown": -4.514323495538269,
+    "num_trades": 15,
+    "params": {
+      "signal_type": "velocity_crossover_or_zone",
+      "vel_smoothing": 1,
+      "oversold_threshold": -0.1276928309828291,
+      "overbought_threshold": 0.35277464923086455,
+      "stop_loss_pct": 4.97108258679299,
+      "take_profit_pct": 1.275428737220179,
+      "min_bars_between": 8,
+      "require_accel": false,
+      "extreme_zone_mult": 2.258444776550969,
+      "exit_on_opposite_signal": false,
+      "exit_on_midline_cross": false
+    }
+  },
+  "improvements": 4,
+  "regressions": 0
+}

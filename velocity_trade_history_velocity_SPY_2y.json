@@ -11,33 +11,5 @@
     "exit_reason": "Opposite Signal (2.35%)",
     "pnl_pct": 2.3474589231564176,
     "pnl_dollars": 234.74589231564175
-  },
-  {
-    "id": 2,
-    "ticker": "SPY",
-    "strategy_name": "velocity_SPY_2y",
-    "type": "short",
-    "entry_price": 687.8499755859375,
-    "exit_price": 687.1395263671875,
-    "entry_time": "2025-12-29 00:00:00",
-    "exit_time": "2025-12-11 00:00:00",
-    "exit_reason": "[SYNC] Opposite Signal",
-    "pnl_pct": 0.23269317780568624,
-    "pnl_dollars": 23.269317780568624
-  },
-  {
-    "id": 3,
-    "ticker": "SPY",
-    "strategy_name": "velocity_SPY_2y",
-    "type": "short",
-    "entry_price": 687.8499755859375,
-    "exit_price": 687.1395263671875,
-    "entry_time": "2025-12-29 00:00:00",
-    "exit_time": "2025-12-11 00:00:00",
-    "entry_signal_bar": "2025-12-29 00:00:00",
-    "exit_signal_bar": "2025-12-11 00:00:00",
-    "exit_reason": "[SYNC] Opposite Signal",
-    "pnl_pct": 0.23269317780568624,
-    "pnl_dollars": 23.269317780568624
   }
 ]

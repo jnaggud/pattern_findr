@@ -1,6 +1,7 @@
 {
-  "position": "long",
-  "entry_price": 87234.7421875,
-  "entry_time": "2025-12-25 00:00:00",
-  "last_signal_time": "2025-12-25 00:00:00"
+  "position": null,
+  "entry_price": null,
+  "entry_time": null,
+  "last_signal_time": "2026-01-06 00:00:00",
+  "entry_signal_bar": null
 }
