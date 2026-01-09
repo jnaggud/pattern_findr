@@ -6525,8 +6525,11 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     # Get feature importance from stored predictor
                     range_predictor = st.session_state.get('range_predictor')
                     if range_predictor and hasattr(range_predictor, 'range_model') and range_predictor.range_model is not None:
-                        # Use feature_names to match model's feature_importances_
-                        feature_names_for_importance = range_predictor.feature_names
+                        # Use selected_features if available (after feature selection), otherwise all features
+                        if hasattr(range_predictor, 'selected_features') and range_predictor.selected_features:
+                            feature_names_for_importance = range_predictor.selected_features
+                        else:
+                            feature_names_for_importance = range_predictor.feature_names
                         importance_df = pd.DataFrame({
                             'Feature': feature_names_for_importance,
                             'Importance': range_predictor.range_model.feature_importances_
@@ -9533,6 +9536,405 @@ features['volume_rel_velocity'] = volume_norm.diff()
                         f"{leverage:.2f}x",
                         "vs buying stock"
                     )
+
+            # ========================================
+            # FIND BEST COMBO - Test All Combinations
+            # ========================================
+            st.markdown("---")
+            st.markdown("## 🔍 Find Best Strategy Combination")
+            st.caption("Test ALL velocity strategies × ALL options types to find the optimal combination")
+
+            combo_col1, combo_col2 = st.columns([2, 1])
+            with combo_col1:
+                combo_capital = st.number_input("Capital for Combo Test ($)", min_value=1000, max_value=100000, value=10000, key="combo_capital")
+            with combo_col2:
+                combo_contracts = st.number_input("Contracts", min_value=1, max_value=10, value=1, key="combo_contracts")
+
+            if st.button("🚀 Find Best Combo (Test All)", type="primary", key="find_best_combo"):
+                import glob
+                from datetime import datetime as dt_combo
+
+                # Get all velocity strategies
+                all_strat_dirs = sorted(glob.glob("velocity_strategies/*"), reverse=True)
+                all_strat_dirs = [d for d in all_strat_dirs if os.path.isdir(d)]
+
+                if not all_strat_dirs:
+                    st.error("No velocity strategies found. Create some in Step 5c first.")
+                else:
+                    ALL_OPT_TYPES = ["vertical_spread", "single_leg", "straddle", "strangle"]
+                    all_combos = []
+
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+
+                    total_combos = len(all_strat_dirs) * len(ALL_OPT_TYPES)
+                    combo_idx = 0
+
+                    for strat_dir in all_strat_dirs:
+                        strat_name = os.path.basename(strat_dir)
+                        config_path = os.path.join(strat_dir, 'velocity_config.json')
+
+                        # Load velocity config
+                        vel_config = None
+                        if os.path.exists(config_path):
+                            try:
+                                with open(config_path, 'r') as f:
+                                    vel_config = json.load(f)
+                            except:
+                                continue
+
+                        if not vel_config:
+                            continue
+
+                        ticker = vel_config.get('ticker', 'Unknown')
+
+                        # Try to find locked backtest
+                        locked_bt = None
+                        strategy_name = vel_config.get('strategy_name') or vel_config.get('bundle_name')
+
+                        possible_paths = []
+                        if strategy_name:
+                            possible_paths.append(f"velocity_locked_backtest_{strategy_name}.json")
+
+                        import re
+                        base_match = re.match(r'^(.*?)_\d{8}_\d{6}$', strat_name)
+                        if base_match:
+                            possible_paths.append(f"velocity_locked_backtest_{base_match.group(1)}.json")
+
+                        if ticker:
+                            for tf in ['1y', '2y', '5y', '1d', '4h']:
+                                possible_paths.append(f"velocity_locked_backtest_velocity_{ticker}_{tf}.json")
+
+                        for path in possible_paths:
+                            if path and os.path.exists(path):
+                                try:
+                                    with open(path, 'r') as f:
+                                        locked_bt = json.load(f)
+                                    break
+                                except:
+                                    pass
+
+                        # If no locked backtest, try running fresh from bundled data
+                        if not locked_bt or not locked_bt.get('exits'):
+                            bundle_path = os.path.join(strat_dir, 'data.parquet')
+                            if os.path.exists(bundle_path) and vel_config:
+                                try:
+                                    from oscillator_predictor_testing_page import run_velocity_backtest
+                                    bt_df = pd.read_parquet(bundle_path)
+                                    backtest_params = {
+                                        'signal_type': vel_config.get('signal_type', 'any_reversal'),
+                                        'vel_smoothing': vel_config.get('vel_smoothing', 4),
+                                        'oversold_threshold': vel_config.get('oversold_threshold', -0.1),
+                                        'overbought_threshold': vel_config.get('overbought_threshold', 0.1),
+                                        'stop_loss_pct': vel_config.get('stop_loss_pct', 5.0),
+                                        'take_profit_pct': vel_config.get('take_profit_pct', 10.0),
+                                        'min_bars_between': vel_config.get('min_bars_between', 2),
+                                        'extreme_zone_mult': vel_config.get('extreme_zone_mult', 2.0),
+                                        'exit_on_opposite_signal': vel_config.get('exit_on_opposite_signal', True),
+                                        'exit_on_midline_cross': vel_config.get('exit_on_midline_cross', False),
+                                    }
+                                    result = run_velocity_backtest(bt_df, backtest_params)
+                                    if result and result.get('trades'):
+                                        exits = []
+                                        for trade in result['trades']:
+                                            exits.append({
+                                                'date': str(trade.get('exit_date', '')),
+                                                'price': trade.get('exit_price', 0),
+                                                'pnl': trade.get('pnl', 0),
+                                                'reason': trade.get('exit_reason', 'Unknown'),
+                                                'entry_price': trade.get('entry_price', 0),
+                                                'entry_date': str(trade.get('entry_date', ''))
+                                            })
+                                        locked_bt = {'exits': exits}
+                                except:
+                                    pass
+
+                        if not locked_bt or not locked_bt.get('exits'):
+                            combo_idx += len(ALL_OPT_TYPES)
+                            progress_bar.progress(min(1.0, combo_idx / total_combos))
+                            continue
+
+                        exits = locked_bt['exits']
+
+                        # Test each options strategy type
+                        for opt_type in ALL_OPT_TYPES:
+                            status_text.text(f"Testing: {strat_name[:30]}... × {opt_type}")
+
+                            # Simulate this combination
+                            total_pnl = 0
+                            wins = 0
+                            losses = 0
+                            trade_details = []
+
+                            for exit_trade in exits:
+                                entry_price = exit_trade.get('entry_price', 0)
+                                exit_price = exit_trade.get('price', 0)
+                                underlying_pnl = exit_trade.get('pnl', 0)
+                                entry_date = exit_trade.get('entry_date', '')
+                                exit_date = exit_trade.get('date', '')
+
+                                if entry_price <= 0:
+                                    continue
+
+                                # Calculate hold days and DTE
+                                try:
+                                    entry_dt = dt_combo.strptime(str(entry_date)[:10], '%Y-%m-%d')
+                                    exit_dt = dt_combo.strptime(str(exit_date)[:10], '%Y-%m-%d')
+                                    hold_days = max(1, (exit_dt - entry_dt).days)
+                                    trade_dte = min(45, max(7, int(hold_days * 1.5)))
+                                except:
+                                    hold_days = 5
+                                    trade_dte = 14
+
+                                atm_premium_pct = 0.025 * (trade_dte / 21) ** 0.5
+                                atm_premium = entry_price * atm_premium_pct
+
+                                # Calculate options P&L based on strategy type
+                                if opt_type == 'single_leg':
+                                    underlying_move = exit_price - entry_price
+                                    delta = 0.50
+                                    if underlying_pnl > 2:
+                                        delta = 0.65
+                                    elif underlying_pnl < -2:
+                                        delta = 0.35
+                                    option_value_change = delta * underlying_move * 100 * combo_contracts
+                                    option_cost = atm_premium * 100 * combo_contracts
+                                    option_pnl = max(-option_cost, option_value_change - (option_cost * 0.3))
+
+                                elif opt_type == 'vertical_spread':
+                                    spread_width = 5.0
+                                    debit = spread_width * 0.45
+                                    short_strike = entry_price + spread_width
+                                    if exit_price >= short_strike:
+                                        option_pnl = (spread_width - debit) * 100 * combo_contracts
+                                    elif exit_price <= entry_price:
+                                        option_pnl = -debit * 100 * combo_contracts
+                                    else:
+                                        intrinsic = exit_price - entry_price
+                                        option_pnl = (intrinsic - debit) * 100 * combo_contracts
+
+                                elif opt_type == 'straddle':
+                                    total_premium = entry_price * 0.045 * (trade_dte / 21) ** 0.5
+                                    abs_move = abs(exit_price - entry_price)
+                                    if abs_move > total_premium:
+                                        option_pnl = (abs_move - total_premium) * 100 * combo_contracts
+                                    else:
+                                        option_pnl = max(-(total_premium - abs_move) * 100 * combo_contracts, -total_premium * 100 * combo_contracts)
+
+                                elif opt_type == 'strangle':
+                                    total_premium = entry_price * 0.030 * (trade_dte / 21) ** 0.5
+                                    abs_move = abs(exit_price - entry_price)
+                                    if abs_move > total_premium:
+                                        option_pnl = (abs_move - total_premium) * 100 * combo_contracts
+                                    else:
+                                        option_pnl = max(-(total_premium - abs_move) * 100 * combo_contracts, -total_premium * 100 * combo_contracts)
+                                else:
+                                    option_pnl = 0
+
+                                total_pnl += option_pnl
+                                if option_pnl > 0:
+                                    wins += 1
+                                else:
+                                    losses += 1
+
+                                trade_details.append({'pnl': option_pnl, 'hold': hold_days})
+
+                            num_trades = wins + losses
+                            win_rate = (wins / num_trades * 100) if num_trades > 0 else 0
+                            pct_return = (total_pnl / combo_capital * 100) if combo_capital > 0 else 0
+                            avg_hold = sum(t['hold'] for t in trade_details) / len(trade_details) if trade_details else 0
+
+                            # Calculate max drawdown
+                            equity = combo_capital
+                            peak = combo_capital
+                            max_dd = 0
+                            for t in trade_details:
+                                equity += t['pnl']
+                                if equity > peak:
+                                    peak = equity
+                                dd = (peak - equity) / peak * 100 if peak > 0 else 0
+                                if dd > max_dd:
+                                    max_dd = dd
+
+                            all_combos.append({
+                                'velocity_strategy': strat_name,
+                                'ticker': ticker,
+                                'options_type': opt_type,
+                                'total_pnl': total_pnl,
+                                'pct_return': pct_return,
+                                'win_rate': win_rate,
+                                'num_trades': num_trades,
+                                'wins': wins,
+                                'losses': losses,
+                                'avg_hold_days': avg_hold,
+                                'max_drawdown': max_dd,
+                                'tp_pct': vel_config.get('take_profit_pct', 0),
+                                'sl_pct': vel_config.get('stop_loss_pct', 0),
+                                'config_path': config_path
+                            })
+
+                            combo_idx += 1
+                            progress_bar.progress(min(1.0, combo_idx / total_combos))
+
+                    progress_bar.progress(1.0)
+                    status_text.text(f"Complete! Tested {len(all_combos)} combinations.")
+
+                    if all_combos:
+                        # Store results
+                        st.session_state.combo_results = all_combos
+                        st.success(f"Tested {len(all_combos)} combinations across {len(all_strat_dirs)} strategies!")
+
+            # Display combo results if available
+            if 'combo_results' in st.session_state and st.session_state.combo_results:
+                all_combos = st.session_state.combo_results
+
+                # Sort by return
+                all_combos_sorted = sorted(all_combos, key=lambda x: x['pct_return'], reverse=True)
+
+                # Best combo
+                best = all_combos_sorted[0]
+
+                st.markdown("### 🏆 Best Combination Found")
+                st.markdown(f"""
+                <div style="background: linear-gradient(135deg, #1a472a 0%, #2d5a3d 100%); padding: 25px; border-radius: 12px; margin: 15px 0; border-left: 5px solid #ffd700;">
+                    <h3 style="color: #ffd700; margin: 0 0 15px 0;">🥇 WINNER: {best['ticker']} + {best['options_type'].replace('_', ' ').title()}</h3>
+                    <p style="color: #fff; margin: 0; font-size: 18px;">
+                        <strong style="color: #00d4aa;">Return: {best['pct_return']:.1f}%</strong> (${best['total_pnl']:,.2f})<br>
+                        Win Rate: <strong>{best['win_rate']:.1f}%</strong> |
+                        Trades: <strong>{best['num_trades']}</strong> |
+                        Max Drawdown: <strong>{best['max_drawdown']:.1f}%</strong>
+                    </p>
+                    <p style="color: #aaa; margin: 10px 0 0 0; font-size: 14px;">
+                        Strategy: {best['velocity_strategy'][:50]}...<br>
+                        Settings: TP={best['tp_pct']:.1f}%, SL={best['sl_pct']:.1f}%, Avg Hold={best['avg_hold_days']:.1f} days
+                    </p>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # Top 10 table
+                st.markdown("### Top 10 Combinations")
+                top10 = all_combos_sorted[:10]
+                top10_data = []
+                for i, combo in enumerate(top10):
+                    top10_data.append({
+                        'Rank': f"{'🥇' if i==0 else '🥈' if i==1 else '🥉' if i==2 else i+1}",
+                        'Ticker': combo['ticker'],
+                        'Options Type': combo['options_type'].replace('_', ' ').title(),
+                        'Return': f"{combo['pct_return']:.1f}%",
+                        'P&L': f"${combo['total_pnl']:,.2f}",
+                        'Win Rate': f"{combo['win_rate']:.1f}%",
+                        'Trades': combo['num_trades'],
+                        'Max DD': f"{combo['max_drawdown']:.1f}%",
+                        'TP/SL': f"{combo['tp_pct']:.1f}/{combo['sl_pct']:.1f}%"
+                    })
+
+                st.dataframe(pd.DataFrame(top10_data), use_container_width=True, hide_index=True)
+
+                # ========================================
+                # DEPLOY TO PRODUCTION
+                # ========================================
+                st.markdown("---")
+                st.markdown("## 🚀 Deploy to Production")
+                st.caption("Take your winning strategy live")
+
+                # Production config
+                prod_col1, prod_col2 = st.columns(2)
+
+                with prod_col1:
+                    st.markdown("### Winning Strategy Config")
+                    st.code(f"""
+# PRODUCTION SETTINGS
+Ticker: {best['ticker']}
+Options Strategy: {best['options_type'].replace('_', ' ').title()}
+
+# Velocity Signal Settings
+Take Profit: {best['tp_pct']:.1f}%
+Stop Loss: {best['sl_pct']:.1f}%
+Avg Hold Period: {best['avg_hold_days']:.1f} days
+Suggested DTE: {max(7, min(45, int(best['avg_hold_days'] * 1.5)))} days
+
+# Expected Performance
+Win Rate: {best['win_rate']:.1f}%
+Avg Return: {best['pct_return'] / max(1, best['num_trades']):.2f}% per trade
+Max Drawdown: {best['max_drawdown']:.1f}%
+                    """, language="yaml")
+
+                with prod_col2:
+                    st.markdown("### Production Checklist")
+                    st.markdown("""
+                    **Before Going Live:**
+
+                    - [ ] Paper trade for 2-4 weeks minimum
+                    - [ ] Verify signals match backtest logic
+                    - [ ] Set position size (1-2% of account per trade)
+                    - [ ] Configure broker alerts/automation
+                    - [ ] Set daily loss limit (e.g., 5% of account)
+
+                    **Risk Management:**
+
+                    - [ ] Never risk more than you can afford to lose
+                    - [ ] Options can go to $0 - size accordingly
+                    - [ ] Past performance ≠ future results
+                    - [ ] Have exit rules before entering
+                    """)
+
+                st.markdown("---")
+
+                # Save production config button
+                if st.button("💾 Save Production Config", type="primary", key="save_prod_config"):
+                    prod_config = {
+                        'created_at': datetime.now().isoformat(),
+                        'ticker': best['ticker'],
+                        'velocity_strategy': best['velocity_strategy'],
+                        'velocity_config_path': best['config_path'],
+                        'options_strategy': best['options_type'],
+                        'backtest_results': {
+                            'total_return_pct': best['pct_return'],
+                            'total_pnl': best['total_pnl'],
+                            'win_rate': best['win_rate'],
+                            'num_trades': best['num_trades'],
+                            'max_drawdown': best['max_drawdown'],
+                            'avg_hold_days': best['avg_hold_days']
+                        },
+                        'trading_params': {
+                            'take_profit_pct': best['tp_pct'],
+                            'stop_loss_pct': best['sl_pct'],
+                            'suggested_dte': max(7, min(45, int(best['avg_hold_days'] * 1.5))),
+                            'contracts_tested': combo_contracts if 'combo_contracts' in dir() else 1
+                        },
+                        'production_notes': {
+                            'paper_trade_first': True,
+                            'recommended_position_size': '1-2% of account',
+                            'max_daily_loss': '5% of account'
+                        }
+                    }
+
+                    # Save to file
+                    prod_filename = f"production_config_{best['ticker']}_{best['options_type']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                    with open(prod_filename, 'w') as f:
+                        json.dump(prod_config, f, indent=2)
+
+                    st.success(f"Production config saved to: {prod_filename}")
+
+                    # Show the config
+                    with st.expander("View Saved Config"):
+                        st.json(prod_config)
+
+                # Full results expander
+                with st.expander(f"View All {len(all_combos)} Combinations"):
+                    full_data = []
+                    for combo in all_combos_sorted:
+                        full_data.append({
+                            'Strategy': combo['velocity_strategy'][:40],
+                            'Ticker': combo['ticker'],
+                            'Options': combo['options_type'].replace('_', ' ').title(),
+                            'Return': f"{combo['pct_return']:.1f}%",
+                            'P&L': f"${combo['total_pnl']:,.2f}",
+                            'Win%': f"{combo['win_rate']:.1f}%",
+                            'Trades': combo['num_trades'],
+                            'DD': f"{combo['max_drawdown']:.1f}%"
+                        })
+                    st.dataframe(pd.DataFrame(full_data), use_container_width=True, hide_index=True)
 
     else:
         st.markdown("---")
