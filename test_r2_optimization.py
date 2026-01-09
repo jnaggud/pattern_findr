@@ -52,6 +52,15 @@ def test_r2_optimization():
         else:
             print("   WARNING: No ensemble models found!")
 
+        # Check feature selection
+        print("\n4c. Checking feature selection...")
+        if hasattr(predictor, 'selected_features') and len(predictor.selected_features) > 0:
+            print(f"   Selected features: {len(predictor.selected_features)}")
+            print(f"   Top 5: {predictor.selected_features[:5]}")
+            print("   Feature selection status: OK")
+        else:
+            print("   WARNING: No feature selection applied!")
+
         print("\n5. Testing prediction...")
         result = predictor.predict_daily_range(df.tail(2))
         if result is not None:

@@ -207,6 +207,8 @@ class PriceRangePredictor:
         self.polygon = polygon_manager
         self.range_model = None
         self.ensemble_models = []  # For ensemble of top N models
+        self.selected_features = []  # For feature selection
+        self.selected_indices = []  # Indices of selected features
         self.high_model = None
         self.low_model = None
         self.scaler = StandardScaler() if SKLEARN_AVAILABLE else None
@@ -1949,6 +1951,49 @@ class PriceRangePredictor:
         self.range_model = self.ensemble_models[0]  # Best model is primary
         print(f"[DEBUG] Primary model params: {best_params}")
 
+        # Feature Selection: Select top features based on importance
+        # This reduces overfitting and improves generalization
+        feature_importance = self.range_model.feature_importances_
+        importance_df = pd.DataFrame({
+            'feature': self.feature_names,
+            'importance': feature_importance
+        }).sort_values('importance', ascending=False)
+
+        # Select top features (cumulative importance >= 90% or at least 30 features)
+        cumulative_importance = importance_df['importance'].cumsum() / importance_df['importance'].sum()
+        n_features_90pct = (cumulative_importance < 0.90).sum() + 1
+        n_selected = max(30, min(n_features_90pct, 60))  # Between 30 and 60 features
+
+        selected_features = importance_df.head(n_selected)['feature'].tolist()
+        selected_indices = [self.feature_names.index(f) for f in selected_features]
+
+        print(f"\n[FEATURE SELECTION] Selecting top {n_selected} features (90% cumulative importance = {n_features_90pct})")
+        print(f"   Top 5: {selected_features[:5]}")
+
+        # Retrain ensemble with selected features only
+        X_train_selected = X_train_scaled[:, selected_indices]
+        X_test_selected = X_test_scaled[:, selected_indices]
+
+        self.ensemble_models = []  # Reset ensemble
+        for i, trial in enumerate(top_3_trials):
+            params = trial['params'].copy()
+            params['n_jobs'] = 1
+            params['objective'] = 'reg:squarederror'
+            params['verbosity'] = 0
+
+            model = xgb.XGBRegressor(**params)
+            model.fit(X_train_selected, y_train)
+            self.ensemble_models.append(model)
+
+        self.range_model = self.ensemble_models[0]
+        self.selected_features = selected_features
+        self.selected_indices = selected_indices
+        print(f"   Ensemble retrained with {n_selected} features")
+
+        # Update test data for evaluation
+        X_test_scaled = X_test_selected
+        X_train_scaled = X_train_selected
+
         # Wrap with MAPIE for conformal prediction intervals
         self.conformal_model = None
         if MAPIE_AVAILABLE:
@@ -1992,10 +2037,12 @@ class PriceRangePredictor:
         }
         print(f"[DEBUG] Metrics: R2={self.model_metrics['r2']:.4f}, RMSE={self.model_metrics['rmse_pct']:.3f}%")
 
-        # Feature importance (all features)
+        # Feature importance (selected features)
         print("[DEBUG] Creating feature importance...")
+        # Use selected features if available, otherwise all features
+        feature_names_for_importance = self.selected_features if self.selected_features else self.feature_names
         importance = pd.DataFrame({
-            'feature': self.feature_names,
+            'feature': feature_names_for_importance,
             'importance': self.range_model.feature_importances_
         }).sort_values('importance', ascending=False)
         print(f"[DEBUG] Top 3 features: {importance.head(3)['feature'].tolist()}")
@@ -2039,7 +2086,13 @@ class PriceRangePredictor:
 
         print("[DEBUG predict] Scaling features...")
         X_scaled = self.scaler.transform(X)
-        print(f"[DEBUG predict] Using all {X_scaled.shape[1]} features")
+
+        # Apply feature selection if available
+        if hasattr(self, 'selected_indices') and self.selected_indices:
+            X_scaled = X_scaled[:, self.selected_indices]
+            print(f"[DEBUG predict] Using {len(self.selected_indices)} selected features")
+        else:
+            print(f"[DEBUG predict] Using all {X_scaled.shape[1]} features")
 
         # Get current close
         current_close = df['close'].iloc[-1]
