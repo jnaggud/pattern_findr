@@ -206,6 +206,7 @@ class PriceRangePredictor:
         """
         self.polygon = polygon_manager
         self.range_model = None
+        self.ensemble_models = []  # For ensemble of top N models
         self.high_model = None
         self.low_model = None
         self.scaler = StandardScaler() if SKLEARN_AVAILABLE else None
@@ -1912,21 +1913,41 @@ class PriceRangePredictor:
         print(f"   Features used: {X_train_scaled.shape[1]} (all)")
         print(f"   Total time: {total_time:.1f}s ({total_completed/total_time:.1f} trials/sec)")
 
-        # Use best params from the winning worker (just XGBoost params)
-        best_params = best_result['best_params']
-        print(f"[DEBUG] Best params: {best_params}")
+        # Collect all top trials from all workers for ensemble
+        all_top_trials = []
+        for result in results_list:
+            if 'top_trials' in result:
+                all_top_trials.extend(result['top_trials'])
 
-        # Add required XGBoost params
+        # Sort by score (descending) and take top 3 globally
+        all_top_trials = sorted(all_top_trials, key=lambda x: x['score'], reverse=True)
+        ensemble_size = min(3, len(all_top_trials))
+        top_3_trials = all_top_trials[:ensemble_size]
+
+        print(f"\n[ENSEMBLE] Creating ensemble from top {ensemble_size} trials:")
+        for i, trial in enumerate(top_3_trials):
+            print(f"   Model {i+1}: Score={trial['score']:.4f}")
+
+        # Train ensemble of models
+        self.ensemble_models = []
+        for i, trial in enumerate(top_3_trials):
+            params = trial['params'].copy()
+            params['n_jobs'] = 1
+            params['objective'] = 'reg:squarederror'
+            params['verbosity'] = 0
+
+            model = xgb.XGBRegressor(**params)
+            model.fit(X_train_scaled, y_train)
+            self.ensemble_models.append(model)
+            print(f"   Model {i+1} trained successfully")
+
+        # Use the best model as the primary (for feature importance, etc.)
+        best_params = top_3_trials[0]['params'].copy()
         best_params['n_jobs'] = 1
         best_params['objective'] = 'reg:squarederror'
         best_params['verbosity'] = 0
-
-        # Train final model with ALL features (no feature selection)
-        print("[DEBUG] Creating final XGBRegressor...")
-        self.range_model = xgb.XGBRegressor(**best_params)
-        print(f"[DEBUG] Fitting final model on {X_train_scaled.shape[1]} features...")
-        self.range_model.fit(X_train_scaled, y_train)
-        print("[DEBUG] Model fitted successfully")
+        self.range_model = self.ensemble_models[0]  # Best model is primary
+        print(f"[DEBUG] Primary model params: {best_params}")
 
         # Wrap with MAPIE for conformal prediction intervals
         self.conformal_model = None
@@ -1945,9 +1966,15 @@ class PriceRangePredictor:
                 print(f"[DEBUG] MAPIE fitting failed: {mapie_err}")
                 self.conformal_model = None
 
-        # Evaluate on test set
-        print("[DEBUG] Predicting on test set...")
-        y_pred = self.range_model.predict(X_test_scaled)
+        # Evaluate on test set using ensemble average
+        print("[DEBUG] Predicting on test set with ensemble...")
+        if hasattr(self, 'ensemble_models') and len(self.ensemble_models) > 1:
+            # Ensemble prediction: average of all models
+            predictions = np.array([m.predict(X_test_scaled) for m in self.ensemble_models])
+            y_pred = np.mean(predictions, axis=0)
+            print(f"[DEBUG] Ensemble predictions: {len(self.ensemble_models)} models averaged")
+        else:
+            y_pred = self.range_model.predict(X_test_scaled)
         print(f"[DEBUG] Predictions shape: {y_pred.shape}")
 
         print("[DEBUG] Calculating metrics...")
@@ -2047,12 +2074,23 @@ class PriceRangePredictor:
                 }
                 print(f"[DEBUG predict] Conformal bounds (pct): [{range_lower_pct:.3f}%, {range_upper_pct:.3f}%]")
             except Exception as conf_err:
-                print(f"[DEBUG predict] Conformal prediction failed: {conf_err}, using point estimate")
-                predicted_range_pct = self.range_model.predict(X_scaled)[0]
+                print(f"[DEBUG predict] Conformal prediction failed: {conf_err}, using ensemble prediction")
+                # Use ensemble average if available
+                if hasattr(self, 'ensemble_models') and len(self.ensemble_models) > 1:
+                    predictions = np.array([m.predict(X_scaled)[0] for m in self.ensemble_models])
+                    predicted_range_pct = np.mean(predictions)
+                else:
+                    predicted_range_pct = self.range_model.predict(X_scaled)[0]
                 predicted_range = predicted_range_pct / 100.0  # Convert to fraction
         else:
             print("[DEBUG predict] Making point prediction...")
-            predicted_range_pct = self.range_model.predict(X_scaled)[0]
+            # Use ensemble average if available
+            if hasattr(self, 'ensemble_models') and len(self.ensemble_models) > 1:
+                predictions = np.array([m.predict(X_scaled)[0] for m in self.ensemble_models])
+                predicted_range_pct = np.mean(predictions)
+                print(f"[DEBUG predict] Ensemble of {len(self.ensemble_models)} models averaged")
+            else:
+                predicted_range_pct = self.range_model.predict(X_scaled)[0]
             predicted_range = predicted_range_pct / 100.0  # Convert from percentage to fraction
 
         print(f"[DEBUG predict] Predicted range: {predicted_range_pct:.3f}% ({predicted_range:.6f} fraction)")

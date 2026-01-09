@@ -806,9 +806,23 @@ def run_range_study(data_path, n_trials, seed, worker_id=0):
     best_score = -best_val if best_val != float('inf') else 0.0
     print(f"[Worker {worker_id}] Done! Best Composite Score: {best_score:.4f}", flush=True)
 
+    # Get top N trials for ensemble (sorted by value, ascending = best first)
+    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    sorted_trials = sorted(completed_trials, key=lambda t: t.value)
+    top_n = 5  # Return top 5 so we can pick best 3 globally across workers
+
+    top_trials = []
+    for t in sorted_trials[:top_n]:
+        top_trials.append({
+            'value': t.value,  # Negative composite score
+            'score': -t.value,  # Positive composite score
+            'params': t.params
+        })
+
     return {
         'best_value': best_val,  # Negative composite score (for consistency with minimize)
         'best_score': best_score,  # Positive composite score (for display)
         'best_params': best_params,
-        'n_trials': len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+        'top_trials': top_trials,  # Top N trials for ensemble
+        'n_trials': len(completed_trials)
     }

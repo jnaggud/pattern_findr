@@ -1,4 +1,4 @@
-"""Quick test for R² + Composite objective optimization."""
+"""Quick test for R² + Composite objective optimization and Ensemble models."""
 import sys
 import numpy as np
 import pandas as pd
@@ -8,9 +8,9 @@ import yfinance as yf
 from price_prediction import PriceRangePredictor
 
 def test_r2_optimization():
-    """Test that the R² + Composite optimization runs without errors."""
+    """Test that the R² + Composite optimization and Ensemble runs without errors."""
     print("=" * 60)
-    print("Testing R² + Composite Objective Optimization")
+    print("Testing R² + Composite Optimization + Ensemble Models")
     print("=" * 60)
 
     # Get some test data
@@ -43,6 +43,14 @@ def test_r2_optimization():
         print(f"   R²: {predictor.model_metrics['r2']:.4f}")
         print(f"   RMSE: {predictor.model_metrics['rmse_pct']:.3f}%")
         print(f"   MAE: {predictor.model_metrics['mae_pct']:.3f}%")
+
+        # Check ensemble models
+        print("\n4b. Checking ensemble models...")
+        if hasattr(predictor, 'ensemble_models') and len(predictor.ensemble_models) > 0:
+            print(f"   Ensemble size: {len(predictor.ensemble_models)} models")
+            print("   Ensemble status: OK")
+        else:
+            print("   WARNING: No ensemble models found!")
 
         print("\n5. Testing prediction...")
         result = predictor.predict_daily_range(df.tail(2))
