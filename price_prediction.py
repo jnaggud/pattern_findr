@@ -55,12 +55,18 @@ except ImportError:
     print("Warning: novel_indicators not available")
 
 # Try to import MAPIE for conformal prediction
+# Note: MAPIE 1.2.0+ renamed MapieRegressor to SplitConformalRegressor
 try:
-    from mapie.regression import MapieRegressor
+    from mapie.regression import SplitConformalRegressor as MapieRegressor
     MAPIE_AVAILABLE = True
 except ImportError:
-    MAPIE_AVAILABLE = False
-    print("Warning: mapie not available, conformal prediction disabled")
+    try:
+        # Fallback for older versions
+        from mapie.regression import MapieRegressor
+        MAPIE_AVAILABLE = True
+    except ImportError:
+        MAPIE_AVAILABLE = False
+        print("Warning: mapie not available, conformal prediction disabled")
 
 
 # Import optuna_worker for proper multiprocessing (file-based data sharing)
@@ -2003,17 +2009,19 @@ class PriceRangePredictor:
             print(f"\n[FEATURE SELECTION] Disabled - using all {len(self.feature_names)} features")
 
         # Wrap with MAPIE for conformal prediction intervals
+        # Note: MAPIE 1.2.0+ uses SplitConformalRegressor with different API
         self.conformal_model = None
+        self.conformal_confidence = 0.9  # Store confidence level for prediction
         if MAPIE_AVAILABLE:
             try:
                 print("[DEBUG] Fitting conformal prediction model (MAPIE)...")
                 self.conformal_model = MapieRegressor(
                     estimator=self.range_model,
-                    method="plus",
-                    cv=5,
+                    confidence_level=0.9,  # 90% confidence intervals
+                    prefit=True,  # Model is already fitted
                     n_jobs=1
                 )
-                self.conformal_model.fit(X_train_scaled, y_train)
+                self.conformal_model.conformalize(X_train_scaled, y_train)
                 print("[DEBUG] Conformal model fitted successfully")
             except Exception as mapie_err:
                 print(f"[DEBUG] MAPIE fitting failed: {mapie_err}")
@@ -2119,12 +2127,13 @@ class PriceRangePredictor:
         if self.conformal_model is not None and MAPIE_AVAILABLE:
             try:
                 print("[DEBUG predict] Using conformal prediction (MAPIE)...")
-                y_pred, y_pis = self.conformal_model.predict(X_scaled, alpha=alpha)
+                # MAPIE 1.2.0+ API: predict_interval returns (y_pred, y_intervals)
+                y_pred, y_intervals = self.conformal_model.predict_interval(X_scaled)
                 predicted_range_pct = y_pred[0]
 
-                # y_pis shape: (n_samples, 2, 1) -> [lower, upper]
-                range_lower_pct = y_pis[0, 0, 0]  # Lower bound (percentage)
-                range_upper_pct = y_pis[0, 1, 0]  # Upper bound (percentage)
+                # y_intervals shape: (n_samples, 2) -> [lower, upper]
+                range_lower_pct = y_intervals[0, 0]  # Lower bound (percentage)
+                range_upper_pct = y_intervals[0, 1]  # Upper bound (percentage)
 
                 # Convert from percentage to fraction
                 predicted_range = predicted_range_pct / 100.0
@@ -2172,19 +2181,25 @@ class PriceRangePredictor:
             high_uncertainty = (high_upper - high_lower) / 2
             low_uncertainty = (low_upper - low_lower) / 2
         else:
-            # Fall back to RMSE-based bounds
+            # Fall back to RMSE-based bounds with ASYMMETRIC intervals
+            # Lows are harder to predict (sharp drops), so we use wider bounds
             rmse = self.model_metrics.get('rmse', predicted_range * 0.2)
-            z_scores = {0.8: 1.28, 0.9: 1.645, 0.95: 1.96}
-            z = z_scores.get(confidence_level, 1.645)
-            range_uncertainty = rmse * z
-            high_uncertainty = current_close * range_uncertainty * high_ratio
-            low_uncertainty = current_close * range_uncertainty * low_ratio
+            z_scores_high = {0.8: 1.28, 0.9: 1.645, 0.95: 1.96}
+            z_scores_low = {0.8: 1.5, 0.9: 2.0, 0.95: 2.3}  # Wider for lows
+            z_high = z_scores_high.get(confidence_level, 1.645)
+            z_low = z_scores_low.get(confidence_level, 2.0)  # 20-25% wider for lows
+
+            range_uncertainty_high = rmse * z_high
+            range_uncertainty_low = rmse * z_low
+
+            high_uncertainty = current_close * range_uncertainty_high * high_ratio
+            low_uncertainty = current_close * range_uncertainty_low * low_ratio
 
             high_lower = predicted_high - high_uncertainty
             high_upper = predicted_high + high_uncertainty
-            low_lower = predicted_low - low_uncertainty
+            low_lower = predicted_low - low_uncertainty  # Wider band for lows
             low_upper = predicted_low + low_uncertainty
-            conformal_bounds = {'method': 'rmse'}
+            conformal_bounds = {'method': 'rmse_asymmetric'}
 
         print(f"[DEBUG predict] Returning prediction dict...")
         result = {
