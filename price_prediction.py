@@ -1818,7 +1818,8 @@ class PriceRangePredictor:
         return targets
 
     def train_range_model(self, df: pd.DataFrame, options_features: Dict = None,
-                          n_trials: int = 30, n_workers: int = None, progress_callback=None) -> Dict:
+                          n_trials: int = 30, n_workers: int = None, progress_callback=None,
+                          feature_selection: bool = True) -> Dict:
         """
         Train XGBRegressor to predict next day's range.
 
@@ -1828,6 +1829,7 @@ class PriceRangePredictor:
             n_trials: Optuna trials for hyperparameter tuning
             n_workers: Number of parallel workers for Optuna (default: CPU cores - 1)
             progress_callback: Optional callback for progress updates
+            feature_selection: Whether to apply feature selection (default True, disable for walk-forward stability)
 
         Returns:
             dict with model, metrics, feature_importances
@@ -1951,48 +1953,54 @@ class PriceRangePredictor:
         self.range_model = self.ensemble_models[0]  # Best model is primary
         print(f"[DEBUG] Primary model params: {best_params}")
 
-        # Feature Selection: Select top features based on importance
-        # This reduces overfitting and improves generalization
-        feature_importance = self.range_model.feature_importances_
-        importance_df = pd.DataFrame({
-            'feature': self.feature_names,
-            'importance': feature_importance
-        }).sort_values('importance', ascending=False)
+        # Feature Selection: Optionally select top features based on importance
+        # This can reduce overfitting but may cause instability in walk-forward
+        if feature_selection:
+            feature_importance = self.range_model.feature_importances_
+            importance_df = pd.DataFrame({
+                'feature': self.feature_names,
+                'importance': feature_importance
+            }).sort_values('importance', ascending=False)
 
-        # Select top features (cumulative importance >= 90% or at least 30 features)
-        cumulative_importance = importance_df['importance'].cumsum() / importance_df['importance'].sum()
-        n_features_90pct = (cumulative_importance < 0.90).sum() + 1
-        n_selected = max(30, min(n_features_90pct, 60))  # Between 30 and 60 features
+            # Select top features (cumulative importance >= 90% or at least 30 features)
+            cumulative_importance = importance_df['importance'].cumsum() / importance_df['importance'].sum()
+            n_features_90pct = (cumulative_importance < 0.90).sum() + 1
+            n_selected = max(30, min(n_features_90pct, 60))  # Between 30 and 60 features
 
-        selected_features = importance_df.head(n_selected)['feature'].tolist()
-        selected_indices = [self.feature_names.index(f) for f in selected_features]
+            selected_features = importance_df.head(n_selected)['feature'].tolist()
+            selected_indices = [self.feature_names.index(f) for f in selected_features]
 
-        print(f"\n[FEATURE SELECTION] Selecting top {n_selected} features (90% cumulative importance = {n_features_90pct})")
-        print(f"   Top 5: {selected_features[:5]}")
+            print(f"\n[FEATURE SELECTION] Selecting top {n_selected} features (90% cumulative importance = {n_features_90pct})")
+            print(f"   Top 5: {selected_features[:5]}")
 
-        # Retrain ensemble with selected features only
-        X_train_selected = X_train_scaled[:, selected_indices]
-        X_test_selected = X_test_scaled[:, selected_indices]
+            # Retrain ensemble with selected features only
+            X_train_selected = X_train_scaled[:, selected_indices]
+            X_test_selected = X_test_scaled[:, selected_indices]
 
-        self.ensemble_models = []  # Reset ensemble
-        for i, trial in enumerate(top_3_trials):
-            params = trial['params'].copy()
-            params['n_jobs'] = 1
-            params['objective'] = 'reg:squarederror'
-            params['verbosity'] = 0
+            self.ensemble_models = []  # Reset ensemble
+            for i, trial in enumerate(top_3_trials):
+                params = trial['params'].copy()
+                params['n_jobs'] = 1
+                params['objective'] = 'reg:squarederror'
+                params['verbosity'] = 0
 
-            model = xgb.XGBRegressor(**params)
-            model.fit(X_train_selected, y_train)
-            self.ensemble_models.append(model)
+                model = xgb.XGBRegressor(**params)
+                model.fit(X_train_selected, y_train)
+                self.ensemble_models.append(model)
 
-        self.range_model = self.ensemble_models[0]
-        self.selected_features = selected_features
-        self.selected_indices = selected_indices
-        print(f"   Ensemble retrained with {n_selected} features")
+            self.range_model = self.ensemble_models[0]
+            self.selected_features = selected_features
+            self.selected_indices = selected_indices
+            print(f"   Ensemble retrained with {n_selected} features")
 
-        # Update test data for evaluation
-        X_test_scaled = X_test_selected
-        X_train_scaled = X_train_selected
+            # Update test data for evaluation
+            X_test_scaled = X_test_selected
+            X_train_scaled = X_train_selected
+        else:
+            # No feature selection - use all features
+            self.selected_features = []
+            self.selected_indices = []
+            print(f"\n[FEATURE SELECTION] Disabled - using all {len(self.feature_names)} features")
 
         # Wrap with MAPIE for conformal prediction intervals
         self.conformal_model = None

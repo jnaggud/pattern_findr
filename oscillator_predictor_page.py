@@ -6920,7 +6920,8 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                             train_df,
                                             options_features=None,  # Don't use options for training!
                                             n_trials=wf_n_trials,
-                                            n_workers=wf_n_workers
+                                            n_workers=wf_n_workers,
+                                            feature_selection=False  # Disable for walk-forward stability
                                         )
 
                                     current_model = wf_predictor
