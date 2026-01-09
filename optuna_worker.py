@@ -686,8 +686,16 @@ def clear_range_shared_data():
 
 class RangeModelObjective:
     """
-    SIMPLE Optuna objective for range model XGBoost optimization.
-    Uses ALL features, optimizes for MSE.
+    Optuna objective for range model XGBoost optimization.
+    Uses composite objective: R² + MAPE for better trading performance.
+
+    Composite Score = 0.6 * R² + 0.4 * (1 - MAPE/100)
+
+    Where:
+    - R² measures how well the model explains variance (0-1, higher is better)
+    - MAPE measures percentage error (lower is better)
+
+    We MAXIMIZE this score (return negative for Optuna minimization).
     """
 
     def __init__(self, data_path):
@@ -702,7 +710,7 @@ class RangeModelObjective:
     def __call__(self, trial):
         from xgboost import XGBRegressor
         from sklearn.model_selection import TimeSeriesSplit
-        from sklearn.metrics import mean_squared_error
+        from sklearn.metrics import r2_score, mean_absolute_percentage_error
 
         data = self._load_data()
         X = data['X_train_scaled']
@@ -731,25 +739,51 @@ class RangeModelObjective:
 
         # Time Series Cross-Validation
         tscv = TimeSeriesSplit(n_splits=3)
-        mse_scores = []
+        r2_scores = []
+        mape_scores = []
+
         for train_idx, val_idx in tscv.split(X):
             model.fit(X[train_idx], y[train_idx])
             pred = model.predict(X[val_idx])
-            mse = mean_squared_error(y[val_idx], pred)
-            mse_scores.append(mse)
 
-        return np.mean(mse_scores)  # Minimize MSE
+            # R² score (can be negative for bad models)
+            r2 = r2_score(y[val_idx], pred)
+            r2_scores.append(r2)
+
+            # MAPE (Mean Absolute Percentage Error)
+            # Clip to avoid division by zero issues
+            y_val_safe = np.clip(y[val_idx], 0.01, None)  # Minimum 0.01% range
+            mape = np.mean(np.abs((y[val_idx] - pred) / y_val_safe)) * 100
+            mape_scores.append(min(mape, 100))  # Cap at 100% for extreme cases
+
+        avg_r2 = np.mean(r2_scores)
+        avg_mape = np.mean(mape_scores)
+
+        # Composite score: higher is better
+        # R² component: 0-1 scale (can be negative for bad models)
+        # MAPE component: convert to 0-1 scale (1 = perfect, 0 = 100% error)
+        r2_component = max(0, avg_r2)  # Clip negative R² to 0
+        mape_component = max(0, 1 - avg_mape / 100)  # Convert MAPE to 0-1 scale
+
+        composite_score = 0.6 * r2_component + 0.4 * mape_component
+
+        # Return negative because Optuna minimizes by default
+        return -composite_score
 
 
 def run_range_study(data_path, n_trials, seed, worker_id=0):
-    """Run Optuna study for range model optimization."""
+    """Run Optuna study for range model optimization.
+
+    Uses composite objective: R² + MAPE (higher is better).
+    Returns negative score (for minimization), so best_value closer to -1.0 is better.
+    """
     import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     objective = RangeModelObjective(data_path)
 
     study = optuna.create_study(
-        direction='minimize',  # Minimize MSE
+        direction='minimize',  # Minimize negative composite score (= maximize score)
         sampler=optuna.samplers.TPESampler(seed=seed, n_startup_trials=min(10, n_trials // 5))
     )
 
@@ -758,17 +792,23 @@ def run_range_study(data_path, n_trials, seed, worker_id=0):
     def progress_callback(study, trial):
         n_complete = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
         if n_complete % log_interval == 0 or n_complete == n_trials:
-            best_val = study.best_value if study.best_trial else float('inf')
-            print(f"[Worker {worker_id}] Trial {n_complete}/{n_trials} | Best MSE: {best_val:.6f}", flush=True)
+            if study.best_trial:
+                # Show positive composite score (better = higher = closer to 1.0)
+                best_score = -study.best_value  # Convert back to positive
+                print(f"[Worker {worker_id}] Trial {n_complete}/{n_trials} | Best Score: {best_score:.4f}", flush=True)
+            else:
+                print(f"[Worker {worker_id}] Trial {n_complete}/{n_trials} | No valid trials yet", flush=True)
 
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False, n_jobs=1, callbacks=[progress_callback])
 
     best_val = study.best_value if study.best_trial else float('inf')
     best_params = study.best_params if study.best_trial else {}
-    print(f"[Worker {worker_id}] Done! Best MSE: {best_val:.6f}", flush=True)
+    best_score = -best_val if best_val != float('inf') else 0.0
+    print(f"[Worker {worker_id}] Done! Best Composite Score: {best_score:.4f}", flush=True)
 
     return {
-        'best_value': best_val,
+        'best_value': best_val,  # Negative composite score (for consistency with minimize)
+        'best_score': best_score,  # Positive composite score (for display)
         'best_params': best_params,
         'n_trials': len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
     }

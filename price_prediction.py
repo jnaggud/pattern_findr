@@ -104,7 +104,33 @@ FEATURE_CONFIG = {
     'interaction_features': False,  # uptrend_atr, downtrend_volume - LOW importance
     'scientific_features': False,   # Hurst exponent - VERY LOW, slow to compute
     'novel_indicators': False,      # ARWO, DCO, etc - disabled by default
+
+    # NEW: Cross-Market Features (for enhanced range prediction)
+    # Set USE_NEW_CROSS_MARKET_FEATURES = False for baseline, True for test
+    'vvix_features': True,          # VVIX (VIX of VIX) - volatility of volatility
+    'sector_breadth_features': True, # Sector ETFs breadth - market internal health
+    'credit_spread_features': True,  # HYG/LQD credit spreads - risk sentiment
+    'treasury_features': True,       # Treasury yields 10Y/30Y - macro context
+    'dollar_features': True,         # Dollar index (DXY) - currency context
+    'correlation_features': True,    # SPY/QQQ correlation - market structure
+    'earnings_features': True,       # Earnings calendar for top SPY holdings
 }
+
+# TOGGLE: Set to False for baseline (old features only), True for test (with new features)
+USE_NEW_CROSS_MARKET_FEATURES = True
+
+def set_cross_market_features(enabled: bool):
+    """Toggle cross-market features on/off for A/B testing."""
+    global USE_NEW_CROSS_MARKET_FEATURES
+    USE_NEW_CROSS_MARKET_FEATURES = enabled
+    FEATURE_CONFIG['vvix_features'] = enabled
+    FEATURE_CONFIG['sector_breadth_features'] = enabled
+    FEATURE_CONFIG['credit_spread_features'] = enabled
+    FEATURE_CONFIG['treasury_features'] = enabled
+    FEATURE_CONFIG['dollar_features'] = enabled
+    FEATURE_CONFIG['correlation_features'] = enabled
+    FEATURE_CONFIG['earnings_features'] = enabled
+    print(f"Cross-market features {'ENABLED' if enabled else 'DISABLED'}")
 
 
 class PriceRangePredictor:
@@ -124,9 +150,52 @@ class PriceRangePredictor:
     - Market regime indicators
     """
 
-    # Class-level VIX cache (shared across all instances)
+    # Class-level caches (shared across all instances for efficiency)
     _class_vix_cache = None
     _class_vix_cache_date = None
+    _class_vvix_cache = None
+    _class_vvix_cache_date = None
+    _class_sector_cache = {}
+    _class_sector_cache_date = None
+    _class_credit_cache = None
+    _class_credit_cache_date = None
+    _class_treasury_cache = None
+    _class_treasury_cache_date = None
+    _class_dollar_cache = None
+    _class_dollar_cache_date = None
+    _class_qqq_cache = None
+    _class_qqq_cache_date = None
+    _class_earnings_cache = {}
+    _class_earnings_cache_date = None
+
+    # Top SPY holdings for earnings calendar (top 10 = ~35% of SPY)
+    SPY_TOP_HOLDINGS = [
+        'AAPL',   # ~7%
+        'MSFT',   # ~7%
+        'NVDA',   # ~6%
+        'AMZN',   # ~4%
+        'META',   # ~2.5%
+        'GOOGL',  # ~2%
+        'GOOG',   # ~2%
+        'BRK-B',  # ~2%
+        'TSLA',   # ~2%
+        'UNH',    # ~1.5%
+    ]
+
+    # Sector ETFs for breadth analysis
+    SECTOR_ETFS = [
+        'XLK',   # Technology
+        'XLF',   # Financials
+        'XLV',   # Healthcare
+        'XLE',   # Energy
+        'XLI',   # Industrials
+        'XLP',   # Consumer Staples
+        'XLY',   # Consumer Discretionary
+        'XLU',   # Utilities
+        'XLB',   # Materials
+        'XLRE',  # Real Estate
+        'XLC',   # Communication Services
+    ]
 
     def __init__(self, polygon_manager=None):
         """
@@ -196,6 +265,273 @@ class PriceRangePredictor:
         except Exception as e:
             print(f"   VIX fetch error: {e}")
             return pd.DataFrame()
+
+    def fetch_vvix_data(self, start_date: str = None, end_date: str = None) -> pd.DataFrame:
+        """
+        Fetch VVIX (VIX of VIX) data from Yahoo Finance.
+        VVIX measures the expected volatility of VIX - high VVIX = expecting VIX moves.
+        """
+        if not YF_AVAILABLE:
+            return pd.DataFrame()
+
+        try:
+            today = datetime.now().date()
+            if PriceRangePredictor._class_vvix_cache is not None and PriceRangePredictor._class_vvix_cache_date == today:
+                return PriceRangePredictor._class_vvix_cache
+
+            if end_date is None:
+                end_date = datetime.now().strftime('%Y-%m-%d')
+            if start_date is None:
+                start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
+
+            vvix = yf.download('^VVIX', start=start_date, end=end_date, progress=False)
+
+            if vvix.empty:
+                return pd.DataFrame()
+
+            if isinstance(vvix.columns, pd.MultiIndex):
+                vvix.columns = vvix.columns.get_level_values(0)
+            vvix.columns = vvix.columns.str.lower()
+
+            PriceRangePredictor._class_vvix_cache = vvix
+            PriceRangePredictor._class_vvix_cache_date = today
+
+            return vvix
+
+        except Exception as e:
+            print(f"   VVIX fetch error: {e}")
+            return pd.DataFrame()
+
+    def fetch_sector_data(self, start_date: str = None, end_date: str = None) -> Dict[str, pd.DataFrame]:
+        """
+        Fetch sector ETF data for breadth analysis.
+        """
+        if not YF_AVAILABLE:
+            return {}
+
+        try:
+            today = datetime.now().date()
+            if PriceRangePredictor._class_sector_cache and PriceRangePredictor._class_sector_cache_date == today:
+                return PriceRangePredictor._class_sector_cache
+
+            if end_date is None:
+                end_date = datetime.now().strftime('%Y-%m-%d')
+            if start_date is None:
+                start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
+
+            sector_data = {}
+            # Download all sector ETFs in one call for efficiency
+            tickers = ' '.join(self.SECTOR_ETFS)
+            data = yf.download(tickers, start=start_date, end=end_date, progress=False, group_by='ticker')
+
+            for etf in self.SECTOR_ETFS:
+                try:
+                    if len(self.SECTOR_ETFS) == 1:
+                        df = data.copy()
+                    else:
+                        df = data[etf].copy()
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                    df.columns = df.columns.str.lower()
+                    if not df.empty:
+                        sector_data[etf] = df
+                except:
+                    continue
+
+            PriceRangePredictor._class_sector_cache = sector_data
+            PriceRangePredictor._class_sector_cache_date = today
+
+            return sector_data
+
+        except Exception as e:
+            print(f"   Sector data fetch error: {e}")
+            return {}
+
+    def fetch_credit_data(self, start_date: str = None, end_date: str = None) -> Dict[str, pd.DataFrame]:
+        """
+        Fetch HYG (high yield) and LQD (investment grade) for credit spread analysis.
+        """
+        if not YF_AVAILABLE:
+            return {}
+
+        try:
+            today = datetime.now().date()
+            if PriceRangePredictor._class_credit_cache is not None and PriceRangePredictor._class_credit_cache_date == today:
+                return PriceRangePredictor._class_credit_cache
+
+            if end_date is None:
+                end_date = datetime.now().strftime('%Y-%m-%d')
+            if start_date is None:
+                start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
+
+            credit_data = {}
+            for ticker in ['HYG', 'LQD']:
+                try:
+                    df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                    df.columns = df.columns.str.lower()
+                    if not df.empty:
+                        credit_data[ticker] = df
+                except:
+                    continue
+
+            PriceRangePredictor._class_credit_cache = credit_data
+            PriceRangePredictor._class_credit_cache_date = today
+
+            return credit_data
+
+        except Exception as e:
+            print(f"   Credit data fetch error: {e}")
+            return {}
+
+    def fetch_treasury_data(self, start_date: str = None, end_date: str = None) -> Dict[str, pd.DataFrame]:
+        """
+        Fetch Treasury yield data (10Y and 30Y).
+        """
+        if not YF_AVAILABLE:
+            return {}
+
+        try:
+            today = datetime.now().date()
+            if PriceRangePredictor._class_treasury_cache is not None and PriceRangePredictor._class_treasury_cache_date == today:
+                return PriceRangePredictor._class_treasury_cache
+
+            if end_date is None:
+                end_date = datetime.now().strftime('%Y-%m-%d')
+            if start_date is None:
+                start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
+
+            treasury_data = {}
+            for ticker, name in [('^TNX', '10Y'), ('^TYX', '30Y')]:
+                try:
+                    df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                    df.columns = df.columns.str.lower()
+                    if not df.empty:
+                        treasury_data[name] = df
+                except:
+                    continue
+
+            PriceRangePredictor._class_treasury_cache = treasury_data
+            PriceRangePredictor._class_treasury_cache_date = today
+
+            return treasury_data
+
+        except Exception as e:
+            print(f"   Treasury data fetch error: {e}")
+            return {}
+
+    def fetch_dollar_data(self, start_date: str = None, end_date: str = None) -> pd.DataFrame:
+        """
+        Fetch Dollar Index (DXY) data. Uses UUP ETF as more reliable proxy.
+        """
+        if not YF_AVAILABLE:
+            return pd.DataFrame()
+
+        try:
+            today = datetime.now().date()
+            if PriceRangePredictor._class_dollar_cache is not None and PriceRangePredictor._class_dollar_cache_date == today:
+                return PriceRangePredictor._class_dollar_cache
+
+            if end_date is None:
+                end_date = datetime.now().strftime('%Y-%m-%d')
+            if start_date is None:
+                start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
+
+            # Try UUP first (Invesco DB US Dollar Index Bullish Fund), then DX-Y.NYB
+            for ticker in ['UUP', 'DX-Y.NYB']:
+                try:
+                    df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                    df.columns = df.columns.str.lower()
+                    if not df.empty:
+                        PriceRangePredictor._class_dollar_cache = df
+                        PriceRangePredictor._class_dollar_cache_date = today
+                        return df
+                except:
+                    continue
+
+            return pd.DataFrame()
+
+        except Exception as e:
+            print(f"   Dollar data fetch error: {e}")
+            return pd.DataFrame()
+
+    def fetch_qqq_data(self, start_date: str = None, end_date: str = None) -> pd.DataFrame:
+        """
+        Fetch QQQ data for correlation analysis with SPY.
+        """
+        if not YF_AVAILABLE:
+            return pd.DataFrame()
+
+        try:
+            today = datetime.now().date()
+            if PriceRangePredictor._class_qqq_cache is not None and PriceRangePredictor._class_qqq_cache_date == today:
+                return PriceRangePredictor._class_qqq_cache
+
+            if end_date is None:
+                end_date = datetime.now().strftime('%Y-%m-%d')
+            if start_date is None:
+                start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
+
+            df = yf.download('QQQ', start=start_date, end=end_date, progress=False)
+
+            if df.empty:
+                return pd.DataFrame()
+
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df.columns = df.columns.str.lower()
+
+            PriceRangePredictor._class_qqq_cache = df
+            PriceRangePredictor._class_qqq_cache_date = today
+
+            return df
+
+        except Exception as e:
+            print(f"   QQQ data fetch error: {e}")
+            return pd.DataFrame()
+
+    def fetch_earnings_calendar(self) -> Dict[str, List[datetime]]:
+        """
+        Fetch upcoming earnings dates for top SPY holdings.
+        Returns dict of ticker -> list of earnings dates.
+        """
+        if not YF_AVAILABLE:
+            return {}
+
+        try:
+            today = datetime.now().date()
+            if PriceRangePredictor._class_earnings_cache and PriceRangePredictor._class_earnings_cache_date == today:
+                return PriceRangePredictor._class_earnings_cache
+
+            earnings_data = {}
+            for ticker in self.SPY_TOP_HOLDINGS:
+                try:
+                    stock = yf.Ticker(ticker)
+                    cal = stock.calendar
+                    if cal is not None and not cal.empty:
+                        # Try to get earnings date(s)
+                        if 'Earnings Date' in cal.index:
+                            dates = cal.loc['Earnings Date']
+                            if isinstance(dates, pd.Series):
+                                earnings_data[ticker] = [d for d in dates if pd.notna(d)]
+                            elif pd.notna(dates):
+                                earnings_data[ticker] = [dates]
+                except:
+                    continue
+
+            PriceRangePredictor._class_earnings_cache = earnings_data
+            PriceRangePredictor._class_earnings_cache_date = today
+
+            return earnings_data
+
+        except Exception as e:
+            print(f"   Earnings calendar fetch error: {e}")
+            return {}
 
     def get_options_features(self, ticker: str, current_price: float = None) -> Dict:
         """
@@ -1114,6 +1450,324 @@ class PriceRangePredictor:
         else:
             print("   Scientific indicators DISABLED (FEATURE_CONFIG['scientific_features'] = False)")
 
+        # =================================================================
+        # CROSS-MARKET FEATURES (NEW - for enhanced range prediction)
+        # These capture broader market dynamics that affect SPY volatility
+        # =================================================================
+
+        # --- 1. VVIX Features (VIX of VIX) ---
+        # VVIX measures expected volatility of VIX itself
+        # High VVIX = market expects VIX to move significantly
+        if FEATURE_CONFIG.get('vvix_features', True):
+            vvix_df = self.fetch_vvix_data()
+            if not vvix_df.empty:
+                try:
+                    vvix_daily = vvix_df.copy()
+                    vvix_daily.index = pd.to_datetime(vvix_daily.index).date
+                    vvix_close = vvix_daily['close']
+
+                    features['vvix'] = df.index.map(lambda x: vvix_close.get(x.date() if hasattr(x, 'date') else x, np.nan))
+                    features['vvix'] = features['vvix'].ffill().bfill()
+
+                    # VVIX derivatives
+                    features['vvix_change_1d'] = features['vvix'].pct_change() * 100
+                    features['vvix_change_5d'] = features['vvix'].pct_change(5) * 100
+                    features['vvix_sma_10'] = features['vvix'].rolling(10).mean()
+                    features['vvix_vs_sma'] = (features['vvix'] - features['vvix_sma_10']) / features['vvix_sma_10']
+                    features['vvix_zscore'] = (features['vvix'] - features['vvix'].rolling(20).mean()) / features['vvix'].rolling(20).std()
+
+                    # VVIX velocity and acceleration
+                    features['vvix_velocity'] = features['vvix'].diff()
+                    features['vvix_accel'] = features['vvix_velocity'].diff()
+
+                    # VIX/VVIX ratio (fear of fear)
+                    if 'vix' in features.columns and features['vix'].notna().any():
+                        features['vix_vvix_ratio'] = features['vix'] / features['vvix']
+                        features['vix_vvix_ratio_zscore'] = (
+                            features['vix_vvix_ratio'] - features['vix_vvix_ratio'].rolling(20).mean()
+                        ) / features['vix_vvix_ratio'].rolling(20).std()
+
+                    print(f"   VVIX features added: current VVIX={features['vvix'].iloc[-1]:.2f}")
+                except Exception as e:
+                    print(f"   VVIX feature error: {e}")
+                    for col in ['vvix', 'vvix_change_1d', 'vvix_change_5d', 'vvix_sma_10', 'vvix_vs_sma',
+                               'vvix_zscore', 'vvix_velocity', 'vvix_accel', 'vix_vvix_ratio', 'vix_vvix_ratio_zscore']:
+                        features[col] = 0
+            else:
+                for col in ['vvix', 'vvix_change_1d', 'vvix_change_5d', 'vvix_sma_10', 'vvix_vs_sma',
+                           'vvix_zscore', 'vvix_velocity', 'vvix_accel', 'vix_vvix_ratio', 'vix_vvix_ratio_zscore']:
+                    features[col] = 0
+
+        # --- 2. Sector Breadth Features ---
+        # Market breadth: how many sectors are participating in the move
+        if FEATURE_CONFIG.get('sector_breadth_features', True):
+            sector_data = self.fetch_sector_data()
+            if sector_data:
+                try:
+                    # Calculate returns for each sector and count how many are positive/above SMA
+                    sector_returns_1d = {}
+                    sector_above_sma = {}
+
+                    for etf, etf_df in sector_data.items():
+                        try:
+                            etf_daily = etf_df.copy()
+                            etf_daily.index = pd.to_datetime(etf_daily.index).date
+                            etf_close = etf_daily['close']
+
+                            # Map to main df index
+                            mapped = df.index.map(lambda x: etf_close.get(x.date() if hasattr(x, 'date') else x, np.nan))
+                            mapped = pd.Series(mapped, index=df.index).ffill().bfill()
+
+                            sector_returns_1d[etf] = mapped.pct_change() * 100
+                            sector_above_sma[etf] = (mapped > mapped.rolling(20).mean()).astype(int)
+                        except:
+                            continue
+
+                    if sector_returns_1d:
+                        # Breadth: count of sectors with positive returns
+                        returns_df = pd.DataFrame(sector_returns_1d)
+                        features['sector_breadth_positive'] = (returns_df > 0).sum(axis=1)
+                        features['sector_breadth_pct'] = features['sector_breadth_positive'] / len(sector_returns_1d)
+
+                        # Average sector return
+                        features['sector_avg_return'] = returns_df.mean(axis=1)
+
+                        # Sector dispersion (std of returns - high = divergence)
+                        features['sector_dispersion'] = returns_df.std(axis=1)
+
+                        # Sectors above SMA20
+                        sma_df = pd.DataFrame(sector_above_sma)
+                        features['sector_above_sma_count'] = sma_df.sum(axis=1)
+                        features['sector_above_sma_pct'] = features['sector_above_sma_count'] / len(sector_above_sma)
+
+                        # Breadth momentum
+                        features['breadth_momentum'] = features['sector_breadth_pct'].diff(5)
+
+                        print(f"   Sector breadth features added: {len(sector_data)} sectors, breadth={features['sector_breadth_pct'].iloc[-1]:.2f}")
+                    else:
+                        for col in ['sector_breadth_positive', 'sector_breadth_pct', 'sector_avg_return',
+                                   'sector_dispersion', 'sector_above_sma_count', 'sector_above_sma_pct', 'breadth_momentum']:
+                            features[col] = 0
+                except Exception as e:
+                    print(f"   Sector breadth error: {e}")
+                    for col in ['sector_breadth_positive', 'sector_breadth_pct', 'sector_avg_return',
+                               'sector_dispersion', 'sector_above_sma_count', 'sector_above_sma_pct', 'breadth_momentum']:
+                        features[col] = 0
+            else:
+                for col in ['sector_breadth_positive', 'sector_breadth_pct', 'sector_avg_return',
+                           'sector_dispersion', 'sector_above_sma_count', 'sector_above_sma_pct', 'breadth_momentum']:
+                    features[col] = 0
+
+        # --- 3. Credit Spread Features (HYG/LQD) ---
+        # Credit spreads widen when risk appetite decreases
+        if FEATURE_CONFIG.get('credit_spread_features', True):
+            credit_data = self.fetch_credit_data()
+            if 'HYG' in credit_data and 'LQD' in credit_data:
+                try:
+                    hyg_df = credit_data['HYG'].copy()
+                    lqd_df = credit_data['LQD'].copy()
+
+                    hyg_df.index = pd.to_datetime(hyg_df.index).date
+                    lqd_df.index = pd.to_datetime(lqd_df.index).date
+
+                    hyg_close = hyg_df['close']
+                    lqd_close = lqd_df['close']
+
+                    # Map to main df index
+                    hyg_mapped = df.index.map(lambda x: hyg_close.get(x.date() if hasattr(x, 'date') else x, np.nan))
+                    lqd_mapped = df.index.map(lambda x: lqd_close.get(x.date() if hasattr(x, 'date') else x, np.nan))
+
+                    hyg_series = pd.Series(hyg_mapped, index=df.index).ffill().bfill()
+                    lqd_series = pd.Series(lqd_mapped, index=df.index).ffill().bfill()
+
+                    # HYG/LQD ratio (high yield vs investment grade)
+                    # Rising ratio = risk-on, falling = risk-off
+                    features['hyg_lqd_ratio'] = hyg_series / lqd_series
+                    features['hyg_lqd_change_1d'] = features['hyg_lqd_ratio'].pct_change() * 100
+                    features['hyg_lqd_change_5d'] = features['hyg_lqd_ratio'].pct_change(5) * 100
+                    features['hyg_lqd_zscore'] = (
+                        features['hyg_lqd_ratio'] - features['hyg_lqd_ratio'].rolling(20).mean()
+                    ) / features['hyg_lqd_ratio'].rolling(20).std()
+
+                    # Credit spread velocity
+                    features['credit_spread_velocity'] = features['hyg_lqd_ratio'].diff()
+                    features['credit_spread_accel'] = features['credit_spread_velocity'].diff()
+
+                    print(f"   Credit spread features added: HYG/LQD={features['hyg_lqd_ratio'].iloc[-1]:.4f}")
+                except Exception as e:
+                    print(f"   Credit spread error: {e}")
+                    for col in ['hyg_lqd_ratio', 'hyg_lqd_change_1d', 'hyg_lqd_change_5d', 'hyg_lqd_zscore',
+                               'credit_spread_velocity', 'credit_spread_accel']:
+                        features[col] = 0
+            else:
+                for col in ['hyg_lqd_ratio', 'hyg_lqd_change_1d', 'hyg_lqd_change_5d', 'hyg_lqd_zscore',
+                           'credit_spread_velocity', 'credit_spread_accel']:
+                    features[col] = 0
+
+        # --- 4. Treasury Yield Features ---
+        # Yield curve dynamics affect equity volatility
+        if FEATURE_CONFIG.get('treasury_features', True):
+            treasury_data = self.fetch_treasury_data()
+            if '10Y' in treasury_data:
+                try:
+                    y10_df = treasury_data['10Y'].copy()
+                    y10_df.index = pd.to_datetime(y10_df.index).date
+                    y10_close = y10_df['close']
+
+                    # Map to main df index
+                    y10_mapped = df.index.map(lambda x: y10_close.get(x.date() if hasattr(x, 'date') else x, np.nan))
+                    y10_series = pd.Series(y10_mapped, index=df.index).ffill().bfill()
+
+                    features['treasury_10y'] = y10_series
+                    features['treasury_10y_change_1d'] = y10_series.diff()
+                    features['treasury_10y_change_5d'] = y10_series.diff(5)
+                    features['treasury_10y_zscore'] = (y10_series - y10_series.rolling(20).mean()) / y10_series.rolling(20).std()
+                    features['treasury_10y_velocity'] = y10_series.diff()
+
+                    # Yield curve slope (if 30Y available)
+                    if '30Y' in treasury_data:
+                        y30_df = treasury_data['30Y'].copy()
+                        y30_df.index = pd.to_datetime(y30_df.index).date
+                        y30_close = y30_df['close']
+                        y30_mapped = df.index.map(lambda x: y30_close.get(x.date() if hasattr(x, 'date') else x, np.nan))
+                        y30_series = pd.Series(y30_mapped, index=df.index).ffill().bfill()
+
+                        features['treasury_30y'] = y30_series
+                        features['yield_curve_slope'] = y30_series - y10_series  # 30Y - 10Y spread
+                        features['yield_curve_slope_change'] = features['yield_curve_slope'].diff(5)
+                    else:
+                        features['treasury_30y'] = 0
+                        features['yield_curve_slope'] = 0
+                        features['yield_curve_slope_change'] = 0
+
+                    print(f"   Treasury features added: 10Y={features['treasury_10y'].iloc[-1]:.2f}%")
+                except Exception as e:
+                    print(f"   Treasury feature error: {e}")
+                    for col in ['treasury_10y', 'treasury_10y_change_1d', 'treasury_10y_change_5d',
+                               'treasury_10y_zscore', 'treasury_10y_velocity', 'treasury_30y',
+                               'yield_curve_slope', 'yield_curve_slope_change']:
+                        features[col] = 0
+            else:
+                for col in ['treasury_10y', 'treasury_10y_change_1d', 'treasury_10y_change_5d',
+                           'treasury_10y_zscore', 'treasury_10y_velocity', 'treasury_30y',
+                           'yield_curve_slope', 'yield_curve_slope_change']:
+                    features[col] = 0
+
+        # --- 5. Dollar Index (DXY) Features ---
+        # Strong dollar typically weighs on equities
+        if FEATURE_CONFIG.get('dollar_features', True):
+            dollar_df = self.fetch_dollar_data()
+            if not dollar_df.empty:
+                try:
+                    dxy_daily = dollar_df.copy()
+                    dxy_daily.index = pd.to_datetime(dxy_daily.index).date
+                    dxy_close = dxy_daily['close']
+
+                    # Map to main df index
+                    dxy_mapped = df.index.map(lambda x: dxy_close.get(x.date() if hasattr(x, 'date') else x, np.nan))
+                    dxy_series = pd.Series(dxy_mapped, index=df.index).ffill().bfill()
+
+                    features['dxy'] = dxy_series
+                    features['dxy_change_1d'] = dxy_series.pct_change() * 100
+                    features['dxy_change_5d'] = dxy_series.pct_change(5) * 100
+                    features['dxy_sma_20'] = dxy_series.rolling(20).mean()
+                    features['dxy_vs_sma'] = (dxy_series - features['dxy_sma_20']) / features['dxy_sma_20']
+                    features['dxy_zscore'] = (dxy_series - dxy_series.rolling(20).mean()) / dxy_series.rolling(20).std()
+
+                    # Dollar velocity and acceleration
+                    features['dxy_velocity'] = dxy_series.diff()
+                    features['dxy_accel'] = features['dxy_velocity'].diff()
+
+                    print(f"   Dollar features added: DXY={features['dxy'].iloc[-1]:.2f}")
+                except Exception as e:
+                    print(f"   Dollar feature error: {e}")
+                    for col in ['dxy', 'dxy_change_1d', 'dxy_change_5d', 'dxy_sma_20', 'dxy_vs_sma',
+                               'dxy_zscore', 'dxy_velocity', 'dxy_accel']:
+                        features[col] = 0
+            else:
+                for col in ['dxy', 'dxy_change_1d', 'dxy_change_5d', 'dxy_sma_20', 'dxy_vs_sma',
+                           'dxy_zscore', 'dxy_velocity', 'dxy_accel']:
+                    features[col] = 0
+
+        # --- 6. SPY/QQQ Correlation Features ---
+        # High correlation = normal market, low correlation = divergence/rotation
+        if FEATURE_CONFIG.get('correlation_features', True):
+            qqq_df = self.fetch_qqq_data()
+            if not qqq_df.empty:
+                try:
+                    qqq_daily = qqq_df.copy()
+                    qqq_daily.index = pd.to_datetime(qqq_daily.index).date
+                    qqq_close = qqq_daily['close']
+
+                    # Map to main df index
+                    qqq_mapped = df.index.map(lambda x: qqq_close.get(x.date() if hasattr(x, 'date') else x, np.nan))
+                    qqq_series = pd.Series(qqq_mapped, index=df.index).ffill().bfill()
+
+                    # QQQ returns
+                    qqq_returns = qqq_series.pct_change()
+                    spy_returns = df['close'].pct_change()
+
+                    # Rolling correlation
+                    features['spy_qqq_corr_10d'] = spy_returns.rolling(10).corr(qqq_returns)
+                    features['spy_qqq_corr_20d'] = spy_returns.rolling(20).corr(qqq_returns)
+
+                    # Correlation change (sudden drops often precede volatility)
+                    features['spy_qqq_corr_change'] = features['spy_qqq_corr_20d'].diff(5)
+
+                    # SPY/QQQ relative strength
+                    features['spy_qqq_ratio'] = df['close'] / qqq_series
+                    features['spy_qqq_ratio_zscore'] = (
+                        features['spy_qqq_ratio'] - features['spy_qqq_ratio'].rolling(20).mean()
+                    ) / features['spy_qqq_ratio'].rolling(20).std()
+
+                    # Return divergence (SPY - QQQ return)
+                    features['spy_qqq_return_diff'] = (spy_returns - qqq_returns) * 100
+
+                    print(f"   Correlation features added: SPY/QQQ corr={features['spy_qqq_corr_20d'].iloc[-1]:.3f}")
+                except Exception as e:
+                    print(f"   Correlation feature error: {e}")
+                    for col in ['spy_qqq_corr_10d', 'spy_qqq_corr_20d', 'spy_qqq_corr_change',
+                               'spy_qqq_ratio', 'spy_qqq_ratio_zscore', 'spy_qqq_return_diff']:
+                        features[col] = 0
+            else:
+                for col in ['spy_qqq_corr_10d', 'spy_qqq_corr_20d', 'spy_qqq_corr_change',
+                           'spy_qqq_ratio', 'spy_qqq_ratio_zscore', 'spy_qqq_return_diff']:
+                    features[col] = 0
+
+        # --- 7. Earnings Calendar Features ---
+        # Big tech earnings drive SPY volatility
+        if FEATURE_CONFIG.get('earnings_features', True):
+            try:
+                # Calculate days until next earnings for top holdings
+                # This is more useful for live prediction - for training, we use a simple proxy
+                # High earnings activity period = higher expected volatility
+
+                # For now, use month/quarter-end as earnings proxy
+                # Most earnings are in Jan/Apr/Jul/Oct
+                earnings_months = [1, 4, 7, 10]
+                features['earnings_month'] = df.index.month.isin(earnings_months).astype(int)
+
+                # Week of month (earnings usually weeks 2-4 of earnings months)
+                features['week_of_month'] = (df.index.day - 1) // 7 + 1
+                features['earnings_week'] = (
+                    features['earnings_month'] &
+                    (features['week_of_month'].isin([2, 3, 4]))
+                ).astype(int)
+
+                # Quarterly expiration weeks (triple witching) - high volatility
+                # Third Friday of Mar/Jun/Sep/Dec
+                features['opex_month'] = df.index.month.isin([3, 6, 9, 12]).astype(int)
+                features['opex_week'] = (
+                    features['opex_month'] &
+                    (features['week_of_month'] == 3)
+                ).astype(int)
+
+                print(f"   Earnings features added (calendar-based)")
+            except Exception as e:
+                print(f"   Earnings feature error: {e}")
+                for col in ['earnings_month', 'week_of_month', 'earnings_week', 'opex_month', 'opex_week']:
+                    features[col] = 0
+
         # --- Lagged features (configurable - adds ~12 features, low importance) ---
         if FEATURE_CONFIG.get('lag_features', False):
             for lag in [1, 2, 3]:
@@ -1247,13 +1901,14 @@ class PriceRangePredictor:
 
         total_time = time_module.time() - start_opt
 
-        # Find best result across all workers (MINIMIZE MSE)
+        # Find best result across all workers (MAXIMIZE composite score)
+        # best_value is negative, so min() finds the best (most negative = highest positive score)
         best_result = min(results_list, key=lambda x: x['best_value'])
         total_completed = sum(r['n_trials'] for r in results_list)
 
-        best_mse = best_result['best_value']
+        best_composite_score = best_result.get('best_score', -best_result['best_value'])
         print(f"Optimization complete!")
-        print(f"   Best MSE: {best_mse:.6f}")
+        print(f"   Best Composite Score: {best_composite_score:.4f} (0.6*R² + 0.4*MAPE_component)")
         print(f"   Features used: {X_train_scaled.shape[1]} (all)")
         print(f"   Total time: {total_time:.1f}s ({total_completed/total_time:.1f} trials/sec)")
 
