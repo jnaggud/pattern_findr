@@ -6880,6 +6880,7 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     current_model = None
                     current_scaler = None
                     last_train_idx = -999  # Force initial training
+                    st.session_state['wf_train_r2_list'] = []  # Reset R² tracking for new run
 
                     # Progress tracking
                     progress_bar = st.progress(0)
@@ -6927,12 +6928,23 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                     current_model = wf_predictor
                                     last_train_idx = test_idx
 
-                                    # Store feature importances for analysis
-                                    if train_result and 'feature_importance' in train_result:
-                                        imp_df = train_result['feature_importance'].copy()
-                                        imp_df['train_date'] = test_date
-                                        imp_df['train_idx'] = test_idx
-                                        wf_feature_importances.append(imp_df)
+                                    # Store feature importances and R² for analysis
+                                    if train_result:
+                                        # Store R² from this training
+                                        train_r2 = train_result.get('r2', 0)
+                                        if 'wf_train_r2_list' not in st.session_state:
+                                            st.session_state['wf_train_r2_list'] = []
+                                        st.session_state['wf_train_r2_list'].append({
+                                            'date': test_date,
+                                            'r2': train_r2,
+                                            'rmse_pct': train_result.get('rmse_pct', 0)
+                                        })
+
+                                        if 'feature_importance' in train_result:
+                                            imp_df = train_result['feature_importance'].copy()
+                                            imp_df['train_date'] = test_date
+                                            imp_df['train_idx'] = test_idx
+                                            wf_feature_importances.append(imp_df)
                                         if wf_feature_names is None:
                                             wf_feature_names = train_result.get('feature_names', [])
 
@@ -7064,6 +7076,44 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                 with met_col8:
                     st.metric("Low Bias", f"${low_error:+.2f}",
                               help="Average prediction bias (+ = overpredict)")
+
+                # R² Metrics row
+                r2_col1, r2_col2, r2_col3, r2_col4 = st.columns(4)
+
+                # Calculate average R² from stored predictions
+                avg_model_r2 = wf_df['model_r2'].mean() if 'model_r2' in wf_df.columns else 0
+
+                # Get training R² from session state
+                train_r2_list = st.session_state.get('wf_train_r2_list', [])
+                if train_r2_list:
+                    avg_train_r2 = np.mean([x['r2'] for x in train_r2_list])
+                    avg_train_rmse = np.mean([x['rmse_pct'] for x in train_r2_list])
+                else:
+                    avg_train_r2 = avg_model_r2
+                    avg_train_rmse = 0
+
+                # Calculate test R² from actual vs predicted
+                # R² = 1 - SS_res / SS_tot
+                ss_res_high = ((wf_df['actual_high'] - wf_df['predicted_high']) ** 2).sum()
+                ss_tot_high = ((wf_df['actual_high'] - wf_df['actual_high'].mean()) ** 2).sum()
+                test_r2_high = 1 - (ss_res_high / ss_tot_high) if ss_tot_high > 0 else 0
+
+                ss_res_low = ((wf_df['actual_low'] - wf_df['predicted_low']) ** 2).sum()
+                ss_tot_low = ((wf_df['actual_low'] - wf_df['actual_low'].mean()) ** 2).sum()
+                test_r2_low = 1 - (ss_res_low / ss_tot_low) if ss_tot_low > 0 else 0
+
+                with r2_col1:
+                    st.metric("Train R² (avg)", f"{avg_train_r2:.3f}",
+                              help="Average R² from training periods (how well model fits training data)")
+                with r2_col2:
+                    st.metric("Test R² High", f"{test_r2_high:.3f}",
+                              help="R² of high predictions vs actuals (out-of-sample)")
+                with r2_col3:
+                    st.metric("Test R² Low", f"{test_r2_low:.3f}",
+                              help="R² of low predictions vs actuals (out-of-sample)")
+                with r2_col4:
+                    st.metric("Train RMSE (avg)", f"{avg_train_rmse:.2f}%",
+                              help="Average RMSE from training periods")
 
                 # Save predictions button for Options Builder
                 st.markdown("---")
