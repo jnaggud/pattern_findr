@@ -1868,6 +1868,29 @@ class PriceRangePredictor:
         X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
         y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 
+        # CORRELATION-BASED FEATURE SELECTION
+        # With limited training data (e.g., 180 days), using 184 features causes overfitting
+        # Select top N features by correlation with target (calculated on training data only)
+        n_train = len(X_train)
+        max_features = min(50, max(10, n_train // 10))  # 10-50 features based on data size
+
+        correlations = X_train.corrwith(y_train).abs().sort_values(ascending=False)
+        top_features = correlations.head(max_features).index.tolist()
+
+        # Store for later use
+        self.correlation_selected_features = top_features
+        self.feature_correlations = correlations
+
+        print(f"\n[CORRELATION SELECTION] Training samples: {n_train}, selecting top {max_features} features")
+        print(f"   Top 5: {top_features[:5]}")
+        print(f"   Correlations: {[f'{correlations[f]:.3f}' for f in top_features[:5]]}")
+
+        # Use only selected features
+        X_train = X_train[top_features]
+        X_test = X_test[top_features]
+        self.feature_names = top_features  # Update feature names to selected subset
+        self.training_feature_names = top_features  # Store for prediction (won't be overwritten)
+
         # Scale features
         X_train_scaled = self.scaler.fit_transform(X_train)
         X_test_scaled = self.scaler.transform(X_test)
@@ -2092,7 +2115,11 @@ class PriceRangePredictor:
         # Create features for latest bar
         print("[DEBUG predict] Creating features...")
         features = self.create_range_features(df, options_features)
-        X = features[self.feature_names].iloc[[-1]]  # Last row only
+
+        # Use training_feature_names (won't be overwritten by create_range_features)
+        # Fall back to feature_names for backwards compatibility
+        feature_cols = getattr(self, 'training_feature_names', None) or self.feature_names
+        X = features[feature_cols].iloc[[-1]]  # Last row only
         print(f"[DEBUG predict] Features shape: {X.shape}, NaN count: {X.isna().sum().sum()}")
 
         if X.isna().any().any():
@@ -2221,7 +2248,10 @@ class PriceRangePredictor:
             'atr_14': features['atr_14'].iloc[-1] if 'atr_14' in features else None
         }
         print(f"[DEBUG predict] DONE! Predicted High: ${result['predicted_high']:.2f}, Low: ${result['predicted_low']:.2f}")
-        print(f"[DEBUG predict] Confidence bounds ({confidence_level*100:.0f}%): High=[${high_lower:.2f}, ${high_upper:.2f}], Low=[${low_lower:.2f}, ${low_upper:.2f}]")
+        # Convert to float in case they're numpy arrays
+        hl, hu = float(high_lower), float(high_upper)
+        ll, lu = float(low_lower), float(low_upper)
+        print(f"[DEBUG predict] Confidence bounds ({confidence_level*100:.0f}%): High=[${hl:.2f}, ${hu:.2f}], Low=[${ll:.2f}, ${lu:.2f}]")
         return result
 
     def save_predictions(self, predictions: dict, ticker: str, path: str = None) -> str:
