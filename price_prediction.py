@@ -2197,48 +2197,109 @@ class PriceRangePredictor:
         predicted_low = current_close * (1 - predicted_range * low_ratio)
         print(f"[DEBUG predict] High: ${predicted_high:.2f}, Low: ${predicted_low:.2f}")
 
-        # Calculate confidence bounds
-        # NOTE: Conformal bounds are for RANGE prediction, NOT for high/low prices directly
-        # Using range intervals to derive high/low bounds is mathematically incorrect
-        # Instead, we calculate high/low bounds based on prediction error (MAE/RMSE)
+        # ==========================================================================
+        # ADAPTIVE CONFIDENCE BANDS
+        # Band width adapts to current and predicted market conditions
+        # ==========================================================================
         #
-        # The key insight: uncertainty in HIGH/LOW comes from:
-        # 1. Uncertainty in RANGE prediction
-        # 2. Uncertainty in WHERE in the range the high/low will occur
+        # Factors that affect band width:
+        # 1. Predicted range - larger predicted moves = wider bands
+        # 2. Current volatility (VIX) - high vol regime = wider bands
+        # 3. Recent range volatility - unstable ranges = wider bands
+        # 4. Trend direction - asymmetric bands (wider in direction of risk)
         #
-        # For proper 90% confidence, we need bounds that empirically contain 90% of outcomes
-        # Using historical MAE and z-scores calibrated to achieve target coverage
+        # Base uncertainty = RMSE (historical prediction error)
+        # Adjusted uncertainty = base × volatility_multiplier × range_multiplier
 
-        # Calculate uncertainty based on RMSE of range prediction
-        # RMSE is in fraction form (e.g., 0.005 = 0.5% error)
-        rmse = self.model_metrics.get('rmse', predicted_range * 0.3)
+        rmse = self.model_metrics.get('rmse', 0.005)  # ~0.5% default
 
-        # z-scores calibrated for USEFUL bands (not just high coverage)
-        # Too wide = not actionable, too narrow = false precision
-        # Target: ~70-80% containment for actionable trading signals
-        z_scores = {0.8: 1.3, 0.9: 1.6, 0.95: 2.0}
-        z = z_scores.get(confidence_level, 1.6)
+        # --- 1. VOLATILITY REGIME MULTIPLIER ---
+        # Extract current VIX and volatility from features
+        vix_current = features['vix'].iloc[-1] if 'vix' in features.columns else 15
+        vix_avg = features['vix'].mean() if 'vix' in features.columns else 15
 
-        # Additional buffer for lows (typically harder to predict due to sharp drops)
-        z_low_multiplier = 1.15  # 15% wider for lows
+        # Volatility ratio: >1 means higher than average vol
+        vol_ratio = vix_current / max(vix_avg, 10)
+        # Clamp between 0.7 and 1.8
+        vol_multiplier = max(0.7, min(1.8, vol_ratio))
 
-        # Calculate uncertainty in dollars based on RMSE
-        # This gives tighter bands when model is confident, wider when uncertain
-        # Formula: uncertainty = RMSE * z * current_close
-        # The RMSE already captures the prediction error magnitude
-        high_uncertainty = rmse * z * current_close
-        low_uncertainty = rmse * z * current_close * z_low_multiplier
+        # --- 2. PREDICTED RANGE MULTIPLIER ---
+        # Larger predicted ranges have more uncertainty
+        avg_range = features['daily_range_pct'].mean() if 'daily_range_pct' in features.columns else 0.01
+        range_ratio = predicted_range / max(avg_range, 0.005)
+        # Clamp between 0.8 and 1.5
+        range_multiplier = max(0.8, min(1.5, range_ratio))
+
+        # --- 3. RECENT RANGE STABILITY ---
+        # If recent ranges have been volatile, increase uncertainty
+        if 'daily_range_pct' in features.columns:
+            recent_range_std = features['daily_range_pct'].tail(10).std()
+            range_mean = features['daily_range_pct'].tail(10).mean()
+            cv = recent_range_std / max(range_mean, 0.005)  # Coefficient of variation
+            stability_multiplier = max(0.9, min(1.4, 1 + cv))
+        else:
+            stability_multiplier = 1.0
+
+        # --- 4. TREND-BASED ASYMMETRY ---
+        # In downtrends: widen LOW band (sharp drops more likely)
+        # In uptrends: slightly widen HIGH band (momentum overshoots)
+        if 'trend_direction' in features.columns:
+            trend = features['trend_direction'].iloc[-1]
+        elif 'price_vs_sma20' in features.columns:
+            trend = 1 if features['price_vs_sma20'].iloc[-1] > 0 else -1
+        else:
+            trend = 0
+
+        # Base asymmetry: lows are generally harder to predict
+        high_asym = 1.0
+        low_asym = 1.15  # 15% wider for lows by default
+
+        if trend < -0.5:  # Strong downtrend
+            low_asym = 1.35   # 35% wider for lows
+            high_asym = 0.9   # 10% tighter for highs
+        elif trend > 0.5:  # Strong uptrend
+            low_asym = 1.05   # Only 5% wider for lows
+            high_asym = 1.1   # 10% wider for highs (momentum can overshoot)
+
+        # --- 5. VIX SPIKE DETECTION ---
+        # Sudden VIX spikes indicate regime change, need wider bands
+        if 'vix_velocity' in features.columns:
+            vix_velocity = features['vix_velocity'].iloc[-1]
+            if vix_velocity > 2:  # VIX spiking up
+                vol_multiplier *= 1.3  # Extra 30% width
+        elif 'vix' in features.columns and len(features) > 5:
+            vix_change = (features['vix'].iloc[-1] - features['vix'].iloc[-5]) / max(features['vix'].iloc[-5], 10)
+            if vix_change > 0.15:  # VIX up 15%+ in 5 days
+                vol_multiplier *= 1.25
+
+        # --- COMBINE ALL FACTORS ---
+        base_z = {0.8: 1.2, 0.9: 1.5, 0.95: 1.9}.get(confidence_level, 1.5)
+
+        combined_multiplier = vol_multiplier * range_multiplier * stability_multiplier
+
+        # Calculate final uncertainties
+        high_uncertainty = rmse * base_z * current_close * combined_multiplier * high_asym
+        low_uncertainty = rmse * base_z * current_close * combined_multiplier * low_asym
 
         high_lower = predicted_high - high_uncertainty
         high_upper = predicted_high + high_uncertainty
         low_lower = predicted_low - low_uncertainty
         low_upper = predicted_low + low_uncertainty
 
-        # Store method used
-        if conformal_bounds:
-            conformal_bounds['method'] = 'rmse_calibrated'
-        else:
-            conformal_bounds = {'method': 'rmse_calibrated'}
+        # Store method and diagnostics
+        conformal_bounds = {
+            'method': 'adaptive',
+            'vol_multiplier': float(vol_multiplier),
+            'range_multiplier': float(range_multiplier),
+            'stability_multiplier': float(stability_multiplier),
+            'high_asymmetry': float(high_asym),
+            'low_asymmetry': float(low_asym),
+            'trend': float(trend) if isinstance(trend, (int, float)) else 0,
+            'vix_current': float(vix_current) if not np.isnan(vix_current) else 15
+        }
+
+        print(f"[DEBUG predict] Adaptive bands: vol={vol_multiplier:.2f}, range={range_multiplier:.2f}, "
+              f"stability={stability_multiplier:.2f}, trend={trend:.2f}, high_asym={high_asym:.2f}, low_asym={low_asym:.2f}")
 
         print(f"[DEBUG predict] Returning prediction dict...")
         # Convert all values to Python floats to avoid numpy array issues
