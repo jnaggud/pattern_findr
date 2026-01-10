@@ -7359,13 +7359,13 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                 bounds_col1, bounds_col2, bounds_col3, bounds_col4 = st.columns(4)
 
                                 with bounds_col1:
-                                    st.metric("High Lower", f"${tomorrow_pred['high_lower']:.2f}")
+                                    st.metric("High Lower", f"${float(tomorrow_pred['high_lower']):.2f}")
                                 with bounds_col2:
-                                    st.metric("High Upper", f"${tomorrow_pred['high_upper']:.2f}")
+                                    st.metric("High Upper", f"${float(tomorrow_pred['high_upper']):.2f}")
                                 with bounds_col3:
-                                    st.metric("Low Lower", f"${tomorrow_pred['low_lower']:.2f}")
+                                    st.metric("Low Lower", f"${float(tomorrow_pred['low_lower']):.2f}")
                                 with bounds_col4:
-                                    st.metric("Low Upper", f"${tomorrow_pred['low_upper']:.2f}")
+                                    st.metric("Low Upper", f"${float(tomorrow_pred['low_upper']):.2f}")
 
                                 # Create candlestick chart with prediction
                                 st.markdown("---")

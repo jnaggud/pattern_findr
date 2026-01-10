@@ -2229,23 +2229,24 @@ class PriceRangePredictor:
             conformal_bounds = {'method': 'rmse_asymmetric'}
 
         print(f"[DEBUG predict] Returning prediction dict...")
+        # Convert all values to Python floats to avoid numpy array issues
         result = {
-            'current_close': current_close,
-            'predicted_range': predicted_range,
-            'predicted_range_dollars': current_close * predicted_range,
-            'predicted_high': predicted_high,
-            'predicted_low': predicted_low,
-            'high_lower': high_lower,
-            'high_upper': high_upper,
-            'low_lower': low_lower,
-            'low_upper': low_upper,
-            'high_uncertainty': high_uncertainty,
-            'low_uncertainty': low_uncertainty,
-            'confidence_level': confidence_level,
+            'current_close': float(current_close),
+            'predicted_range': float(predicted_range),
+            'predicted_range_dollars': float(current_close * predicted_range),
+            'predicted_high': float(predicted_high),
+            'predicted_low': float(predicted_low),
+            'high_lower': float(high_lower),
+            'high_upper': float(high_upper),
+            'low_lower': float(low_lower),
+            'low_upper': float(low_upper),
+            'high_uncertainty': float(high_uncertainty),
+            'low_uncertainty': float(low_uncertainty),
+            'confidence_level': float(confidence_level),
             'confidence_method': conformal_bounds.get('method', 'rmse'),
             'prediction_date': df.index[-1] + timedelta(days=1) if hasattr(df.index[-1], 'date') else None,
-            'model_r2': self.model_metrics.get('r2', 0),
-            'atr_14': features['atr_14'].iloc[-1] if 'atr_14' in features else None
+            'model_r2': float(self.model_metrics.get('r2', 0)),
+            'atr_14': float(features['atr_14'].iloc[-1]) if 'atr_14' in features else None
         }
         print(f"[DEBUG predict] DONE! Predicted High: ${result['predicted_high']:.2f}, Low: ${result['predicted_low']:.2f}")
         # Convert to float in case they're numpy arrays
