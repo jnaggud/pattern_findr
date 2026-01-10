@@ -2209,25 +2209,25 @@ class PriceRangePredictor:
         # For proper 90% confidence, we need bounds that empirically contain 90% of outcomes
         # Using historical MAE and z-scores calibrated to achieve target coverage
 
-        # Get MAE for high/low predictions (stored during training), fall back to RMSE-based
-        mae_high = self.model_metrics.get('mae', predicted_range * 0.25)  # fallback ~25% of range
-        mae_low = self.model_metrics.get('mae', predicted_range * 0.25)
+        # Calculate uncertainty based on RMSE of range prediction
+        # RMSE is in fraction form (e.g., 0.005 = 0.5% error)
+        rmse = self.model_metrics.get('rmse', predicted_range * 0.3)
 
-        # Use larger z-scores to achieve actual 90% coverage
-        # Standard z=1.645 only works for normal distributions with known variance
-        # Empirically, prediction errors are often fat-tailed, need larger multipliers
-        z_scores = {0.8: 2.0, 0.9: 2.5, 0.95: 3.0}  # Calibrated for actual coverage
-        z = z_scores.get(confidence_level, 2.5)
+        # z-scores calibrated for USEFUL bands (not just high coverage)
+        # Too wide = not actionable, too narrow = false precision
+        # Target: ~70-80% containment for actionable trading signals
+        z_scores = {0.8: 1.3, 0.9: 1.6, 0.95: 2.0}
+        z = z_scores.get(confidence_level, 1.6)
 
         # Additional buffer for lows (typically harder to predict due to sharp drops)
-        z_low_multiplier = 1.2  # 20% wider for lows
+        z_low_multiplier = 1.15  # 15% wider for lows
 
-        # Calculate uncertainty in dollars
-        # The uncertainty should reflect actual prediction errors, not range variance
-        # Use: uncertainty = predicted_range * z * current_close
-        # This scales with the expected move size
-        high_uncertainty = predicted_range * z * current_close * high_ratio
-        low_uncertainty = predicted_range * z * current_close * low_ratio * z_low_multiplier
+        # Calculate uncertainty in dollars based on RMSE
+        # This gives tighter bands when model is confident, wider when uncertain
+        # Formula: uncertainty = RMSE * z * current_close
+        # The RMSE already captures the prediction error magnitude
+        high_uncertainty = rmse * z * current_close
+        low_uncertainty = rmse * z * current_close * z_low_multiplier
 
         high_lower = predicted_high - high_uncertainty
         high_upper = predicted_high + high_uncertainty
@@ -2236,9 +2236,9 @@ class PriceRangePredictor:
 
         # Store method used
         if conformal_bounds:
-            conformal_bounds['method'] = 'calibrated_mae'
+            conformal_bounds['method'] = 'rmse_calibrated'
         else:
-            conformal_bounds = {'method': 'calibrated_mae'}
+            conformal_bounds = {'method': 'rmse_calibrated'}
 
         print(f"[DEBUG predict] Returning prediction dict...")
         # Convert all values to Python floats to avoid numpy array issues

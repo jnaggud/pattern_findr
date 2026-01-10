@@ -7774,6 +7774,204 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                         # Get top features for discovery
                         top_10_features = agg_importance.head(10)['feature'].tolist()
 
+                        # === AUTO-DISCOVER BUTTON ===
+                        st.markdown("---")
+                        auto_col1, auto_col2 = st.columns([2, 3])
+                        with auto_col1:
+                            auto_discover_btn = st.button("🔍 Auto-Discover Best Features", type="primary", use_container_width=True,
+                                                         help="Automatically test all feature combinations and find the best ones")
+                        with auto_col2:
+                            st.caption("Tests: Top 5 feature interactions × 4 operations, Lags 1-10 for top 5, Rolling windows 5-30, Volume derivatives")
+
+                        if auto_discover_btn:
+                            with st.spinner("Running comprehensive feature discovery (this may take 1-2 minutes)..."):
+                                try:
+                                    # Initialize
+                                    auto_predictor = PriceRangePredictor()
+                                    auto_features = auto_predictor.create_range_features(wf_analysis_df)
+                                    auto_targets = auto_predictor.create_targets(wf_analysis_df)
+                                    target_series = auto_targets['next_range']
+
+                                    all_discoveries = []
+                                    progress_auto = st.progress(0)
+                                    status_auto = st.empty()
+
+                                    # 1. LAG ANALYSIS for top 5 features
+                                    status_auto.text("Testing lags for top features...")
+                                    top_5 = [f for f in top_10_features[:5] if f in auto_features.columns]
+                                    for feat in top_5:
+                                        base_series = auto_features[feat]
+                                        for lag in range(1, 11):
+                                            lagged = base_series.shift(lag)
+                                            valid_idx = lagged.dropna().index.intersection(target_series.dropna().index)
+                                            if len(valid_idx) > 30:
+                                                corr = lagged.loc[valid_idx].corr(target_series.loc[valid_idx])
+                                                all_discoveries.append({
+                                                    'feature': f'{feat}_lag{lag}',
+                                                    'type': 'Lag',
+                                                    'correlation': corr,
+                                                    'abs_corr': abs(corr),
+                                                    'formula': f'{feat}.shift({lag})'
+                                                })
+                                    progress_auto.progress(0.2)
+
+                                    # 2. INTERACTION TERMS (top 5 × top 5 × 4 operations)
+                                    status_auto.text("Testing feature interactions...")
+                                    operations = [('multiply', '*'), ('divide', '/'), ('add', '+'), ('subtract', '-')]
+                                    for i, f1 in enumerate(top_5):
+                                        for f2 in top_5[i+1:]:
+                                            s1 = auto_features[f1]
+                                            s2 = auto_features[f2]
+                                            for op_name, op_symbol in operations:
+                                                try:
+                                                    if op_name == 'multiply':
+                                                        interaction = s1 * s2
+                                                    elif op_name == 'divide':
+                                                        interaction = s1 / (s2.abs() + 1e-10)
+                                                    elif op_name == 'add':
+                                                        interaction = s1 + s2
+                                                    else:
+                                                        interaction = s1 - s2
+
+                                                    valid_idx = interaction.dropna().index.intersection(target_series.dropna().index)
+                                                    if len(valid_idx) > 30:
+                                                        corr = interaction.loc[valid_idx].corr(target_series.loc[valid_idx])
+                                                        all_discoveries.append({
+                                                            'feature': f'{f1}_{op_symbol}_{f2}',
+                                                            'type': 'Interaction',
+                                                            'correlation': corr,
+                                                            'abs_corr': abs(corr),
+                                                            'formula': f'{f1} {op_symbol} {f2}'
+                                                        })
+                                                except:
+                                                    pass
+                                    progress_auto.progress(0.4)
+
+                                    # 3. ROLLING WINDOWS for range
+                                    status_auto.text("Testing rolling windows...")
+                                    if 'high' in wf_analysis_df.columns:
+                                        base_range = (wf_analysis_df['high'] - wf_analysis_df['low']) / wf_analysis_df['close']
+                                        for window in [3, 5, 7, 10, 14, 21, 30]:
+                                            for agg in ['mean', 'std', 'min', 'max']:
+                                                rolled = getattr(base_range.rolling(window), agg)()
+                                                valid_idx = rolled.dropna().index.intersection(target_series.dropna().index)
+                                                if len(valid_idx) > 30:
+                                                    corr = rolled.loc[valid_idx].corr(target_series.loc[valid_idx])
+                                                    all_discoveries.append({
+                                                        'feature': f'range_{agg}_{window}d',
+                                                        'type': 'Rolling',
+                                                        'correlation': corr,
+                                                        'abs_corr': abs(corr),
+                                                        'formula': f'range.rolling({window}).{agg}()'
+                                                    })
+                                    progress_auto.progress(0.6)
+
+                                    # 4. VOLUME DERIVATIVES
+                                    status_auto.text("Testing volume derivatives...")
+                                    if 'volume' in wf_analysis_df.columns:
+                                        volume = wf_analysis_df['volume']
+                                        vol_norm = volume / volume.rolling(20).mean()
+                                        for window in [1, 3, 5, 10]:
+                                            vol_smooth = volume.rolling(max(1, window)).mean() if window > 1 else volume
+                                            for deriv in ['level', 'velocity', 'acceleration']:
+                                                if deriv == 'level':
+                                                    series = vol_smooth
+                                                elif deriv == 'velocity':
+                                                    series = vol_smooth.diff()
+                                                else:
+                                                    series = vol_smooth.diff().diff()
+                                                valid_idx = series.dropna().index.intersection(target_series.dropna().index)
+                                                if len(valid_idx) > 30:
+                                                    corr = series.loc[valid_idx].corr(target_series.loc[valid_idx])
+                                                    all_discoveries.append({
+                                                        'feature': f'vol_{deriv}_w{window}',
+                                                        'type': 'Volume',
+                                                        'correlation': corr,
+                                                        'abs_corr': abs(corr),
+                                                        'formula': f'volume.rolling({window}).mean().diff(n={0 if deriv=="level" else (1 if deriv=="velocity" else 2)})'
+                                                    })
+                                    progress_auto.progress(0.8)
+
+                                    # 5. REGIME-BASED CORRELATIONS
+                                    status_auto.text("Testing regime features...")
+                                    if 'volatility_20d' in auto_features.columns or 'vix' in auto_features.columns:
+                                        regime_col = 'vix' if 'vix' in auto_features.columns else 'volatility_20d'
+                                        regime_series = auto_features[regime_col]
+                                        median_regime = regime_series.median()
+                                        high_vol_idx = regime_series[regime_series > median_regime].index
+                                        low_vol_idx = regime_series[regime_series <= median_regime].index
+
+                                        for feat in top_5:
+                                            for regime_name, regime_idx in [('high_vol', high_vol_idx), ('low_vol', low_vol_idx)]:
+                                                valid_idx = auto_features[feat].dropna().index.intersection(target_series.dropna().index).intersection(regime_idx)
+                                                if len(valid_idx) > 20:
+                                                    corr = auto_features.loc[valid_idx, feat].corr(target_series.loc[valid_idx])
+                                                    all_discoveries.append({
+                                                        'feature': f'{feat}_{regime_name}',
+                                                        'type': 'Regime',
+                                                        'correlation': corr,
+                                                        'abs_corr': abs(corr),
+                                                        'formula': f'{feat} (in {regime_name} regime)'
+                                                    })
+                                    progress_auto.progress(1.0)
+                                    status_auto.text("Discovery complete!")
+
+                                    # Store results
+                                    discovery_df = pd.DataFrame(all_discoveries)
+                                    discovery_df = discovery_df.sort_values('abs_corr', ascending=False)
+                                    st.session_state['auto_discovery_results'] = discovery_df
+
+                                except Exception as auto_err:
+                                    st.error(f"Auto-discovery failed: {auto_err}")
+                                    import traceback
+                                    st.code(traceback.format_exc())
+
+                        # Display auto-discovery results
+                        if 'auto_discovery_results' in st.session_state:
+                            discovery_df = st.session_state['auto_discovery_results']
+                            st.markdown("### 🏆 Auto-Discovery Results")
+                            st.markdown(f"Tested **{len(discovery_df)} features** across all categories")
+
+                            # Top discoveries by type
+                            top_by_type = discovery_df.groupby('type').apply(lambda x: x.nlargest(3, 'abs_corr')).reset_index(drop=True)
+
+                            res_col1, res_col2 = st.columns(2)
+                            with res_col1:
+                                st.markdown("**🥇 Top 10 Overall:**")
+                                for i, row in discovery_df.head(10).iterrows():
+                                    sign = "+" if row['correlation'] > 0 else ""
+                                    st.markdown(f"- `{row['feature']}` ({row['type']}): **{sign}{row['correlation']:.3f}**")
+
+                            with res_col2:
+                                st.markdown("**📊 Best by Category:**")
+                                for cat in discovery_df['type'].unique():
+                                    best = discovery_df[discovery_df['type'] == cat].iloc[0]
+                                    sign = "+" if best['correlation'] > 0 else ""
+                                    st.markdown(f"- **{cat}**: `{best['feature']}` ({sign}{best['correlation']:.3f})")
+
+                            # Detailed table in expander
+                            with st.expander("View All Discovered Features"):
+                                st.dataframe(
+                                    discovery_df[['feature', 'type', 'correlation', 'formula']].head(50),
+                                    use_container_width=True,
+                                    height=400
+                                )
+
+                            # Chart
+                            fig_discovery = px.bar(
+                                discovery_df.head(20),
+                                x='correlation',
+                                y='feature',
+                                color='type',
+                                orientation='h',
+                                title='Top 20 Discovered Features by Correlation',
+                                color_discrete_sequence=px.colors.qualitative.Set2
+                            )
+                            fig_discovery.update_layout(height=500, yaxis={'categoryorder': 'total ascending'})
+                            st.plotly_chart(fig_discovery, use_container_width=True)
+
+                        st.markdown("---")
+
                         discovery_tab1, discovery_tab2, discovery_tab3, discovery_tab4, discovery_tab5 = st.tabs([
                             "Lag Analysis",
                             "Interaction Terms",
