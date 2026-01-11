@@ -1,0 +1,94 @@
+================================================================================
+FEATURE ANALYSIS SUMMARY
+================================================================================
+Generated: 2026-01-10 11:00:15
+Ticker: SPY
+Total Features Analyzed: 203
+Training Iterations: 60
+
+================================================================================
+TOP 20 FEATURES BY CORRELATION WITH TARGET
+================================================================================
+Rank   Feature                                        Correlation     |Corr|
+---------------------------------------------------------------------------
+1      range_mean_3d                                       0.6440     0.6440
+2      momentum_trend_divergence                           0.6433     0.6433
+3      vol_regime_interaction                              0.6362     0.6362
+4      drawdown_from_high_20d                             -0.6310     0.6310
+5      upside_potential_x_price_vs_sma50                  -0.6241     0.6241
+6      range_max_3d                                        0.6229     0.6229
+7      range_mean_5d                                       0.6189     0.6189
+8      range_momentum                                      0.6166     0.6166
+9      price_vs_sma50                                     -0.6089     0.6089
+10     upside_potential                                    0.6082     0.6082
+11     range_max_5d                                        0.6038     0.6038
+12     range_mean_7d                                       0.5935     0.5935
+13     vol_weighted_range                                  0.5814     0.5814
+14     rsi_14                                             -0.5793     0.5793
+15     atr_14_pct                                          0.5759     0.5759
+16     upside_potential_x_sma50_lag1                      -0.5593     0.5593
+17     price_vs_sma20                                     -0.5367     0.5367
+18     momentum_trend_divergence_high_vol                  0.5304     0.5304
+19     upside_potential_x_sma50_high_vol                  -0.5262     0.5262
+20     volatility_5d                                       0.5256     0.5256
+
+================================================================================
+TOP 20 FEATURES BY MODEL IMPORTANCE
+================================================================================
+Rank   Feature                                           Mean Imp        Std  Consistency
+---------------------------------------------------------------------------------------
+1      dxy_vs_sma                                          0.0330     0.0297         1.11
+2      dxy                                                 0.0260     0.0252         1.03
+3      upside_potential_x_price_vs_sma50                   0.0235     0.0286         0.82
+4      sma_20                                              0.0213     0.0492         0.43
+5      atr_14                                              0.0192     0.0262         0.73
+6      sector_above_sma_count                              0.0172     0.0234         0.73
+7      downside_potential                                  0.0168     0.0110         1.52
+8      composite_osc_smooth                                0.0158     0.0181         0.87
+9      vvix_vs_sma                                         0.0147     0.0136         1.09
+10     spy_qqq_corr_change                                 0.0144     0.0206         0.70
+11     trend_momentum                                      0.0137     0.0197         0.69
+12     spy_qqq_ratio                                       0.0136     0.0146         0.93
+13     rsi_14                                              0.0133     0.0313         0.43
+14     roc_5                                               0.0122     0.0146         0.84
+15     upside_potential_x_sma50_lag1                       0.0121     0.0103         1.18
+16     vvix                                                0.0118     0.0087         1.36
+17     vol_ratio                                           0.0117     0.0121         0.97
+18     trend_dislocation                                   0.0112     0.0167         0.67
+19     atr_21                                              0.0110     0.0116         0.95
+20     vvix_zscore                                         0.0110     0.0090         1.22
+
+================================================================================
+TOP 20 DISCOVERED FEATURES
+================================================================================
+Rank   Feature                                  Type             Correlation
+---------------------------------------------------------------------------
+1      upside_potential_x_price_vs_sma50_high_vol Regime               -0.7965
+2      range_mean_3d                            Rolling               0.6440
+3      upside_potential_x_price_vs_sma50_*_sma_20 Interaction          -0.6436
+4      dxy_*_upside_potential_x_price_vs_sma50  Interaction          -0.6293
+5      upside_potential_x_price_vs_sma50_*_atr_14 Interaction          -0.6244
+6      range_max_3d                             Rolling               0.6229
+7      range_mean_5d                            Rolling               0.6189
+8      range_max_5d                             Rolling               0.6038
+9      atr_14_low_vol                           Regime                0.5985
+10     range_mean_7d                            Rolling               0.5935
+11     range_min_3d                             Rolling               0.5850
+12     upside_potential_x_price_vs_sma50_/_sma_20 Interaction          -0.5847
+13     upside_potential_x_price_vs_sma50_/_atr_14 Interaction          -0.5747
+14     range_max_7d                             Rolling               0.5697
+15     range_mean_10d                           Rolling               0.5618
+16     upside_potential_x_price_vs_sma50_lag1   Lag                  -0.5593
+17     range_min_5d                             Rolling               0.5515
+18     range_max_10d                            Rolling               0.5381
+19     range_mean_14d                           Rolling               0.5302
+20     range_std_5d                             Rolling               0.5189
+
+================================================================================
+EXPORTED FILES
+================================================================================
+Correlations CSV: feature_analysis/SPY_correlations_20260110_110015.csv
+Importances CSV: feature_analysis/SPY_importances_20260110_110015.csv
+Discovered Features CSV: feature_analysis/SPY_discovered_features_20260110_110015.csv
+Summary: feature_analysis/SPY_feature_analysis_20260110_110015_summary.txt
+================================================================================

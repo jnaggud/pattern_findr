@@ -1,0 +1,94 @@
+================================================================================
+FEATURE ANALYSIS SUMMARY
+================================================================================
+Generated: 2026-01-11 10:08:04
+Ticker: SPY
+Total Features Analyzed: 220
+Training Iterations: 60
+
+================================================================================
+TOP 20 FEATURES BY CORRELATION WITH TARGET
+================================================================================
+Rank   Feature                                        Correlation     |Corr|
+---------------------------------------------------------------------------
+1      vol_regime_minus_position                           0.6822     0.6822
+2      range_plus_upside                                   0.6815     0.6815
+3      range_times_upside                                  0.6794     0.6794
+4      daily_range_plus_upside                             0.6778     0.6778
+5      upside_times_atr7                                   0.6727     0.6727
+6      upside_times_atr14                                  0.6676     0.6676
+7      upside_plus_range_mean20                            0.6659     0.6659
+8      range_times_high_stretch                            0.6572     0.6572
+9      vol_regime_minus_trend                              0.6475     0.6475
+10     range_mean_3d                                       0.6439     0.6439
+11     momentum_trend_divergence                           0.6434     0.6434
+12     vol_regime_plus_range                               0.6379     0.6379
+13     vol_regime_interaction                              0.6364     0.6364
+14     drawdown_from_high_20d                             -0.6307     0.6307
+15     upside_potential_x_price_vs_sma50                  -0.6242     0.6242
+16     range_max_3d                                        0.6228     0.6228
+17     range_mean_5d                                       0.6188     0.6188
+18     range_momentum                                      0.6166     0.6166
+19     price_vs_sma50                                     -0.6089     0.6089
+20     upside_potential                                    0.6083     0.6083
+
+================================================================================
+TOP 20 FEATURES BY MODEL IMPORTANCE
+================================================================================
+Rank   Feature                                           Mean Imp        Std  Consistency
+---------------------------------------------------------------------------------------
+1      dxy                                                 0.0248     0.0213         1.17
+2      range_plus_upside                                   0.0205     0.0285         0.72
+3      sma_20                                              0.0201     0.0426         0.47
+4      upside_potential_x_price_vs_sma50                   0.0184     0.0281         0.66
+5      dxy_vs_sma                                          0.0181     0.0182         1.00
+6      range_times_upside                                  0.0158     0.0214         0.74
+7      spy_qqq_corr_change                                 0.0145     0.0226         0.64
+8      sector_above_sma_count                              0.0140     0.0208         0.67
+9      atr_14                                              0.0133     0.0196         0.68
+10     composite_osc_smooth                                0.0132     0.0137         0.97
+11     sell_pressure                                       0.0131     0.0158         0.83
+12     atr_14_pct                                          0.0128     0.0266         0.48
+13     downside_potential                                  0.0126     0.0134         0.94
+14     spy_qqq_ratio                                       0.0125     0.0160         0.78
+15     sell_pressure_3d                                    0.0124     0.0203         0.61
+16     close_pos_mean_5d                                   0.0123     0.0145         0.85
+17     vvix_vs_sma                                         0.0121     0.0123         0.98
+18     trend_momentum                                      0.0116     0.0223         0.52
+19     atr_21                                              0.0114     0.0143         0.80
+20     dxy_change_5d                                       0.0112     0.0116         0.96
+
+================================================================================
+TOP 20 DISCOVERED FEATURES
+================================================================================
+Rank   Feature                                  Type             Correlation
+---------------------------------------------------------------------------
+1      upside_plus_range_mean20_*_range_mean_3d Interaction           0.7146
+2      vol_regime_minus_position_+_upside_times_atr7 Interaction           0.7143
+3      upside_plus_range_mean20_*_range_mean_5d Interaction           0.7115
+4      vol_regime_minus_position_+_upside_times_atr14 Interaction           0.7079
+5      upside_plus_range_mean20_+_range_max_3d  Interaction           0.7078
+6      daily_range_plus_upside_+_range_mean_5d  Interaction           0.7075
+7      range_plus_upside_+_daily_range          Interaction           0.7075
+8      daily_range_plus_upside_*_range_mean_5d  Interaction           0.7074
+9      range_plus_upside_+_range_mean_3d        Interaction           0.7062
+10     upside_plus_range_mean20_+_range_mean_3d Interaction           0.7061
+11     range_plus_upside_+_range_max_3d         Interaction           0.7059
+12     upside_plus_range_mean20_+_daily_range   Interaction           0.7052
+13     daily_range_plus_upside_+_range_mean_3d  Interaction           0.7051
+14     daily_range_plus_upside_+_range_max_3d   Interaction           0.7049
+15     upside_plus_range_mean20_*_range_max_3d  Interaction           0.7047
+16     range_plus_upside_+_range_mean_5d        Interaction           0.7024
+17     upside_plus_range_mean20_+_range_mean_5d Interaction           0.7018
+18     upside_times_atr7_+_vol_regime_minus_trend Interaction           0.6999
+19     range_mean_3d_+_momentum_trend_divergence Interaction           0.6989
+20     upside_plus_range_mean20_*_daily_range   Interaction           0.6970
+
+================================================================================
+EXPORTED FILES
+================================================================================
+Correlations CSV: feature_analysis/SPY_correlations_20260111_100804.csv
+Importances CSV: feature_analysis/SPY_importances_20260111_100804.csv
+Discovered Features CSV: feature_analysis/SPY_discovered_features_20260111_100804.csv
+Summary: feature_analysis/SPY_feature_analysis_20260111_100804_summary.txt
+================================================================================

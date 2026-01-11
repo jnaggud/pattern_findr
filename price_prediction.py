@@ -24,6 +24,13 @@ except ImportError:
     XGB_AVAILABLE = False
 
 try:
+    import lightgbm as lgb
+    LGBM_AVAILABLE = True
+except ImportError:
+    LGBM_AVAILABLE = False
+    print("Warning: LightGBM not available, ensemble will use XGBoost only")
+
+try:
     from sklearn.preprocessing import StandardScaler
     from sklearn.model_selection import TimeSeriesSplit
     from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
@@ -85,6 +92,14 @@ except ImportError:
     MAIN_COMPOSITE_AVAILABLE = False
     print("Warning: create_composite_oscillator not available, using simplified version")
 
+# Import Deep Learning Feature Extractor
+try:
+    from dl_feature_extractor import DLFeatureExtractor
+    DL_FEATURE_AVAILABLE = True
+except ImportError:
+    DL_FEATURE_AVAILABLE = False
+    print("Warning: DLFeatureExtractor not available, deep learning features disabled")
+
 
 # =============================================================================
 # FEATURE GROUP CONFIGURATION
@@ -111,6 +126,12 @@ FEATURE_CONFIG = {
     'scientific_features': False,   # Hurst exponent - VERY LOW, slow to compute
     'novel_indicators': False,      # ARWO, DCO, etc - disabled by default
 
+    # Deep Learning Features (CNN+LSTM embeddings)
+    'dl_features': True,            # DL embeddings - captures temporal patterns XGBoost may miss
+
+    # Feature Pruning - remove features with zero importance from analysis
+    'prune_zero_importance': True,  # Remove features that never split in any tree
+
     # NEW: Cross-Market Features (for enhanced range prediction)
     # Set USE_NEW_CROSS_MARKET_FEATURES = False for baseline, True for test
     'vvix_features': True,          # VVIX (VIX of VIX) - volatility of volatility
@@ -125,6 +146,33 @@ FEATURE_CONFIG = {
 # TOGGLE: Set to False for baseline (old features only), True for test (with new features)
 USE_NEW_CROSS_MARKET_FEATURES = True
 
+# =============================================================================
+# ZERO-IMPORTANCE FEATURES TO PRUNE
+# These features had exactly 0.0 importance in 60 walk-forward iterations
+# Most are options-related (no real data) or regime-based (constant values)
+# =============================================================================
+ZERO_IMPORTANCE_FEATURES = {
+    # Options features with no real data (all defaults)
+    'pcr_volume', 'pcr_oi', 'sentiment_bullish', 'sentiment_bearish',
+    'iv_skew', 'max_pain_distance', 'high_call_oi_distance', 'high_put_oi_distance',
+    'atm_skew', 'atm_iv_rv_spread', 'gamma_long', 'gamma_short',
+    'net_gamma_normalized', 'net_delta_normalized',
+    'unusual_activity_bullish', 'unusual_activity_bearish', 'unusual_activity_count',
+    'term_structure_slope', 'term_structure_backwardation', 'term_structure_contango',
+    'near_term_iv', 'far_term_iv', 'iv_term_spread',
+
+    # Regime features that don't provide good split points
+    'is_downtrend', 'is_uptrend', 'vix_regime_high', 'vix_regime_low',
+    'range_momentum_high_vol', 'range_momentum_double_high_vol',
+    'range_momentum_high_vol_lag1', 'range_mean_3d_high_vol', 'range_accel_high_vol',
+    'upside_potential_high_vol', 'upside_potential_double_high_vol',
+    'upside_potential_x_sma50_high_vol', 'momentum_trend_divergence_high_vol',
+    'downside_potential_high_vol', 'downside_momentum_high_vol', 'vix_accel_high_vol',
+
+    # Very low importance binary/temporal
+    'volume_spike', 'earnings_week',
+}
+
 def set_cross_market_features(enabled: bool):
     """Toggle cross-market features on/off for A/B testing."""
     global USE_NEW_CROSS_MARKET_FEATURES
@@ -137,6 +185,207 @@ def set_cross_market_features(enabled: bool):
     FEATURE_CONFIG['correlation_features'] = enabled
     FEATURE_CONFIG['earnings_features'] = enabled
     print(f"Cross-market features {'ENABLED' if enabled else 'DISABLED'}")
+
+
+# =============================================================================
+# TRAINING SUMMARY - Collects key metrics for compact end-of-run output
+# =============================================================================
+class TrainingSummary:
+    """Collects training metrics and prints a compact summary at the end."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """Reset all collected data for a new run."""
+        self.start_time = datetime.now()
+        self.data = {
+            # Data info
+            'total_rows': 0,
+            'training_samples': 0,
+            'test_samples': 0,
+            'features_created': 0,
+            'features_pruned_zero_imp': 0,
+            'features_pruned_corr': 0,
+            'features_used': 0,
+            'feature_sample_ratio': 0.0,
+
+            # Feature health checks
+            'iv_fallback_pct': 0.0,  # % of IV features that are fallback values
+            'dxy_value': 0.0,  # DXY value (should be ~100-110)
+            'vix_value': 0.0,
+            'dl_samples': 0,  # Samples used for DL training
+
+            # Optimization results
+            'range_best_score': 0.0,
+            'range_trials': 0,
+            'range_all_scores': [],  # All worker scores
+            'high_best_score': 0.0,
+            'high_all_scores': [],
+            'low_best_score': 0.0,
+            'low_all_scores': [],
+            'low_negative_count': 0,  # Workers with negative R²
+
+            # Final metrics
+            'test_r2': 0.0,
+            'test_rmse': 0.0,
+            'ensemble_size': 0,
+            'low_ensemble_size': 0,
+
+            # Model details
+            'best_params': {},
+            'quantile_levels': [],
+
+            # Top features
+            'top_features_corr': [],
+            'top_features_importance': [],
+            'nonzero_importance_count': 0,
+
+            # Warnings
+            'warnings': [],
+
+            # Timing
+            'range_opt_time': 0.0,
+            'highlow_opt_time': 0.0,
+            'total_time': 0.0,
+        }
+
+    def add_warning(self, msg: str):
+        """Add a warning to track."""
+        if msg not in self.data['warnings']:
+            self.data['warnings'].append(msg)
+
+    def check_issues(self):
+        """Check for common issues and add warnings automatically."""
+        d = self.data
+
+        # Feature/sample ratio check
+        if d['training_samples'] > 0 and d['features_used'] > 0:
+            ratio = d['features_used'] / d['training_samples']
+            d['feature_sample_ratio'] = ratio
+            if ratio > 0.5:
+                self.add_warning(f"HIGH OVERFIT RISK: {ratio:.1f} features/sample (want <0.1)")
+            elif ratio > 0.2:
+                self.add_warning(f"Moderate overfit risk: {ratio:.2f} features/sample")
+
+        # Negative LOW scores
+        if d['low_all_scores']:
+            d['low_negative_count'] = sum(1 for s in d['low_all_scores'] if s < 0)
+            if d['low_negative_count'] > 0:
+                self.add_warning(f"LOW model unstable: {d['low_negative_count']}/{len(d['low_all_scores'])} workers had negative R²")
+
+        # Large optimization vs test gap
+        if d['range_best_score'] > 0 and d['test_r2'] > 0:
+            gap = (d['range_best_score'] - d['test_r2']) / d['range_best_score']
+            if gap > 0.3:
+                self.add_warning(f"Overfit detected: {gap*100:.0f}% drop from optimization to test")
+
+        # Very low training samples
+        if d['training_samples'] < 100:
+            self.add_warning(f"Low training samples: {d['training_samples']} (recommend 200+)")
+
+        # IV fallback check
+        if d['iv_fallback_pct'] > 50:
+            self.add_warning(f"IV features are {d['iv_fallback_pct']:.0f}% fallback (no real options data)")
+
+        # DXY sanity check (should be ~100-110)
+        if d['dxy_value'] > 0 and (d['dxy_value'] < 80 or d['dxy_value'] > 130):
+            self.add_warning(f"DXY value suspicious: {d['dxy_value']:.2f} (expected ~100-110)")
+
+        # DL samples check
+        if d['dl_samples'] > 0 and d['dl_samples'] < 500:
+            self.add_warning(f"DL trained on only {d['dl_samples']} samples (need 1000+ for reliability)")
+
+        # HIGH model variance check
+        if d['high_all_scores']:
+            high_range = max(d['high_all_scores']) - min(d['high_all_scores'])
+            if high_range > 0.15:
+                self.add_warning(f"HIGH model high variance: scores range {min(d['high_all_scores']):.3f} to {max(d['high_all_scores']):.3f}")
+
+    def print_summary(self):
+        """Print compact summary at end of training."""
+        self.data['total_time'] = (datetime.now() - self.start_time).total_seconds()
+        self.check_issues()
+        d = self.data
+
+        print("\n" + "="*70)
+        print("TRAINING SUMMARY")
+        print("="*70)
+
+        # Data
+        print(f"\n[DATA]")
+        print(f"  Samples: {d['training_samples']} train / {d['test_samples']} test")
+        pruned_total = d['features_pruned_zero_imp'] + d['features_pruned_corr']
+        print(f"  Features: {d['features_created']} created -> {pruned_total} pruned ({d['features_pruned_zero_imp']} zero-imp, {d['features_pruned_corr']} corr) -> {d['features_used']} used")
+        print(f"  Feature/Sample Ratio: {d['feature_sample_ratio']:.2f} (want <0.1)")
+
+        # Feature Health
+        print(f"\n[FEATURE HEALTH]")
+        print(f"  VIX: {d['vix_value']:.2f} | DXY: {d['dxy_value']:.2f} | IV Fallback: {d['iv_fallback_pct']:.0f}%")
+        if d['dl_samples'] > 0:
+            print(f"  DL Training: {d['dl_samples']} samples")
+        print(f"  Non-zero Importance: {d['nonzero_importance_count']}/{d['features_used']} features")
+
+        # Optimization scores with distribution
+        print(f"\n[OPTIMIZATION]")
+        print(f"  RANGE: best={d['range_best_score']:.4f} ({d['range_trials']} trials)")
+        if d['range_all_scores']:
+            print(f"         scores: min={min(d['range_all_scores']):.3f} med={sorted(d['range_all_scores'])[len(d['range_all_scores'])//2]:.3f} max={max(d['range_all_scores']):.3f}")
+
+        print(f"  HIGH:  best={d['high_best_score']:.4f}")
+        if d['high_all_scores']:
+            print(f"         scores: min={min(d['high_all_scores']):.3f} med={sorted(d['high_all_scores'])[len(d['high_all_scores'])//2]:.3f} max={max(d['high_all_scores']):.3f}")
+
+        print(f"  LOW:   best={d['low_best_score']:.4f}")
+        if d['low_all_scores']:
+            neg_count = sum(1 for s in d['low_all_scores'] if s < 0)
+            print(f"         scores: min={min(d['low_all_scores']):.3f} med={sorted(d['low_all_scores'])[len(d['low_all_scores'])//2]:.3f} max={max(d['low_all_scores']):.3f} (neg:{neg_count})")
+
+        # Final Metrics
+        print(f"\n[TEST METRICS]")
+        print(f"  R²: {d['test_r2']:.4f} | RMSE: {d['test_rmse']:.3f}%")
+        print(f"  Ensemble: {d['ensemble_size']} RANGE + {d['low_ensemble_size']} LOW models")
+        if d['quantile_levels']:
+            print(f"  Quantile CIs: {d['quantile_levels']}")
+
+        # Top Features
+        if d['top_features_corr']:
+            print(f"\n[TOP 5 FEATURES - Correlation]")
+            for i, (feat, corr) in enumerate(d['top_features_corr'][:5], 1):
+                print(f"  {i}. {feat}: {corr:.3f}")
+
+        if d['top_features_importance']:
+            print(f"\n[TOP 5 FEATURES - Importance]")
+            for i, feat in enumerate(d['top_features_importance'][:5], 1):
+                print(f"  {i}. {feat}")
+
+        # Best params (condensed)
+        if d['best_params']:
+            p = d['best_params']
+            print(f"\n[BEST PARAMS]")
+            print(f"  n_est={p.get('n_estimators', '?')} depth={p.get('max_depth', '?')} lr={p.get('learning_rate', 0):.4f}")
+            print(f"  subsample={p.get('subsample', 0):.2f} colsample={p.get('colsample_bytree', 0):.2f}")
+            print(f"  reg_alpha={p.get('reg_alpha', 0):.4f} reg_lambda={p.get('reg_lambda', 0):.4f}")
+
+        # Warnings
+        if d['warnings']:
+            print(f"\n[WARNINGS] ({len(d['warnings'])})")
+            for w in d['warnings']:
+                print(f"  ⚠ {w}")
+        else:
+            print(f"\n[WARNINGS] None")
+
+        # Timing
+        print(f"\n[TIMING]")
+        print(f"  Range Opt: {d['range_opt_time']:.1f}s | HighLow Opt: {d['highlow_opt_time']:.1f}s | Total: {d['total_time']:.1f}s")
+
+        print("="*70 + "\n")
+
+        return d  # Return data for programmatic access
+
+
+# Global summary instance (reset at start of each train_range_model call)
+_training_summary = TrainingSummary()
 
 
 class PriceRangePredictor:
@@ -449,8 +698,8 @@ class PriceRangePredictor:
             if start_date is None:
                 start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
 
-            # Try UUP first (Invesco DB US Dollar Index Bullish Fund), then DX-Y.NYB
-            for ticker in ['UUP', 'DX-Y.NYB']:
+            # Try actual DXY tickers first, UUP as last resort (UUP trades ~$27 not ~$100)
+            for ticker in ['DX=F', 'DX-Y.NYB', 'UUP']:
                 try:
                     df = yf.download(ticker, start=start_date, end=end_date, progress=False)
                     if isinstance(df.columns, pd.MultiIndex):
@@ -715,10 +964,14 @@ class PriceRangePredictor:
         )
 
         # Rolling range statistics
+        features['range_mean_3d'] = features['daily_range'].rolling(3).mean()  # Added early for RSI-normalized features
         features['range_mean_5d'] = features['daily_range'].rolling(5).mean()
+        features['range_mean_7d'] = features['daily_range'].rolling(7).mean()  # Added early for RSI-normalized features
         features['range_std_5d'] = features['daily_range'].rolling(5).std()
         features['range_mean_20d'] = features['daily_range'].rolling(20).mean()
         features['range_std_20d'] = features['daily_range'].rolling(20).std()
+        features['range_max_3d'] = features['daily_range'].rolling(3).max()   # For super-features
+        features['range_max_5d'] = features['daily_range'].rolling(5).max()   # For super-features
 
         # Range z-score
         features['range_zscore'] = (features['daily_range'] - features['range_mean_20d']) / features['range_std_20d']
@@ -802,6 +1055,74 @@ class PriceRangePredictor:
         features['range_reversion_signal'] = -features['range_zscore'] * features['range_percentile_20d']
 
         # =================================================================
+        # RSI-NORMALIZED FEATURES (Part 1 - features that don't need upside_potential)
+        # Dividing by RSI captures momentum-adjusted volatility
+        # These had 0.718 correlation vs 0.644 for best existing features
+        # =================================================================
+
+        # Ensure RSI exists before creating RSI-based features
+        if 'rsi_14' in features.columns:
+            rsi_safe = features['rsi_14'].clip(lower=1)  # Avoid division by zero
+            rsi_inverted = 100 - features['rsi_14']  # Inverted RSI (high when oversold)
+
+            # Top 4 discovered features - all involve dividing by RSI
+            # 1. vol_regime_interaction / rsi_14 → 0.718 correlation (BEST)
+            features['vol_regime_over_rsi'] = features['vol_regime_interaction'] / rsi_safe * 100
+
+            # 2. range_mean_5d / rsi_14 → 0.714 correlation
+            features['range_5d_over_rsi'] = features['range_mean_5d'] / rsi_safe * 100
+
+            # 3. daily_range / rsi_14 → 0.704 correlation
+            features['range_over_rsi'] = features['daily_range'] / rsi_safe * 100
+
+            # 4. daily_range_pct / rsi_14 → 0.704 correlation
+            features['range_pct_over_rsi'] = features['daily_range_pct'] / rsi_safe
+
+            # These don't need upside_potential
+            features['price_sma50_over_rsi'] = features['price_vs_sma50'] / rsi_safe * 100
+            features['atr_pct_over_rsi'] = features['atr_14_pct'] / rsi_safe
+
+            # === EXPANDED RSI-NORMALIZED FEATURES ===
+            # ATR variants normalized by RSI
+            features['atr_7_over_rsi'] = features['atr_7'] / rsi_safe
+            features['atr_14_over_rsi'] = features['atr_14'] / rsi_safe
+            features['atr_21_over_rsi'] = features['atr_21'] / rsi_safe
+
+            # Volatility metrics normalized by RSI
+            features['vol_5d_over_rsi'] = features['volatility_5d'] / rsi_safe * 100
+            features['vol_20d_over_rsi'] = features['volatility_20d'] / rsi_safe * 100
+
+            # Range statistics normalized by RSI
+            features['range_mean_3d_over_rsi'] = features['range_mean_3d'] / rsi_safe * 100
+            features['range_mean_7d_over_rsi'] = features['range_mean_7d'] / rsi_safe * 100
+            features['range_mean_20d_over_rsi'] = features['range_mean_20d'] / rsi_safe * 100
+            features['range_std_5d_over_rsi'] = features['range_std_5d'] / rsi_safe * 100
+
+            # Price position features normalized by RSI
+            features['price_sma20_over_rsi'] = features['price_vs_sma20'] / rsi_safe * 100
+            features['drawdown_over_rsi'] = features['drawdown_from_high_20d'] / rsi_safe
+
+            # Momentum features multiplied by inverted RSI (amplify when oversold)
+            features['range_x_inv_rsi'] = features['daily_range'] * rsi_inverted / 100
+            features['atr_x_inv_rsi'] = features['atr_14_pct'] * rsi_inverted / 100
+            features['vol_x_inv_rsi'] = features['volatility_20d'] * rsi_inverted / 100
+
+            # RSI-based regime indicators
+            features['rsi_oversold_intensity'] = np.maximum(0, 30 - features['rsi_14']) / 30
+            features['rsi_overbought_intensity'] = np.maximum(0, features['rsi_14'] - 70) / 30
+
+            # RSI velocity and acceleration
+            features['rsi_velocity'] = features['rsi_14'].diff()
+            features['rsi_accel'] = features['rsi_velocity'].diff()
+
+            # RSI divergence from price (price up but RSI down = bearish divergence)
+            price_direction = np.sign(df['close'].diff(5))
+            rsi_direction = np.sign(features['rsi_14'].diff(5))
+            features['rsi_price_divergence'] = (price_direction != rsi_direction).astype(int)
+
+            print(f"   RSI-normalized features (Part 1) added: 24 new features")
+
+        # =================================================================
         # TREND-AWARE FEATURES (To fix downtrend prediction bias)
         # Analysis showed model predicts highs better than lows
         # =================================================================
@@ -833,6 +1154,47 @@ class PriceRangePredictor:
         # Recent low/high relative to ATR (identifies stretched moves)
         features['low_stretch'] = (df['close'] - df['low'].rolling(10).min()) / features['atr_14']
         features['high_stretch'] = (df['high'].rolling(10).max() - df['close']) / features['atr_14']
+
+        # =================================================================
+        # RSI-NORMALIZED FEATURES (Part 2 - features that need upside_potential)
+        # =================================================================
+        if 'rsi_14' in features.columns:
+            rsi_safe = features['rsi_14'].clip(lower=1)
+            features['upside_over_rsi'] = features['upside_potential'] / rsi_safe * 100
+            print(f"   RSI-normalized features (Part 2) added: 1 new feature")
+
+        # =================================================================
+        # TOP DISCOVERED INTERACTION FEATURES (from comprehensive auto-discover)
+        # These had 0.65-0.72 correlation - significantly better than baseline
+        # =================================================================
+
+        # 5. vol_regime_interaction - price_position → 0.682 correlation
+        features['vol_regime_minus_position'] = features['vol_regime_interaction'] - features['price_position']
+
+        # 6. range_mean_5d + upside_potential → 0.681 correlation
+        features['range_plus_upside'] = features['range_mean_5d'] + features['upside_potential']
+
+        # 7. range_mean_5d * upside_potential → 0.679 correlation
+        features['range_times_upside'] = features['range_mean_5d'] * features['upside_potential']
+
+        # 8. daily_range + upside_potential → 0.678 correlation
+        features['daily_range_plus_upside'] = features['daily_range'] + features['upside_potential']
+
+        # 9. upside_potential * atr_7 → 0.673 correlation
+        features['upside_times_atr7'] = features['upside_potential'] * features['atr_7']
+
+        # 10. upside_potential * atr_14 → 0.668 correlation
+        features['upside_times_atr14'] = features['upside_potential'] * features['atr_14']
+
+        # Additional high-correlation interactions discovered
+        features['upside_plus_range_mean20'] = features['upside_potential'] + features['range_mean_20d']
+        features['range_times_high_stretch'] = features['range_mean_5d'] * features['high_stretch']
+        features['vol_regime_plus_range'] = features['vol_regime_interaction'] + features['daily_range']
+        features['vol_regime_minus_trend'] = features['vol_regime_interaction'] - features['trend_dislocation']
+
+        print(f"   Top discovered interactions added: 10 new features")
+
+        # NOTE: Super-features moved to end of feature creation (after range_mean_3d is defined)
 
         # =================================================================
         # DOWNTREND INTERACTION TERMS (configurable - low importance)
@@ -1777,6 +2139,266 @@ class PriceRangePredictor:
                 for col in ['earnings_month', 'week_of_month', 'earnings_week', 'opex_month', 'opex_week']:
                     features[col] = 0
 
+        # =================================================================
+        # AUTO-DISCOVERED HIGH-CORRELATION FEATURES
+        # From automated feature discovery testing 140+ combinations
+        # These features showed significantly higher correlation with targets
+        # =================================================================
+        print("   Adding auto-discovered high-correlation features...")
+
+        # 1. range_mean_3d: ALREADY DEFINED EARLY (line 766) for RSI-normalized features
+        # Short-term range momentum - very predictive of next day's range
+
+        # 2. range_momentum_high_vol: Range momentum in high volatility regime (+0.775 correlation)
+        # Range * ROC interaction, but only during high VIX periods
+        # High vol regime makes range momentum much more predictive
+        if 'vix_regime_high' in features.columns:
+            features['range_momentum_high_vol'] = features['range_momentum'] * features['vix_regime_high']
+        else:
+            # Fallback: use volatility_20d > 80th percentile
+            vol_high = (features['volatility_20d'] > features['volatility_20d'].rolling(60).quantile(0.8)).astype(int)
+            features['range_momentum_high_vol'] = features['range_momentum'] * vol_high
+
+        # 3. upside_potential_high_vol: Upside potential in high volatility regime (+0.746 correlation)
+        # Room to run higher, but only matters in high vol environment
+        if 'vix_regime_high' in features.columns:
+            features['upside_potential_high_vol'] = features['upside_potential'] * features['vix_regime_high']
+        else:
+            vol_high = (features['volatility_20d'] > features['volatility_20d'].rolling(60).quantile(0.8)).astype(int)
+            features['upside_potential_high_vol'] = features['upside_potential'] * vol_high
+
+        # 4. upside_potential_x_price_vs_sma50: Interaction term (+0.656 correlation)
+        # Upside potential is more meaningful when price is above/below 50 SMA
+        # Above SMA50 + high upside potential = strong bullish, wider high range expected
+        features['upside_potential_x_price_vs_sma50'] = features['upside_potential'] * features['price_vs_sma50']
+
+        # Additional discovered interactions from correlation analysis
+        # 5. downside_potential_high_vol: Symmetric to upside for bearish setups
+        if 'vix_regime_high' in features.columns:
+            features['downside_potential_high_vol'] = features['downside_potential'] * features['vix_regime_high']
+        else:
+            vol_high = (features['volatility_20d'] > features['volatility_20d'].rolling(60).quantile(0.8)).astype(int)
+            features['downside_potential_high_vol'] = features['downside_potential'] * vol_high
+
+        # 6. range_mean_3d_high_vol: Short-term range in high vol regime
+        if 'vix_regime_high' in features.columns:
+            features['range_mean_3d_high_vol'] = features['range_mean_3d'] * features['vix_regime_high']
+        else:
+            vol_high = (features['volatility_20d'] > features['volatility_20d'].rolling(60).quantile(0.8)).astype(int)
+            features['range_mean_3d_high_vol'] = features['range_mean_3d'] * vol_high
+
+        # =================================================================
+        # ADDITIONAL AUTO-DISCOVERED FEATURES (Round 2)
+        # From comprehensive feature discovery testing 140+ combinations
+        # =================================================================
+
+        # Get vol_high for regime features (reuse if already computed)
+        if 'vix_regime_high' in features.columns:
+            vol_high = features['vix_regime_high']
+        else:
+            vol_high = (features['volatility_20d'] > features['volatility_20d'].rolling(60).quantile(0.8)).astype(int)
+
+        # 7. Triple interaction: upside_potential × price_vs_sma50 × high_vol (-0.796 correlation!)
+        # Strongest predictor found - captures regime-dependent trend exhaustion
+        features['upside_potential_x_sma50_high_vol'] = (
+            features['upside_potential'] * features['price_vs_sma50'] * vol_high
+        )
+
+        # 8. Double regime: range_momentum_high_vol × high_vol again (+0.786)
+        # Amplifies signal during extremely high vol (VIX spikes)
+        features['range_momentum_double_high_vol'] = features['range_momentum_high_vol'] * vol_high
+
+        # 9. Double regime: upside_potential_high_vol × high_vol (+0.733)
+        features['upside_potential_double_high_vol'] = features['upside_potential_high_vol'] * vol_high
+
+        # 10-11. Rolling max and mean features - ALREADY DEFINED EARLY (lines 768-773)
+        # range_max_3d, range_max_5d, range_mean_7d moved to line 768 for RSI-normalized features
+
+        # 12. Interaction difference: momentum vs trend signal (+0.643)
+        # Captures divergence between range momentum and trend position
+        features['momentum_trend_divergence'] = (
+            features['range_momentum_high_vol'] - features['upside_potential_x_price_vs_sma50']
+        )
+
+        # 12b. NEW TOP FEATURE: momentum_trend_divergence × high_vol (+0.811 correlation)
+        # This was discovered as the #1 new feature in auto-discovery
+        # Captures divergence amplified during high volatility regimes
+        features['momentum_trend_divergence_high_vol'] = features['momentum_trend_divergence'] * vol_high
+
+        # 13. Volume level features - 3-week volume regime (+0.503)
+        if 'volume' in df.columns:
+            vol_3w_avg = df['volume'].rolling(15).mean()
+            vol_3w_std = df['volume'].rolling(15).std()
+            features['vol_level_3w'] = (df['volume'] - vol_3w_avg) / (vol_3w_std + 1)
+            features['vol_level_3w_zscore'] = features['vol_level_3w'].rolling(5).mean()
+
+        # 14. Range acceleration - 2nd derivative of range (rate of change of range momentum)
+        features['range_accel'] = features['range_mean_3d'].diff().diff()
+        features['range_accel_high_vol'] = features['range_accel'] * vol_high
+
+        # 15. Lag features for top performers (high correlation with lags)
+        features['upside_potential_x_sma50_lag1'] = features['upside_potential_x_price_vs_sma50'].shift(1)
+        features['range_momentum_high_vol_lag1'] = features['range_momentum_high_vol'].shift(1)
+
+        # =================================================================
+        # DOWNSIDE-SPECIFIC FEATURES
+        # These are designed to improve low predictions which typically have
+        # worse R² than high predictions due to market asymmetry
+        # =================================================================
+
+        # 16. Drawdown from recent high - how far has price fallen
+        # Larger drawdowns often precede larger downside range
+        rolling_high_20d = df['high'].rolling(20).max()
+        features['drawdown_from_high_20d'] = (df['close'] - rolling_high_20d) / rolling_high_20d * 100
+
+        # 17. Down days ratio - what % of recent days were down
+        # Higher ratio suggests continued selling pressure
+        is_down_day = (df['close'] < df['open']).astype(int)
+        features['down_days_ratio_5d'] = is_down_day.rolling(5).mean()
+        features['down_days_ratio_10d'] = is_down_day.rolling(10).mean()
+
+        # 18. Gap indicators - gaps often indicate fear/panic
+        features['gap_pct'] = (df['open'] - df['close'].shift(1)) / df['close'].shift(1) * 100
+        features['gap_down'] = (features['gap_pct'] < 0).astype(int) * features['gap_pct'].abs()
+
+        # 19. Downside momentum - rate of decline
+        features['downside_momentum_3d'] = features['downside_potential'].diff(3)
+        features['downside_momentum_high_vol'] = features['downside_momentum_3d'] * vol_high
+
+        # 20. Lower low indicator - consecutive lower lows
+        is_lower_low = (df['low'] < df['low'].shift(1)).astype(int)
+        features['lower_low_streak'] = is_lower_low.rolling(5).sum()
+
+        # 21. Close relative to day's range - near low suggests fear
+        day_range = df['high'] - df['low']
+        features['close_position_in_range'] = (df['close'] - df['low']) / (day_range + 0.001)
+
+        # 22. VIX acceleration - sudden VIX spikes precede large lows
+        if 'vix' in features.columns and features['vix'].notna().any():
+            features['vix_accel'] = features['vix'].diff().diff()
+            features['vix_accel_high_vol'] = features['vix_accel'] * vol_high
+
+        # =================================================================
+        # FEAR/PANIC FEATURES (To specifically improve LOW predictions)
+        # Analysis showed LOW model has R² = -0.17 vs HIGH R² = 0.23
+        # These features capture fear dynamics missing from the model
+        # =================================================================
+
+        # 23. Fear Index - combination of VIX spike and volume spike
+        # Panic selling shows both high VIX velocity and abnormal volume
+        if 'vix' in features.columns and features['vix'].notna().any():
+            vix_velocity = features['vix'].diff().fillna(0)
+            volume_spike_indicator = (features['volume_zscore'] > 1.5).astype(float)
+            features['fear_index'] = vix_velocity * volume_spike_indicator
+            features['fear_index_smooth'] = features['fear_index'].rolling(3).mean()
+
+        # 24. Panic Signal - 3+ consecutive down days triggers panic mode
+        features['panic_signal'] = (features['consecutive_down'] >= 3).astype(int)
+        features['panic_intensity'] = features['consecutive_down'] * features['down_days_ratio_5d']
+
+        # 25. Gap Down Magnitude - large gap downs signal fear
+        features['gap_down_magnitude'] = features['gap_pct'].clip(upper=0).abs()
+        features['gap_down_cumulative_3d'] = features['gap_down_magnitude'].rolling(3).sum()
+
+        # 26. Capitulation Signal - extreme volume + down day + VIX spike
+        extreme_volume = (features['volume_zscore'] > 2.0).astype(float)
+        down_day = (df['close'] < df['open']).astype(float)
+        if 'vix' in features.columns and features['vix'].notna().any():
+            vix_spike = (features['vix_zscore'] > 1.5).astype(float)
+            features['capitulation_signal'] = extreme_volume * down_day * vix_spike
+        else:
+            features['capitulation_signal'] = extreme_volume * down_day
+
+        # 27. Sell Pressure - combination of indicators suggesting selling
+        features['sell_pressure'] = (
+            features['down_days_ratio_5d'] * 0.3 +
+            features['lower_low_streak'] / 5 * 0.3 +
+            (1 - features['close_position_in_range']) * 0.4
+        )
+
+        # 28. RSI-adjusted downside (low RSI + high range = more downside coming)
+        if 'rsi_14' in features.columns:
+            rsi_low_indicator = (features['rsi_14'] < 35).astype(float)
+            features['rsi_adjusted_downside'] = features['downside_potential'] * (1 + rsi_low_indicator)
+            features['oversold_range'] = features['daily_range'] * rsi_low_indicator
+
+        # 29. Breakdown Signal - price below multiple support levels
+        sma_20_below = (df['close'] < features['sma_20']).astype(float)
+        sma_50_below = (df['close'] < features['sma_50']).astype(float) if 'sma_50' in features.columns else 0
+        features['breakdown_signal'] = sma_20_below + sma_50_below
+
+        # 30. Range Expansion in Downtrend - range expands more in fear
+        features['downtrend_range_expansion'] = features['is_downtrend'] * features['range_zscore']
+
+        # =================================================================
+        # MULTI-TIMEFRAME FEAR FEATURES (Different lookback periods)
+        # Short-term (1-3d): Immediate panic detection
+        # Medium-term (5-10d): Sustained selling pressure
+        # Longer-term (20d): Regime change detection
+        # =================================================================
+
+        # Gap down cumulative at different horizons
+        features['gap_down_cumulative_5d'] = features['gap_down_magnitude'].rolling(5).sum()
+        features['gap_down_cumulative_10d'] = features['gap_down_magnitude'].rolling(10).sum()
+
+        # Down days ratio at multiple lookbacks
+        is_down_day = (df['close'] < df['open']).astype(int)
+        features['down_days_ratio_3d'] = is_down_day.rolling(3).mean()
+        features['down_days_ratio_10d'] = is_down_day.rolling(10).mean()
+        features['down_days_ratio_20d'] = is_down_day.rolling(20).mean()
+
+        # Fear index at different smoothing levels
+        if 'vix' in features.columns and features['vix'].notna().any():
+            features['fear_index_smooth_5d'] = features['fear_index'].rolling(5).mean()
+            features['fear_index_smooth_10d'] = features['fear_index'].rolling(10).mean()
+            features['fear_index_max_5d'] = features['fear_index'].rolling(5).max()
+
+        # Panic signal variants (different thresholds)
+        features['panic_signal_2d'] = (features['consecutive_down'] >= 2).astype(int)
+        features['panic_signal_4d'] = (features['consecutive_down'] >= 4).astype(int)
+        features['panic_signal_5d'] = (features['consecutive_down'] >= 5).astype(int)
+
+        # Sell pressure at different horizons
+        features['sell_pressure_3d'] = (
+            features['down_days_ratio_3d'] * 0.3 +
+            features['lower_low_streak'] / 3 * 0.3 +
+            (1 - features['close_position_in_range']) * 0.4
+        )
+        features['sell_pressure_10d'] = (
+            features['down_days_ratio_10d'] * 0.3 +
+            features['lower_low_streak'] / 5 * 0.3 +
+            (1 - features['close_position_in_range']) * 0.4
+        )
+
+        # VIX velocity at different lookbacks
+        if 'vix' in features.columns and features['vix'].notna().any():
+            features['vix_velocity_1d'] = features['vix'].diff(1)
+            features['vix_velocity_3d'] = features['vix'].diff(3)
+            features['vix_velocity_10d'] = features['vix'].diff(10)
+            features['vix_acceleration_3d'] = features['vix_velocity_3d'].diff()
+
+        # Drawdown velocity (how fast is price falling from high)
+        features['drawdown_velocity_3d'] = features['drawdown_from_high_20d'].diff(3)
+        features['drawdown_velocity_5d'] = features['drawdown_from_high_20d'].diff(5)
+        features['drawdown_accel'] = features['drawdown_velocity_3d'].diff()
+
+        # Volume-weighted fear (fear matters more with high volume)
+        features['vol_weighted_panic'] = features['panic_intensity'] * features['volume_rel']
+        features['vol_weighted_sell_pressure'] = features['sell_pressure'] * features['volume_rel']
+
+        # Lower low streak at different windows
+        is_lower_low = (df['low'] < df['low'].shift(1)).astype(int)
+        features['lower_low_streak_3d'] = is_lower_low.rolling(3).sum()
+        features['lower_low_streak_10d'] = is_lower_low.rolling(10).sum()
+
+        # Close position in range - rolling versions
+        features['close_pos_min_5d'] = features['close_position_in_range'].rolling(5).min()
+        features['close_pos_mean_5d'] = features['close_position_in_range'].rolling(5).mean()
+
+        print(f"   Fear/panic features added: 40+ new features for LOW prediction")
+        print(f"   Downside-specific features added: 10 new features for low prediction")
+        print(f"   Auto-discovered features added (Round 2): {len([c for c in features.columns if 'double_high_vol' in c or 'range_max' in c or 'range_mean_7d' in c])} new features")
+
         # --- Lagged features (configurable - adds ~12 features, low importance) ---
         if FEATURE_CONFIG.get('lag_features', False):
             for lag in [1, 2, 3]:
@@ -1787,6 +2409,129 @@ class PriceRangePredictor:
             if 'vix' in features.columns and features['vix'].notna().any():
                 for lag in [1, 2]:
                     features[f'vix_lag_{lag}'] = features['vix'].shift(lag)
+
+        # --- Deep Learning Features (CNN+LSTM embeddings) ---
+        if FEATURE_CONFIG.get('dl_features', False) and DL_FEATURE_AVAILABLE:
+            try:
+                print("   Generating deep learning embeddings...")
+
+                # Initialize DL extractor with 60-day lookback (enables 2 CNN branches)
+                # and 12 embedding dims for richer representation
+                dl_extractor = DLFeatureExtractor(sequence_length=60, encoding_dim=12)
+
+                # EXPANDED input features for DL model - include more informative signals
+                dl_input_cols = [
+                    # Core volatility & range features
+                    'atr_14_pct', 'volatility_5d', 'volatility_20d', 'vol_ratio',
+                    'daily_range_pct', 'range_zscore', 'range_mean_5d', 'range_std_5d',
+                    # Momentum indicators
+                    'rsi_14', 'roc_5', 'roc_10', 'roc_20',
+                    # Price position features
+                    'volume_rel', 'price_vs_sma20', 'price_vs_sma50',
+                    'price_position', 'upside_potential', 'drawdown_from_high_20d',
+                    # Fear/sentiment features
+                    'consecutive_down', 'sell_pressure', 'panic_intensity'
+                ]
+                dl_input_cols = [c for c in dl_input_cols if c in features.columns]
+
+                if len(dl_input_cols) >= 8:  # Need at least 8 features
+                    # Create DL embeddings with more epochs for better training
+                    dl_embeddings = dl_extractor.generate_embeddings(
+                        features[dl_input_cols],
+                        epochs=20,  # Increased from 10 for better learning
+                        verbose=0,
+                        train=True
+                    )
+
+                    # Fix NaN/Inf issues in DL embeddings
+                    dl_embeddings = dl_embeddings.replace([np.inf, -np.inf], np.nan)
+                    dl_embeddings = dl_embeddings.fillna(0)
+                    # Clip extreme values to prevent numerical issues
+                    for col in dl_embeddings.columns:
+                        dl_embeddings[col] = dl_embeddings[col].clip(-10, 10)
+
+                    # Add to features (DL_pred_0 through DL_pred_11 with 12 dims)
+                    for col in dl_embeddings.columns:
+                        features[col] = dl_embeddings[col]
+
+                    print(f"   DL embeddings added: {len(dl_embeddings.columns)} features "
+                          f"(seq_len=60, input_features={len(dl_input_cols)})")
+
+                    # Collect for summary
+                    _training_summary.data['dl_samples'] = len(dl_embeddings)
+
+                    # Store the extractor for later inference
+                    self._dl_extractor = dl_extractor
+                else:
+                    print(f"   DL features skipped: insufficient input features ({len(dl_input_cols)}/8 required)")
+            except Exception as dl_err:
+                print(f"   DL feature error: {dl_err}")
+                # Don't fail - just skip DL features
+
+        # =================================================================
+        # COMPOSITE SUPER-FEATURES (Fix for XGBoost collinearity issue)
+        # XGBoost arbitrarily picks ONE from correlated feature groups.
+        # These super-features COMBINE the top correlated features so
+        # the model CANNOT ignore their collective predictive signal.
+        # Placed here (at end) to ensure all dependencies are defined.
+        # =================================================================
+
+        # Super-feature 1: Range-Upside Composite (top 3 range features)
+        # Combines: range_plus_upside (0.68), range_times_upside (0.68), daily_range_plus_upside (0.68)
+        features['super_range_upside'] = (
+            features['range_plus_upside'] +
+            features['range_times_upside'] +
+            features['daily_range_plus_upside']
+        ) / 3
+
+        # Super-feature 2: Vol-Regime Composite (vol regime features)
+        # Combines: vol_regime_minus_position (0.68), vol_regime_minus_trend (0.65), vol_regime_interaction (0.64)
+        features['super_vol_regime'] = (
+            features['vol_regime_minus_position'] +
+            features['vol_regime_minus_trend'] +
+            features['vol_regime_interaction']
+        ) / 3
+
+        # Super-feature 3: Upside-ATR Composite (upside * volatility features)
+        # Combines: upside_times_atr7 (0.67), upside_times_atr14 (0.67), upside_plus_range_mean20 (0.67)
+        features['super_upside_vol'] = (
+            features['upside_times_atr7'] +
+            features['upside_times_atr14'] +
+            features['upside_plus_range_mean20']
+        ) / 3
+
+        # Super-feature 4: Master Composite (weighted average of all top features)
+        # This is the "nuclear option" - combines ALL top correlated features
+        features['super_master'] = (
+            features['vol_regime_minus_position'] * 0.15 +
+            features['range_plus_upside'] * 0.15 +
+            features['range_times_upside'] * 0.10 +
+            features['upside_times_atr7'] * 0.10 +
+            features['upside_times_atr14'] * 0.10 +
+            features['range_mean_3d'] * 0.10 +
+            features['momentum_trend_divergence'] * 0.10 +
+            features['vol_regime_interaction'] * 0.10 +
+            features['upside_potential'] * 0.10
+        )
+
+        # Standardize super-features for better model performance
+        for sf in ['super_range_upside', 'super_vol_regime', 'super_upside_vol', 'super_master']:
+            sf_mean = features[sf].rolling(20).mean()
+            sf_std = features[sf].rolling(20).std()
+            features[f'{sf}_zscore'] = (features[sf] - sf_mean) / (sf_std + 1e-8)
+
+        print(f"   Super-features added: 8 composite features (4 raw + 4 z-scored)")
+
+        # --- Feature Pruning (remove zero-importance features) ---
+        if FEATURE_CONFIG.get('prune_zero_importance', True):
+            pruned_count = 0
+            for feat_to_remove in ZERO_IMPORTANCE_FEATURES:
+                if feat_to_remove in features.columns:
+                    features.drop(columns=[feat_to_remove], inplace=True)
+                    pruned_count += 1
+            if pruned_count > 0:
+                print(f"   Pruned {pruned_count} zero-importance features")
+                _training_summary.data['features_pruned_zero_imp'] = pruned_count
 
         # Store feature names (excluding target-related columns)
         self.feature_names = [col for col in features.columns
@@ -1825,7 +2570,7 @@ class PriceRangePredictor:
 
     def train_range_model(self, df: pd.DataFrame, options_features: Dict = None,
                           n_trials: int = 30, n_workers: int = None, progress_callback=None,
-                          feature_selection: bool = True) -> Dict:
+                          feature_selection: bool = True, optimize_highlow: bool = True) -> Dict:
         """
         Train XGBRegressor to predict next day's range.
 
@@ -1836,6 +2581,8 @@ class PriceRangePredictor:
             n_workers: Number of parallel workers for Optuna (default: CPU cores - 1)
             progress_callback: Optional callback for progress updates
             feature_selection: Whether to apply feature selection (default True, disable for walk-forward stability)
+            optimize_highlow: Whether to run separate optimization for HIGH/LOW models (default True).
+                              Set to False for faster training (~40% speedup) at slight accuracy cost.
 
         Returns:
             dict with model, metrics, feature_importances
@@ -1849,9 +2596,24 @@ class PriceRangePredictor:
         import optuna
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+        # Reset training summary for this run
+        _training_summary.reset()
+        _training_summary.data['total_rows'] = len(df)
+
         # Create features and targets
         features = self.create_range_features(df, options_features)
         targets = self.create_targets(df)
+
+        # Collect feature health data for summary
+        _training_summary.data['features_created'] = len(self.feature_names)
+        if 'vix' in features.columns:
+            _training_summary.data['vix_value'] = features['vix'].iloc[-1] if not features['vix'].isna().all() else 0
+        if 'dxy' in features.columns:
+            _training_summary.data['dxy_value'] = features['dxy'].iloc[-1] if not features['dxy'].isna().all() else 0
+        # Check IV fallback (if iv_weighted == volatility_20d, it's fallback)
+        if 'iv_weighted' in features.columns and 'volatility_20d' in features.columns:
+            iv_match = (features['iv_weighted'] == features['volatility_20d']).mean() * 100
+            _training_summary.data['iv_fallback_pct'] = iv_match
 
         # Align and clean
         # IMPORTANT: Use next_range_pct (percentage) for training - XGBoost struggles with tiny values
@@ -1868,28 +2630,79 @@ class PriceRangePredictor:
         X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
         y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 
-        # CORRELATION-BASED FEATURE SELECTION
-        # With limited training data (e.g., 180 days), using 184 features causes overfitting
-        # Select top N features by correlation with target (calculated on training data only)
+        # Collect sample counts for summary
+        _training_summary.data['training_samples'] = len(X_train)
+        _training_summary.data['test_samples'] = len(X_test)
+
+        # FEATURE SELECTION - DISABLED BY DEFAULT
+        # Testing showed ALL FEATURES performs BEST:
+        #   OLD (33→30 features):  R² = 0.256
+        #   MEDIUM (167→109):      R² = 0.368
+        #   ALL (214→214):         R² = 0.423  (+65% vs OLD!)
+        #
+        # XGBoost has built-in regularization (reg_alpha, reg_lambda, max_depth)
+        # that handles high-dimensional data well. Feature selection was causing underfitting.
         n_train = len(X_train)
-        max_features = min(50, max(10, n_train // 10))  # 10-50 features based on data size
+        n_features_total = len(self.feature_names)
 
+        # Compute correlations for reference/debugging only
         correlations = X_train.corrwith(y_train).abs().sort_values(ascending=False)
-        top_features = correlations.head(max_features).index.tolist()
-
-        # Store for later use
-        self.correlation_selected_features = top_features
         self.feature_correlations = correlations
 
-        print(f"\n[CORRELATION SELECTION] Training samples: {n_train}, selecting top {max_features} features")
-        print(f"   Top 5: {top_features[:5]}")
-        print(f"   Correlations: {[f'{correlations[f]:.3f}' for f in top_features[:5]]}")
+        # =================================================================
+        # CORRELATION-BASED FEATURE PRUNING
+        # Remove redundant features that are >0.95 correlated with each other
+        # This prevents XGBoost from arbitrarily picking one and ignoring others
+        # =================================================================
+        print(f"\n[FEATURE PRUNING] Removing redundant highly-correlated features...")
 
-        # Use only selected features
+        # Compute feature-feature correlation matrix
+        feature_corr_matrix = X_train.corr().abs()
+
+        # Find features to drop (keep higher target-correlated one from each pair)
+        features_to_drop = set()
+        feature_list = list(X_train.columns)
+
+        for i, feat_i in enumerate(feature_list):
+            if feat_i in features_to_drop:
+                continue
+            for j, feat_j in enumerate(feature_list[i+1:], i+1):
+                if feat_j in features_to_drop:
+                    continue
+                # Check if features are highly correlated with each other
+                if feature_corr_matrix.loc[feat_i, feat_j] > 0.95:
+                    # Keep the one with higher target correlation
+                    corr_i = correlations.get(feat_i, 0)
+                    corr_j = correlations.get(feat_j, 0)
+                    if corr_i >= corr_j:
+                        features_to_drop.add(feat_j)
+                    else:
+                        features_to_drop.add(feat_i)
+
+        # Apply pruning
+        if len(features_to_drop) > 0:
+            print(f"   Dropping {len(features_to_drop)} redundant features (>0.95 inter-correlation)")
+            top_features = [f for f in self.feature_names if f not in features_to_drop]
+        else:
+            top_features = self.feature_names
+
+        self.correlation_selected_features = top_features
+        self.training_feature_names = top_features
+        self.dropped_redundant_features = list(features_to_drop)
+
+        print(f"[FEATURES] Using {len(top_features)} features (pruned {len(features_to_drop)} redundant)")
+        print(f"   Training samples: {n_train}")
+        print(f"   Top 5 by correlation: {correlations.head(5).index.tolist()}")
+        print(f"   Correlations: {[f'{correlations[f]:.3f}' for f in correlations.head(5).index]}")
+
+        # Collect for summary
+        _training_summary.data['features_pruned_corr'] = len(features_to_drop)
+        _training_summary.data['features_used'] = len(top_features)
+        _training_summary.data['top_features_corr'] = [(f, correlations[f]) for f in correlations.head(10).index]
+
+        # Apply feature pruning to training/test data
         X_train = X_train[top_features]
         X_test = X_test[top_features]
-        self.feature_names = top_features  # Update feature names to selected subset
-        self.training_feature_names = top_features  # Store for prediction (won't be overwritten)
 
         # Scale features
         X_train_scaled = self.scaler.fit_transform(X_train)
@@ -1946,6 +2759,12 @@ class PriceRangePredictor:
         print(f"   Features used: {X_train_scaled.shape[1]} (all)")
         print(f"   Total time: {total_time:.1f}s ({total_completed/total_time:.1f} trials/sec)")
 
+        # Collect for summary
+        _training_summary.data['range_best_score'] = best_composite_score
+        _training_summary.data['range_trials'] = total_completed
+        _training_summary.data['range_opt_time'] = total_time
+        _training_summary.data['range_all_scores'] = [r.get('best_score', -r['best_value']) for r in results_list]
+
         # Collect all top trials from all workers for ensemble
         all_top_trials = []
         for result in results_list:
@@ -1982,73 +2801,355 @@ class PriceRangePredictor:
         self.range_model = self.ensemble_models[0]  # Best model is primary
         print(f"[DEBUG] Primary model params: {best_params}")
 
-        # Feature Selection: Optionally select top features based on importance
-        # This can reduce overfitting but may cause instability in walk-forward
-        if feature_selection:
-            feature_importance = self.range_model.feature_importances_
-            importance_df = pd.DataFrame({
-                'feature': self.feature_names,
-                'importance': feature_importance
-            }).sort_values('importance', ascending=False)
+        # Feature Selection: DISABLED
+        # Testing showed ALL features performs best (R² = 0.423 vs 0.256 with selection)
+        # XGBoost's built-in regularization handles high-dimensional data well.
+        # Keeping this code structure but always using all features.
 
-            # Select top features (cumulative importance >= 90% or at least 30 features)
-            cumulative_importance = importance_df['importance'].cumsum() / importance_df['importance'].sum()
-            n_features_90pct = (cumulative_importance < 0.90).sum() + 1
-            n_selected = max(30, min(n_features_90pct, 60))  # Between 30 and 60 features
+        # Log feature importance for reference
+        # Use training_feature_names (after pruning) to match model's feature count
+        feature_importance = self.range_model.feature_importances_
+        training_features = getattr(self, 'training_feature_names', None) or self.feature_names
+        importance_df = pd.DataFrame({
+            'feature': training_features,
+            'importance': feature_importance
+        }).sort_values('importance', ascending=False)
 
-            selected_features = importance_df.head(n_selected)['feature'].tolist()
-            selected_indices = [self.feature_names.index(f) for f in selected_features]
+        nonzero_features = importance_df[importance_df['importance'] > 0]['feature'].tolist()
 
-            print(f"\n[FEATURE SELECTION] Selecting top {n_selected} features (90% cumulative importance = {n_features_90pct})")
-            print(f"   Top 5: {selected_features[:5]}")
+        print(f"\n[FEATURES] Using ALL {len(self.feature_names)} features (importance-based selection DISABLED)")
+        print(f"   Non-zero importance: {len(nonzero_features)}/{len(self.feature_names)}")
+        print(f"   Top 5 by importance: {importance_df.head(5)['feature'].tolist()}")
 
-            # Retrain ensemble with selected features only
-            X_train_selected = X_train_scaled[:, selected_indices]
-            X_test_selected = X_test_scaled[:, selected_indices]
+        # No feature filtering - use all
+        self.selected_features = []
+        self.selected_indices = []
 
-            self.ensemble_models = []  # Reset ensemble
-            for i, trial in enumerate(top_3_trials):
-                params = trial['params'].copy()
-                params['n_jobs'] = 1
-                params['objective'] = 'reg:squarederror'
-                params['verbosity'] = 0
+        # Get high/low targets aligned with training data (needed for both optimization and model training)
+        y_high_full = targets['next_high_pct'].copy()
+        y_low_full = targets['next_low_pct'].copy()
+        y_high_valid = y_high_full.loc[valid_idx]
+        y_low_valid = y_low_full.loc[valid_idx]
+        y_high_train = y_high_valid.iloc[:split_idx]
+        y_low_train = y_low_valid.iloc[:split_idx]
 
-                model = xgb.XGBRegressor(**params)
-                model.fit(X_train_selected, y_train)
-                self.ensemble_models.append(model)
+        # Handle any length mismatches
+        if len(y_high_train) != X_train_scaled.shape[0]:
+            y_high_train = targets['next_high_pct'].loc[y.iloc[:split_idx].index]
+            y_low_train = targets['next_low_pct'].loc[y.iloc[:split_idx].index]
 
-            self.range_model = self.ensemble_models[0]
-            self.selected_features = selected_features
-            self.selected_indices = selected_indices
-            print(f"   Ensemble retrained with {n_selected} features")
+        # Convert to numpy arrays
+        y_high_train_arr = y_high_train.values if hasattr(y_high_train, 'values') else y_high_train
+        y_low_train_arr = y_low_train.values if hasattr(y_low_train, 'values') else y_low_train
 
-            # Update test data for evaluation
-            X_test_scaled = X_test_selected
-            X_train_scaled = X_train_selected
-        else:
-            # No feature selection - use all features
-            self.selected_features = []
-            self.selected_indices = []
-            print(f"\n[FEATURE SELECTION] Disabled - using all {len(self.feature_names)} features")
+        # =================================================================
+        # HIGH/LOW SPECIFIC OPTIMIZATION (optional)
+        # Optimize hyperparameters directly for predicting high/low
+        # instead of reusing range-optimized params (which was causing lower R²)
+        # =================================================================
+        if optimize_highlow:
+            print("\n[HIGH/LOW OPTIMIZATION] Training dedicated models for high and low prediction...")
 
-        # Wrap with MAPIE for conformal prediction intervals
-        # Note: MAPIE 1.2.0+ uses SplitConformalRegressor with different API
-        self.conformal_model = None
-        self.conformal_confidence = 0.9  # Store confidence level for prediction
-        if MAPIE_AVAILABLE:
+            # Save data for parallel workers
+            # Use training_feature_names (after pruning) to match X_train_scaled columns
+            training_features = getattr(self, 'training_feature_names', None) or self.feature_names
+            highlow_data_path = optuna_worker.set_highlow_shared_data(
+                X_train_scaled, y_high_train_arr, y_low_train_arr, training_features
+            )
+
+            # Use same parallelization pattern as RANGE optimization:
+            # Spawn multiple joblib workers, each running their own Optuna study
+            total_hl_trials = max(n_trials // 2, 50)  # Total trials for each target
+            trials_per_worker = max(3, total_hl_trials // n_workers)
+            actual_trials = trials_per_worker * n_workers
+
+            print(f"   HIGH: {actual_trials} trials across {n_workers} workers ({trials_per_worker}/worker)")
+
             try:
-                print("[DEBUG] Fitting conformal prediction model (MAPIE)...")
-                self.conformal_model = MapieRegressor(
-                    estimator=self.range_model,
-                    confidence_level=0.9,  # 90% confidence intervals
-                    prefit=True,  # Model is already fitted
-                    n_jobs=1
+                # HIGH optimization - parallel workers
+                from joblib import Parallel, delayed
+                high_results = Parallel(n_jobs=n_workers, backend='loky', verbose=0)(
+                    delayed(optuna_worker.run_highlow_study)(
+                        highlow_data_path, trials_per_worker, seed=42 + i, target='high', worker_id=i
+                    )
+                    for i in range(n_workers)
                 )
-                self.conformal_model.conformalize(X_train_scaled, y_train)
-                print("[DEBUG] Conformal model fitted successfully")
-            except Exception as mapie_err:
-                print(f"[DEBUG] MAPIE fitting failed: {mapie_err}")
-                self.conformal_model = None
+
+                # Find best HIGH result across all workers
+                best_high = max(high_results, key=lambda x: x['best_score'])
+                if best_high and best_high['best_params']:
+                    self.high_best_params = best_high['best_params'].copy()
+                    self.high_best_params['n_jobs'] = 1
+                    self.high_best_params['objective'] = 'reg:squarederror'
+                    self.high_best_params['verbosity'] = 0
+                    print(f"   HIGH optimization: Score={best_high['best_score']:.4f}")
+                    # Collect for summary
+                    _training_summary.data['high_best_score'] = best_high['best_score']
+                    _training_summary.data['high_all_scores'] = [r['best_score'] for r in high_results]
+                else:
+                    self.high_best_params = best_params.copy()
+                    print(f"   HIGH optimization: Using range params (fallback)")
+
+                print(f"   LOW: {actual_trials} trials across {n_workers} workers ({trials_per_worker}/worker)")
+
+                # LOW optimization - parallel workers
+                low_results = Parallel(n_jobs=n_workers, backend='loky', verbose=0)(
+                    delayed(optuna_worker.run_highlow_study)(
+                        highlow_data_path, trials_per_worker, seed=142 + i, target='low', worker_id=i
+                    )
+                    for i in range(n_workers)
+                )
+
+                # Find best LOW result across all workers
+                best_low = max(low_results, key=lambda x: x['best_score'])
+                if best_low and best_low['best_params']:
+                    self.low_best_params = best_low['best_params'].copy()
+                    self.low_best_params['n_jobs'] = 1
+                    self.low_best_params['objective'] = 'reg:squarederror'
+                    self.low_best_params['verbosity'] = 0
+                    print(f"   LOW optimization: Score={best_low['best_score']:.4f}")
+                    # Collect for summary
+                    _training_summary.data['low_best_score'] = best_low['best_score']
+                    _training_summary.data['low_all_scores'] = [r['best_score'] for r in low_results]
+                else:
+                    self.low_best_params = best_params.copy()
+                    print(f"   LOW optimization: Using range params (fallback)")
+
+            except Exception as hl_err:
+                print(f"   HIGH/LOW optimization failed: {hl_err}")
+                print(f"   Using range-optimized params as fallback")
+                self.high_best_params = best_params.copy()
+                self.low_best_params = best_params.copy()
+        else:
+            # Skip HIGH/LOW optimization - use range-optimized params
+            print("\n[HIGH/LOW MODELS] Using range-optimized params (optimize_highlow=False)")
+            self.high_best_params = best_params.copy()
+            self.low_best_params = best_params.copy()
+
+        # =================================================================
+        # ASYMMETRIC LOW MODEL ADJUSTMENTS
+        # Analysis showed LOW predictions have R² = -0.17 vs HIGH R² = 0.23
+        # LOW model needs more regularization to prevent overfitting to noise
+        # =================================================================
+        print("\n[ASYMMETRIC ADJUSTMENT] Applying LOW-specific hyperparameter tuning...")
+
+        # Increase regularization for LOW model (more prone to overfitting on volatile target)
+        self.low_best_params['reg_alpha'] = self.low_best_params.get('reg_alpha', 0.0) + 0.3  # L1 regularization
+        self.low_best_params['reg_lambda'] = max(self.low_best_params.get('reg_lambda', 1.0), 1.5)  # L2 regularization
+
+        # Reduce tree depth for LOW (simpler model = less overfitting)
+        if self.low_best_params.get('max_depth', 6) > 4:
+            self.low_best_params['max_depth'] = 4
+
+        # Slower learning rate for LOW (more careful fitting)
+        self.low_best_params['learning_rate'] = min(self.low_best_params.get('learning_rate', 0.1), 0.05)
+
+        # Increase min_child_weight for LOW (require more samples per leaf)
+        self.low_best_params['min_child_weight'] = max(self.low_best_params.get('min_child_weight', 1), 3)
+
+        # More subsampling for LOW (bagging helps with noisy targets)
+        self.low_best_params['subsample'] = min(self.low_best_params.get('subsample', 1.0), 0.7)
+        self.low_best_params['colsample_bytree'] = min(self.low_best_params.get('colsample_bytree', 1.0), 0.7)
+
+        print(f"   LOW adjusted: max_depth={self.low_best_params.get('max_depth')}, "
+              f"reg_alpha={self.low_best_params.get('reg_alpha'):.2f}, "
+              f"learning_rate={self.low_best_params.get('learning_rate'):.3f}")
+
+        # Train dedicated HIGH model with optimized params
+        print("\n[HIGH MODEL] Training with optimized hyperparameters...")
+        self.high_model = xgb.XGBRegressor(**self.high_best_params)
+        self.high_model.fit(X_train_scaled, y_high_train_arr)
+
+        # Train dedicated LOW model with optimized params
+        # =================================================================
+        # LOW MODEL ENSEMBLE (Multiple models for better LOW predictions)
+        # LOW predictions are harder - use ensemble to reduce variance
+        # =================================================================
+        print("[LOW MODEL ENSEMBLE] Training multiple models for robust LOW prediction...")
+
+        self.low_ensemble_models = []
+        ensemble_configs = [
+            # Config 1: Original optimized params
+            {'name': 'base', 'params': self.low_best_params.copy()},
+
+            # Config 2: Very conservative (more regularization)
+            {'name': 'conservative', 'params': {
+                **self.low_best_params,
+                'max_depth': 3,
+                'reg_alpha': self.low_best_params.get('reg_alpha', 0.3) + 0.5,
+                'reg_lambda': 2.0,
+                'learning_rate': 0.03,
+                'min_child_weight': 5,
+            }},
+
+            # Config 3: Different tree structure
+            {'name': 'wide_shallow', 'params': {
+                **self.low_best_params,
+                'max_depth': 2,
+                'n_estimators': self.low_best_params.get('n_estimators', 100) + 50,
+                'colsample_bytree': 0.5,
+                'subsample': 0.6,
+            }},
+
+            # Config 4: Focus on recent data (higher learning rate, fewer trees)
+            {'name': 'adaptive', 'params': {
+                **self.low_best_params,
+                'max_depth': 4,
+                'learning_rate': 0.08,
+                'n_estimators': 80,
+                'subsample': 0.8,
+            }},
+        ]
+
+        for config in ensemble_configs:
+            try:
+                model = xgb.XGBRegressor(**config['params'])
+                model.fit(X_train_scaled, y_low_train_arr)
+                self.low_ensemble_models.append({'name': config['name'], 'model': model, 'type': 'xgb'})
+                print(f"   LOW ensemble member '{config['name']}' (XGB) trained")
+            except Exception as e:
+                print(f"   LOW ensemble member '{config['name']}' failed: {e}")
+
+        # Add LightGBM to ensemble (handles collinearity differently than XGBoost)
+        if LGBM_AVAILABLE:
+            try:
+                lgb_params = {
+                    'objective': 'regression',
+                    'metric': 'rmse',
+                    'boosting_type': 'gbdt',
+                    'num_leaves': 31,
+                    'max_depth': 4,
+                    'learning_rate': 0.05,
+                    'n_estimators': 100,
+                    'min_child_samples': 10,
+                    'reg_alpha': 0.5,
+                    'reg_lambda': 1.0,
+                    'subsample': 0.7,
+                    'colsample_bytree': 0.7,
+                    'verbosity': -1,
+                    'force_col_wise': True,  # Better for small datasets
+                }
+                lgb_model = lgb.LGBMRegressor(**lgb_params)
+                lgb_model.fit(X_train_scaled, y_low_train_arr)
+                self.low_ensemble_models.append({'name': 'lightgbm', 'model': lgb_model, 'type': 'lgb'})
+                print(f"   LOW ensemble member 'lightgbm' (LGB) trained")
+            except Exception as e:
+                print(f"   LightGBM ensemble member failed: {e}")
+
+        # Primary LOW model is the first (base) for compatibility
+        if self.low_ensemble_models:
+            self.low_model = self.low_ensemble_models[0]['model']
+        else:
+            # Fallback: train single model
+            self.low_model = xgb.XGBRegressor(**self.low_best_params)
+            self.low_model.fit(X_train_scaled, y_low_train_arr)
+
+        print(f"   LOW ensemble: {len(self.low_ensemble_models)} models trained (XGB + LightGBM)")
+
+        # =================================================================
+        # REGIME DETECTION - DISABLED FOR HIGH MODEL
+        # Analysis showed regime detection hurt HIGH model (R² dropped 40%)
+        # but helped LOW model (R² improved 25%). Keep regime for LOW only.
+        # =================================================================
+        print("\n[REGIME DETECTION] Disabled for HIGH model (was hurting performance)")
+        print("   HIGH model will use base model only (R² was 0.30 before regime)")
+
+        self.vol_regime_thresholds = None
+        self.regime_high_models = {}  # Empty - HIGH won't use regime
+        self.regime_low_models = {}   # Could enable for LOW later if needed
+
+        # =================================================================
+        # QUANTILE REGRESSION FOR LEARNED CONFIDENCE BANDS
+        # Instead of heuristic z-scores, learn the prediction intervals
+        # directly from data using XGBoost's quantile objective
+        # =================================================================
+        print("\n[QUANTILE REGRESSION] Training models for learned confidence bands...")
+
+        # Train quantile models for different confidence levels
+        self.quantile_models = {}
+
+        # y_high_train_arr and y_low_train_arr were already prepared above
+        # Only proceed if we have valid targets
+        if y_high_train_arr is not None and y_low_train_arr is not None and len(y_high_train_arr) == X_train_scaled.shape[0]:
+
+            # Quantile levels for different confidence intervals
+            # For TRADING, tighter bands (50-68%) are more actionable
+            # For RISK MANAGEMENT, wider bands (80-95%) are safer
+            quantile_levels = {
+                0.50: (0.25, 0.75),  # 50% confidence - TIGHT, most actionable
+                0.68: (0.16, 0.84),  # 68% confidence - ~1 std dev, good balance
+                0.80: (0.10, 0.90),  # 80% confidence
+                0.90: (0.05, 0.95),  # 90% confidence
+                0.95: (0.025, 0.975) # 95% confidence - widest
+            }
+
+            # Use HIGH-optimized params for HIGH quantile models
+            quantile_high_params = self.high_best_params.copy()
+            quantile_high_params['objective'] = 'reg:quantileerror'
+            quantile_high_params['n_jobs'] = 1
+            quantile_high_params['verbosity'] = 0
+            # Reduce complexity slightly for quantile models
+            quantile_high_params['max_depth'] = min(quantile_high_params.get('max_depth', 6), 6)
+            quantile_high_params['n_estimators'] = min(quantile_high_params.get('n_estimators', 100), 100)
+
+            # Use LOW-optimized params for LOW quantile models
+            quantile_low_params = self.low_best_params.copy()
+            quantile_low_params['objective'] = 'reg:quantileerror'
+            quantile_low_params['n_jobs'] = 1
+            quantile_low_params['verbosity'] = 0
+            quantile_low_params['max_depth'] = min(quantile_low_params.get('max_depth', 6), 6)
+            quantile_low_params['n_estimators'] = min(quantile_low_params.get('n_estimators', 100), 100)
+
+            for conf_level, (q_low, q_high) in quantile_levels.items():
+                try:
+                    # Train lower quantile model for HIGH predictions (using HIGH-optimized params)
+                    params_high_lower = quantile_high_params.copy()
+                    params_high_lower['quantile_alpha'] = q_low
+                    model_high_lower = xgb.XGBRegressor(**params_high_lower)
+                    model_high_lower.fit(X_train_scaled, y_high_train_arr)
+
+                    # Train upper quantile model for HIGH predictions
+                    params_high_upper = quantile_high_params.copy()
+                    params_high_upper['quantile_alpha'] = q_high
+                    model_high_upper = xgb.XGBRegressor(**params_high_upper)
+                    model_high_upper.fit(X_train_scaled, y_high_train_arr)
+
+                    # Train lower quantile model for LOW predictions (using LOW-optimized params)
+                    params_low_lower = quantile_low_params.copy()
+                    params_low_lower['quantile_alpha'] = q_low
+                    model_low_lower = xgb.XGBRegressor(**params_low_lower)
+                    model_low_lower.fit(X_train_scaled, y_low_train_arr)
+
+                    # Train upper quantile model for LOW predictions
+                    params_low_upper = quantile_low_params.copy()
+                    params_low_upper['quantile_alpha'] = q_high
+                    model_low_upper = xgb.XGBRegressor(**params_low_upper)
+                    model_low_upper.fit(X_train_scaled, y_low_train_arr)
+
+                    self.quantile_models[conf_level] = {
+                        'high_lower': model_high_lower,  # 5th percentile of high
+                        'high_upper': model_high_upper,  # 95th percentile of high
+                        'low_lower': model_low_lower,    # 5th percentile of low
+                        'low_upper': model_low_upper,    # 95th percentile of low
+                        'quantiles': (q_low, q_high)
+                    }
+                    print(f"   {int(conf_level*100)}% CI: Trained 4 quantile models (q={q_low}, {q_high})")
+
+                except Exception as q_err:
+                    print(f"   {int(conf_level*100)}% CI: Failed - {q_err}")
+                    import traceback
+                    traceback.print_exc()
+
+            # Note: high_model and low_model are already trained above with
+            # dedicated hyperparameter optimization (not median quantile)
+
+        else:
+            print(f"   SKIPPED quantile training due to data issues")
+
+        print(f"[QUANTILE REGRESSION] Complete - {len(self.quantile_models)} confidence levels available")
+        print(f"[QUANTILE REGRESSION] Keys: {list(self.quantile_models.keys())}")
+        print(f"[QUANTILE REGRESSION] high_model is None: {self.high_model is None}")
+        print(f"[QUANTILE REGRESSION] low_model is None: {self.low_model is None}")
 
         # Evaluate on test set using ensemble average
         print("[DEBUG] Predicting on test set with ensemble...")
@@ -2078,13 +3179,26 @@ class PriceRangePredictor:
 
         # Feature importance (selected features)
         print("[DEBUG] Creating feature importance...")
-        # Use selected features if available, otherwise all features
-        feature_names_for_importance = self.selected_features if self.selected_features else self.feature_names
+        # Use training_feature_names (after pruning) to match model's feature count
+        feature_names_for_importance = getattr(self, 'training_feature_names', None) or self.feature_names
         importance = pd.DataFrame({
             'feature': feature_names_for_importance,
             'importance': self.range_model.feature_importances_
         }).sort_values('importance', ascending=False)
         print(f"[DEBUG] Top 3 features: {importance.head(3)['feature'].tolist()}")
+
+        # Collect final metrics for summary
+        _training_summary.data['test_r2'] = self.model_metrics['r2']
+        _training_summary.data['test_rmse'] = self.model_metrics['rmse_pct']
+        _training_summary.data['ensemble_size'] = len(self.ensemble_models)
+        _training_summary.data['low_ensemble_size'] = len(getattr(self, 'low_ensemble_models', []))
+        _training_summary.data['best_params'] = best_params
+        _training_summary.data['top_features_importance'] = importance.head(10)['feature'].tolist()
+        _training_summary.data['nonzero_importance_count'] = (importance['importance'] > 0).sum()
+        _training_summary.data['quantile_levels'] = list(getattr(self, 'quantile_models', {}).keys())
+
+        # Print the compact training summary
+        _training_summary.print_summary()
 
         print("[DEBUG] Returning result dict...")
         return {
@@ -2145,50 +3259,17 @@ class PriceRangePredictor:
         high_ratio = 0.55
         low_ratio = 0.45
 
-        # Convert confidence level to alpha for MAPIE
-        alpha = 1 - confidence_level  # e.g., 0.9 confidence -> 0.1 alpha
-
-        # Use conformal prediction if available, otherwise fall back to point prediction
+        # Make point prediction for range (used as fallback if quantile models unavailable)
         # IMPORTANT: Model was trained on PERCENTAGE target (1.0 = 1%), must convert back to fraction
-        conformal_bounds = None
-        if self.conformal_model is not None and MAPIE_AVAILABLE:
-            try:
-                print("[DEBUG predict] Using conformal prediction (MAPIE)...")
-                # MAPIE 1.2.0+ API: predict_interval returns (y_pred, y_intervals)
-                y_pred, y_intervals = self.conformal_model.predict_interval(X_scaled)
-                predicted_range_pct = y_pred[0]
-
-                # y_intervals shape: (n_samples, 2) -> [lower, upper]
-                range_lower_pct = y_intervals[0, 0]  # Lower bound (percentage)
-                range_upper_pct = y_intervals[0, 1]  # Upper bound (percentage)
-
-                # Convert from percentage to fraction
-                predicted_range = predicted_range_pct / 100.0
-                conformal_bounds = {
-                    'range_lower': range_lower_pct / 100.0,
-                    'range_upper': range_upper_pct / 100.0,
-                    'method': 'conformal'
-                }
-                print(f"[DEBUG predict] Conformal bounds (pct): [{range_lower_pct:.3f}%, {range_upper_pct:.3f}%]")
-            except Exception as conf_err:
-                print(f"[DEBUG predict] Conformal prediction failed: {conf_err}, using ensemble prediction")
-                # Use ensemble average if available
-                if hasattr(self, 'ensemble_models') and len(self.ensemble_models) > 1:
-                    predictions = np.array([m.predict(X_scaled)[0] for m in self.ensemble_models])
-                    predicted_range_pct = np.mean(predictions)
-                else:
-                    predicted_range_pct = self.range_model.predict(X_scaled)[0]
-                predicted_range = predicted_range_pct / 100.0  # Convert to fraction
+        print("[DEBUG predict] Making point prediction...")
+        # Use ensemble average if available
+        if hasattr(self, 'ensemble_models') and len(self.ensemble_models) > 1:
+            predictions = np.array([m.predict(X_scaled)[0] for m in self.ensemble_models])
+            predicted_range_pct = np.mean(predictions)
+            print(f"[DEBUG predict] Ensemble of {len(self.ensemble_models)} models averaged")
         else:
-            print("[DEBUG predict] Making point prediction...")
-            # Use ensemble average if available
-            if hasattr(self, 'ensemble_models') and len(self.ensemble_models) > 1:
-                predictions = np.array([m.predict(X_scaled)[0] for m in self.ensemble_models])
-                predicted_range_pct = np.mean(predictions)
-                print(f"[DEBUG predict] Ensemble of {len(self.ensemble_models)} models averaged")
-            else:
-                predicted_range_pct = self.range_model.predict(X_scaled)[0]
-            predicted_range = predicted_range_pct / 100.0  # Convert from percentage to fraction
+            predicted_range_pct = self.range_model.predict(X_scaled)[0]
+        predicted_range = predicted_range_pct / 100.0  # Convert from percentage to fraction
 
         print(f"[DEBUG predict] Predicted range: {predicted_range_pct:.3f}% ({predicted_range:.6f} fraction)")
 
@@ -2198,108 +3279,165 @@ class PriceRangePredictor:
         print(f"[DEBUG predict] High: ${predicted_high:.2f}, Low: ${predicted_low:.2f}")
 
         # ==========================================================================
-        # ADAPTIVE CONFIDENCE BANDS
-        # Band width adapts to current and predicted market conditions
+        # LEARNED CONFIDENCE BANDS (Quantile Regression)
+        # Band widths are learned from data, not heuristic multipliers
         # ==========================================================================
         #
-        # Factors that affect band width:
-        # 1. Predicted range - larger predicted moves = wider bands
-        # 2. Current volatility (VIX) - high vol regime = wider bands
-        # 3. Recent range volatility - unstable ranges = wider bands
-        # 4. Trend direction - asymmetric bands (wider in direction of risk)
+        # Quantile regression models predict actual percentiles of the distribution:
+        # - 90% CI: 5th and 95th percentiles
+        # - 80% CI: 10th and 90th percentiles
+        # - 95% CI: 2.5th and 97.5th percentiles
         #
-        # Base uncertainty = RMSE (historical prediction error)
-        # Adjusted uncertainty = base × volatility_multiplier × range_multiplier
+        # This approach learns heteroscedastic uncertainty (wider bands when
+        # the model should be less confident, tighter when more confident)
 
-        rmse = self.model_metrics.get('rmse', 0.005)  # ~0.5% default
+        # Debug: Check each condition for quantile bands
+        has_quantile_attr = hasattr(self, 'quantile_models')
+        has_conf_level = has_quantile_attr and confidence_level in self.quantile_models
+        has_high_model = hasattr(self, 'high_model') and self.high_model is not None
 
-        # --- 1. VOLATILITY REGIME MULTIPLIER ---
-        # Extract current VIX and volatility from features
-        vix_current = features['vix'].iloc[-1] if 'vix' in features.columns else 15
-        vix_avg = features['vix'].mean() if 'vix' in features.columns else 15
+        print(f"[DEBUG predict] Quantile check: has_attr={has_quantile_attr}, "
+              f"conf_level_exists={has_conf_level} (requested={confidence_level}), "
+              f"high_model_exists={has_high_model}")
+        if has_quantile_attr:
+            print(f"[DEBUG predict] Available confidence levels: {list(self.quantile_models.keys())}")
 
-        # Volatility ratio: >1 means higher than average vol
-        vol_ratio = vix_current / max(vix_avg, 10)
-        # Clamp between 0.7 and 1.8
-        vol_multiplier = max(0.7, min(1.8, vol_ratio))
+        use_quantile_bands = has_quantile_attr and has_conf_level and has_high_model
 
-        # --- 2. PREDICTED RANGE MULTIPLIER ---
-        # Larger predicted ranges have more uncertainty
-        avg_range = features['daily_range_pct'].mean() if 'daily_range_pct' in features.columns else 0.01
-        range_ratio = predicted_range / max(avg_range, 0.005)
-        # Clamp between 0.8 and 1.5
-        range_multiplier = max(0.8, min(1.5, range_ratio))
+        if use_quantile_bands:
+            print(f"[DEBUG predict] Using LEARNED confidence bands (quantile regression)")
 
-        # --- 3. RECENT RANGE STABILITY ---
-        # If recent ranges have been volatile, increase uncertainty
-        if 'daily_range_pct' in features.columns:
-            recent_range_std = features['daily_range_pct'].tail(10).std()
-            range_mean = features['daily_range_pct'].tail(10).mean()
-            cv = recent_range_std / max(range_mean, 0.005)  # Coefficient of variation
-            stability_multiplier = max(0.9, min(1.4, 1 + cv))
+            q_models = self.quantile_models[confidence_level]
+
+            # Get quantile predictions (in percentage)
+            high_lower_pct = q_models['high_lower'].predict(X_scaled)[0]
+            high_upper_pct = q_models['high_upper'].predict(X_scaled)[0]
+            low_lower_pct = q_models['low_lower'].predict(X_scaled)[0]
+            low_upper_pct = q_models['low_upper'].predict(X_scaled)[0]
+
+            # =================================================================
+            # REGIME-AWARE PREDICTION
+            # Detect current volatility regime and blend predictions
+            # =================================================================
+            current_regime = 'mid'  # Default
+            regime_weight = 0.0
+
+            if hasattr(self, 'vol_regime_thresholds') and self.vol_regime_thresholds is not None:
+                # Get current volatility from features
+                current_vol = None
+                if 'volatility_20d' in features.columns:
+                    current_vol = features['volatility_20d'].iloc[-1]
+                elif 'atr_14_pct' in features.columns:
+                    current_vol = features['atr_14_pct'].iloc[-1]
+
+                if current_vol is not None and not np.isnan(current_vol):
+                    thresholds = self.vol_regime_thresholds
+                    if current_vol >= thresholds['high']:
+                        current_regime = 'high_vol'
+                        # Weight based on how far into high-vol territory
+                        regime_weight = min(1.0, (current_vol - thresholds['high']) / (thresholds['high'] - thresholds['median']) * 0.5 + 0.5)
+                    elif current_vol <= thresholds['low']:
+                        current_regime = 'low_vol'
+                        regime_weight = min(1.0, (thresholds['low'] - current_vol) / (thresholds['median'] - thresholds['low']) * 0.5 + 0.5)
+                    print(f"   Regime detected: {current_regime} (vol={current_vol:.2f}%, weight={regime_weight:.2f})")
+
+            # Get median predictions for high/low with regime blending
+            base_high_pct = self.high_model.predict(X_scaled)[0]
+
+            # Blend with regime-specific model if available (conservative 30% max blend)
+            if (hasattr(self, 'regime_high_models') and
+                current_regime in self.regime_high_models and
+                regime_weight > 0.4):  # Only use regime model if weight > 40%
+
+                regime_high_pct = self.regime_high_models[current_regime].predict(X_scaled)[0]
+                # Blend: base * (1 - weight) + regime * weight (max 30% regime contribution)
+                blend_factor = regime_weight * 0.3  # Conservative: max 30% regime influence
+                pred_high_pct = base_high_pct * (1 - blend_factor) + regime_high_pct * blend_factor
+                print(f"   HIGH blended: base={base_high_pct:.3f}%, regime={regime_high_pct:.3f}% -> {pred_high_pct:.3f}%")
+            else:
+                pred_high_pct = base_high_pct
+
+            # LOW prediction uses ensemble if available
+            if hasattr(self, 'low_ensemble_models') and len(self.low_ensemble_models) > 1:
+                # Get predictions from all ensemble members
+                low_predictions = []
+                for member in self.low_ensemble_models:
+                    pred = member['model'].predict(X_scaled)[0]
+                    low_predictions.append(pred)
+
+                # Use median of ensemble (more robust than mean to outliers)
+                base_low_pct = np.median(low_predictions)
+
+                # Also store ensemble stats for debugging
+                low_ensemble_std = np.std(low_predictions)
+                low_ensemble_range = max(low_predictions) - min(low_predictions)
+                print(f"   LOW ensemble: median={base_low_pct:.3f}%, std={low_ensemble_std:.3f}%, range={low_ensemble_range:.3f}%")
+            else:
+                base_low_pct = self.low_model.predict(X_scaled)[0]
+
+            # Blend LOW with regime-specific model if available (conservative 30% max blend)
+            if (hasattr(self, 'regime_low_models') and
+                current_regime in self.regime_low_models and
+                regime_weight > 0.4):
+
+                regime_low_pct = self.regime_low_models[current_regime].predict(X_scaled)[0]
+                # Blend: base * (1 - weight) + regime * weight (max 30% regime contribution)
+                blend_factor = regime_weight * 0.3  # Conservative: max 30% regime influence
+                pred_low_pct = base_low_pct * (1 - blend_factor) + regime_low_pct * blend_factor
+                print(f"   LOW blended: base={base_low_pct:.3f}%, regime={regime_low_pct:.3f}% -> {pred_low_pct:.3f}%")
+            else:
+                pred_low_pct = base_low_pct
+
+            # Convert percentages to prices
+            # next_high_pct = (next_high - close) / close * 100
+            # So: next_high = close * (1 + next_high_pct / 100)
+            predicted_high = current_close * (1 + pred_high_pct / 100)
+            predicted_low = current_close * (1 - pred_low_pct / 100)  # Note: low is subtracted
+
+            high_lower = current_close * (1 + high_lower_pct / 100)
+            high_upper = current_close * (1 + high_upper_pct / 100)
+            low_lower = current_close * (1 - low_upper_pct / 100)  # Swap: upper quantile of low% = lower price
+            low_upper = current_close * (1 - low_lower_pct / 100)  # Swap: lower quantile of low% = upper price
+
+            # Calculate uncertainties for display
+            high_uncertainty = (high_upper - high_lower) / 2
+            low_uncertainty = (low_upper - low_lower) / 2
+
+            conformal_bounds = {
+                'method': 'quantile_regression',
+                'confidence_level': confidence_level,
+                'quantiles': q_models['quantiles'],
+                'high_pct_bounds': (high_lower_pct, high_upper_pct),
+                'low_pct_bounds': (low_lower_pct, low_upper_pct)
+            }
+
+            print(f"[DEBUG predict] Quantile bands: High=[${high_lower:.2f}, ${high_upper:.2f}], "
+                  f"Low=[${low_lower:.2f}, ${low_upper:.2f}]")
+
         else:
-            stability_multiplier = 1.0
+            # Fallback to RMSE-based bands if quantile models not available
+            print(f"[DEBUG predict] Using FALLBACK confidence bands (RMSE-based)")
 
-        # --- 4. TREND-BASED ASYMMETRY ---
-        # In downtrends: widen LOW band (sharp drops more likely)
-        # In uptrends: slightly widen HIGH band (momentum overshoots)
-        if 'trend_direction' in features.columns:
-            trend = features['trend_direction'].iloc[-1]
-        elif 'price_vs_sma20' in features.columns:
-            trend = 1 if features['price_vs_sma20'].iloc[-1] > 0 else -1
-        else:
-            trend = 0
+            rmse = self.model_metrics.get('rmse', 0.005)
 
-        # Base asymmetry: lows are generally harder to predict
-        high_asym = 1.0
-        low_asym = 1.15  # 15% wider for lows by default
+            # Simple RMSE-based bands with minimal adjustments
+            base_z = {0.8: 1.28, 0.9: 1.645, 0.95: 1.96}.get(confidence_level, 1.645)
 
-        if trend < -0.5:  # Strong downtrend
-            low_asym = 1.35   # 35% wider for lows
-            high_asym = 0.9   # 10% tighter for highs
-        elif trend > 0.5:  # Strong uptrend
-            low_asym = 1.05   # Only 5% wider for lows
-            high_asym = 1.1   # 10% wider for highs (momentum can overshoot)
+            high_uncertainty = rmse * base_z * current_close
+            low_uncertainty = rmse * base_z * current_close * 1.15  # Slightly wider for lows
 
-        # --- 5. VIX SPIKE DETECTION ---
-        # Sudden VIX spikes indicate regime change, need wider bands
-        if 'vix_velocity' in features.columns:
-            vix_velocity = features['vix_velocity'].iloc[-1]
-            if vix_velocity > 2:  # VIX spiking up
-                vol_multiplier *= 1.3  # Extra 30% width
-        elif 'vix' in features.columns and len(features) > 5:
-            vix_change = (features['vix'].iloc[-1] - features['vix'].iloc[-5]) / max(features['vix'].iloc[-5], 10)
-            if vix_change > 0.15:  # VIX up 15%+ in 5 days
-                vol_multiplier *= 1.25
+            high_lower = predicted_high - high_uncertainty
+            high_upper = predicted_high + high_uncertainty
+            low_lower = predicted_low - low_uncertainty
+            low_upper = predicted_low + low_uncertainty
 
-        # --- COMBINE ALL FACTORS ---
-        base_z = {0.8: 1.2, 0.9: 1.5, 0.95: 1.9}.get(confidence_level, 1.5)
+            conformal_bounds = {
+                'method': 'rmse_fallback',
+                'rmse': rmse,
+                'base_z': base_z
+            }
 
-        combined_multiplier = vol_multiplier * range_multiplier * stability_multiplier
-
-        # Calculate final uncertainties
-        high_uncertainty = rmse * base_z * current_close * combined_multiplier * high_asym
-        low_uncertainty = rmse * base_z * current_close * combined_multiplier * low_asym
-
-        high_lower = predicted_high - high_uncertainty
-        high_upper = predicted_high + high_uncertainty
-        low_lower = predicted_low - low_uncertainty
-        low_upper = predicted_low + low_uncertainty
-
-        # Store method and diagnostics
-        conformal_bounds = {
-            'method': 'adaptive',
-            'vol_multiplier': float(vol_multiplier),
-            'range_multiplier': float(range_multiplier),
-            'stability_multiplier': float(stability_multiplier),
-            'high_asymmetry': float(high_asym),
-            'low_asymmetry': float(low_asym),
-            'trend': float(trend) if isinstance(trend, (int, float)) else 0,
-            'vix_current': float(vix_current) if not np.isnan(vix_current) else 15
-        }
-
-        print(f"[DEBUG predict] Adaptive bands: vol={vol_multiplier:.2f}, range={range_multiplier:.2f}, "
-              f"stability={stability_multiplier:.2f}, trend={trend:.2f}, high_asym={high_asym:.2f}, low_asym={low_asym:.2f}")
+            print(f"[DEBUG predict] Fallback bands: RMSE={rmse:.4f}, z={base_z:.2f}")
 
         print(f"[DEBUG predict] Returning prediction dict...")
         # Convert all values to Python floats to avoid numpy array issues
@@ -2319,7 +3457,7 @@ class PriceRangePredictor:
             'confidence_method': conformal_bounds.get('method', 'rmse'),
             'prediction_date': df.index[-1] + timedelta(days=1) if hasattr(df.index[-1], 'date') else None,
             'model_r2': float(self.model_metrics.get('r2', 0)),
-            'atr_14': float(features['atr_14'].iloc[-1]) if 'atr_14' in features else None
+            'atr_14': float(features['atr_14'].iloc[-1]) if ('atr_14' in features and pd.notna(features['atr_14'].iloc[-1])) else None
         }
         print(f"[DEBUG predict] DONE! Predicted High: ${result['predicted_high']:.2f}, Low: ${result['predicted_low']:.2f}")
         # Convert to float in case they're numpy arrays

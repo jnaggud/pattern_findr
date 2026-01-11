@@ -180,6 +180,435 @@ except ImportError:
     XGBOOST_AVAILABLE = False
 
 # ============================================================================
+# EXPORT UTILITIES - Comprehensive CSV and Summary Text Exports
+# ============================================================================
+
+def ensure_export_directories():
+    """Create export directories if they don't exist."""
+    dirs = ['walk_forward', 'ptr', 'feature_analysis']
+    for d in dirs:
+        os.makedirs(d, exist_ok=True)
+    return dirs
+
+
+def export_walkforward_results(wf_df: pd.DataFrame, metrics: dict, settings: dict, ticker: str) -> tuple:
+    """
+    Export walk-forward analysis results to CSV and create summary text.
+
+    Returns: (csv_path, summary_path, latest_path)
+    """
+    ensure_export_directories()
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    date_range = f"{wf_df['date'].iloc[0].strftime('%Y%m%d')}_to_{wf_df['date'].iloc[-1].strftime('%Y%m%d')}"
+
+    # === CSV Export ===
+    csv_filename = f"walk_forward/{ticker}_wf_{date_range}_{timestamp}.csv"
+
+    # Add computed columns to export
+    export_df = wf_df.copy()
+    export_df['high_error'] = export_df['predicted_high'] - export_df['actual_high']
+    export_df['low_error'] = export_df['predicted_low'] - export_df['actual_low']
+    export_df['high_in_range'] = ((export_df['actual_high'] >= export_df['high_lower']) &
+                                   (export_df['actual_high'] <= export_df['high_upper']))
+    export_df['low_in_range'] = ((export_df['actual_low'] >= export_df['low_lower']) &
+                                  (export_df['actual_low'] <= export_df['low_upper']))
+    export_df['full_containment'] = ((export_df['actual_high'] <= export_df['high_upper']) &
+                                      (export_df['actual_low'] >= export_df['low_lower']))
+
+    export_df.to_csv(csv_filename, index=False)
+
+    # === Summary Text Export ===
+    summary_filename = f"walk_forward/{ticker}_wf_{date_range}_{timestamp}_summary.txt"
+
+    summary_lines = [
+        "=" * 80,
+        "WALK-FORWARD ANALYSIS SUMMARY",
+        "=" * 80,
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Ticker: {ticker}",
+        f"Test Period: {wf_df['date'].iloc[0].strftime('%Y-%m-%d')} to {wf_df['date'].iloc[-1].strftime('%Y-%m-%d')}",
+        f"Total Predictions: {len(wf_df)}",
+        "",
+        "=" * 80,
+        "SETTINGS",
+        "=" * 80,
+        f"Training Days: {settings.get('n_train_days', 'N/A')}",
+        f"Retrain Frequency: {settings.get('retrain_frequency', 'N/A')}",
+        f"Confidence Level: {settings.get('confidence_level', 'N/A')}",
+        f"Optuna Trials: {settings.get('n_trials', 'N/A')}",
+        f"Parallel Workers: {settings.get('n_workers', 'N/A')}",
+        "",
+        "=" * 80,
+        "CONTAINMENT METRICS",
+        "=" * 80,
+        f"High in Confidence Range: {metrics.get('high_in_range', 0):.2f}%",
+        f"Low in Confidence Range: {metrics.get('low_in_range', 0):.2f}%",
+        f"Full Containment: {metrics.get('full_containment', 0):.2f}%",
+        "",
+        "=" * 80,
+        "ERROR METRICS",
+        "=" * 80,
+        f"High MAE: ${metrics.get('high_mae', 0):.2f}",
+        f"Low MAE: ${metrics.get('low_mae', 0):.2f}",
+        f"High Bias: ${metrics.get('high_bias', 0):+.2f}",
+        f"Low Bias: ${metrics.get('low_bias', 0):+.2f}",
+        f"Range MAE: ${metrics.get('range_mae', 0):.2f}",
+        f"Range MAPE: {metrics.get('range_mape', 0):.2f}%",
+        "",
+        "=" * 80,
+        "R-SQUARED METRICS",
+        "=" * 80,
+        f"Test R² High: {metrics.get('test_r2_high', 0):.4f}",
+        f"Test R² Low: {metrics.get('test_r2_low', 0):.4f}",
+        f"Train R² (avg): {metrics.get('train_r2_avg', 0):.4f}",
+        f"Train RMSE (avg): {metrics.get('train_rmse_avg', 0):.4f}%",
+        "",
+        "=" * 80,
+        "CONFIDENCE BAND INFO",
+        "=" * 80,
+        f"Method: {metrics.get('confidence_method', 'N/A')}",
+        f"Quantile Regression %: {metrics.get('quantile_pct', 0):.1f}%",
+        "",
+        "=" * 80,
+        "PREDICTION STATISTICS",
+        "=" * 80,
+        f"Avg Predicted High: ${export_df['predicted_high'].mean():.2f}",
+        f"Avg Actual High: ${export_df['actual_high'].mean():.2f}",
+        f"Avg Predicted Low: ${export_df['predicted_low'].mean():.2f}",
+        f"Avg Actual Low: ${export_df['actual_low'].mean():.2f}",
+        f"Avg High Error: ${export_df['high_error'].mean():+.2f}",
+        f"Avg Low Error: ${export_df['low_error'].mean():+.2f}",
+        f"Std High Error: ${export_df['high_error'].std():.2f}",
+        f"Std Low Error: ${export_df['low_error'].std():.2f}",
+        "",
+        "=" * 80,
+        "RETRAINING INFO",
+        "=" * 80,
+        f"Total Retrains: {export_df['retrained'].sum()}",
+        f"Retrain Dates: {', '.join(export_df[export_df['retrained']]['date'].dt.strftime('%Y-%m-%d').tolist()[:10])}{'...' if export_df['retrained'].sum() > 10 else ''}",
+        "",
+        "=" * 80,
+        "DAILY PREDICTIONS TABLE (Last 10 Days)",
+        "=" * 80,
+    ]
+
+    # Add last 10 days of predictions
+    last_10 = export_df.tail(10)
+    summary_lines.append(f"{'Date':<12} {'PredHigh':>10} {'ActHigh':>10} {'HiErr':>8} {'PredLow':>10} {'ActLow':>10} {'LoErr':>8} {'HiOK':>6} {'LoOK':>6}")
+    summary_lines.append("-" * 90)
+    for _, row in last_10.iterrows():
+        summary_lines.append(
+            f"{row['date'].strftime('%Y-%m-%d'):<12} "
+            f"${row['predicted_high']:>9.2f} ${row['actual_high']:>9.2f} {row['high_error']:>+8.2f} "
+            f"${row['predicted_low']:>9.2f} ${row['actual_low']:>9.2f} {row['low_error']:>+8.2f} "
+            f"{'Yes' if row['high_in_range'] else 'No':>6} {'Yes' if row['low_in_range'] else 'No':>6}"
+        )
+
+    summary_lines.extend([
+        "",
+        "=" * 80,
+        "FILES",
+        "=" * 80,
+        f"CSV Data: {csv_filename}",
+        f"Summary: {summary_filename}",
+        "=" * 80,
+    ])
+
+    summary_text = "\n".join(summary_lines)
+
+    with open(summary_filename, 'w') as f:
+        f.write(summary_text)
+
+    # === Update Latest File ===
+    latest_path = f"walk_forward/LATEST_{ticker}_summary.txt"
+    with open(latest_path, 'w') as f:
+        f.write(summary_text)
+
+    return csv_filename, summary_filename, latest_path, summary_text
+
+
+def export_ptr_results(prediction: dict, ticker: str, model_info: dict) -> tuple:
+    """
+    Export Predict Tomorrow's Range results.
+
+    Returns: (csv_path, summary_path, latest_path, summary_text)
+    """
+    ensure_export_directories()
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    prediction_date = prediction.get('prediction_for_date', datetime.now().strftime('%Y-%m-%d'))
+
+    # === CSV Export ===
+    csv_filename = f"ptr/{ticker}_ptr_{timestamp}.csv"
+
+    export_data = {
+        'timestamp': [datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
+        'ticker': [ticker],
+        'prediction_for_date': [prediction_date],
+        'current_close': [prediction.get('current_close', 0)],
+        'predicted_high': [prediction.get('predicted_high', 0)],
+        'predicted_low': [prediction.get('predicted_low', 0)],
+        'predicted_range': [prediction.get('predicted_range_dollars', 0)],
+        'high_upper': [prediction.get('ci_high_upper', 0)],
+        'high_lower': [prediction.get('ci_high_lower', 0)],
+        'low_upper': [prediction.get('ci_low_upper', 0)],
+        'low_lower': [prediction.get('ci_low_lower', 0)],
+        'confidence_level': [prediction.get('confidence_level', 0.9)],
+        'high_pct_from_close': [((prediction.get('predicted_high', 0) / prediction.get('current_close', 1)) - 1) * 100],
+        'low_pct_from_close': [((prediction.get('current_close', 1) - prediction.get('predicted_low', 0)) / prediction.get('current_close', 1)) * 100],
+    }
+
+    export_df = pd.DataFrame(export_data)
+    export_df.to_csv(csv_filename, index=False)
+
+    # === Summary Text Export ===
+    summary_filename = f"ptr/{ticker}_ptr_{timestamp}_summary.txt"
+
+    current_close = prediction.get('current_close', 0)
+    pred_high = prediction.get('predicted_high', 0)
+    pred_low = prediction.get('predicted_low', 0)
+
+    summary_lines = [
+        "=" * 80,
+        "PREDICT TOMORROW'S RANGE - SUMMARY",
+        "=" * 80,
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Ticker: {ticker}",
+        f"Prediction For: {prediction_date}",
+        "",
+        "=" * 80,
+        "CURRENT PRICE",
+        "=" * 80,
+        f"Current Close: ${current_close:.2f}",
+        "",
+        "=" * 80,
+        "POINT PREDICTIONS",
+        "=" * 80,
+        f"Predicted High: ${pred_high:.2f} ({((pred_high/current_close)-1)*100:+.2f}% from close)",
+        f"Predicted Low: ${pred_low:.2f} ({((current_close-pred_low)/current_close)*100:+.2f}% below close)",
+        f"Predicted Range: ${prediction.get('predicted_range_dollars', 0):.2f}",
+        "",
+        "=" * 80,
+        f"CONFIDENCE BANDS ({int(prediction.get('confidence_level', 0.9)*100)}% CI)",
+        "=" * 80,
+        f"High Upper Bound: ${prediction.get('ci_high_upper', 0):.2f}",
+        f"High Lower Bound: ${prediction.get('ci_high_lower', 0):.2f}",
+        f"Low Upper Bound: ${prediction.get('ci_low_upper', 0):.2f}",
+        f"Low Lower Bound: ${prediction.get('ci_low_lower', 0):.2f}",
+        f"High Band Width: ${prediction.get('ci_high_upper', 0) - prediction.get('ci_high_lower', 0):.2f}",
+        f"Low Band Width: ${prediction.get('ci_low_upper', 0) - prediction.get('ci_low_lower', 0):.2f}",
+        "",
+        "=" * 80,
+        "MODEL INFO",
+        "=" * 80,
+        f"Model R²: {model_info.get('model_r2', 'N/A')}",
+        f"Model RMSE: {model_info.get('model_rmse', 'N/A')}",
+        f"Features Used: {model_info.get('n_features', 'N/A')}",
+        f"Training Samples: {model_info.get('train_samples', 'N/A')}",
+        "",
+        "=" * 80,
+        "TRADING LEVELS",
+        "=" * 80,
+        f"Resistance (High Upper): ${prediction.get('ci_high_upper', 0):.2f}",
+        f"Target High: ${pred_high:.2f}",
+        f"Current: ${current_close:.2f}",
+        f"Target Low: ${pred_low:.2f}",
+        f"Support (Low Lower): ${prediction.get('ci_low_lower', 0):.2f}",
+        "",
+        "=" * 80,
+        "FILES",
+        "=" * 80,
+        f"CSV Data: {csv_filename}",
+        f"Summary: {summary_filename}",
+        "=" * 80,
+    ]
+
+    summary_text = "\n".join(summary_lines)
+
+    with open(summary_filename, 'w') as f:
+        f.write(summary_text)
+
+    # === Update Latest File ===
+    latest_path = f"ptr/LATEST_{ticker}_summary.txt"
+    with open(latest_path, 'w') as f:
+        f.write(summary_text)
+
+    return csv_filename, summary_filename, latest_path, summary_text
+
+
+def export_feature_analysis(feature_data: dict, ticker: str) -> tuple:
+    """
+    Export feature analysis and discovery results.
+
+    Returns: (corr_csv, imp_csv, summary_filename, latest_path, summary_text)
+    """
+    ensure_export_directories()
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    # === CSV Export - Correlations ===
+    corr_csv = f"feature_analysis/{ticker}_correlations_{timestamp}.csv"
+    corr_data = feature_data.get('correlations', [])
+    if corr_data and len(corr_data) > 0:
+        if isinstance(corr_data, list):
+            corr_df = pd.DataFrame(corr_data)
+        else:
+            corr_df = corr_data
+        corr_df.to_csv(corr_csv, index=False)
+
+    # === CSV Export - Importances ===
+    imp_csv = f"feature_analysis/{ticker}_importances_{timestamp}.csv"
+    imp_data = feature_data.get('importances', [])
+    if imp_data and len(imp_data) > 0:
+        if isinstance(imp_data, list):
+            imp_df = pd.DataFrame(imp_data)
+        else:
+            imp_df = imp_data
+        imp_df.to_csv(imp_csv, index=False)
+
+    # === CSV Export - SHAP Importance (if available) ===
+    shap_csv = None
+    shap_data = feature_data.get('shap_importance', [])
+    if shap_data and len(shap_data) > 0:
+        shap_csv = f"feature_analysis/{ticker}_shap_importance_{timestamp}.csv"
+        if isinstance(shap_data, list):
+            shap_df = pd.DataFrame(shap_data)
+        else:
+            shap_df = shap_data
+        shap_df.to_csv(shap_csv, index=False)
+
+    # === CSV Export - Discovered Features (if available) ===
+    discovery_csv = None
+    discovery_data = feature_data.get('discovered_features', [])
+    if discovery_data and len(discovery_data) > 0:
+        discovery_csv = f"feature_analysis/{ticker}_discovered_features_{timestamp}.csv"
+        if isinstance(discovery_data, list):
+            discovery_df = pd.DataFrame(discovery_data)
+        else:
+            discovery_df = discovery_data
+        discovery_df.to_csv(discovery_csv, index=False)
+
+    # === Summary Text Export ===
+    summary_filename = f"feature_analysis/{ticker}_feature_analysis_{timestamp}_summary.txt"
+    model_info = feature_data.get('model_info', {})
+
+    summary_lines = [
+        "=" * 80,
+        "FEATURE ANALYSIS SUMMARY",
+        "=" * 80,
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Ticker: {ticker}",
+        f"Total Features Analyzed: {model_info.get('total_features', 'N/A')}",
+        f"Training Iterations: {model_info.get('training_count', 'N/A')}",
+        "",
+    ]
+
+    # === TOP CORRELATIONS ===
+    summary_lines.extend([
+        "=" * 80,
+        "TOP 20 FEATURES BY CORRELATION WITH TARGET",
+        "=" * 80,
+    ])
+
+    if corr_data and len(corr_data) > 0:
+        corr_list = corr_data if isinstance(corr_data, list) else corr_data.to_dict('records')
+        summary_lines.append(f"{'Rank':<6} {'Feature':<45} {'Correlation':>12} {'|Corr|':>10}")
+        summary_lines.append("-" * 75)
+        for i, row in enumerate(corr_list[:20], 1):
+            feat = row.get('feature', 'N/A')
+            corr = row.get('correlation', 0)
+            abs_corr = row.get('abs_corr', abs(corr))
+            summary_lines.append(f"{i:<6} {feat:<45} {corr:>12.4f} {abs_corr:>10.4f}")
+    else:
+        summary_lines.append("No correlation data available")
+
+    # === TOP IMPORTANCES ===
+    summary_lines.extend([
+        "",
+        "=" * 80,
+        "TOP 20 FEATURES BY MODEL IMPORTANCE",
+        "=" * 80,
+    ])
+
+    if imp_data and len(imp_data) > 0:
+        imp_list = imp_data if isinstance(imp_data, list) else imp_data.to_dict('records')
+        summary_lines.append(f"{'Rank':<6} {'Feature':<45} {'Mean Imp':>12} {'Std':>10} {'Consistency':>12}")
+        summary_lines.append("-" * 87)
+        for i, row in enumerate(imp_list[:20], 1):
+            feat = row.get('feature', 'N/A')
+            mean_imp = row.get('mean_importance', 0)
+            std_imp = row.get('std_importance', 0)
+            consistency = row.get('consistency', 0)
+            summary_lines.append(f"{i:<6} {feat:<45} {mean_imp:>12.4f} {std_imp:>10.4f} {consistency:>12.2f}")
+    else:
+        summary_lines.append("No importance data available")
+
+    # === SHAP IMPORTANCE (if available) ===
+    if shap_data and len(shap_data) > 0:
+        summary_lines.extend([
+            "",
+            "=" * 80,
+            "TOP 20 FEATURES BY SHAP IMPORTANCE",
+            "=" * 80,
+        ])
+        shap_list = shap_data if isinstance(shap_data, list) else shap_data.to_dict('records')
+        summary_lines.append(f"{'Rank':<6} {'Feature':<50} {'SHAP Value':>15}")
+        summary_lines.append("-" * 73)
+        for i, row in enumerate(shap_list[:20], 1):
+            feat = row.get('feature', 'N/A')
+            shap_val = row.get('shap_importance', 0)
+            summary_lines.append(f"{i:<6} {feat:<50} {shap_val:>15.4f}")
+
+    # === DISCOVERED FEATURES (if available) ===
+    if discovery_data and len(discovery_data) > 0:
+        summary_lines.extend([
+            "",
+            "=" * 80,
+            "TOP 20 DISCOVERED FEATURES",
+            "=" * 80,
+        ])
+        disc_list = discovery_data if isinstance(discovery_data, list) else discovery_data.to_dict('records')
+        summary_lines.append(f"{'Rank':<6} {'Feature':<40} {'Type':<15} {'Correlation':>12}")
+        summary_lines.append("-" * 75)
+        for i, row in enumerate(disc_list[:20], 1):
+            feat = row.get('feature', 'N/A')
+            ftype = row.get('type', 'N/A')
+            corr = row.get('correlation', 0)
+            summary_lines.append(f"{i:<6} {feat:<40} {ftype:<15} {corr:>12.4f}")
+
+    # === FILES OUTPUT ===
+    summary_lines.extend([
+        "",
+        "=" * 80,
+        "EXPORTED FILES",
+        "=" * 80,
+        f"Correlations CSV: {corr_csv}",
+        f"Importances CSV: {imp_csv}",
+    ])
+    if shap_csv:
+        summary_lines.append(f"SHAP Importance CSV: {shap_csv}")
+    if discovery_csv:
+        summary_lines.append(f"Discovered Features CSV: {discovery_csv}")
+    summary_lines.extend([
+        f"Summary: {summary_filename}",
+        "=" * 80,
+    ])
+
+    summary_text = "\n".join(summary_lines)
+
+    with open(summary_filename, 'w') as f:
+        f.write(summary_text)
+
+    # === Update Latest File ===
+    latest_path = f"feature_analysis/LATEST_{ticker}_summary.txt"
+    with open(latest_path, 'w') as f:
+        f.write(summary_text)
+
+    return corr_csv, imp_csv, summary_filename, latest_path, summary_text
+
+
+# ============================================================================
 # STEP 1: INDICATOR CALCULATIONS
 # ============================================================================
 
@@ -6834,7 +7263,7 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                 )
 
             # Optuna settings
-            wf_col4, wf_col5 = st.columns(2)
+            wf_col4, wf_col5, wf_col6 = st.columns(3)
             with wf_col4:
                 wf_n_trials = st.number_input(
                     "Optuna Trials per Training",
@@ -6850,6 +7279,14 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     max_value=32,
                     value=min(16, max(1, (os.cpu_count() or 4) - 1)),
                     help="CPU cores for parallel Optuna optimization."
+                )
+            with wf_col6:
+                wf_ci_level = st.selectbox(
+                    "Confidence Level",
+                    options=[0.50, 0.68, 0.80, 0.90, 0.95],
+                    index=1,  # Default to 68%
+                    format_func=lambda x: f"{int(x*100)}%",
+                    help="50-68% = tight actionable bands for trading. 80-95% = wider bands for risk management."
                 )
 
             st.markdown("---")
@@ -6931,13 +7368,16 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                     # Store feature importances and R² for analysis
                                     if train_result:
                                         # Store R² from this training
-                                        train_r2 = train_result.get('r2', 0)
+                                        # NOTE: metrics are nested under 'metrics' key in train_result
+                                        metrics = train_result.get('metrics', {})
+                                        train_r2 = metrics.get('r2', 0)
+                                        train_rmse = metrics.get('rmse_pct', 0)
                                         if 'wf_train_r2_list' not in st.session_state:
                                             st.session_state['wf_train_r2_list'] = []
                                         st.session_state['wf_train_r2_list'].append({
                                             'date': test_date,
                                             'r2': train_r2,
-                                            'rmse_pct': train_result.get('rmse_pct', 0)
+                                            'rmse_pct': train_rmse
                                         })
 
                                         if 'feature_importance' in train_result:
@@ -6960,8 +7400,11 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                 # Use data up to the day BEFORE test_date for prediction
                                 pred_input_df = pred_df.iloc[:test_idx].copy()
 
-                                # Get prediction
-                                prediction = current_model.predict_daily_range(pred_input_df)
+                                # Get prediction with user-selected confidence level
+                                prediction = current_model.predict_daily_range(
+                                    pred_input_df,
+                                    confidence_level=wf_ci_level
+                                )
 
                                 # Get actual values for test_date
                                 actual_high = pred_df['high'].iloc[test_idx]
@@ -6986,6 +7429,8 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                     'actual_close': actual_close,
                                     'actual_range': actual_range,
                                     'model_r2': prediction.get('model_r2', 0),
+                                    'confidence_method': prediction.get('confidence_method', 'unknown'),
+                                    'confidence_level': prediction.get('confidence_level', wf_ci_level),
                                     'retrained': need_retrain
                                 })
 
@@ -7077,6 +7522,19 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     st.metric("Low Bias", f"${low_error:+.2f}",
                               help="Average prediction bias (+ = overpredict)")
 
+                # Show confidence method used (quantile regression vs RMSE fallback)
+                if 'confidence_method' in wf_df.columns:
+                    method_counts = wf_df['confidence_method'].value_counts()
+                    quantile_pct = method_counts.get('quantile_regression', 0) / len(wf_df) * 100
+                    conf_level = wf_df['confidence_level'].iloc[0] if 'confidence_level' in wf_df.columns else 0.9
+
+                    if quantile_pct > 50:
+                        st.success(f"Confidence bands using **Quantile Regression** ({quantile_pct:.0f}% of predictions) at {int(conf_level*100)}% CI")
+                    elif quantile_pct > 0:
+                        st.warning(f"Confidence bands: Mixed - {quantile_pct:.0f}% Quantile Regression, {100-quantile_pct:.0f}% RMSE Fallback")
+                    else:
+                        st.warning("Confidence bands using **RMSE Fallback** (quantile models not available). Re-run walk-forward to train quantile models.")
+
                 # R² Metrics row
                 r2_col1, r2_col2, r2_col3, r2_col4 = st.columns(4)
 
@@ -7092,28 +7550,104 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     avg_train_r2 = avg_model_r2
                     avg_train_rmse = 0
 
-                # Calculate test R² from actual vs predicted
-                # R² = 1 - SS_res / SS_tot
-                ss_res_high = ((wf_df['actual_high'] - wf_df['predicted_high']) ** 2).sum()
-                ss_tot_high = ((wf_df['actual_high'] - wf_df['actual_high'].mean()) ** 2).sum()
+                # Calculate test R² from actual vs predicted DEVIATIONS (not absolute prices!)
+                # Using absolute prices gives artificially high R² due to price autocorrelation
+                # Instead, calculate R² on percentage deviations from close:
+                #   actual_high_dev = (actual_high - close) / close
+                #   pred_high_dev = (predicted_high - close) / close
+                # This measures how well we predict the UPSIDE/DOWNSIDE move, not price level
+
+                # Use previous day's close as the baseline (what we knew when making prediction)
+                # For walk-forward, we predict based on previous close
+                prev_close = wf_df['actual_close'].shift(1).fillna(wf_df['actual_close'].iloc[0])
+
+                # Actual deviations as percentage of close
+                actual_high_dev = (wf_df['actual_high'] - prev_close) / prev_close * 100
+                actual_low_dev = (prev_close - wf_df['actual_low']) / prev_close * 100  # Low is below close
+
+                # Predicted deviations as percentage of close
+                pred_high_dev = (wf_df['predicted_high'] - prev_close) / prev_close * 100
+                pred_low_dev = (prev_close - wf_df['predicted_low']) / prev_close * 100
+
+                # R² on deviations (this is the meaningful metric)
+                ss_res_high = ((actual_high_dev - pred_high_dev) ** 2).sum()
+                ss_tot_high = ((actual_high_dev - actual_high_dev.mean()) ** 2).sum()
                 test_r2_high = 1 - (ss_res_high / ss_tot_high) if ss_tot_high > 0 else 0
 
-                ss_res_low = ((wf_df['actual_low'] - wf_df['predicted_low']) ** 2).sum()
-                ss_tot_low = ((wf_df['actual_low'] - wf_df['actual_low'].mean()) ** 2).sum()
+                ss_res_low = ((actual_low_dev - pred_low_dev) ** 2).sum()
+                ss_tot_low = ((actual_low_dev - actual_low_dev.mean()) ** 2).sum()
                 test_r2_low = 1 - (ss_res_low / ss_tot_low) if ss_tot_low > 0 else 0
 
                 with r2_col1:
                     st.metric("Train R² (avg)", f"{avg_train_r2:.3f}",
                               help="Average R² from training periods (how well model fits training data)")
                 with r2_col2:
-                    st.metric("Test R² High", f"{test_r2_high:.3f}",
+                    # Color-code high R² based on quality
+                    high_r2_color = "🟢" if test_r2_high > 0.2 else "🟡" if test_r2_high > 0 else "🔴"
+                    st.metric(f"Test R² High {high_r2_color}", f"{test_r2_high:.3f}",
                               help="R² of high predictions vs actuals (out-of-sample)")
                 with r2_col3:
-                    st.metric("Test R² Low", f"{test_r2_low:.3f}",
+                    # Color-code low R² based on quality
+                    low_r2_color = "🟢" if test_r2_low > 0.2 else "🟡" if test_r2_low > 0 else "🔴"
+                    st.metric(f"Test R² Low {low_r2_color}", f"{test_r2_low:.3f}",
                               help="R² of low predictions vs actuals (out-of-sample)")
                 with r2_col4:
                     st.metric("Train RMSE (avg)", f"{avg_train_rmse:.2f}%",
                               help="Average RMSE from training periods")
+
+                # Explain negative R² if present
+                if test_r2_low < 0:
+                    st.warning(f"""
+                    **Test R² Low is negative ({test_r2_low:.3f})** - The model predicts lows worse than simply using the historical average.
+
+                    This is common because:
+                    - Volatility features (which drive range prediction) correlate better with upside moves than downside
+                    - Market behavior is asymmetric: rallies are gradual, selloffs are sudden
+                    - Consider using the confidence bands (high_lower/low_lower) instead of point predictions for lows
+                    """)
+
+                # === AUTO-EXPORT WALK-FORWARD RESULTS ===
+                try:
+                    # Gather all metrics for export
+                    wf_metrics = {
+                        'high_in_range': high_in_range,
+                        'low_in_range': low_in_range,
+                        'full_containment': price_contained,
+                        'high_mae': high_mae,
+                        'low_mae': low_mae,
+                        'high_bias': high_error,
+                        'low_bias': low_error,
+                        'range_mae': range_mae,
+                        'range_mape': range_mape,
+                        'test_r2_high': test_r2_high,
+                        'test_r2_low': test_r2_low,
+                        'train_r2_avg': avg_train_r2,
+                        'train_rmse_avg': avg_train_rmse,
+                        'confidence_method': 'quantile_regression' if quantile_pct > 50 else 'rmse_fallback',
+                        'quantile_pct': quantile_pct,
+                    }
+
+                    wf_settings = {
+                        'n_train_days': st.session_state.get('wf_min_train_days', wf_min_train_days),
+                        'retrain_frequency': st.session_state.get('wf_retrain_freq', 'Daily'),
+                        'confidence_level': f"{int(conf_level * 100)}%",
+                        'n_trials': st.session_state.get('wf_n_trials', 100),
+                        'n_workers': st.session_state.get('wf_n_workers', 4),
+                    }
+
+                    wf_ticker = st.session_state.get('ticker', 'SPY')
+                    csv_path, summary_path, latest_path, summary_text = export_walkforward_results(
+                        wf_df, wf_metrics, wf_settings, wf_ticker
+                    )
+
+                    # Show export info and summary in expander
+                    with st.expander("📊 **Walk-Forward Export Summary** (click to expand)", expanded=False):
+                        st.success(f"✅ Auto-exported to: `{latest_path}`")
+                        st.code(summary_text, language=None)
+                        st.caption(f"CSV: `{csv_path}` | Summary: `{summary_path}`")
+
+                except Exception as export_err:
+                    st.warning(f"Export failed: {export_err}")
 
                 # Save predictions button for Options Builder
                 st.markdown("---")
@@ -7346,6 +7880,27 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                 wf_current_model = st.session_state.get('wf_current_model')
 
                 if wf_current_model is not None:
+                    # Settings row
+                    settings_col1, settings_col2, settings_col3 = st.columns([2, 2, 2])
+
+                    with settings_col1:
+                        # Confidence level selector - lower = tighter bands
+                        ci_level = st.selectbox(
+                            "Confidence Level",
+                            options=[0.50, 0.68, 0.80, 0.90, 0.95],
+                            index=1,  # Default to 68%
+                            format_func=lambda x: f"{int(x*100)}%",
+                            help="50-68% = tight actionable bands for trading. 80-95% = wider bands for risk."
+                        )
+
+                    with settings_col2:
+                        # Option to prevent band overlap
+                        prevent_overlap = st.checkbox(
+                            "Prevent Band Overlap",
+                            value=True,
+                            help="Constrain bands so high_lower >= low_upper (no overlap)"
+                        )
+
                     pred_col1, pred_col2 = st.columns([3, 1])
 
                     with pred_col2:
@@ -7372,13 +7927,41 @@ def render_strategy_discovery_section(df: pd.DataFrame):
 
                                 # Make prediction using the trained model
                                 if predict_tomorrow_btn:
+                                    # Debug: Check if quantile models are available
+                                    has_quantile = (
+                                        hasattr(wf_current_model, 'quantile_models') and
+                                        len(wf_current_model.quantile_models) > 0 and
+                                        hasattr(wf_current_model, 'high_model') and
+                                        wf_current_model.high_model is not None
+                                    )
+                                    if not has_quantile:
+                                        st.warning("⚠️ Quantile models not available - using RMSE fallback for confidence bands. Re-run walk-forward analysis to train quantile models.")
+
                                     tomorrow_pred = wf_current_model.predict_daily_range(
                                         pred_df,
-                                        options_features=wf_options
+                                        options_features=wf_options,
+                                        confidence_level=ci_level  # User-selected confidence level
                                     )
+
+                                    # Apply band overlap prevention if enabled
+                                    if prevent_overlap:
+                                        # Ensure high_lower >= low_upper (no overlap)
+                                        # If they overlap, set them to the midpoint
+                                        if tomorrow_pred['high_lower'] < tomorrow_pred['low_upper']:
+                                            midpoint = (tomorrow_pred['high_lower'] + tomorrow_pred['low_upper']) / 2
+                                            tomorrow_pred['high_lower'] = midpoint
+                                            tomorrow_pred['low_upper'] = midpoint
+                                            # Also ensure predicted_high > predicted_low
+                                            if tomorrow_pred['predicted_high'] < midpoint:
+                                                tomorrow_pred['predicted_high'] = midpoint + 0.01
+                                            if tomorrow_pred['predicted_low'] > midpoint:
+                                                tomorrow_pred['predicted_low'] = midpoint - 0.01
+
                                     st.session_state['wf_tomorrow_prediction'] = tomorrow_pred
+                                    st.session_state['wf_ci_level'] = ci_level  # Store for display
                                 else:
                                     tomorrow_pred = st.session_state['wf_tomorrow_prediction']
+                                    ci_level = st.session_state.get('wf_ci_level', 0.9)
 
                                 # Display prediction stats
                                 with pred_col1:
@@ -7405,7 +7988,8 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                     st.metric("CI Level", f"{confidence:.0f}%", help="Confidence Interval level")
 
                                 # Confidence bounds
-                                st.markdown("**Prediction Bounds (90% CI)**")
+                                ci_pct = int(ci_level * 100)
+                                st.markdown(f"**Prediction Bounds ({ci_pct}% CI)**")
                                 bounds_col1, bounds_col2, bounds_col3, bounds_col4 = st.columns(4)
 
                                 with bounds_col1:
@@ -7416,6 +8000,53 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                     st.metric("Low Lower", f"${float(tomorrow_pred['low_lower']):.2f}")
                                 with bounds_col4:
                                     st.metric("Low Upper", f"${float(tomorrow_pred['low_upper']):.2f}")
+
+                                # === AUTO-EXPORT PTR RESULTS ===
+                                try:
+                                    # Calculate next trading day for export
+                                    ptr_last_date = pred_df.index[-1]
+                                    if hasattr(ptr_last_date, 'date'):
+                                        ptr_next_date = ptr_last_date + pd.Timedelta(days=1)
+                                        while ptr_next_date.weekday() >= 5:  # Skip weekends
+                                            ptr_next_date += pd.Timedelta(days=1)
+                                    else:
+                                        ptr_next_date = ptr_last_date
+
+                                    # Build prediction dict for export
+                                    ptr_prediction = {
+                                        'prediction_for_date': str(ptr_next_date.date()) if hasattr(ptr_next_date, 'date') else str(ptr_next_date),
+                                        'current_close': float(current_close),
+                                        'predicted_high': float(pred_high),
+                                        'predicted_low': float(pred_low),
+                                        'predicted_range_dollars': float(pred_range),
+                                        'ci_high_upper': float(tomorrow_pred.get('high_upper', pred_high)),
+                                        'ci_high_lower': float(tomorrow_pred.get('high_lower', pred_high)),
+                                        'ci_low_upper': float(tomorrow_pred.get('low_upper', pred_low)),
+                                        'ci_low_lower': float(tomorrow_pred.get('low_lower', pred_low)),
+                                        'confidence_level': ci_level,
+                                    }
+
+                                    # Get model info
+                                    ptr_model_info = {
+                                        'model_r2': wf_current_model.model_metrics.get('r2', 'N/A') if hasattr(wf_current_model, 'model_metrics') else 'N/A',
+                                        'model_rmse': wf_current_model.model_metrics.get('rmse_pct', 'N/A') if hasattr(wf_current_model, 'model_metrics') else 'N/A',
+                                        'n_features': len(wf_current_model.feature_names) if hasattr(wf_current_model, 'feature_names') else 'N/A',
+                                        'train_samples': wf_current_model.model_metrics.get('train_samples', 'N/A') if hasattr(wf_current_model, 'model_metrics') else 'N/A',
+                                    }
+
+                                    ptr_ticker = st.session_state.get('ticker', 'SPY')
+                                    ptr_csv, ptr_summary_file, ptr_latest, ptr_summary_text = export_ptr_results(
+                                        ptr_prediction, ptr_ticker, ptr_model_info
+                                    )
+
+                                    # Show export info in expander
+                                    with st.expander("📊 **PTR Export Summary** (click to expand)", expanded=False):
+                                        st.success(f"✅ Auto-exported to: `{ptr_latest}`")
+                                        st.code(ptr_summary_text, language=None)
+                                        st.caption(f"CSV: `{ptr_csv}` | Summary: `{ptr_summary_file}`")
+
+                                except Exception as ptr_export_err:
+                                    st.warning(f"PTR Export failed: {ptr_export_err}")
 
                                 # Create candlestick chart with prediction
                                 st.markdown("---")
@@ -7477,7 +8108,7 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                         y=[tomorrow_pred['high_lower'], tomorrow_pred['high_upper']],
                                         mode='lines',
                                         line=dict(color='rgba(255, 152, 0, 0.8)', width=3),
-                                        name='High Range (90%)'
+                                        name=f'High Range ({ci_pct}%)'
                                     )
                                 )
 
@@ -7488,7 +8119,7 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                         y=[tomorrow_pred['low_lower'], tomorrow_pred['low_upper']],
                                         mode='lines',
                                         line=dict(color='rgba(33, 150, 243, 0.8)', width=3),
-                                        name='Low Range (90%)'
+                                        name=f'Low Range ({ci_pct}%)'
                                     )
                                 )
 
@@ -7625,6 +8256,9 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                         correlations.append({'feature': col, 'correlation': corr, 'abs_corr': abs(corr)})
 
                                 corr_df = pd.DataFrame(correlations).sort_values('abs_corr', ascending=False)
+
+                                # Store in session state for export
+                                st.session_state['wf_corr_df'] = corr_df
 
                                 # Correlation bar chart
                                 top_corr = corr_df.head(25)
@@ -7774,17 +8408,17 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                         # Get top features for discovery
                         top_10_features = agg_importance.head(10)['feature'].tolist()
 
-                        # === AUTO-DISCOVER BUTTON ===
+                        # === AUTO-DISCOVER BUTTON (COMPREHENSIVE) ===
                         st.markdown("---")
                         auto_col1, auto_col2 = st.columns([2, 3])
                         with auto_col1:
                             auto_discover_btn = st.button("🔍 Auto-Discover Best Features", type="primary", use_container_width=True,
-                                                         help="Automatically test all feature combinations and find the best ones")
+                                                         help="Comprehensive feature discovery - tests ALL combinations")
                         with auto_col2:
-                            st.caption("Tests: Top 5 feature interactions × 4 operations, Lags 1-10 for top 5, Rolling windows 5-30, Volume derivatives")
+                            st.caption("Tests: ALL feature interactions, lags 1-30, rolling windows, derivatives, polynomials, regime-conditional, percentiles")
 
                         if auto_discover_btn:
-                            with st.spinner("Running comprehensive feature discovery (this may take 1-2 minutes)..."):
+                            with st.spinner("Running COMPREHENSIVE feature discovery (3-5 minutes)..."):
                                 try:
                                     # Initialize
                                     auto_predictor = PriceRangePredictor()
@@ -7796,12 +8430,35 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                     progress_auto = st.progress(0)
                                     status_auto = st.empty()
 
-                                    # 1. LAG ANALYSIS for top 5 features
-                                    status_auto.text("Testing lags for top features...")
-                                    top_5 = [f for f in top_10_features[:5] if f in auto_features.columns]
-                                    for feat in top_5:
+                                    # Get ALL numeric features (not just top 5)
+                                    all_feature_cols = [c for c in auto_features.columns if auto_features[c].dtype in ['float64', 'float32', 'int64', 'int32']]
+                                    # Filter out features with too many NaNs
+                                    valid_features = [c for c in all_feature_cols if auto_features[c].notna().sum() > 50]
+
+                                    total_features = len(valid_features)
+                                    status_auto.text(f"Analyzing {total_features} features...")
+
+                                    # =============================================================
+                                    # 1. LAG ANALYSIS (Lags 1-30 for TOP 20 features by correlation)
+                                    # =============================================================
+                                    status_auto.text("Phase 1/8: Testing lags 1-30 for top 20 features...")
+
+                                    # First, compute base correlations to find top 20
+                                    base_correlations = []
+                                    for feat in valid_features:
+                                        try:
+                                            valid_idx = auto_features[feat].dropna().index.intersection(target_series.dropna().index)
+                                            if len(valid_idx) > 30:
+                                                corr = auto_features.loc[valid_idx, feat].corr(target_series.loc[valid_idx])
+                                                base_correlations.append((feat, abs(corr)))
+                                        except:
+                                            pass
+                                    base_correlations.sort(key=lambda x: x[1], reverse=True)
+                                    top_20_features = [x[0] for x in base_correlations[:20]]
+
+                                    for feat in top_20_features:
                                         base_series = auto_features[feat]
-                                        for lag in range(1, 11):
+                                        for lag in range(1, 31):  # Extended to 30 lags
                                             lagged = base_series.shift(lag)
                                             valid_idx = lagged.dropna().index.intersection(target_series.dropna().index)
                                             if len(valid_idx) > 30:
@@ -7813,13 +8470,16 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                                     'abs_corr': abs(corr),
                                                     'formula': f'{feat}.shift({lag})'
                                                 })
-                                    progress_auto.progress(0.2)
+                                    progress_auto.progress(0.1)
 
-                                    # 2. INTERACTION TERMS (top 5 × top 5 × 4 operations)
-                                    status_auto.text("Testing feature interactions...")
+                                    # =============================================================
+                                    # 2. INTERACTION TERMS (Top 20 × Top 20 × 4 operations)
+                                    # =============================================================
+                                    status_auto.text("Phase 2/8: Testing feature interactions (top 20 × top 20)...")
                                     operations = [('multiply', '*'), ('divide', '/'), ('add', '+'), ('subtract', '-')]
-                                    for i, f1 in enumerate(top_5):
-                                        for f2 in top_5[i+1:]:
+
+                                    for i, f1 in enumerate(top_20_features):
+                                        for f2 in top_20_features[i+1:]:
                                             s1 = auto_features[f1]
                                             s2 = auto_features[f2]
                                             for op_name, op_symbol in operations:
@@ -7845,81 +8505,256 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                                         })
                                                 except:
                                                     pass
+                                    progress_auto.progress(0.25)
+
+                                    # =============================================================
+                                    # 3. ROLLING WINDOWS for MULTIPLE base features
+                                    # =============================================================
+                                    status_auto.text("Phase 3/8: Testing rolling windows for all base metrics...")
+
+                                    # Test rolling on multiple base series, not just range
+                                    base_series_dict = {}
+                                    if 'high' in wf_analysis_df.columns:
+                                        base_series_dict['range'] = (wf_analysis_df['high'] - wf_analysis_df['low']) / wf_analysis_df['close']
+                                    if 'close' in wf_analysis_df.columns:
+                                        base_series_dict['returns'] = wf_analysis_df['close'].pct_change()
+                                        base_series_dict['close'] = wf_analysis_df['close']
+                                    if 'volume' in wf_analysis_df.columns:
+                                        base_series_dict['volume'] = wf_analysis_df['volume']
+                                    # Add top 5 features as rolling bases
+                                    for feat in top_20_features[:5]:
+                                        if feat in auto_features.columns:
+                                            base_series_dict[feat] = auto_features[feat]
+
+                                    windows = [3, 5, 7, 10, 14, 21, 30, 60]
+                                    agg_funcs = ['mean', 'std', 'min', 'max', 'skew']
+
+                                    for base_name, base_series in base_series_dict.items():
+                                        for window in windows:
+                                            for agg in agg_funcs:
+                                                try:
+                                                    if agg == 'skew':
+                                                        rolled = base_series.rolling(window).apply(lambda x: x.skew() if len(x) > 2 else 0, raw=False)
+                                                    else:
+                                                        rolled = getattr(base_series.rolling(window), agg)()
+                                                    valid_idx = rolled.dropna().index.intersection(target_series.dropna().index)
+                                                    if len(valid_idx) > 30:
+                                                        corr = rolled.loc[valid_idx].corr(target_series.loc[valid_idx])
+                                                        all_discoveries.append({
+                                                            'feature': f'{base_name}_{agg}_{window}d',
+                                                            'type': 'Rolling',
+                                                            'correlation': corr,
+                                                            'abs_corr': abs(corr),
+                                                            'formula': f'{base_name}.rolling({window}).{agg}()'
+                                                        })
+                                                except:
+                                                    pass
                                     progress_auto.progress(0.4)
 
-                                    # 3. ROLLING WINDOWS for range
-                                    status_auto.text("Testing rolling windows...")
-                                    if 'high' in wf_analysis_df.columns:
-                                        base_range = (wf_analysis_df['high'] - wf_analysis_df['low']) / wf_analysis_df['close']
-                                        for window in [3, 5, 7, 10, 14, 21, 30]:
-                                            for agg in ['mean', 'std', 'min', 'max']:
-                                                rolled = getattr(base_range.rolling(window), agg)()
-                                                valid_idx = rolled.dropna().index.intersection(target_series.dropna().index)
+                                    # =============================================================
+                                    # 4. DERIVATIVES (1st and 2nd order for top 20 features)
+                                    # =============================================================
+                                    status_auto.text("Phase 4/8: Testing derivatives (velocity/acceleration)...")
+
+                                    for feat in top_20_features:
+                                        base_series = auto_features[feat]
+                                        for smoothing in [1, 3, 5, 10]:
+                                            smoothed = base_series.rolling(smoothing).mean() if smoothing > 1 else base_series
+
+                                            # 1st derivative (velocity)
+                                            velocity = smoothed.diff()
+                                            valid_idx = velocity.dropna().index.intersection(target_series.dropna().index)
+                                            if len(valid_idx) > 30:
+                                                corr = velocity.loc[valid_idx].corr(target_series.loc[valid_idx])
+                                                all_discoveries.append({
+                                                    'feature': f'{feat}_velocity_s{smoothing}',
+                                                    'type': 'Derivative',
+                                                    'correlation': corr,
+                                                    'abs_corr': abs(corr),
+                                                    'formula': f'{feat}.rolling({smoothing}).mean().diff()'
+                                                })
+
+                                            # 2nd derivative (acceleration)
+                                            accel = velocity.diff()
+                                            valid_idx = accel.dropna().index.intersection(target_series.dropna().index)
+                                            if len(valid_idx) > 30:
+                                                corr = accel.loc[valid_idx].corr(target_series.loc[valid_idx])
+                                                all_discoveries.append({
+                                                    'feature': f'{feat}_accel_s{smoothing}',
+                                                    'type': 'Derivative',
+                                                    'correlation': corr,
+                                                    'abs_corr': abs(corr),
+                                                    'formula': f'{feat}.rolling({smoothing}).mean().diff().diff()'
+                                                })
+                                    progress_auto.progress(0.5)
+
+                                    # =============================================================
+                                    # 5. POLYNOMIAL FEATURES (squared, cubed for top 10)
+                                    # =============================================================
+                                    status_auto.text("Phase 5/8: Testing polynomial features...")
+
+                                    for feat in top_20_features[:10]:
+                                        base_series = auto_features[feat]
+                                        for power, power_name in [(2, 'squared'), (3, 'cubed')]:
+                                            try:
+                                                powered = base_series ** power
+                                                valid_idx = powered.dropna().index.intersection(target_series.dropna().index)
                                                 if len(valid_idx) > 30:
-                                                    corr = rolled.loc[valid_idx].corr(target_series.loc[valid_idx])
+                                                    corr = powered.loc[valid_idx].corr(target_series.loc[valid_idx])
                                                     all_discoveries.append({
-                                                        'feature': f'range_{agg}_{window}d',
-                                                        'type': 'Rolling',
+                                                        'feature': f'{feat}_{power_name}',
+                                                        'type': 'Polynomial',
                                                         'correlation': corr,
                                                         'abs_corr': abs(corr),
-                                                        'formula': f'range.rolling({window}).{agg}()'
+                                                        'formula': f'{feat}^{power}'
                                                     })
+                                            except:
+                                                pass
+
+                                        # Also test absolute value
+                                        try:
+                                            abs_series = base_series.abs()
+                                            valid_idx = abs_series.dropna().index.intersection(target_series.dropna().index)
+                                            if len(valid_idx) > 30:
+                                                corr = abs_series.loc[valid_idx].corr(target_series.loc[valid_idx])
+                                                all_discoveries.append({
+                                                    'feature': f'{feat}_abs',
+                                                    'type': 'Transform',
+                                                    'correlation': corr,
+                                                    'abs_corr': abs(corr),
+                                                    'formula': f'abs({feat})'
+                                                })
+                                        except:
+                                            pass
                                     progress_auto.progress(0.6)
 
-                                    # 4. VOLUME DERIVATIVES
-                                    status_auto.text("Testing volume derivatives...")
-                                    if 'volume' in wf_analysis_df.columns:
-                                        volume = wf_analysis_df['volume']
-                                        vol_norm = volume / volume.rolling(20).mean()
-                                        for window in [1, 3, 5, 10]:
-                                            vol_smooth = volume.rolling(max(1, window)).mean() if window > 1 else volume
-                                            for deriv in ['level', 'velocity', 'acceleration']:
-                                                if deriv == 'level':
-                                                    series = vol_smooth
-                                                elif deriv == 'velocity':
-                                                    series = vol_smooth.diff()
-                                                else:
-                                                    series = vol_smooth.diff().diff()
-                                                valid_idx = series.dropna().index.intersection(target_series.dropna().index)
+                                    # =============================================================
+                                    # 6. PERCENTILE TRANSFORMATIONS
+                                    # =============================================================
+                                    status_auto.text("Phase 6/8: Testing percentile transformations...")
+
+                                    for feat in top_20_features[:15]:
+                                        base_series = auto_features[feat]
+                                        for lookback in [20, 60, 120]:
+                                            try:
+                                                pct = base_series.rolling(lookback).apply(
+                                                    lambda x: (x.iloc[-1] - x.min()) / (x.max() - x.min()) if x.max() != x.min() else 0.5,
+                                                    raw=False
+                                                )
+                                                valid_idx = pct.dropna().index.intersection(target_series.dropna().index)
                                                 if len(valid_idx) > 30:
-                                                    corr = series.loc[valid_idx].corr(target_series.loc[valid_idx])
+                                                    corr = pct.loc[valid_idx].corr(target_series.loc[valid_idx])
                                                     all_discoveries.append({
-                                                        'feature': f'vol_{deriv}_w{window}',
-                                                        'type': 'Volume',
+                                                        'feature': f'{feat}_pct_{lookback}d',
+                                                        'type': 'Percentile',
                                                         'correlation': corr,
                                                         'abs_corr': abs(corr),
-                                                        'formula': f'volume.rolling({window}).mean().diff(n={0 if deriv=="level" else (1 if deriv=="velocity" else 2)})'
+                                                        'formula': f'{feat}.rolling({lookback}).percentile()'
                                                     })
-                                    progress_auto.progress(0.8)
+                                            except:
+                                                pass
 
-                                    # 5. REGIME-BASED CORRELATIONS
-                                    status_auto.text("Testing regime features...")
-                                    if 'volatility_20d' in auto_features.columns or 'vix' in auto_features.columns:
-                                        regime_col = 'vix' if 'vix' in auto_features.columns else 'volatility_20d'
-                                        regime_series = auto_features[regime_col]
-                                        median_regime = regime_series.median()
-                                        high_vol_idx = regime_series[regime_series > median_regime].index
-                                        low_vol_idx = regime_series[regime_series <= median_regime].index
+                                            # Z-score transformation
+                                            try:
+                                                zscore = (base_series - base_series.rolling(lookback).mean()) / (base_series.rolling(lookback).std() + 1e-10)
+                                                valid_idx = zscore.dropna().index.intersection(target_series.dropna().index)
+                                                if len(valid_idx) > 30:
+                                                    corr = zscore.loc[valid_idx].corr(target_series.loc[valid_idx])
+                                                    all_discoveries.append({
+                                                        'feature': f'{feat}_zscore_{lookback}d',
+                                                        'type': 'ZScore',
+                                                        'correlation': corr,
+                                                        'abs_corr': abs(corr),
+                                                        'formula': f'({feat} - mean) / std over {lookback}d'
+                                                    })
+                                            except:
+                                                pass
+                                    progress_auto.progress(0.75)
 
-                                        for feat in top_5:
-                                            for regime_name, regime_idx in [('high_vol', high_vol_idx), ('low_vol', low_vol_idx)]:
-                                                valid_idx = auto_features[feat].dropna().index.intersection(target_series.dropna().index).intersection(regime_idx)
-                                                if len(valid_idx) > 20:
-                                                    corr = auto_features.loc[valid_idx, feat].corr(target_series.loc[valid_idx])
+                                    # =============================================================
+                                    # 7. REGIME-CONDITIONAL FEATURES (for top 20)
+                                    # =============================================================
+                                    status_auto.text("Phase 7/8: Testing regime-conditional features...")
+
+                                    # Define multiple regime splits
+                                    regime_definitions = []
+                                    if 'vix' in auto_features.columns and auto_features['vix'].notna().sum() > 50:
+                                        vix = auto_features['vix']
+                                        regime_definitions.append(('vix_high', vix > vix.median()))
+                                        regime_definitions.append(('vix_low', vix <= vix.median()))
+                                    if 'volatility_20d' in auto_features.columns:
+                                        vol = auto_features['volatility_20d']
+                                        regime_definitions.append(('vol_high', vol > vol.median()))
+                                        regime_definitions.append(('vol_low', vol <= vol.median()))
+                                    if 'trend_direction' in auto_features.columns:
+                                        trend = auto_features['trend_direction']
+                                        regime_definitions.append(('uptrend', trend > 0))
+                                        regime_definitions.append(('downtrend', trend < 0))
+
+                                    for feat in top_20_features:
+                                        base_series = auto_features[feat]
+                                        for regime_name, regime_mask in regime_definitions:
+                                            try:
+                                                # Create regime-conditional feature (zeroed outside regime)
+                                                conditional = base_series * regime_mask.astype(float)
+                                                valid_idx = conditional.dropna().index.intersection(target_series.dropna().index)
+                                                if len(valid_idx) > 30:
+                                                    corr = conditional.loc[valid_idx].corr(target_series.loc[valid_idx])
                                                     all_discoveries.append({
                                                         'feature': f'{feat}_{regime_name}',
                                                         'type': 'Regime',
                                                         'correlation': corr,
                                                         'abs_corr': abs(corr),
-                                                        'formula': f'{feat} (in {regime_name} regime)'
+                                                        'formula': f'{feat} × {regime_name}_indicator'
                                                     })
+                                            except:
+                                                pass
+                                    progress_auto.progress(0.9)
+
+                                    # =============================================================
+                                    # 8. CROSS-FEATURE RATIOS (target-aware features)
+                                    # =============================================================
+                                    status_auto.text("Phase 8/8: Testing cross-feature ratios...")
+
+                                    # Key ratios that often matter for range prediction
+                                    ratio_pairs = [
+                                        ('atr_7', 'atr_21'),
+                                        ('atr_14', 'volatility_20d'),
+                                        ('volume_rel', 'volatility_20d'),
+                                        ('rsi_14', 'vix'),
+                                        ('volatility_5d', 'volatility_20d'),
+                                        ('upside_potential', 'downside_potential'),
+                                    ]
+
+                                    for f1, f2 in ratio_pairs:
+                                        if f1 in auto_features.columns and f2 in auto_features.columns:
+                                            try:
+                                                s1 = auto_features[f1]
+                                                s2 = auto_features[f2]
+                                                ratio = s1 / (s2.abs() + 1e-10)
+                                                valid_idx = ratio.dropna().index.intersection(target_series.dropna().index)
+                                                if len(valid_idx) > 30:
+                                                    corr = ratio.loc[valid_idx].corr(target_series.loc[valid_idx])
+                                                    all_discoveries.append({
+                                                        'feature': f'{f1}_over_{f2}',
+                                                        'type': 'Ratio',
+                                                        'correlation': corr,
+                                                        'abs_corr': abs(corr),
+                                                        'formula': f'{f1} / {f2}'
+                                                    })
+                                            except:
+                                                pass
+
                                     progress_auto.progress(1.0)
                                     status_auto.text("Discovery complete!")
 
                                     # Store results
                                     discovery_df = pd.DataFrame(all_discoveries)
                                     discovery_df = discovery_df.sort_values('abs_corr', ascending=False)
+                                    discovery_df = discovery_df.drop_duplicates(subset=['feature'], keep='first')
                                     st.session_state['auto_discovery_results'] = discovery_df
+
+                                    st.success(f"✅ Discovered **{len(discovery_df)}** features across all categories!")
 
                                 except Exception as auto_err:
                                     st.error(f"Auto-discovery failed: {auto_err}")
@@ -8374,6 +9209,65 @@ features['volume_rel_velocity'] = volume_norm.diff()
 
                                     except Exception as vol_err:
                                         st.error(f"Volume analysis failed: {vol_err}")
+
+                    # === AUTO-EXPORT FEATURE ANALYSIS RESULTS ===
+                    st.markdown("---")
+                    st.subheader("Export Feature Analysis")
+
+                    export_feat_col1, export_feat_col2 = st.columns([1, 2])
+                    with export_feat_col1:
+                        export_feature_btn = st.button("📊 Export Feature Analysis", type="primary", use_container_width=True,
+                                                       help="Export all feature analysis data to CSV and summary files")
+
+                    if export_feature_btn:
+                        try:
+                            # Gather all available feature data
+                            feature_data = {
+                                'ticker': wf_ticker,
+                                'importances': [],
+                            }
+
+                            # Get importances (agg_importance is defined earlier in this scope)
+                            try:
+                                if agg_importance is not None and len(agg_importance) > 0:
+                                    feature_data['importances'] = agg_importance.to_dict('records')
+                            except NameError:
+                                pass
+
+                            # Add correlations from session state if available
+                            if 'wf_corr_df' in st.session_state and st.session_state['wf_corr_df'] is not None:
+                                feature_data['correlations'] = st.session_state['wf_corr_df'].to_dict('records')
+
+                            # Add SHAP importance if available
+                            if 'shap_importance' in st.session_state and st.session_state['shap_importance'] is not None:
+                                feature_data['shap_importance'] = st.session_state['shap_importance'].to_dict('records')
+
+                            # Add auto-discovery results if available
+                            if 'auto_discovery_results' in st.session_state and st.session_state['auto_discovery_results'] is not None:
+                                feature_data['discovered_features'] = st.session_state['auto_discovery_results'].to_dict('records')
+
+                            # Add model info
+                            try:
+                                feature_data['model_info'] = {
+                                    'total_features': len(agg_importance) if agg_importance is not None else 0,
+                                    'training_count': int(agg_importance['train_count'].max()) if agg_importance is not None and 'train_count' in agg_importance.columns else 0,
+                                }
+                            except NameError:
+                                feature_data['model_info'] = {'total_features': 0, 'training_count': 0}
+
+                            # Export
+                            corr_csv, imp_csv, summary_file, latest_path, summary_text = export_feature_analysis(
+                                feature_data, wf_ticker
+                            )
+
+                            with st.expander("📊 **Feature Analysis Export Summary** (click to expand)", expanded=True):
+                                st.success(f"✅ Auto-exported to: `{latest_path}`")
+                                st.code(summary_text, language=None)
+
+                        except Exception as feat_export_err:
+                            st.error(f"Feature analysis export failed: {feat_export_err}")
+                            import traceback
+                            st.code(traceback.format_exc())
 
                 else:
                     st.info("Run walk forward analysis first to enable feature analysis.")

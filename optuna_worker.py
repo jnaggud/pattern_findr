@@ -611,6 +611,9 @@ def run_velocity_study(data_path, n_trials, seed, optimize_metric='total_return'
     import sys
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+    # Check for quiet mode (set by test scripts)
+    quiet_mode = os.environ.get('QUIET_WORKERS', '0') == '1'
+
     objective = VelocityOptunaObjective(data_path)
 
     study = optuna.create_study(
@@ -622,12 +625,15 @@ def run_velocity_study(data_path, n_trials, seed, optimize_metric='total_return'
     log_interval = max(100, n_trials // 20)  # Log every 5% or 100 trials
 
     def progress_callback(study, trial):
+        if quiet_mode:
+            return
         n_complete = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
         if n_complete % log_interval == 0 or n_complete == n_trials:
             best_val = study.best_value if study.best_trial else 0
             print(f"[Worker {worker_id}] Trial {n_complete}/{n_trials} | Best {optimize_metric}: {best_val:.2f}", flush=True)
 
-    print(f"[Worker {worker_id}] Starting {n_trials} trials (seed={seed})...", flush=True)
+    if not quiet_mode:
+        print(f"[Worker {worker_id}] Starting {n_trials} trials (seed={seed})...", flush=True)
 
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False, n_jobs=1, callbacks=[progress_callback])
 
@@ -640,7 +646,8 @@ def run_velocity_study(data_path, n_trials, seed, optimize_metric='total_return'
                 results.append(result)
 
     best_val = study.best_value if study.best_trial else 0
-    print(f"[Worker {worker_id}] ✓ Completed! {len(results)} valid results, best: {best_val:.2f}", flush=True)
+    if not quiet_mode:
+        print(f"[Worker {worker_id}] ✓ Completed! {len(results)} valid results, best: {best_val:.2f}", flush=True)
 
     return results
 
@@ -780,6 +787,9 @@ def run_range_study(data_path, n_trials, seed, worker_id=0):
     import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+    # Check for quiet mode (set by test scripts)
+    quiet_mode = os.environ.get('QUIET_WORKERS', '0') == '1'
+
     objective = RangeModelObjective(data_path)
 
     study = optuna.create_study(
@@ -790,6 +800,8 @@ def run_range_study(data_path, n_trials, seed, worker_id=0):
     log_interval = max(10, n_trials // 10)
 
     def progress_callback(study, trial):
+        if quiet_mode:
+            return
         n_complete = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
         if n_complete % log_interval == 0 or n_complete == n_trials:
             if study.best_trial:
@@ -804,7 +816,8 @@ def run_range_study(data_path, n_trials, seed, worker_id=0):
     best_val = study.best_value if study.best_trial else float('inf')
     best_params = study.best_params if study.best_trial else {}
     best_score = -best_val if best_val != float('inf') else 0.0
-    print(f"[Worker {worker_id}] Done! Best Composite Score: {best_score:.4f}", flush=True)
+    if not quiet_mode:
+        print(f"[Worker {worker_id}] Done! Best Composite Score: {best_score:.4f}", flush=True)
 
     # Get top N trials for ensemble (sorted by value, ascending = best first)
     completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
@@ -825,4 +838,159 @@ def run_range_study(data_path, n_trials, seed, worker_id=0):
         'best_params': best_params,
         'top_trials': top_trials,  # Top N trials for ensemble
         'n_trials': len(completed_trials)
+    }
+
+
+# ============================================================================
+# HIGH/LOW MODEL OPTIMIZATION (separate optimization for high and low)
+# This directly optimizes for predicting next_high_pct and next_low_pct
+# instead of next_range_pct, which should improve R² for those targets
+# ============================================================================
+
+_HIGHLOW_DATA_PATH = None
+
+
+def set_highlow_shared_data(X_train_scaled, y_high_train, y_low_train, feature_names=None):
+    """Save high/low model data to temp file for parallel workers."""
+    global _HIGHLOW_DATA_PATH
+
+    data = {
+        'X_train_scaled': X_train_scaled,
+        'y_high_train': y_high_train,
+        'y_low_train': y_low_train,
+        'feature_names': feature_names
+    }
+
+    fd, path = tempfile.mkstemp(suffix='.joblib')
+    os.close(fd)
+    joblib.dump(data, path)
+    _HIGHLOW_DATA_PATH = path
+    return path
+
+
+def get_highlow_data_path():
+    """Get path to shared high/low data."""
+    return _HIGHLOW_DATA_PATH
+
+
+class HighLowModelObjective:
+    """
+    Optuna objective for HIGH or LOW prediction.
+
+    Optimizes XGBoost hyperparameters directly for predicting
+    next_high_pct or next_low_pct (not range).
+    """
+
+    def __init__(self, data_path, target='high'):
+        self.data_path = data_path
+        self.target = target  # 'high' or 'low'
+        self._cached_data = None
+
+    def _load_data(self):
+        if self._cached_data is None:
+            self._cached_data = joblib.load(self.data_path)
+        return self._cached_data
+
+    def __call__(self, trial):
+        from xgboost import XGBRegressor
+        from sklearn.model_selection import TimeSeriesSplit
+        from sklearn.metrics import r2_score
+
+        data = self._load_data()
+        X = data['X_train_scaled']
+        y = data['y_high_train'] if self.target == 'high' else data['y_low_train']
+
+        # XGBoost hyperparameters - optimized for high/low prediction
+        params = {
+            'n_estimators': trial.suggest_int('n_estimators', 100, 400),
+            'max_depth': trial.suggest_int('max_depth', 4, 8),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+            'subsample': trial.suggest_float('subsample', 0.6, 0.95),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 0.95),
+            'reg_alpha': trial.suggest_float('reg_alpha', 1e-6, 1.0, log=True),
+            'reg_lambda': trial.suggest_float('reg_lambda', 0.01, 5.0, log=True),
+            'min_child_weight': trial.suggest_int('min_child_weight', 1, 5),
+            'gamma': trial.suggest_float('gamma', 0, 0.3),
+            'n_jobs': 1,
+            'objective': 'reg:squarederror',
+            'verbosity': 0
+        }
+
+        model = XGBRegressor(**params)
+
+        # Time Series Cross-Validation with more splits for better evaluation
+        tscv = TimeSeriesSplit(n_splits=4)
+        r2_scores = []
+        mae_scores = []
+
+        for train_idx, val_idx in tscv.split(X):
+            model.fit(X[train_idx], y[train_idx])
+            pred = model.predict(X[val_idx])
+
+            r2 = r2_score(y[val_idx], pred)
+            r2_scores.append(r2)
+
+            mae = np.mean(np.abs(y[val_idx] - pred))
+            mae_scores.append(mae)
+
+        avg_r2 = np.mean(r2_scores)
+        avg_mae = np.mean(mae_scores)
+
+        # Composite score focused on R² (what we want to improve)
+        # MAE component scaled to ~0-1 range assuming typical MAE is 0.5-2%
+        r2_component = max(-0.5, avg_r2)  # Allow slightly negative R²
+        mae_component = max(0, 1 - avg_mae / 2)  # 0% MAE = 1, 2% MAE = 0
+
+        # Weight R² more heavily since that's our target metric
+        composite_score = 0.7 * r2_component + 0.3 * mae_component
+
+        return -composite_score  # Minimize negative = maximize positive
+
+
+def run_highlow_study(data_path, n_trials, seed, target='high', worker_id=0):
+    """
+    Run Optuna study for HIGH or LOW model optimization.
+    Designed to be called from joblib for parallel execution (like run_range_study).
+
+    target: 'high' for next_high_pct, 'low' for next_low_pct
+    """
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    quiet_mode = os.environ.get('QUIET_WORKERS', '0') == '1'
+
+    objective = HighLowModelObjective(data_path, target=target)
+
+    study = optuna.create_study(
+        direction='minimize',
+        sampler=optuna.samplers.TPESampler(seed=seed, n_startup_trials=min(5, n_trials // 3))
+    )
+
+    log_interval = max(5, n_trials // 3)
+
+    def progress_callback(study, trial):
+        if quiet_mode:
+            return
+        n_complete = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+        if n_complete % log_interval == 0 or n_complete == n_trials:
+            if study.best_trial:
+                best_score = -study.best_value
+                print(f"[W{worker_id}:{target.upper()}] Trial {n_complete}/{n_trials} | Best: {best_score:.4f}", flush=True)
+
+    # n_jobs=1 - parallelism comes from joblib spawning multiple processes
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False, n_jobs=1, callbacks=[progress_callback])
+
+    best_val = study.best_value if study.best_trial else float('inf')
+    best_params = study.best_params if study.best_trial else {}
+    best_score = -best_val if best_val != float('inf') else 0.0
+
+    if not quiet_mode:
+        print(f"[Worker {worker_id}] {target.upper()} Done! Best Score: {best_score:.4f}", flush=True)
+
+    return {
+        'target': target,
+        'best_value': best_val,
+        'best_score': best_score,
+        'best_params': best_params,
+        'n_trials': len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
     }

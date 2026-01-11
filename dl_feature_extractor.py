@@ -115,8 +115,11 @@ class DLFeatureExtractor:
         # Slice: Take the last 30 steps
         # Lambda layer to slice: inputs[:, -30:, :]
         slice_30 = tf.keras.layers.Lambda(lambda x: x[:, -30:, :])(inputs)
-        x30 = Conv1D(filters=32, kernel_size=3, activation='relu', padding='same')(slice_30)
-        x30 = Conv1D(filters=32, kernel_size=3, activation='relu', padding='same')(x30)
+        x30 = Conv1D(filters=32, kernel_size=3, activation='relu', padding='same',
+                     kernel_regularizer=tf.keras.regularizers.l2(0.01))(slice_30)
+        x30 = Dropout(0.2)(x30)
+        x30 = Conv1D(filters=32, kernel_size=3, activation='relu', padding='same',
+                     kernel_regularizer=tf.keras.regularizers.l2(0.01))(x30)
         x30 = GlobalAveragePooling1D()(x30) # Shape: (batch, 32)
         
         # --- Branch 2: Medium Term (Last 60 days) ---
@@ -125,40 +128,52 @@ class DLFeatureExtractor:
         
         if self.sequence_length >= 60:
             slice_60 = tf.keras.layers.Lambda(lambda x: x[:, -60:, :])(inputs)
-            x60 = Conv1D(filters=32, kernel_size=5, activation='relu', padding='same')(slice_60)
+            x60 = Conv1D(filters=32, kernel_size=5, activation='relu', padding='same',
+                         kernel_regularizer=tf.keras.regularizers.l2(0.01))(slice_60)
             x60 = MaxPooling1D(pool_size=2)(x60)
-            x60 = Conv1D(filters=32, kernel_size=3, activation='relu', padding='same')(x60)
+            x60 = Dropout(0.2)(x60)
+            x60 = Conv1D(filters=32, kernel_size=3, activation='relu', padding='same',
+                         kernel_regularizer=tf.keras.regularizers.l2(0.01))(x60)
             x60 = GlobalAveragePooling1D()(x60)
             branches.append(x60)
             
         if self.sequence_length >= 90:
             slice_90 = tf.keras.layers.Lambda(lambda x: x[:, -90:, :])(inputs)
-            x90 = Conv1D(filters=32, kernel_size=7, activation='relu', padding='same')(slice_90)
+            x90 = Conv1D(filters=32, kernel_size=7, activation='relu', padding='same',
+                         kernel_regularizer=tf.keras.regularizers.l2(0.01))(slice_90)
             x90 = MaxPooling1D(pool_size=2)(x90)
-            x90 = Conv1D(filters=32, kernel_size=3, activation='relu', padding='same')(x90)
+            x90 = Dropout(0.2)(x90)
+            x90 = Conv1D(filters=32, kernel_size=3, activation='relu', padding='same',
+                         kernel_regularizer=tf.keras.regularizers.l2(0.01))(x90)
             x90 = GlobalAveragePooling1D()(x90)
             branches.append(x90)
-            
+
         if self.sequence_length >= 180:
             slice_180 = tf.keras.layers.Lambda(lambda x: x[:, -180:, :])(inputs)
-            x180 = Conv1D(filters=32, kernel_size=9, activation='relu', padding='same')(slice_180)
+            x180 = Conv1D(filters=32, kernel_size=9, activation='relu', padding='same',
+                          kernel_regularizer=tf.keras.regularizers.l2(0.01))(slice_180)
             x180 = MaxPooling1D(pool_size=4)(x180) # More aggressive pooling
-            x180 = Conv1D(filters=32, kernel_size=3, activation='relu', padding='same')(x180)
+            x180 = Dropout(0.2)(x180)
+            x180 = Conv1D(filters=32, kernel_size=3, activation='relu', padding='same',
+                          kernel_regularizer=tf.keras.regularizers.l2(0.01))(x180)
             x180 = GlobalAveragePooling1D()(x180)
             branches.append(x180)
-            
+
         # --- Concatenate All Scales ---
         if len(branches) > 1:
             merged = Concatenate()(branches)
         else:
             merged = branches[0]
-            
-        # Dense Fusion
-        merged = Dense(64, activation='relu')(merged)
-        merged = Dropout(0.3)(merged)
+
+        # Dense Fusion with more regularization
+        merged = Dense(64, activation='relu',
+                       kernel_regularizer=tf.keras.regularizers.l2(0.01))(merged)
+        merged = Dropout(0.4)(merged)  # Increased from 0.3
         
         # Bottleneck (The Feature Embedding)
-        bottleneck = Dense(self.encoding_dim, activation='relu', name='embedding_layer')(merged)
+        # Use 'linear' activation to preserve full embedding range (not clipped by ReLU)
+        bottleneck = Dense(self.encoding_dim, activation='linear', name='embedding_layer',
+                           kernel_regularizer=tf.keras.regularizers.l2(0.01))(merged)
         
         # Head 1: Regression (Price Change)
         out_reg = Dense(1, activation='linear', name='regression_output')(bottleneck)
