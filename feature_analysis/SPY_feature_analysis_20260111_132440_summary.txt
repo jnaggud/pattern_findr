@@ -1,0 +1,89 @@
+================================================================================
+FEATURE ANALYSIS SUMMARY
+================================================================================
+Generated: 2026-01-11 13:24:40
+Ticker: SPY
+Total Features Analyzed: 15
+Training Iterations: 1
+
+================================================================================
+TOP 20 FEATURES BY CORRELATION WITH TARGET
+================================================================================
+Rank   Feature                                        Correlation     |Corr|
+---------------------------------------------------------------------------
+1      super_master                                        0.7115     0.7115
+2      super_range_upside                                  0.6846     0.6846
+3      vol_regime_minus_position                           0.6822     0.6822
+4      range_plus_upside                                   0.6815     0.6815
+5      range_times_upside                                  0.6794     0.6794
+6      daily_range_plus_upside                             0.6778     0.6778
+7      super_upside_vol                                    0.6748     0.6748
+8      upside_times_atr7                                   0.6727     0.6727
+9      super_vol_regime                                    0.6720     0.6720
+10     upside_times_atr14                                  0.6676     0.6676
+11     upside_plus_range_mean20                            0.6659     0.6659
+12     range_times_high_stretch                            0.6572     0.6572
+13     vol_regime_minus_trend                              0.6475     0.6475
+14     range_mean_3d                                       0.6439     0.6439
+15     momentum_trend_divergence                           0.6434     0.6434
+16     vol_regime_plus_range                               0.6379     0.6379
+17     vol_regime_interaction                              0.6364     0.6364
+18     drawdown_from_high_20d                             -0.6307     0.6307
+19     upside_potential_x_price_vs_sma50                  -0.6242     0.6242
+20     range_max_3d                                        0.6228     0.6228
+
+================================================================================
+TOP 20 FEATURES BY MODEL IMPORTANCE
+================================================================================
+Rank   Feature                                           Mean Imp        Std  Consistency
+---------------------------------------------------------------------------------------
+1      momentum_trend_divergence                           0.1777        nan          nan
+2      upside_potential_x_price_vs_sma50                   0.1485        nan          nan
+3      super_master                                        0.1330        nan          nan
+4      range_momentum                                      0.0964        nan          nan
+5      range_times_high_stretch                            0.0594        nan          nan
+6      daily_range_plus_upside                             0.0561        nan          nan
+7      vix                                                 0.0490        nan          nan
+8      range_times_upside                                  0.0489        nan          nan
+9      super_range_upside                                  0.0398        nan          nan
+10     upside_plus_range_mean20                            0.0378        nan          nan
+11     range_plus_upside                                   0.0208        nan          nan
+12     upside_potential                                    0.0166        nan          nan
+13     upside_times_atr14                                  0.0035        nan          nan
+14     upside_times_atr7                                   0.0028        nan          nan
+15     super_upside_vol                                    0.0014        nan          nan
+
+================================================================================
+TOP 20 DISCOVERED FEATURES
+================================================================================
+Rank   Feature                                  Type             Correlation
+---------------------------------------------------------------------------
+1      super_master_+_super_upside_vol          Interaction           0.7282
+2      super_master_+_upside_times_atr7         Interaction           0.7277
+3      super_master_+_upside_times_atr14        Interaction           0.7235
+4      super_master_+_range_times_high_stretch  Interaction           0.7184
+5      super_master_+_range_plus_upside         Interaction           0.7156
+6      super_master_+_upside_plus_range_mean20  Interaction           0.7152
+7      super_master_+_daily_range_plus_upside   Interaction           0.7148
+8      upside_plus_range_mean20_*_range_mean_3d Interaction           0.7146
+9      super_master_+_super_range_upside        Interaction           0.7143
+10     vol_regime_minus_position_+_upside_times_atr7 Interaction           0.7143
+11     super_master_+_range_max_3d              Interaction           0.7134
+12     super_master_+_range_mean_3d             Interaction           0.7133
+13     upside_times_atr7_+_super_vol_regime     Interaction           0.7129
+14     super_master_+_momentum_trend_divergence Interaction           0.7127
+15     super_range_upside_+_range_mean_3d       Interaction           0.7126
+16     super_master_-_upside_potential_x_price_vs_sma50 Interaction           0.7124
+17     super_master_+_range_times_upside        Interaction           0.7117
+18     super_master_-_range_times_upside        Interaction           0.7112
+19     super_master_+_upside_potential_x_price_vs_sma50 Interaction           0.7104
+20     super_master_-_momentum_trend_divergence Interaction           0.7101
+
+================================================================================
+EXPORTED FILES
+================================================================================
+Correlations CSV: feature_analysis/SPY_correlations_20260111_132440.csv
+Importances CSV: feature_analysis/SPY_importances_20260111_132440.csv
+Discovered Features CSV: feature_analysis/SPY_discovered_features_20260111_132440.csv
+Summary: feature_analysis/SPY_feature_analysis_20260111_132440_summary.txt
+================================================================================

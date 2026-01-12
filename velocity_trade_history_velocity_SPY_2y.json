@@ -11,5 +11,20 @@
     "exit_reason": "Opposite Signal (2.35%)",
     "pnl_pct": 2.3474589231564176,
     "pnl_dollars": 234.74589231564175
+  },
+  {
+    "id": 2,
+    "ticker": "SPY",
+    "strategy_name": "velocity_SPY_2y",
+    "type": "LONG",
+    "entry_price": 683.1699829101562,
+    "exit_price": 689.51,
+    "entry_time": "2026-01-02 00:00:00",
+    "exit_time": "2026-01-08 00:00:00",
+    "entry_signal_bar": "2026-01-02 00:00:00",
+    "exit_signal_bar": "2026-01-08 00:00:00",
+    "exit_reason": "Opposite Signal (0.93%)",
+    "pnl_pct": 0.9280292238304501,
+    "pnl_dollars": 6.340017089843741
   }
 ]

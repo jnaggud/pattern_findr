@@ -1,0 +1,44 @@
+{
+  "baseline_timestamp": "2026-01-08T11:18:51.944222",
+  "test_timestamp": "2026-01-08T11:23:32.967128",
+  "metrics": {
+    "high_containment": {
+      "baseline": 70.0,
+      "test": 73.33333333333333,
+      "improvement": 3.3333333333333286
+    },
+    "low_containment": {
+      "baseline": 55.00000000000001,
+      "test": 55.00000000000001,
+      "improvement": 0.0
+    },
+    "full_containment": {
+      "baseline": 60.0,
+      "test": 61.66666666666667,
+      "improvement": 1.6666666666666714
+    },
+    "range_mape": {
+      "baseline": 43.460145492231234,
+      "test": 39.57541017872027,
+      "improvement": 3.8847353135109657
+    },
+    "high_mae": {
+      "baseline": 2.9812963215328523,
+      "test": 2.8629715581202864,
+      "improvement": 0.11832476341256593
+    },
+    "low_mae": {
+      "baseline": 3.48123461279612,
+      "test": 3.4606483886344184,
+      "improvement": 0.020586224161701416
+    },
+    "high_bias": {
+      "baseline": -0.4986527956996952,
+      "test": -0.2962183424481149
+    },
+    "low_bias": {
+      "baseline": 0.06831113793787343,
+      "test": -0.09731705108613747
+    }
+  }
+}

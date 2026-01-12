@@ -80,6 +80,11 @@
       "date": "2026-01-02 00:00:00",
       "price": 683.1699829101562,
       "position": "long"
+    },
+    {
+      "date": "2026-01-08 00:00:00",
+      "price": 694.07,
+      "position": "long"
     }
   ],
   "exits": [
@@ -202,15 +207,24 @@
       "reason": "Opposite Signal",
       "entry_price": 674.4769287109375,
       "entry_date": "2025-12-18 00:00:00"
+    },
+    {
+      "date": "2026-01-08 00:00:00",
+      "price": 689.51,
+      "pnl": 0.9280292238304501,
+      "reason": "Opposite Signal (0.93%)",
+      "entry_price": 683.1699829101562,
+      "entry_date": "2026-01-02 00:00:00"
     }
   ],
   "current_position": {
     "position": "long",
-    "entry_price": 683.1699829101562,
-    "entry_date": "2026-01-02 00:00:00"
+    "entry_price": 694.07,
+    "entry_date": "2026-01-08 00:00:00"
   },
-  "num_trades": 15,
+  "num_trades": 16,
   "win_rate": 100.0,
-  "total_return": 28.05053210374988,
-  "profit_factor": Infinity
+  "total_return": 29.238878462943063,
+  "profit_factor": 26000.28892911596,
+  "num_missed": 0
 }

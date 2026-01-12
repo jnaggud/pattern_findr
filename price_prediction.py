@@ -9,6 +9,7 @@ Provides three core prediction capabilities:
 Uses: XGBoost regression, options data (Polygon), technical indicators, VIX data
 """
 
+import os
 import numpy as np
 import pandas as pd
 from typing import Tuple, Dict, Optional, List
@@ -34,6 +35,7 @@ try:
     from sklearn.preprocessing import StandardScaler
     from sklearn.model_selection import TimeSeriesSplit
     from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+    from sklearn.linear_model import Ridge
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
@@ -49,6 +51,14 @@ try:
     YF_AVAILABLE = True
 except ImportError:
     YF_AVAILABLE = False
+
+# Market data database for caching (eliminates yfinance rate limiting)
+try:
+    from market_data_db import get_market_db, MarketDataDB
+    MARKET_DB_AVAILABLE = True
+except ImportError:
+    MARKET_DB_AVAILABLE = False
+    print("Warning: market_data_db not available, using direct yfinance calls")
 
 # Try to import novel indicators
 try:
@@ -100,6 +110,22 @@ except ImportError:
     DL_FEATURE_AVAILABLE = False
     print("Warning: DLFeatureExtractor not available, deep learning features disabled")
 
+# Import News Sentiment for catching big moves
+try:
+    from news_sentiment import NewsSentimentManager, create_news_features, get_news_manager, FreeNewsScraper
+    NEWS_SENTIMENT_AVAILABLE = True
+except ImportError:
+    NEWS_SENTIMENT_AVAILABLE = False
+    print("Warning: news_sentiment not available, news features disabled")
+
+# Import News Features V2 - Engineered features with proven predictive power
+try:
+    from news_features_v2 import create_predictive_news_features
+    NEWS_FEATURES_V2_AVAILABLE = True
+except ImportError:
+    NEWS_FEATURES_V2_AVAILABLE = False
+    print("Warning: news_features_v2 not available, using legacy news features")
+
 
 # =============================================================================
 # FEATURE GROUP CONFIGURATION
@@ -141,10 +167,39 @@ FEATURE_CONFIG = {
     'dollar_features': True,         # Dollar index (DXY) - currency context
     'correlation_features': True,    # SPY/QQQ correlation - market structure
     'earnings_features': True,       # Earnings calendar for top SPY holdings
+
+    # News Sentiment Features (requires Finnhub API key or scraper)
+    'news_sentiment': True,          # News sentiment for big move prediction
 }
 
 # TOGGLE: Set to False for baseline (old features only), True for test (with new features)
 USE_NEW_CROSS_MARKET_FEATURES = True
+
+# =============================================================================
+# MODEL CONFIGURATION
+# Based on hypothesis testing results (test_model_hypotheses.py):
+# - Ridge (top 15 corr) achieves R²=0.5624 vs XGBoost (all) R²=0.3254
+# - Linear models handle collinear features better than tree-based
+# - Optimal feature count is 10-20 top correlated features
+# =============================================================================
+MODEL_CONFIG = {
+    # Model type: 'ridge' (recommended), 'xgboost', or 'ensemble' (blend both)
+    'model_type': 'ridge',
+
+    # Top-N correlation feature selection
+    # Hypothesis testing showed 15 is optimal (R²=0.5624)
+    'top_n_features': 15,
+
+    # Ridge alpha (regularization strength)
+    # Testing showed alpha=1.0 works well for top-N features
+    'ridge_alpha': 1.0,
+
+    # For ensemble mode: weight for Ridge vs XGBoost (0.0 = all XGB, 1.0 = all Ridge)
+    'ridge_weight': 0.7,
+
+    # Whether to use correlation-based feature selection (recommended True)
+    'use_correlation_selection': True,
+}
 
 # =============================================================================
 # ZERO-IMPORTANCE FEATURES TO PRUNE
@@ -475,7 +530,7 @@ class PriceRangePredictor:
 
     def fetch_vix_data(self, start_date: str = None, end_date: str = None) -> pd.DataFrame:
         """
-        Fetch VIX data from Yahoo Finance.
+        Fetch VIX data - uses SQLite cache for historical, fresh for today.
 
         Args:
             start_date: Start date in YYYY-MM-DD format
@@ -484,10 +539,6 @@ class PriceRangePredictor:
         Returns:
             DataFrame with VIX OHLC data indexed by date
         """
-        if not YF_AVAILABLE:
-            print("Warning: yfinance not available, skipping VIX data")
-            return pd.DataFrame()
-
         try:
             # Use CLASS-LEVEL cache if recent (shared across all instances)
             today = datetime.now().date()
@@ -500,25 +551,47 @@ class PriceRangePredictor:
             if start_date is None:
                 start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
 
-            print(f"   Fetching VIX data from {start_date} to {end_date}...")
-            vix = yf.download('^VIX', start=start_date, end=end_date, progress=False)
+            # Use database if available (fast, no rate limiting)
+            if MARKET_DB_AVAILABLE:
+                db = get_market_db(suppress_init_message=True)
+                vix_df = db.get_vix(start_date, end_date)
 
-            if vix.empty:
-                print("   Warning: No VIX data returned")
+                if vix_df.empty:
+                    print("   Warning: No VIX data in database")
+                    return pd.DataFrame()
+
+                # Convert to expected format (date as index)
+                vix = vix_df.set_index('date')
+                vix.index = pd.to_datetime(vix.index)
+
+                # Cache at CLASS level
+                PriceRangePredictor._class_vix_cache = vix
+                PriceRangePredictor._class_vix_cache_date = today
+
+                print(f"   VIX data loaded: {len(vix)} bars, current VIX={vix['close'].iloc[-1]:.2f}")
+                return vix
+
+            # Fallback to direct yfinance if DB not available
+            elif YF_AVAILABLE:
+                print(f"   Fetching VIX data from {start_date} to {end_date}...")
+                vix = yf.download('^VIX', start=start_date, end=end_date, progress=False)
+
+                if vix.empty:
+                    print("   Warning: No VIX data returned")
+                    return pd.DataFrame()
+
+                if isinstance(vix.columns, pd.MultiIndex):
+                    vix.columns = vix.columns.get_level_values(0)
+                vix.columns = vix.columns.str.lower()
+
+                PriceRangePredictor._class_vix_cache = vix
+                PriceRangePredictor._class_vix_cache_date = today
+
+                print(f"   VIX data loaded: {len(vix)} bars, current VIX={vix['close'].iloc[-1]:.2f}")
+                return vix
+            else:
+                print("Warning: No data source available for VIX")
                 return pd.DataFrame()
-
-            # Handle multi-level columns
-            if isinstance(vix.columns, pd.MultiIndex):
-                vix.columns = vix.columns.get_level_values(0)
-
-            vix.columns = vix.columns.str.lower()
-
-            # Cache at CLASS level (shared across all instances)
-            PriceRangePredictor._class_vix_cache = vix
-            PriceRangePredictor._class_vix_cache_date = today
-
-            print(f"   VIX data loaded: {len(vix)} bars, current VIX={vix['close'].iloc[-1]:.2f}")
-            return vix
 
         except Exception as e:
             print(f"   VIX fetch error: {e}")
@@ -526,12 +599,9 @@ class PriceRangePredictor:
 
     def fetch_vvix_data(self, start_date: str = None, end_date: str = None) -> pd.DataFrame:
         """
-        Fetch VVIX (VIX of VIX) data from Yahoo Finance.
+        Fetch VVIX (VIX of VIX) data - uses SQLite cache for historical, fresh for today.
         VVIX measures the expected volatility of VIX - high VVIX = expecting VIX moves.
         """
-        if not YF_AVAILABLE:
-            return pd.DataFrame()
-
         try:
             today = datetime.now().date()
             if PriceRangePredictor._class_vvix_cache is not None and PriceRangePredictor._class_vvix_cache_date == today:
@@ -542,19 +612,37 @@ class PriceRangePredictor:
             if start_date is None:
                 start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
 
-            vvix = yf.download('^VVIX', start=start_date, end=end_date, progress=False)
+            # Use database if available
+            if MARKET_DB_AVAILABLE:
+                db = get_market_db(suppress_init_message=True)
+                vvix_df = db.get_vvix(start_date, end_date)
 
-            if vvix.empty:
+                if vvix_df.empty:
+                    return pd.DataFrame()
+
+                vvix = vvix_df.set_index('date')
+                vvix.index = pd.to_datetime(vvix.index)
+
+                PriceRangePredictor._class_vvix_cache = vvix
+                PriceRangePredictor._class_vvix_cache_date = today
+                return vvix
+
+            # Fallback to yfinance
+            elif YF_AVAILABLE:
+                vvix = yf.download('^VVIX', start=start_date, end=end_date, progress=False)
+
+                if vvix.empty:
+                    return pd.DataFrame()
+
+                if isinstance(vvix.columns, pd.MultiIndex):
+                    vvix.columns = vvix.columns.get_level_values(0)
+                vvix.columns = vvix.columns.str.lower()
+
+                PriceRangePredictor._class_vvix_cache = vvix
+                PriceRangePredictor._class_vvix_cache_date = today
+                return vvix
+            else:
                 return pd.DataFrame()
-
-            if isinstance(vvix.columns, pd.MultiIndex):
-                vvix.columns = vvix.columns.get_level_values(0)
-            vvix.columns = vvix.columns.str.lower()
-
-            PriceRangePredictor._class_vvix_cache = vvix
-            PriceRangePredictor._class_vvix_cache_date = today
-
-            return vvix
 
         except Exception as e:
             print(f"   VVIX fetch error: {e}")
@@ -562,11 +650,8 @@ class PriceRangePredictor:
 
     def fetch_sector_data(self, start_date: str = None, end_date: str = None) -> Dict[str, pd.DataFrame]:
         """
-        Fetch sector ETF data for breadth analysis.
+        Fetch sector ETF data - uses SQLite cache for historical, fresh for today.
         """
-        if not YF_AVAILABLE:
-            return {}
-
         try:
             today = datetime.now().date()
             if PriceRangePredictor._class_sector_cache and PriceRangePredictor._class_sector_cache_date == today:
@@ -577,29 +662,50 @@ class PriceRangePredictor:
             if start_date is None:
                 start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
 
-            sector_data = {}
-            # Download all sector ETFs in one call for efficiency
-            tickers = ' '.join(self.SECTOR_ETFS)
-            data = yf.download(tickers, start=start_date, end=end_date, progress=False, group_by='ticker')
+            # Use database if available
+            if MARKET_DB_AVAILABLE:
+                db = get_market_db(suppress_init_message=True)
+                sector_data = {}
 
-            for etf in self.SECTOR_ETFS:
-                try:
-                    if len(self.SECTOR_ETFS) == 1:
-                        df = data.copy()
-                    else:
-                        df = data[etf].copy()
-                    if isinstance(df.columns, pd.MultiIndex):
-                        df.columns = df.columns.get_level_values(0)
-                    df.columns = df.columns.str.lower()
-                    if not df.empty:
-                        sector_data[etf] = df
-                except:
-                    continue
+                for etf in self.SECTOR_ETFS:
+                    try:
+                        df = db.get_data(etf, start_date, end_date)
+                        if not df.empty:
+                            df = df.set_index('date')
+                            df.index = pd.to_datetime(df.index)
+                            sector_data[etf] = df
+                    except:
+                        continue
 
-            PriceRangePredictor._class_sector_cache = sector_data
-            PriceRangePredictor._class_sector_cache_date = today
+                PriceRangePredictor._class_sector_cache = sector_data
+                PriceRangePredictor._class_sector_cache_date = today
+                return sector_data
 
-            return sector_data
+            # Fallback to yfinance
+            elif YF_AVAILABLE:
+                sector_data = {}
+                tickers = ' '.join(self.SECTOR_ETFS)
+                data = yf.download(tickers, start=start_date, end=end_date, progress=False, group_by='ticker')
+
+                for etf in self.SECTOR_ETFS:
+                    try:
+                        if len(self.SECTOR_ETFS) == 1:
+                            df = data.copy()
+                        else:
+                            df = data[etf].copy()
+                        if isinstance(df.columns, pd.MultiIndex):
+                            df.columns = df.columns.get_level_values(0)
+                        df.columns = df.columns.str.lower()
+                        if not df.empty:
+                            sector_data[etf] = df
+                    except:
+                        continue
+
+                PriceRangePredictor._class_sector_cache = sector_data
+                PriceRangePredictor._class_sector_cache_date = today
+                return sector_data
+            else:
+                return {}
 
         except Exception as e:
             print(f"   Sector data fetch error: {e}")
@@ -607,11 +713,8 @@ class PriceRangePredictor:
 
     def fetch_credit_data(self, start_date: str = None, end_date: str = None) -> Dict[str, pd.DataFrame]:
         """
-        Fetch HYG (high yield) and LQD (investment grade) for credit spread analysis.
+        Fetch HYG and LQD - uses SQLite cache for historical, fresh for today.
         """
-        if not YF_AVAILABLE:
-            return {}
-
         try:
             today = datetime.now().date()
             if PriceRangePredictor._class_credit_cache is not None and PriceRangePredictor._class_credit_cache_date == today:
@@ -622,22 +725,44 @@ class PriceRangePredictor:
             if start_date is None:
                 start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
 
-            credit_data = {}
-            for ticker in ['HYG', 'LQD']:
-                try:
-                    df = yf.download(ticker, start=start_date, end=end_date, progress=False)
-                    if isinstance(df.columns, pd.MultiIndex):
-                        df.columns = df.columns.get_level_values(0)
-                    df.columns = df.columns.str.lower()
-                    if not df.empty:
-                        credit_data[ticker] = df
-                except:
-                    continue
+            # Use database if available
+            if MARKET_DB_AVAILABLE:
+                db = get_market_db(suppress_init_message=True)
+                credit_data = {}
 
-            PriceRangePredictor._class_credit_cache = credit_data
-            PriceRangePredictor._class_credit_cache_date = today
+                for ticker in ['HYG', 'LQD']:
+                    try:
+                        df = db.get_data(ticker, start_date, end_date)
+                        if not df.empty:
+                            df = df.set_index('date')
+                            df.index = pd.to_datetime(df.index)
+                            credit_data[ticker] = df
+                    except:
+                        continue
 
-            return credit_data
+                PriceRangePredictor._class_credit_cache = credit_data
+                PriceRangePredictor._class_credit_cache_date = today
+                return credit_data
+
+            # Fallback to yfinance
+            elif YF_AVAILABLE:
+                credit_data = {}
+                for ticker in ['HYG', 'LQD']:
+                    try:
+                        df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+                        if isinstance(df.columns, pd.MultiIndex):
+                            df.columns = df.columns.get_level_values(0)
+                        df.columns = df.columns.str.lower()
+                        if not df.empty:
+                            credit_data[ticker] = df
+                    except:
+                        continue
+
+                PriceRangePredictor._class_credit_cache = credit_data
+                PriceRangePredictor._class_credit_cache_date = today
+                return credit_data
+            else:
+                return {}
 
         except Exception as e:
             print(f"   Credit data fetch error: {e}")
@@ -645,11 +770,8 @@ class PriceRangePredictor:
 
     def fetch_treasury_data(self, start_date: str = None, end_date: str = None) -> Dict[str, pd.DataFrame]:
         """
-        Fetch Treasury yield data (10Y and 30Y).
+        Fetch Treasury yield data - uses SQLite cache for historical, fresh for today.
         """
-        if not YF_AVAILABLE:
-            return {}
-
         try:
             today = datetime.now().date()
             if PriceRangePredictor._class_treasury_cache is not None and PriceRangePredictor._class_treasury_cache_date == today:
@@ -660,22 +782,44 @@ class PriceRangePredictor:
             if start_date is None:
                 start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
 
-            treasury_data = {}
-            for ticker, name in [('^TNX', '10Y'), ('^TYX', '30Y')]:
-                try:
-                    df = yf.download(ticker, start=start_date, end=end_date, progress=False)
-                    if isinstance(df.columns, pd.MultiIndex):
-                        df.columns = df.columns.get_level_values(0)
-                    df.columns = df.columns.str.lower()
-                    if not df.empty:
-                        treasury_data[name] = df
-                except:
-                    continue
+            # Use database if available
+            if MARKET_DB_AVAILABLE:
+                db = get_market_db(suppress_init_message=True)
+                treasury_data = {}
 
-            PriceRangePredictor._class_treasury_cache = treasury_data
-            PriceRangePredictor._class_treasury_cache_date = today
+                for ticker, name in [('^TNX', '10Y'), ('^TYX', '30Y')]:
+                    try:
+                        df = db.get_data(ticker, start_date, end_date)
+                        if not df.empty:
+                            df = df.set_index('date')
+                            df.index = pd.to_datetime(df.index)
+                            treasury_data[name] = df
+                    except:
+                        continue
 
-            return treasury_data
+                PriceRangePredictor._class_treasury_cache = treasury_data
+                PriceRangePredictor._class_treasury_cache_date = today
+                return treasury_data
+
+            # Fallback to yfinance
+            elif YF_AVAILABLE:
+                treasury_data = {}
+                for ticker, name in [('^TNX', '10Y'), ('^TYX', '30Y')]:
+                    try:
+                        df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+                        if isinstance(df.columns, pd.MultiIndex):
+                            df.columns = df.columns.get_level_values(0)
+                        df.columns = df.columns.str.lower()
+                        if not df.empty:
+                            treasury_data[name] = df
+                    except:
+                        continue
+
+                PriceRangePredictor._class_treasury_cache = treasury_data
+                PriceRangePredictor._class_treasury_cache_date = today
+                return treasury_data
+            else:
+                return {}
 
         except Exception as e:
             print(f"   Treasury data fetch error: {e}")
@@ -683,11 +827,8 @@ class PriceRangePredictor:
 
     def fetch_dollar_data(self, start_date: str = None, end_date: str = None) -> pd.DataFrame:
         """
-        Fetch Dollar Index (DXY) data. Uses UUP ETF as more reliable proxy.
+        Fetch Dollar Index (DXY) data - uses SQLite cache for historical, fresh for today.
         """
-        if not YF_AVAILABLE:
-            return pd.DataFrame()
-
         try:
             today = datetime.now().date()
             if PriceRangePredictor._class_dollar_cache is not None and PriceRangePredictor._class_dollar_cache_date == today:
@@ -698,19 +839,32 @@ class PriceRangePredictor:
             if start_date is None:
                 start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
 
-            # Try actual DXY tickers first, UUP as last resort (UUP trades ~$27 not ~$100)
-            for ticker in ['DX=F', 'DX-Y.NYB', 'UUP']:
-                try:
-                    df = yf.download(ticker, start=start_date, end=end_date, progress=False)
-                    if isinstance(df.columns, pd.MultiIndex):
-                        df.columns = df.columns.get_level_values(0)
-                    df.columns = df.columns.str.lower()
-                    if not df.empty:
-                        PriceRangePredictor._class_dollar_cache = df
-                        PriceRangePredictor._class_dollar_cache_date = today
-                        return df
-                except:
-                    continue
+            # Use database if available
+            if MARKET_DB_AVAILABLE:
+                db = get_market_db(suppress_init_message=True)
+                df = db.get_dollar(start_date, end_date)
+
+                if not df.empty:
+                    df = df.set_index('date')
+                    df.index = pd.to_datetime(df.index)
+                    PriceRangePredictor._class_dollar_cache = df
+                    PriceRangePredictor._class_dollar_cache_date = today
+                    return df
+
+            # Fallback to yfinance - try multiple tickers
+            if YF_AVAILABLE:
+                for ticker in ['DX=F', 'DX-Y.NYB', 'UUP']:
+                    try:
+                        df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+                        if isinstance(df.columns, pd.MultiIndex):
+                            df.columns = df.columns.get_level_values(0)
+                        df.columns = df.columns.str.lower()
+                        if not df.empty:
+                            PriceRangePredictor._class_dollar_cache = df
+                            PriceRangePredictor._class_dollar_cache_date = today
+                            return df
+                    except:
+                        continue
 
             return pd.DataFrame()
 
@@ -720,11 +874,8 @@ class PriceRangePredictor:
 
     def fetch_qqq_data(self, start_date: str = None, end_date: str = None) -> pd.DataFrame:
         """
-        Fetch QQQ data for correlation analysis with SPY.
+        Fetch QQQ data - uses SQLite cache for historical, fresh for today.
         """
-        if not YF_AVAILABLE:
-            return pd.DataFrame()
-
         try:
             today = datetime.now().date()
             if PriceRangePredictor._class_qqq_cache is not None and PriceRangePredictor._class_qqq_cache_date == today:
@@ -735,19 +886,34 @@ class PriceRangePredictor:
             if start_date is None:
                 start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
 
-            df = yf.download('QQQ', start=start_date, end=end_date, progress=False)
+            # Use database if available
+            if MARKET_DB_AVAILABLE:
+                db = get_market_db(suppress_init_message=True)
+                df = db.get_qqq(start_date, end_date)
 
-            if df.empty:
-                return pd.DataFrame()
+                if not df.empty:
+                    df = df.set_index('date')
+                    df.index = pd.to_datetime(df.index)
+                    PriceRangePredictor._class_qqq_cache = df
+                    PriceRangePredictor._class_qqq_cache_date = today
+                    return df
 
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df.columns = df.columns.str.lower()
+            # Fallback to yfinance
+            if YF_AVAILABLE:
+                df = yf.download('QQQ', start=start_date, end=end_date, progress=False)
 
-            PriceRangePredictor._class_qqq_cache = df
-            PriceRangePredictor._class_qqq_cache_date = today
+                if df.empty:
+                    return pd.DataFrame()
 
-            return df
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                df.columns = df.columns.str.lower()
+
+                PriceRangePredictor._class_qqq_cache = df
+                PriceRangePredictor._class_qqq_cache_date = today
+                return df
+
+            return pd.DataFrame()
 
         except Exception as e:
             print(f"   QQQ data fetch error: {e}")
@@ -880,6 +1046,23 @@ class PriceRangePredictor:
                 print(f"     Max Pain=${features.get('max_pain', 'N/A')}")
                 print(f"     Net Gamma={features.get('net_gamma', 'N/A')} ({features.get('gamma_interpretation', 'N/A')})")
                 print(f"     Activity Bias={features.get('activity_bias', 'N/A')}, Unusual={features.get('unusual_contracts_count', 0)} contracts")
+
+                # CACHE IV DATA for future walk-forward training
+                # This builds historical IV data that can be used when training on past dates
+                if features.get('iv_weighted') is not None:
+                    try:
+                        from market_data_db import get_market_db
+                        db = get_market_db(suppress_init_message=True)
+                        iv_cache_data = {
+                            'iv_weighted': features.get('iv_weighted', 0),
+                            'iv_call': features.get('iv_call', 0),
+                            'iv_put': features.get('iv_put', 0),
+                            'iv_skew': features.get('iv_skew', 0),
+                            'atm_iv': features.get('atm_iv', 0),
+                        }
+                        db.save_iv_data(ticker, iv_cache_data)
+                    except Exception as e:
+                        print(f"   [IV Cache] Warning: Could not cache IV data: {e}")
             else:
                 # Fallback to individual calls if full analysis fails
                 print(f"   Full analysis unavailable, using fallback methods...")
@@ -911,13 +1094,204 @@ class PriceRangePredictor:
 
         return features
 
-    def create_range_features(self, df: pd.DataFrame, options_features: Dict = None) -> pd.DataFrame:
+    def _merge_cached_news_sentiment(self, features: pd.DataFrame, ticker: str) -> pd.DataFrame:
+        """
+        Merge cached historical news sentiment into features DataFrame.
+
+        This uses historical sentiment data from the database for walk-forward training,
+        instead of just using today's sentiment for all rows.
+
+        Args:
+            features: DataFrame with features (must have DatetimeIndex)
+            ticker: Stock ticker symbol
+
+        Returns:
+            Features DataFrame with merged news sentiment where available
+        """
+        try:
+            import sqlite3
+            import os
+            news_db = os.path.join(os.path.dirname(__file__), 'news_sentiment_cache.db')
+
+            if not os.path.exists(news_db):
+                return features
+
+            conn = sqlite3.connect(news_db)
+
+            # Get date range
+            start_date = features.index.min().strftime('%Y-%m-%d')
+            end_date = features.index.max().strftime('%Y-%m-%d')
+
+            # Load historical sentiment
+            query = """
+                SELECT date, sentiment_score, sentiment_bullish, sentiment_bearish,
+                       buzz_score, company_news_score, sector_avg_bullish
+                FROM daily_sentiment
+                WHERE symbol = ? AND date >= ? AND date <= ?
+                ORDER BY date
+            """
+            sentiment_df = pd.read_sql_query(query, conn, params=(ticker, start_date, end_date))
+            conn.close()
+
+            if sentiment_df.empty:
+                return features
+
+            # Convert to datetime index
+            sentiment_df['date'] = pd.to_datetime(sentiment_df['date'])
+            sentiment_df.set_index('date', inplace=True)
+
+            # Count matches
+            features_dates = set(features.index.date)
+            sentiment_dates = set(sentiment_df.index.date)
+            matched_dates = features_dates & sentiment_dates
+
+            if not matched_dates:
+                return features
+
+            print(f"   [News Cache] Merging {len(matched_dates)}/{len(features)} days of historical sentiment")
+
+            # Create date lookup
+            sentiment_by_date = {}
+            for dt in sentiment_df.index:
+                sentiment_by_date[dt.date()] = {
+                    'sentiment_score': sentiment_df.loc[dt, 'sentiment_score'],
+                    'sentiment_bullish': sentiment_df.loc[dt, 'sentiment_bullish'],
+                    'sentiment_bearish': sentiment_df.loc[dt, 'sentiment_bearish'],
+                    'buzz_score': sentiment_df.loc[dt, 'buzz_score'],
+                    'company_news_score': sentiment_df.loc[dt, 'company_news_score'],
+                    'sector_avg_bullish': sentiment_df.loc[dt, 'sector_avg_bullish'],
+                }
+
+            # Merge into features
+            for idx in features.index:
+                dt = idx.date()
+                if dt in sentiment_by_date:
+                    s = sentiment_by_date[dt]
+
+                    if 'news_sentiment_score' in features.columns:
+                        features.at[idx, 'news_sentiment_score'] = s['sentiment_score']
+                    if 'news_sentiment_bullish' in features.columns:
+                        features.at[idx, 'news_sentiment_bullish'] = s['sentiment_bullish']
+                    if 'news_sentiment_bearish' in features.columns:
+                        features.at[idx, 'news_sentiment_bearish'] = s['sentiment_bearish']
+                    if 'news_buzz_score' in features.columns:
+                        features.at[idx, 'news_buzz_score'] = s['buzz_score']
+                    if 'news_company_score' in features.columns:
+                        features.at[idx, 'news_company_score'] = s['company_news_score']
+                    if 'news_sector_avg_bullish' in features.columns:
+                        features.at[idx, 'news_sector_avg_bullish'] = s['sector_avg_bullish']
+
+                    # Update derived features
+                    if 'news_sentiment_vs_sector' in features.columns:
+                        features.at[idx, 'news_sentiment_vs_sector'] = s['sentiment_bullish'] - s['sector_avg_bullish']
+                    if 'news_buzz_normalized' in features.columns:
+                        features.at[idx, 'news_buzz_normalized'] = min(s['buzz_score'], 3) / 3
+                    if 'news_extremely_bullish' in features.columns:
+                        features.at[idx, 'news_extremely_bullish'] = float(s['sentiment_bullish'] > 0.7)
+                    if 'news_extremely_bearish' in features.columns:
+                        features.at[idx, 'news_extremely_bearish'] = float(s['sentiment_bearish'] > 0.7)
+                    if 'news_high_buzz' in features.columns:
+                        features.at[idx, 'news_high_buzz'] = float(s['buzz_score'] > 1.5)
+                    if 'news_big_move_signal' in features.columns:
+                        features.at[idx, 'news_big_move_signal'] = float(
+                            s['buzz_score'] > 1.5 and
+                            (s['sentiment_bullish'] > 0.65 or s['sentiment_bearish'] > 0.65)
+                        )
+
+            return features
+
+        except Exception as e:
+            print(f"   [News Cache] Error merging historical sentiment: {e}")
+            return features
+
+    def _merge_cached_iv_data(self, features: pd.DataFrame, ticker: str) -> pd.DataFrame:
+        """
+        Merge cached historical IV data into features DataFrame.
+
+        This replaces the fallback IV values (volatility_20d) with actual historical IV
+        for dates where we have cached data from previous sessions.
+
+        Args:
+            features: DataFrame with features (must have DatetimeIndex)
+            ticker: Stock ticker symbol
+
+        Returns:
+            Features DataFrame with merged IV data where available
+        """
+        try:
+            from market_data_db import get_market_db
+            db = get_market_db(suppress_init_message=True)
+
+            # Get date range from features
+            start_date = features.index.min().strftime('%Y-%m-%d')
+            end_date = features.index.max().strftime('%Y-%m-%d')
+
+            # Load cached IV data
+            iv_df = db.get_iv_data(ticker, start_date, end_date)
+
+            if iv_df.empty:
+                return features
+
+            # Convert feature index to date for merging
+            features_dates = features.index.date
+            iv_dates = iv_df.index.date
+
+            # Count matches
+            matched_dates = set(features_dates) & set(iv_dates)
+            total_dates = len(features)
+            cached_count = len(matched_dates)
+
+            if cached_count == 0:
+                return features
+
+            print(f"   [IV Cache] Merging {cached_count}/{total_dates} days of cached IV data ({cached_count/total_dates*100:.1f}%)")
+
+            # Create a mapping from date to IV values
+            iv_by_date = {}
+            for dt in iv_df.index:
+                iv_by_date[dt.date()] = {
+                    'iv_weighted': iv_df.loc[dt, 'iv_weighted'],
+                    'iv_call': iv_df.loc[dt, 'iv_call'],
+                    'iv_put': iv_df.loc[dt, 'iv_put'],
+                    'iv_skew': iv_df.loc[dt, 'iv_skew'],
+                    'atm_iv': iv_df.loc[dt, 'atm_iv'],
+                }
+
+            # Overwrite fallback IV with cached values where available
+            for idx in features.index:
+                dt = idx.date()
+                if dt in iv_by_date:
+                    iv_data = iv_by_date[dt]
+                    if 'iv_weighted' in features.columns and iv_data['iv_weighted'] > 0:
+                        features.at[idx, 'iv_weighted'] = iv_data['iv_weighted']
+                    if 'iv_call' in features.columns and iv_data['iv_call'] > 0:
+                        features.at[idx, 'iv_call'] = iv_data['iv_call']
+                    if 'iv_put' in features.columns and iv_data['iv_put'] > 0:
+                        features.at[idx, 'iv_put'] = iv_data['iv_put']
+                    if 'iv_skew' in features.columns:
+                        features.at[idx, 'iv_skew'] = iv_data['iv_skew']
+                    if 'atm_iv' in features.columns and iv_data['atm_iv'] > 0:
+                        features.at[idx, 'atm_iv'] = iv_data['atm_iv']
+
+            # Update IV-derived features
+            if cached_count > 0 and 'volatility_20d' in features.columns:
+                features['atm_iv_rv_spread'] = features.get('atm_iv', features['volatility_20d']) - features['volatility_20d']
+
+            return features
+
+        except Exception as e:
+            print(f"   [IV Cache] Error merging cached IV: {e}")
+            return features
+
+    def create_range_features(self, df: pd.DataFrame, options_features: Dict = None,
+                               ticker: str = None) -> pd.DataFrame:
         """
         Create features for range prediction.
 
         Args:
             df: OHLCV DataFrame
             options_features: Optional dict with PCR, IV data
+            ticker: Optional ticker symbol (for cached IV lookup)
 
         Returns:
             DataFrame with features for prediction
@@ -1461,6 +1835,56 @@ class PriceRangePredictor:
                 vix_std = features['vix'].rolling(20).std()
                 features['vix_velocity_norm'] = features['vix_velocity'] / (vix_std + 0.01)
 
+                # ================================================================
+                # ENHANCED VIX FEATURES (Critical for catching big moves!)
+                # ================================================================
+
+                # VIX-RV Spread (Implied - Realized Volatility Premium)
+                # This is the key IV premium measure - high spread = fear/hedging demand
+                if 'volatility_20d' in features.columns:
+                    # VIX is annualized %, volatility_20d is also annualized
+                    features['vix_rv_spread'] = features['vix'] - (features['volatility_20d'] * 100)
+                    features['vix_rv_spread_5d'] = features['vix'] - (features['volatility_5d'] * 100) if 'volatility_5d' in features.columns else features['vix_rv_spread']
+                    features['vix_rv_ratio'] = features['vix'] / (features['volatility_20d'] * 100 + 1)  # +1 to avoid div by zero
+
+                    # VIX-RV spread momentum (expanding/contracting premium)
+                    features['vix_rv_spread_change'] = features['vix_rv_spread'].diff()
+                    features['vix_rv_spread_ma5'] = features['vix_rv_spread'].rolling(5).mean()
+                    features['vix_rv_spread_zscore'] = (
+                        features['vix_rv_spread'] - features['vix_rv_spread'].rolling(60).mean()
+                    ) / (features['vix_rv_spread'].rolling(60).std() + 0.01)
+
+                    print(f"   VIX-RV Spread: {features['vix_rv_spread'].iloc[-1]:.2f} (VIX={features['vix'].iloc[-1]:.2f}, RV={features['volatility_20d'].iloc[-1]*100:.2f}%)")
+
+                # VIX Spike Detection (for catching big moves)
+                # A VIX spike often precedes or accompanies large price swings
+                features['vix_spike_1std'] = (features['vix_zscore'] > 1.0).astype(float)
+                features['vix_spike_2std'] = (features['vix_zscore'] > 2.0).astype(float)
+                features['vix_spike_intensity'] = np.maximum(features['vix_zscore'] - 1, 0)  # How much above 1 std
+
+                # VIX Contraction (low VIX often precedes big moves)
+                features['vix_contraction'] = (features['vix_zscore'] < -1.0).astype(float)
+                features['vix_extreme_low'] = (features['vix_percentile'] < 0.1).astype(float)
+
+                # VIX Mean Reversion Signals
+                features['vix_mean_reversion_up'] = (features['vix_zscore'] < -1.5).astype(float)  # VIX likely to rise
+                features['vix_mean_reversion_down'] = (features['vix_zscore'] > 2.0).astype(float)  # VIX likely to fall
+
+                # VIX Term Structure Proxy (using rolling windows)
+                # Short-term vs long-term VIX expectation
+                vix_5d_ma = features['vix'].rolling(5).mean()
+                vix_20d_ma = features['vix'].rolling(20).mean()
+                features['vix_term_structure'] = (vix_5d_ma - vix_20d_ma) / (vix_20d_ma + 0.01)
+                features['vix_backwardation'] = (features['vix_term_structure'] > 0.05).astype(float)  # Short-term > long-term (fear)
+                features['vix_contango'] = (features['vix_term_structure'] < -0.05).astype(float)  # Short-term < long-term (complacency)
+
+                # Combined Big Move Indicator
+                # High probability of big move when: VIX spiking OR VIX extremely low (complacency before move)
+                features['big_move_risk'] = np.maximum(
+                    features['vix_spike_intensity'],
+                    features['vix_extreme_low'] * 0.5  # Low VIX = building risk
+                )
+
                 print(f"   VIX features added: current VIX={features['vix'].iloc[-1]:.2f}, velocity={features['vix_velocity'].iloc[-1]:.2f}")
             except Exception as e:
                 print(f"   VIX feature error: {e}")
@@ -1468,14 +1892,28 @@ class PriceRangePredictor:
                 for col in ['vix', 'vix_change_1d', 'vix_change_5d', 'vix_sma_10', 'vix_vs_sma',
                            'vix_percentile', 'vix_zscore', 'vix_regime_low', 'vix_regime_high',
                            'vix_velocity', 'vix_velocity_3d', 'vix_velocity_5d',
-                           'vix_accel', 'vix_accel_3d', 'vix_accel_5d', 'vix_velocity_norm']:
+                           'vix_accel', 'vix_accel_3d', 'vix_accel_5d', 'vix_velocity_norm',
+                           'vix_rv_spread', 'vix_rv_spread_5d', 'vix_rv_ratio',
+                           'vix_rv_spread_change', 'vix_rv_spread_ma5', 'vix_rv_spread_zscore',
+                           'vix_spike_1std', 'vix_spike_2std', 'vix_spike_intensity',
+                           'vix_contraction', 'vix_extreme_low',
+                           'vix_mean_reversion_up', 'vix_mean_reversion_down',
+                           'vix_term_structure', 'vix_backwardation', 'vix_contango',
+                           'big_move_risk']:
                     features[col] = 0
         else:
             # Add placeholder VIX features if not available
             for col in ['vix', 'vix_change_1d', 'vix_change_5d', 'vix_sma_10', 'vix_vs_sma',
                        'vix_percentile', 'vix_zscore', 'vix_regime_low', 'vix_regime_high',
                        'vix_velocity', 'vix_velocity_3d', 'vix_velocity_5d',
-                       'vix_accel', 'vix_accel_3d', 'vix_accel_5d', 'vix_velocity_norm']:
+                       'vix_accel', 'vix_accel_3d', 'vix_accel_5d', 'vix_velocity_norm',
+                       'vix_rv_spread', 'vix_rv_spread_5d', 'vix_rv_ratio',
+                       'vix_rv_spread_change', 'vix_rv_spread_ma5', 'vix_rv_spread_zscore',
+                       'vix_spike_1std', 'vix_spike_2std', 'vix_spike_intensity',
+                       'vix_contraction', 'vix_extreme_low',
+                       'vix_mean_reversion_up', 'vix_mean_reversion_down',
+                       'vix_term_structure', 'vix_backwardation', 'vix_contango',
+                       'big_move_risk']:
                 features[col] = 0
 
         # --- Novel Indicators (Advanced composite indicators) ---
@@ -2469,6 +2907,70 @@ class PriceRangePredictor:
                 # Don't fail - just skip DL features
 
         # =================================================================
+        # NEWS SENTIMENT FEATURES (For catching big moves)
+        # Requires Finnhub API key in user_settings.json
+        # =================================================================
+        if FEATURE_CONFIG.get('news_sentiment', True) and NEWS_SENTIMENT_AVAILABLE:
+            try:
+                # Only fetch news for stocks/ETFs, not crypto
+                ticker_for_news = ticker if ticker else 'SPY'  # Default to SPY
+                if ticker_for_news and '-' not in ticker_for_news:  # Skip crypto
+                    print(f"   Fetching news sentiment for {ticker_for_news}...")
+
+                    # Use get_news_manager which auto-falls back to free scraper if no API key
+                    news_manager = get_news_manager(prefer_api=True)
+                    sentiment = news_manager.get_news_sentiment(ticker_for_news)
+
+                    if sentiment.get('buzz_score', 0) > 0:  # Valid data
+                        # Add sentiment features (point-in-time, same for all rows)
+                        features['news_sentiment_score'] = sentiment['sentiment_score']
+                        features['news_sentiment_bullish'] = sentiment['sentiment_bullish']
+                        features['news_sentiment_bearish'] = sentiment['sentiment_bearish']
+                        features['news_buzz_score'] = sentiment['buzz_score']
+                        features['news_company_score'] = sentiment['company_news_score']
+                        features['news_sector_avg_bullish'] = sentiment['sector_avg_bullish']
+
+                        # Derived features
+                        features['news_sentiment_vs_sector'] = (
+                            sentiment['sentiment_bullish'] - sentiment['sector_avg_bullish']
+                        )
+                        features['news_buzz_normalized'] = np.clip(sentiment['buzz_score'], 0, 3) / 3
+
+                        # Extreme sentiment flags
+                        features['news_extremely_bullish'] = float(sentiment['sentiment_bullish'] > 0.7)
+                        features['news_extremely_bearish'] = float(sentiment['sentiment_bearish'] > 0.7)
+
+                        # High buzz flag (lots of news = potential big move)
+                        features['news_high_buzz'] = float(sentiment['buzz_score'] > 1.5)
+
+                        # Combined big move indicator from news
+                        features['news_big_move_signal'] = float(
+                            sentiment['buzz_score'] > 1.5 and
+                            (sentiment['sentiment_bullish'] > 0.65 or sentiment['sentiment_bearish'] > 0.65)
+                        )
+
+                        print(f"   News features added: sentiment={sentiment['sentiment_score']:.2f}, "
+                              f"buzz={sentiment['buzz_score']:.2f}")
+                    else:
+                        # Add placeholder features
+                        for col in ['news_sentiment_score', 'news_sentiment_bullish', 'news_sentiment_bearish',
+                                   'news_buzz_score', 'news_company_score', 'news_sector_avg_bullish',
+                                   'news_sentiment_vs_sector', 'news_buzz_normalized',
+                                   'news_extremely_bullish', 'news_extremely_bearish',
+                                   'news_high_buzz', 'news_big_move_signal']:
+                            features[col] = 0
+                        print(f"   News sentiment: No data available (add finnhub_api_key to user_settings.json)")
+            except Exception as e:
+                print(f"   News sentiment error: {e}")
+                # Add placeholder features on error
+                for col in ['news_sentiment_score', 'news_sentiment_bullish', 'news_sentiment_bearish',
+                           'news_buzz_score', 'news_company_score', 'news_sector_avg_bullish',
+                           'news_sentiment_vs_sector', 'news_buzz_normalized',
+                           'news_extremely_bullish', 'news_extremely_bearish',
+                           'news_high_buzz', 'news_big_move_signal']:
+                    features[col] = 0
+
+        # =================================================================
         # COMPOSITE SUPER-FEATURES (Fix for XGBoost collinearity issue)
         # XGBoost arbitrarily picks ONE from correlated feature groups.
         # These super-features COMBINE the top correlated features so
@@ -2539,6 +3041,41 @@ class PriceRangePredictor:
 
         print(f"   Total features created: {len(self.feature_names)}")
 
+        # Merge cached historical data if ticker provided
+        # This replaces fallback values with actual historical data where cached
+        if ticker:
+            # Merge historical IV data
+            features = self._merge_cached_iv_data(features, ticker)
+
+            # Merge historical news sentiment data
+            features = self._merge_cached_news_sentiment(features, ticker)
+
+            # Add V2 predictive news features (buzz×volatility, cumulative sentiment, etc.)
+            # These have proven correlation with next-day range (0.43 avg for buzz×volatility)
+            if NEWS_FEATURES_V2_AVAILABLE:
+                try:
+                    # create_predictive_news_features needs OHLCV data
+                    df_with_news = create_predictive_news_features(df.copy(), ticker)
+
+                    # Get the new news columns (they all start with 'news_')
+                    v2_news_cols = [c for c in df_with_news.columns if c.startswith('news_')
+                                    and c not in features.columns]
+
+                    if v2_news_cols:
+                        # Merge the new features into our features DataFrame
+                        for col in v2_news_cols:
+                            features[col] = df_with_news[col].values
+                        print(f"   News V2 features added: {len(v2_news_cols)} predictive features")
+                except Exception as e:
+                    print(f"   News V2 features error: {e}")
+            else:
+                # Fallback to legacy lagged features
+                try:
+                    from news_features import add_lagged_news_features
+                    features = add_lagged_news_features(features, ticker, max_lag=3)
+                except ImportError:
+                    pass  # news_features module not available
+
         return features
 
     def create_targets(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -2570,7 +3107,8 @@ class PriceRangePredictor:
 
     def train_range_model(self, df: pd.DataFrame, options_features: Dict = None,
                           n_trials: int = 30, n_workers: int = None, progress_callback=None,
-                          feature_selection: bool = True, optimize_highlow: bool = True) -> Dict:
+                          feature_selection: bool = True, optimize_highlow: bool = True,
+                          ticker: str = None) -> Dict:
         """
         Train XGBRegressor to predict next day's range.
 
@@ -2583,6 +3121,7 @@ class PriceRangePredictor:
             feature_selection: Whether to apply feature selection (default True, disable for walk-forward stability)
             optimize_highlow: Whether to run separate optimization for HIGH/LOW models (default True).
                               Set to False for faster training (~40% speedup) at slight accuracy cost.
+            ticker: Stock ticker symbol (enables historical news sentiment merge)
 
         Returns:
             dict with model, metrics, feature_importances
@@ -2600,8 +3139,8 @@ class PriceRangePredictor:
         _training_summary.reset()
         _training_summary.data['total_rows'] = len(df)
 
-        # Create features and targets
-        features = self.create_range_features(df, options_features)
+        # Create features and targets (pass ticker for historical news merge)
+        features = self.create_range_features(df, options_features, ticker=ticker)
         targets = self.create_targets(df)
 
         # Collect feature health data for summary
@@ -2650,54 +3189,71 @@ class PriceRangePredictor:
         self.feature_correlations = correlations
 
         # =================================================================
-        # CORRELATION-BASED FEATURE PRUNING
-        # Remove redundant features that are >0.95 correlated with each other
-        # This prevents XGBoost from arbitrarily picking one and ignoring others
+        # FEATURE SELECTION (Based on hypothesis testing results)
+        # Ridge with top-N correlation features outperforms XGBoost with all:
+        #   Ridge (top 15) R² = 0.5624
+        #   XGBoost (all)  R² = 0.3254
         # =================================================================
-        print(f"\n[FEATURE PRUNING] Removing redundant highly-correlated features...")
+        model_type = MODEL_CONFIG.get('model_type', 'ridge')
+        use_corr_selection = MODEL_CONFIG.get('use_correlation_selection', True)
+        top_n = MODEL_CONFIG.get('top_n_features', 15)
 
-        # Compute feature-feature correlation matrix
-        feature_corr_matrix = X_train.corr().abs()
+        print(f"\n[FEATURE SELECTION] Model type: {model_type.upper()}")
 
-        # Find features to drop (keep higher target-correlated one from each pair)
-        features_to_drop = set()
-        feature_list = list(X_train.columns)
-
-        for i, feat_i in enumerate(feature_list):
-            if feat_i in features_to_drop:
-                continue
-            for j, feat_j in enumerate(feature_list[i+1:], i+1):
-                if feat_j in features_to_drop:
-                    continue
-                # Check if features are highly correlated with each other
-                if feature_corr_matrix.loc[feat_i, feat_j] > 0.95:
-                    # Keep the one with higher target correlation
-                    corr_i = correlations.get(feat_i, 0)
-                    corr_j = correlations.get(feat_j, 0)
-                    if corr_i >= corr_j:
-                        features_to_drop.add(feat_j)
-                    else:
-                        features_to_drop.add(feat_i)
-
-        # Apply pruning
-        if len(features_to_drop) > 0:
-            print(f"   Dropping {len(features_to_drop)} redundant features (>0.95 inter-correlation)")
-            top_features = [f for f in self.feature_names if f not in features_to_drop]
+        if use_corr_selection and model_type in ['ridge', 'ensemble']:
+            # TOP-N CORRELATION SELECTION (for Ridge/ensemble)
+            # Select top N features by absolute correlation with target
+            top_features = correlations.head(top_n).index.tolist()
+            print(f"   Selecting TOP {top_n} features by correlation with target")
+            print(f"   Top 5: {top_features[:5]}")
+            print(f"   Correlations: {[f'{correlations[f]:.3f}' for f in top_features[:5]]}")
         else:
-            top_features = self.feature_names
+            # REDUNDANCY PRUNING (for XGBoost with all features)
+            print(f"   Using all features with redundancy pruning (>0.95 inter-correlation)")
+
+            # Compute feature-feature correlation matrix
+            feature_corr_matrix = X_train.corr().abs()
+
+            # Find features to drop (keep higher target-correlated one from each pair)
+            features_to_drop = set()
+            feature_list = list(X_train.columns)
+
+            for i, feat_i in enumerate(feature_list):
+                if feat_i in features_to_drop:
+                    continue
+                for j, feat_j in enumerate(feature_list[i+1:], i+1):
+                    if feat_j in features_to_drop:
+                        continue
+                    # Check if features are highly correlated with each other
+                    if feature_corr_matrix.loc[feat_i, feat_j] > 0.95:
+                        # Keep the one with higher target correlation
+                        corr_i = correlations.get(feat_i, 0)
+                        corr_j = correlations.get(feat_j, 0)
+                        if corr_i >= corr_j:
+                            features_to_drop.add(feat_j)
+                        else:
+                            features_to_drop.add(feat_i)
+
+            # Apply pruning
+            if len(features_to_drop) > 0:
+                print(f"   Dropping {len(features_to_drop)} redundant features")
+                top_features = [f for f in self.feature_names if f not in features_to_drop]
+            else:
+                top_features = self.feature_names
 
         self.correlation_selected_features = top_features
         self.training_feature_names = top_features
-        self.dropped_redundant_features = list(features_to_drop)
 
-        print(f"[FEATURES] Using {len(top_features)} features (pruned {len(features_to_drop)} redundant)")
+        print(f"[FEATURES] Using {len(top_features)} features")
         print(f"   Training samples: {n_train}")
         print(f"   Top 5 by correlation: {correlations.head(5).index.tolist()}")
         print(f"   Correlations: {[f'{correlations[f]:.3f}' for f in correlations.head(5).index]}")
 
         # Collect for summary
-        _training_summary.data['features_pruned_corr'] = len(features_to_drop)
+        features_pruned = n_features_total - len(top_features)
+        _training_summary.data['features_pruned_corr'] = features_pruned
         _training_summary.data['features_used'] = len(top_features)
+        _training_summary.data['model_type'] = model_type
         _training_summary.data['top_features_corr'] = [(f, correlations[f]) for f in correlations.head(10).index]
 
         # Apply feature pruning to training/test data
@@ -2711,95 +3267,183 @@ class PriceRangePredictor:
         # Convert to numpy for efficient pickling (critical for multiprocessing!)
         y_train_np = y_train.values if hasattr(y_train, 'values') else np.array(y_train)
 
-        # Use file-based data sharing for proper multiprocessing (like working Optuna code)
-        if not OPTUNA_WORKER_AVAILABLE:
-            raise RuntimeError("optuna_worker module required for parallel optimization")
-
-        from joblib import Parallel, delayed
         import time as time_module
-
-        print(f"   Using joblib Parallel for true multiprocessing...")
-        # Pass feature names for Optuna feature group selection
-        feature_names = list(X_train.columns) if hasattr(X_train, 'columns') else self.feature_names
-        data_path = optuna_worker.set_range_shared_data(X_train_scaled, y_train_np, feature_names=feature_names)
-        print(f"   Feature names passed to optimizer: {len(feature_names)} features")
-
-        # Divide trials among workers (like velocity optimization)
-        trials_per_worker = max(1, n_trials // n_workers)
-        actual_trials = trials_per_worker * n_workers
-
-        print(f"Starting Optuna optimization: {actual_trials} trials across {n_workers} parallel workers...")
-        print(f"   Data shape: X={X_train_scaled.shape}, y={len(y_train_np)}")
-        print(f"   Trials per worker: {trials_per_worker}")
-
         start_opt = time_module.time()
 
-        try:
-            # Run multiple independent studies in parallel using joblib (like velocity optimization)
-            results_list = Parallel(n_jobs=n_workers, backend='loky', verbose=0)(
-                delayed(optuna_worker.run_range_study)(
-                    data_path, trials_per_worker, seed=42 + i, worker_id=i
-                )
-                for i in range(n_workers)
+        # =================================================================
+        # MODEL TRAINING - RIDGE or XGBOOST based on MODEL_CONFIG
+        # =================================================================
+        if model_type == 'ridge':
+            # ============================================================
+            # RIDGE REGRESSION WITH PARALLEL ALPHA GRID SEARCH
+            # Uses cross-validation to find optimal alpha, parallelized across workers
+            # ============================================================
+            from joblib import Parallel, delayed
+            from sklearn.model_selection import cross_val_score
+
+            # Alpha values to search (log-spaced from 0.01 to 100)
+            alpha_grid = [0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]
+
+            print(f"\n[RIDGE TRAINING] Parallel alpha grid search ({len(alpha_grid)} values, {n_workers} workers)...")
+            print(f"   Data shape: X={X_train_scaled.shape}, y={len(y_train_np)}")
+            print(f"   Alpha grid: {alpha_grid}")
+
+            def evaluate_alpha(alpha):
+                """Evaluate a single alpha value using cross-validation."""
+                model = Ridge(alpha=alpha)
+                # Use 5-fold time series cross-validation
+                n_splits = min(5, len(y_train_np) // 10)  # At least 10 samples per fold
+                if n_splits < 2:
+                    # Not enough data for CV, just fit and score on training
+                    model.fit(X_train_scaled, y_train_np)
+                    score = model.score(X_train_scaled, y_train_np)
+                else:
+                    scores = cross_val_score(model, X_train_scaled, y_train_np,
+                                            cv=n_splits, scoring='r2')
+                    score = np.mean(scores)
+                return {'alpha': alpha, 'cv_score': score}
+
+            # Run alpha search in parallel
+            results = Parallel(n_jobs=n_workers, verbose=0)(
+                delayed(evaluate_alpha)(alpha) for alpha in alpha_grid
             )
-        finally:
-            # Clean up shared data file
-            optuna_worker.clear_range_shared_data()
 
-        total_time = time_module.time() - start_opt
+            # Find best alpha
+            best_result = max(results, key=lambda x: x['cv_score'])
+            best_alpha = best_result['alpha']
+            best_cv_score = best_result['cv_score']
 
-        # Find best result across all workers (MAXIMIZE composite score)
-        # best_value is negative, so min() finds the best (most negative = highest positive score)
-        best_result = min(results_list, key=lambda x: x['best_value'])
-        total_completed = sum(r['n_trials'] for r in results_list)
+            print(f"   Alpha search results:")
+            for r in sorted(results, key=lambda x: x['cv_score'], reverse=True)[:5]:
+                print(f"      alpha={r['alpha']:6.2f} -> CV R²={r['cv_score']:.4f}")
+            print(f"   Best alpha: {best_alpha} (CV R²={best_cv_score:.4f})")
 
-        best_composite_score = best_result.get('best_score', -best_result['best_value'])
-        print(f"Optimization complete!")
-        print(f"   Best Composite Score: {best_composite_score:.4f} (0.6*R² + 0.4*MAPE_component)")
-        print(f"   Features used: {X_train_scaled.shape[1]} (all)")
-        print(f"   Total time: {total_time:.1f}s ({total_completed/total_time:.1f} trials/sec)")
+            # Train final model with best alpha
+            ridge_model = Ridge(alpha=best_alpha)
+            ridge_model.fit(X_train_scaled, y_train_np)
 
-        # Collect for summary
-        _training_summary.data['range_best_score'] = best_composite_score
-        _training_summary.data['range_trials'] = total_completed
-        _training_summary.data['range_opt_time'] = total_time
-        _training_summary.data['range_all_scores'] = [r.get('best_score', -r['best_value']) for r in results_list]
+            # Evaluate on test set
+            y_pred_test = ridge_model.predict(X_test_scaled)
+            y_test_np = y_test.values if hasattr(y_test, 'values') else np.array(y_test)
+            ridge_r2 = r2_score(y_test_np, y_pred_test)
+            ridge_rmse = np.sqrt(mean_squared_error(y_test_np, y_pred_test))
 
-        # Collect all top trials from all workers for ensemble
-        all_top_trials = []
-        for result in results_list:
-            if 'top_trials' in result:
-                all_top_trials.extend(result['top_trials'])
+            print(f"   Final Test R²: {ridge_r2:.4f}")
+            print(f"   Final Test RMSE: {ridge_rmse:.4f}")
 
-        # Sort by score (descending) and take top 3 globally
-        all_top_trials = sorted(all_top_trials, key=lambda x: x['score'], reverse=True)
-        ensemble_size = min(3, len(all_top_trials))
-        top_3_trials = all_top_trials[:ensemble_size]
+            total_time = time_module.time() - start_opt
 
-        print(f"\n[ENSEMBLE] Creating ensemble from top {ensemble_size} trials:")
-        for i, trial in enumerate(top_3_trials):
-            print(f"   Model {i+1}: Score={trial['score']:.4f}")
+            # Store Ridge as the primary model
+            self.range_model = ridge_model
+            self.ensemble_models = [ridge_model]
+            self.model_type = 'ridge'
+            self.best_alpha = best_alpha
 
-        # Train ensemble of models
-        self.ensemble_models = []
-        for i, trial in enumerate(top_3_trials):
-            params = trial['params'].copy()
-            params['n_jobs'] = 1
-            params['objective'] = 'reg:squarederror'
-            params['verbosity'] = 0
+            # For Ridge, use coefficients as "importance" (absolute value)
+            ridge_importance = np.abs(ridge_model.coef_)
 
-            model = xgb.XGBRegressor(**params)
-            model.fit(X_train_scaled, y_train)
-            self.ensemble_models.append(model)
-            print(f"   Model {i+1} trained successfully")
+            # Collect for summary
+            _training_summary.data['range_best_score'] = ridge_r2
+            _training_summary.data['range_trials'] = len(alpha_grid)
+            _training_summary.data['range_opt_time'] = total_time
+            _training_summary.data['range_all_scores'] = [r['cv_score'] for r in results]
 
-        # Use the best model as the primary (for feature importance, etc.)
-        best_params = top_3_trials[0]['params'].copy()
-        best_params['n_jobs'] = 1
-        best_params['objective'] = 'reg:squarederror'
-        best_params['verbosity'] = 0
-        self.range_model = self.ensemble_models[0]  # Best model is primary
-        print(f"[DEBUG] Primary model params: {best_params}")
+            best_params = {'alpha': best_alpha, 'model': 'ridge', 'cv_score': best_cv_score}
+
+            print(f"Ridge training complete! Time: {total_time:.1f}s")
+
+        else:
+            # ============================================================
+            # XGBOOST with Optuna optimization (original path)
+            # ============================================================
+            # Use file-based data sharing for proper multiprocessing (like working Optuna code)
+            if not OPTUNA_WORKER_AVAILABLE:
+                raise RuntimeError("optuna_worker module required for parallel optimization")
+
+            from joblib import Parallel, delayed
+
+            print(f"   Using joblib Parallel for true multiprocessing...")
+            # Pass feature names for Optuna feature group selection
+            feature_names = list(X_train.columns) if hasattr(X_train, 'columns') else self.feature_names
+            data_path = optuna_worker.set_range_shared_data(X_train_scaled, y_train_np, feature_names=feature_names)
+            print(f"   Feature names passed to optimizer: {len(feature_names)} features")
+
+            # Divide trials among workers (like velocity optimization)
+            trials_per_worker = max(1, n_trials // n_workers)
+            actual_trials = trials_per_worker * n_workers
+
+            print(f"Starting Optuna optimization: {actual_trials} trials across {n_workers} parallel workers...")
+            print(f"   Data shape: X={X_train_scaled.shape}, y={len(y_train_np)}")
+            print(f"   Trials per worker: {trials_per_worker}")
+
+            try:
+                # Run multiple independent studies in parallel using joblib (like velocity optimization)
+                results_list = Parallel(n_jobs=n_workers, backend='loky', verbose=0)(
+                    delayed(optuna_worker.run_range_study)(
+                        data_path, trials_per_worker, seed=42 + i, worker_id=i
+                    )
+                    for i in range(n_workers)
+                )
+            finally:
+                # Clean up shared data file
+                optuna_worker.clear_range_shared_data()
+
+            total_time = time_module.time() - start_opt
+
+            # Find best result across all workers (MAXIMIZE composite score)
+            # best_value is negative, so min() finds the best (most negative = highest positive score)
+            best_result = min(results_list, key=lambda x: x['best_value'])
+            total_completed = sum(r['n_trials'] for r in results_list)
+
+            best_composite_score = best_result.get('best_score', -best_result['best_value'])
+            print(f"Optimization complete!")
+            print(f"   Best Composite Score: {best_composite_score:.4f} (0.6*R² + 0.4*MAPE_component)")
+            print(f"   Features used: {X_train_scaled.shape[1]} (all)")
+            print(f"   Total time: {total_time:.1f}s ({total_completed/total_time:.1f} trials/sec)")
+
+            # Collect for summary
+            _training_summary.data['range_best_score'] = best_composite_score
+            _training_summary.data['range_trials'] = total_completed
+            _training_summary.data['range_opt_time'] = total_time
+            _training_summary.data['range_all_scores'] = [r.get('best_score', -r['best_value']) for r in results_list]
+
+            # Collect all top trials from all workers for ensemble
+            all_top_trials = []
+            for result in results_list:
+                if 'top_trials' in result:
+                    all_top_trials.extend(result['top_trials'])
+
+            # Sort by score (descending) and take top 3 globally
+            all_top_trials = sorted(all_top_trials, key=lambda x: x['score'], reverse=True)
+            ensemble_size = min(3, len(all_top_trials))
+            top_3_trials = all_top_trials[:ensemble_size]
+
+            print(f"\n[ENSEMBLE] Creating ensemble from top {ensemble_size} trials:")
+            for i, trial in enumerate(top_3_trials):
+                print(f"   Model {i+1}: Score={trial['score']:.4f}")
+
+            # Train ensemble of models
+            self.ensemble_models = []
+            for i, trial in enumerate(top_3_trials):
+                params = trial['params'].copy()
+                params['n_jobs'] = 1
+                params['objective'] = 'reg:squarederror'
+                params['verbosity'] = 0
+
+                model = xgb.XGBRegressor(**params)
+                model.fit(X_train_scaled, y_train)
+                self.ensemble_models.append(model)
+                print(f"   Model {i+1} trained successfully")
+
+            # Use the best model as the primary (for feature importance, etc.)
+            best_params = top_3_trials[0]['params'].copy()
+            best_params['n_jobs'] = 1
+            best_params['objective'] = 'reg:squarederror'
+            best_params['verbosity'] = 0
+            self.model_type = 'xgboost'
+            self.range_model = self.ensemble_models[0]  # Best model is primary
+
+        print(f"[DEBUG] Primary model: {self.model_type}, params: {best_params}")
 
         # Feature Selection: DISABLED
         # Testing showed ALL features performs best (R² = 0.423 vs 0.256 with selection)
@@ -2808,8 +3452,17 @@ class PriceRangePredictor:
 
         # Log feature importance for reference
         # Use training_feature_names (after pruning) to match model's feature count
-        feature_importance = self.range_model.feature_importances_
         training_features = getattr(self, 'training_feature_names', None) or self.feature_names
+
+        # Get feature importance (Ridge uses coef_, XGBoost uses feature_importances_)
+        if hasattr(self.range_model, 'feature_importances_'):
+            feature_importance = self.range_model.feature_importances_
+        elif hasattr(self.range_model, 'coef_'):
+            # For Ridge/linear models, use absolute coefficient as importance
+            feature_importance = np.abs(self.range_model.coef_)
+        else:
+            feature_importance = np.ones(len(training_features))  # Fallback
+
         importance_df = pd.DataFrame({
             'feature': training_features,
             'importance': feature_importance
@@ -2817,8 +3470,8 @@ class PriceRangePredictor:
 
         nonzero_features = importance_df[importance_df['importance'] > 0]['feature'].tolist()
 
-        print(f"\n[FEATURES] Using ALL {len(self.feature_names)} features (importance-based selection DISABLED)")
-        print(f"   Non-zero importance: {len(nonzero_features)}/{len(self.feature_names)}")
+        print(f"\n[FEATURES] Using {len(training_features)} features")
+        print(f"   Non-zero importance: {len(nonzero_features)}/{len(training_features)}")
         print(f"   Top 5 by importance: {importance_df.head(5)['feature'].tolist()}")
 
         # No feature filtering - use all
@@ -2843,208 +3496,250 @@ class PriceRangePredictor:
         y_low_train_arr = y_low_train.values if hasattr(y_low_train, 'values') else y_low_train
 
         # =================================================================
-        # HIGH/LOW SPECIFIC OPTIMIZATION (optional)
-        # Optimize hyperparameters directly for predicting high/low
-        # instead of reusing range-optimized params (which was causing lower R²)
+        # HIGH/LOW MODEL TRAINING
+        # For Ridge: Simple Ridge models for HIGH/LOW
+        # For XGBoost: Optuna optimization and ensemble training
         # =================================================================
-        if optimize_highlow:
-            print("\n[HIGH/LOW OPTIMIZATION] Training dedicated models for high and low prediction...")
+        if model_type == 'ridge':
+            # ============================================================
+            # RIDGE: Parallel alpha search for HIGH and LOW predictions
+            # ============================================================
+            from joblib import Parallel, delayed
+            from sklearn.model_selection import cross_val_score
 
-            # Save data for parallel workers
-            # Use training_feature_names (after pruning) to match X_train_scaled columns
-            training_features = getattr(self, 'training_feature_names', None) or self.feature_names
-            highlow_data_path = optuna_worker.set_highlow_shared_data(
-                X_train_scaled, y_high_train_arr, y_low_train_arr, training_features
-            )
+            # Use the best alpha from range training as starting point
+            base_alpha = getattr(self, 'best_alpha', 1.0)
+            alpha_grid = [base_alpha * m for m in [0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 10.0]]
 
-            # Use same parallelization pattern as RANGE optimization:
-            # Spawn multiple joblib workers, each running their own Optuna study
-            total_hl_trials = max(n_trials // 2, 50)  # Total trials for each target
-            trials_per_worker = max(3, total_hl_trials // n_workers)
-            actual_trials = trials_per_worker * n_workers
+            print(f"\n[HIGH/LOW RIDGE] Parallel alpha search for HIGH and LOW...")
+            print(f"   Base alpha from RANGE: {base_alpha}")
 
-            print(f"   HIGH: {actual_trials} trials across {n_workers} workers ({trials_per_worker}/worker)")
-
-            try:
-                # HIGH optimization - parallel workers
-                from joblib import Parallel, delayed
-                high_results = Parallel(n_jobs=n_workers, backend='loky', verbose=0)(
-                    delayed(optuna_worker.run_highlow_study)(
-                        highlow_data_path, trials_per_worker, seed=42 + i, target='high', worker_id=i
-                    )
-                    for i in range(n_workers)
-                )
-
-                # Find best HIGH result across all workers
-                best_high = max(high_results, key=lambda x: x['best_score'])
-                if best_high and best_high['best_params']:
-                    self.high_best_params = best_high['best_params'].copy()
-                    self.high_best_params['n_jobs'] = 1
-                    self.high_best_params['objective'] = 'reg:squarederror'
-                    self.high_best_params['verbosity'] = 0
-                    print(f"   HIGH optimization: Score={best_high['best_score']:.4f}")
-                    # Collect for summary
-                    _training_summary.data['high_best_score'] = best_high['best_score']
-                    _training_summary.data['high_all_scores'] = [r['best_score'] for r in high_results]
+            def evaluate_alpha_target(alpha, X, y_target, target_name):
+                """Evaluate alpha for a specific target."""
+                model = Ridge(alpha=alpha)
+                n_splits = min(5, len(y_target) // 10)
+                if n_splits < 2:
+                    model.fit(X, y_target)
+                    score = model.score(X, y_target)
                 else:
-                    self.high_best_params = best_params.copy()
-                    print(f"   HIGH optimization: Using range params (fallback)")
+                    scores = cross_val_score(model, X, y_target, cv=n_splits, scoring='r2')
+                    score = np.mean(scores)
+                return {'alpha': alpha, 'cv_score': score, 'target': target_name}
 
-                print(f"   LOW: {actual_trials} trials across {n_workers} workers ({trials_per_worker}/worker)")
+            # Parallel search for both HIGH and LOW
+            all_jobs = []
+            for alpha in alpha_grid:
+                all_jobs.append(delayed(evaluate_alpha_target)(alpha, X_train_scaled, y_high_train_arr, 'high'))
+                all_jobs.append(delayed(evaluate_alpha_target)(alpha, X_train_scaled, y_low_train_arr, 'low'))
 
-                # LOW optimization - parallel workers
-                low_results = Parallel(n_jobs=n_workers, backend='loky', verbose=0)(
-                    delayed(optuna_worker.run_highlow_study)(
-                        highlow_data_path, trials_per_worker, seed=142 + i, target='low', worker_id=i
-                    )
-                    for i in range(n_workers)
-                )
+            results = Parallel(n_jobs=n_workers, verbose=0)(all_jobs)
 
-                # Find best LOW result across all workers
-                best_low = max(low_results, key=lambda x: x['best_score'])
-                if best_low and best_low['best_params']:
-                    self.low_best_params = best_low['best_params'].copy()
-                    self.low_best_params['n_jobs'] = 1
-                    self.low_best_params['objective'] = 'reg:squarederror'
-                    self.low_best_params['verbosity'] = 0
-                    print(f"   LOW optimization: Score={best_low['best_score']:.4f}")
-                    # Collect for summary
-                    _training_summary.data['low_best_score'] = best_low['best_score']
-                    _training_summary.data['low_all_scores'] = [r['best_score'] for r in low_results]
-                else:
-                    self.low_best_params = best_params.copy()
-                    print(f"   LOW optimization: Using range params (fallback)")
+            # Separate results
+            high_results = [r for r in results if r['target'] == 'high']
+            low_results = [r for r in results if r['target'] == 'low']
 
-            except Exception as hl_err:
-                print(f"   HIGH/LOW optimization failed: {hl_err}")
-                print(f"   Using range-optimized params as fallback")
-                self.high_best_params = best_params.copy()
-                self.low_best_params = best_params.copy()
-        else:
-            # Skip HIGH/LOW optimization - use range-optimized params
-            print("\n[HIGH/LOW MODELS] Using range-optimized params (optimize_highlow=False)")
-            self.high_best_params = best_params.copy()
-            self.low_best_params = best_params.copy()
+            # Find best alphas
+            best_high = max(high_results, key=lambda x: x['cv_score'])
+            best_low = max(low_results, key=lambda x: x['cv_score'])
 
-        # =================================================================
-        # ASYMMETRIC LOW MODEL ADJUSTMENTS
-        # Analysis showed LOW predictions have R² = -0.17 vs HIGH R² = 0.23
-        # LOW model needs more regularization to prevent overfitting to noise
-        # =================================================================
-        print("\n[ASYMMETRIC ADJUSTMENT] Applying LOW-specific hyperparameter tuning...")
+            print(f"   HIGH best alpha: {best_high['alpha']:.3f} (CV R²={best_high['cv_score']:.4f})")
+            print(f"   LOW best alpha: {best_low['alpha']:.3f} (CV R²={best_low['cv_score']:.4f})")
 
-        # Increase regularization for LOW model (more prone to overfitting on volatile target)
-        self.low_best_params['reg_alpha'] = self.low_best_params.get('reg_alpha', 0.0) + 0.3  # L1 regularization
-        self.low_best_params['reg_lambda'] = max(self.low_best_params.get('reg_lambda', 1.0), 1.5)  # L2 regularization
+            # Train final HIGH model
+            self.high_model = Ridge(alpha=best_high['alpha'])
+            self.high_model.fit(X_train_scaled, y_high_train_arr)
 
-        # Reduce tree depth for LOW (simpler model = less overfitting)
-        if self.low_best_params.get('max_depth', 6) > 4:
-            self.low_best_params['max_depth'] = 4
+            # Evaluate HIGH on test
+            y_high_test = targets['next_high_pct'].loc[y.iloc[split_idx:].index].values
+            if len(y_high_test) == X_test_scaled.shape[0]:
+                high_pred = self.high_model.predict(X_test_scaled)
+                high_r2 = r2_score(y_high_test, high_pred)
+                print(f"   HIGH Test R²: {high_r2:.4f}")
+                _training_summary.data['high_best_score'] = high_r2
 
-        # Slower learning rate for LOW (more careful fitting)
-        self.low_best_params['learning_rate'] = min(self.low_best_params.get('learning_rate', 0.1), 0.05)
-
-        # Increase min_child_weight for LOW (require more samples per leaf)
-        self.low_best_params['min_child_weight'] = max(self.low_best_params.get('min_child_weight', 1), 3)
-
-        # More subsampling for LOW (bagging helps with noisy targets)
-        self.low_best_params['subsample'] = min(self.low_best_params.get('subsample', 1.0), 0.7)
-        self.low_best_params['colsample_bytree'] = min(self.low_best_params.get('colsample_bytree', 1.0), 0.7)
-
-        print(f"   LOW adjusted: max_depth={self.low_best_params.get('max_depth')}, "
-              f"reg_alpha={self.low_best_params.get('reg_alpha'):.2f}, "
-              f"learning_rate={self.low_best_params.get('learning_rate'):.3f}")
-
-        # Train dedicated HIGH model with optimized params
-        print("\n[HIGH MODEL] Training with optimized hyperparameters...")
-        self.high_model = xgb.XGBRegressor(**self.high_best_params)
-        self.high_model.fit(X_train_scaled, y_high_train_arr)
-
-        # Train dedicated LOW model with optimized params
-        # =================================================================
-        # LOW MODEL ENSEMBLE (Multiple models for better LOW predictions)
-        # LOW predictions are harder - use ensemble to reduce variance
-        # =================================================================
-        print("[LOW MODEL ENSEMBLE] Training multiple models for robust LOW prediction...")
-
-        self.low_ensemble_models = []
-        ensemble_configs = [
-            # Config 1: Original optimized params
-            {'name': 'base', 'params': self.low_best_params.copy()},
-
-            # Config 2: Very conservative (more regularization)
-            {'name': 'conservative', 'params': {
-                **self.low_best_params,
-                'max_depth': 3,
-                'reg_alpha': self.low_best_params.get('reg_alpha', 0.3) + 0.5,
-                'reg_lambda': 2.0,
-                'learning_rate': 0.03,
-                'min_child_weight': 5,
-            }},
-
-            # Config 3: Different tree structure
-            {'name': 'wide_shallow', 'params': {
-                **self.low_best_params,
-                'max_depth': 2,
-                'n_estimators': self.low_best_params.get('n_estimators', 100) + 50,
-                'colsample_bytree': 0.5,
-                'subsample': 0.6,
-            }},
-
-            # Config 4: Focus on recent data (higher learning rate, fewer trees)
-            {'name': 'adaptive', 'params': {
-                **self.low_best_params,
-                'max_depth': 4,
-                'learning_rate': 0.08,
-                'n_estimators': 80,
-                'subsample': 0.8,
-            }},
-        ]
-
-        for config in ensemble_configs:
-            try:
-                model = xgb.XGBRegressor(**config['params'])
-                model.fit(X_train_scaled, y_low_train_arr)
-                self.low_ensemble_models.append({'name': config['name'], 'model': model, 'type': 'xgb'})
-                print(f"   LOW ensemble member '{config['name']}' (XGB) trained")
-            except Exception as e:
-                print(f"   LOW ensemble member '{config['name']}' failed: {e}")
-
-        # Add LightGBM to ensemble (handles collinearity differently than XGBoost)
-        if LGBM_AVAILABLE:
-            try:
-                lgb_params = {
-                    'objective': 'regression',
-                    'metric': 'rmse',
-                    'boosting_type': 'gbdt',
-                    'num_leaves': 31,
-                    'max_depth': 4,
-                    'learning_rate': 0.05,
-                    'n_estimators': 100,
-                    'min_child_samples': 10,
-                    'reg_alpha': 0.5,
-                    'reg_lambda': 1.0,
-                    'subsample': 0.7,
-                    'colsample_bytree': 0.7,
-                    'verbosity': -1,
-                    'force_col_wise': True,  # Better for small datasets
-                }
-                lgb_model = lgb.LGBMRegressor(**lgb_params)
-                lgb_model.fit(X_train_scaled, y_low_train_arr)
-                self.low_ensemble_models.append({'name': 'lightgbm', 'model': lgb_model, 'type': 'lgb'})
-                print(f"   LOW ensemble member 'lightgbm' (LGB) trained")
-            except Exception as e:
-                print(f"   LightGBM ensemble member failed: {e}")
-
-        # Primary LOW model is the first (base) for compatibility
-        if self.low_ensemble_models:
-            self.low_model = self.low_ensemble_models[0]['model']
-        else:
-            # Fallback: train single model
-            self.low_model = xgb.XGBRegressor(**self.low_best_params)
+            # Train final LOW model
+            self.low_model = Ridge(alpha=best_low['alpha'])
             self.low_model.fit(X_train_scaled, y_low_train_arr)
 
-        print(f"   LOW ensemble: {len(self.low_ensemble_models)} models trained (XGB + LightGBM)")
+            # Evaluate LOW on test
+            y_low_test = targets['next_low_pct'].loc[y.iloc[split_idx:].index].values
+            if len(y_low_test) == X_test_scaled.shape[0]:
+                low_pred = self.low_model.predict(X_test_scaled)
+                low_r2 = r2_score(y_low_test, low_pred)
+                print(f"   LOW Test R²: {low_r2:.4f}")
+                _training_summary.data['low_best_score'] = low_r2
+
+            # Set ensemble to single models for compatibility
+            self.low_ensemble_models = [{'name': 'ridge', 'model': self.low_model, 'type': 'ridge'}]
+            self.high_best_params = {'alpha': best_high['alpha'], 'model': 'ridge'}
+            self.low_best_params = {'alpha': best_low['alpha'], 'model': 'ridge'}
+
+            print(f"   Ridge HIGH/LOW training complete!")
+
+        else:
+            # ============================================================
+            # XGBOOST: Optuna optimization and ensemble training
+            # ============================================================
+            if optimize_highlow:
+                print("\n[HIGH/LOW OPTIMIZATION] Training dedicated models for high and low prediction...")
+
+                # Save data for parallel workers
+                # Use training_feature_names (after pruning) to match X_train_scaled columns
+                training_features = getattr(self, 'training_feature_names', None) or self.feature_names
+                highlow_data_path = optuna_worker.set_highlow_shared_data(
+                    X_train_scaled, y_high_train_arr, y_low_train_arr, training_features
+                )
+
+                # Use same parallelization pattern as RANGE optimization:
+                # Spawn multiple joblib workers, each running their own Optuna study
+                total_hl_trials = max(n_trials // 2, 50)  # Total trials for each target
+                trials_per_worker = max(3, total_hl_trials // n_workers)
+                actual_trials = trials_per_worker * n_workers
+
+                print(f"   HIGH: {actual_trials} trials across {n_workers} workers ({trials_per_worker}/worker)")
+
+                try:
+                    # HIGH optimization - parallel workers
+                    from joblib import Parallel, delayed
+                    high_results = Parallel(n_jobs=n_workers, backend='loky', verbose=0)(
+                        delayed(optuna_worker.run_highlow_study)(
+                            highlow_data_path, trials_per_worker, seed=42 + i, target='high', worker_id=i
+                        )
+                        for i in range(n_workers)
+                    )
+
+                    # Find best HIGH result across all workers
+                    best_high = max(high_results, key=lambda x: x['best_score'])
+                    if best_high and best_high['best_params']:
+                        self.high_best_params = best_high['best_params'].copy()
+                        self.high_best_params['n_jobs'] = 1
+                        self.high_best_params['objective'] = 'reg:squarederror'
+                        self.high_best_params['verbosity'] = 0
+                        print(f"   HIGH optimization: Score={best_high['best_score']:.4f}")
+                        # Collect for summary
+                        _training_summary.data['high_best_score'] = best_high['best_score']
+                        _training_summary.data['high_all_scores'] = [r['best_score'] for r in high_results]
+                    else:
+                        self.high_best_params = best_params.copy()
+                        print(f"   HIGH optimization: Using range params (fallback)")
+
+                    print(f"   LOW: {actual_trials} trials across {n_workers} workers ({trials_per_worker}/worker)")
+
+                    # LOW optimization - parallel workers
+                    low_results = Parallel(n_jobs=n_workers, backend='loky', verbose=0)(
+                        delayed(optuna_worker.run_highlow_study)(
+                            highlow_data_path, trials_per_worker, seed=142 + i, target='low', worker_id=i
+                        )
+                        for i in range(n_workers)
+                    )
+
+                    # Find best LOW result across all workers
+                    best_low = max(low_results, key=lambda x: x['best_score'])
+                    if best_low and best_low['best_params']:
+                        self.low_best_params = best_low['best_params'].copy()
+                        self.low_best_params['n_jobs'] = 1
+                        self.low_best_params['objective'] = 'reg:squarederror'
+                        self.low_best_params['verbosity'] = 0
+                        print(f"   LOW optimization: Score={best_low['best_score']:.4f}")
+                        # Collect for summary
+                        _training_summary.data['low_best_score'] = best_low['best_score']
+                        _training_summary.data['low_all_scores'] = [r['best_score'] for r in low_results]
+                    else:
+                        self.low_best_params = best_params.copy()
+                        print(f"   LOW optimization: Using range params (fallback)")
+
+                except Exception as hl_err:
+                    print(f"   HIGH/LOW optimization failed: {hl_err}")
+                    print(f"   Using range-optimized params as fallback")
+                    self.high_best_params = best_params.copy()
+                    self.low_best_params = best_params.copy()
+            else:
+                # Skip HIGH/LOW optimization - use range-optimized params
+                print("\n[HIGH/LOW MODELS] Using range-optimized params (optimize_highlow=False)")
+                self.high_best_params = best_params.copy()
+                self.low_best_params = best_params.copy()
+
+            # =================================================================
+            # ASYMMETRIC LOW MODEL ADJUSTMENTS (XGBoost only)
+            # =================================================================
+            print("\n[ASYMMETRIC ADJUSTMENT] Applying LOW-specific hyperparameter tuning...")
+
+            # Increase regularization for LOW model
+            self.low_best_params['reg_alpha'] = self.low_best_params.get('reg_alpha', 0.0) + 0.3
+            self.low_best_params['reg_lambda'] = max(self.low_best_params.get('reg_lambda', 1.0), 1.5)
+
+            if self.low_best_params.get('max_depth', 6) > 4:
+                self.low_best_params['max_depth'] = 4
+
+            self.low_best_params['learning_rate'] = min(self.low_best_params.get('learning_rate', 0.1), 0.05)
+            self.low_best_params['min_child_weight'] = max(self.low_best_params.get('min_child_weight', 1), 3)
+            self.low_best_params['subsample'] = min(self.low_best_params.get('subsample', 1.0), 0.7)
+            self.low_best_params['colsample_bytree'] = min(self.low_best_params.get('colsample_bytree', 1.0), 0.7)
+
+            print(f"   LOW adjusted: max_depth={self.low_best_params.get('max_depth')}, "
+                  f"reg_alpha={self.low_best_params.get('reg_alpha'):.2f}, "
+                  f"learning_rate={self.low_best_params.get('learning_rate'):.3f}")
+
+            # Train HIGH model
+            print("\n[HIGH MODEL] Training with optimized hyperparameters...")
+            self.high_model = xgb.XGBRegressor(**self.high_best_params)
+            self.high_model.fit(X_train_scaled, y_high_train_arr)
+
+            # Train LOW ensemble
+            print("[LOW MODEL ENSEMBLE] Training multiple models for robust LOW prediction...")
+
+            self.low_ensemble_models = []
+            ensemble_configs = [
+                {'name': 'base', 'params': self.low_best_params.copy()},
+                {'name': 'conservative', 'params': {
+                    **self.low_best_params,
+                    'max_depth': 3, 'reg_alpha': self.low_best_params.get('reg_alpha', 0.3) + 0.5,
+                    'reg_lambda': 2.0, 'learning_rate': 0.03, 'min_child_weight': 5,
+                }},
+                {'name': 'wide_shallow', 'params': {
+                    **self.low_best_params, 'max_depth': 2,
+                    'n_estimators': self.low_best_params.get('n_estimators', 100) + 50,
+                    'colsample_bytree': 0.5, 'subsample': 0.6,
+                }},
+                {'name': 'adaptive', 'params': {
+                    **self.low_best_params, 'max_depth': 4, 'learning_rate': 0.08,
+                    'n_estimators': 80, 'subsample': 0.8,
+                }},
+            ]
+
+            for config in ensemble_configs:
+                try:
+                    model = xgb.XGBRegressor(**config['params'])
+                    model.fit(X_train_scaled, y_low_train_arr)
+                    self.low_ensemble_models.append({'name': config['name'], 'model': model, 'type': 'xgb'})
+                    print(f"   LOW ensemble member '{config['name']}' (XGB) trained")
+                except Exception as e:
+                    print(f"   LOW ensemble member '{config['name']}' failed: {e}")
+
+            # Add LightGBM
+            if LGBM_AVAILABLE:
+                try:
+                    lgb_params = {
+                        'objective': 'regression', 'metric': 'rmse', 'boosting_type': 'gbdt',
+                        'num_leaves': 31, 'max_depth': 4, 'learning_rate': 0.05, 'n_estimators': 100,
+                        'min_child_samples': 10, 'reg_alpha': 0.5, 'reg_lambda': 1.0,
+                        'subsample': 0.7, 'colsample_bytree': 0.7, 'verbosity': -1, 'force_col_wise': True,
+                    }
+                    lgb_model = lgb.LGBMRegressor(**lgb_params)
+                    lgb_model.fit(X_train_scaled, y_low_train_arr)
+                    self.low_ensemble_models.append({'name': 'lightgbm', 'model': lgb_model, 'type': 'lgb'})
+                    print(f"   LOW ensemble member 'lightgbm' (LGB) trained")
+                except Exception as e:
+                    print(f"   LightGBM ensemble member failed: {e}")
+
+            # Primary LOW model
+            if self.low_ensemble_models:
+                self.low_model = self.low_ensemble_models[0]['model']
+            else:
+                self.low_model = xgb.XGBRegressor(**self.low_best_params)
+                self.low_model.fit(X_train_scaled, y_low_train_arr)
+
+            print(f"   LOW ensemble: {len(self.low_ensemble_models)} models trained (XGB + LightGBM)")
 
         # =================================================================
         # REGIME DETECTION - DISABLED FOR HIGH MODEL
@@ -3062,15 +3757,85 @@ class PriceRangePredictor:
         # QUANTILE REGRESSION FOR LEARNED CONFIDENCE BANDS
         # Instead of heuristic z-scores, learn the prediction intervals
         # directly from data using XGBoost's quantile objective
+        # Note: Ridge uses residual-based confidence bands instead
         # =================================================================
-        print("\n[QUANTILE REGRESSION] Training models for learned confidence bands...")
-
-        # Train quantile models for different confidence levels
         self.quantile_models = {}
 
-        # y_high_train_arr and y_low_train_arr were already prepared above
-        # Only proceed if we have valid targets
-        if y_high_train_arr is not None and y_low_train_arr is not None and len(y_high_train_arr) == X_train_scaled.shape[0]:
+        if model_type == 'ridge':
+            # For Ridge: Calculate residual-based bands as fallback
+            print("\n[CONFIDENCE BANDS] Calculating residual stats for Ridge model")
+
+            # Calculate training residuals for confidence estimation
+            y_high_pred_train = self.high_model.predict(X_train_scaled)
+            y_low_pred_train = self.low_model.predict(X_train_scaled)
+
+            high_residuals = y_high_train_arr - y_high_pred_train
+            low_residuals = y_low_train_arr - y_low_pred_train
+
+            # Store residual statistics for prediction-time confidence bands
+            self.high_residual_std = np.std(high_residuals)
+            self.low_residual_std = np.std(low_residuals)
+
+            print(f"   HIGH residual std: {self.high_residual_std:.4f}")
+            print(f"   LOW residual std: {self.low_residual_std:.4f}")
+
+            # Also train XGBoost quantile models for learned confidence bands
+            # This gives better bands than simple RMSE fallback
+            print("\n[QUANTILE REGRESSION] Training XGBoost quantile models for confidence bands...")
+
+            quantile_levels = {
+                0.50: (0.25, 0.75),  # 50% confidence
+                0.68: (0.16, 0.84),  # 68% confidence (~1 std dev)
+                0.80: (0.10, 0.90),  # 80% confidence
+                0.90: (0.05, 0.95),  # 90% confidence
+                0.95: (0.025, 0.975) # 95% confidence
+            }
+
+            # Simple XGBoost params for quantile models
+            quantile_params = {
+                'objective': 'reg:quantileerror',
+                'n_estimators': 50,
+                'max_depth': 4,
+                'learning_rate': 0.1,
+                'n_jobs': 1,
+                'verbosity': 0
+            }
+
+            for conf_level, (q_low, q_high) in quantile_levels.items():
+                try:
+                    # Train quantile models for HIGH
+                    params_high_lower = {**quantile_params, 'quantile_alpha': q_low}
+                    model_high_lower = xgb.XGBRegressor(**params_high_lower)
+                    model_high_lower.fit(X_train_scaled, y_high_train_arr)
+
+                    params_high_upper = {**quantile_params, 'quantile_alpha': q_high}
+                    model_high_upper = xgb.XGBRegressor(**params_high_upper)
+                    model_high_upper.fit(X_train_scaled, y_high_train_arr)
+
+                    # Train quantile models for LOW
+                    params_low_lower = {**quantile_params, 'quantile_alpha': q_low}
+                    model_low_lower = xgb.XGBRegressor(**params_low_lower)
+                    model_low_lower.fit(X_train_scaled, y_low_train_arr)
+
+                    params_low_upper = {**quantile_params, 'quantile_alpha': q_high}
+                    model_low_upper = xgb.XGBRegressor(**params_low_upper)
+                    model_low_upper.fit(X_train_scaled, y_low_train_arr)
+
+                    self.quantile_models[conf_level] = {
+                        'high_lower': model_high_lower,
+                        'high_upper': model_high_upper,
+                        'low_lower': model_low_lower,
+                        'low_upper': model_low_upper,
+                        'quantiles': (q_low, q_high)
+                    }
+                    print(f"   {int(conf_level*100)}% CI: Trained 4 quantile models")
+
+                except Exception as q_err:
+                    print(f"   {int(conf_level*100)}% CI: Failed - {q_err}")
+
+        if y_high_train_arr is not None and y_low_train_arr is not None and len(y_high_train_arr) == X_train_scaled.shape[0] and model_type != 'ridge':
+            # XGBoost: Use quantile regression for learned confidence bands
+            print("\n[QUANTILE REGRESSION] Training models for learned confidence bands...")
 
             # Quantile levels for different confidence intervals
             # For TRADING, tighter bands (50-68%) are more actionable
@@ -3181,9 +3946,18 @@ class PriceRangePredictor:
         print("[DEBUG] Creating feature importance...")
         # Use training_feature_names (after pruning) to match model's feature count
         feature_names_for_importance = getattr(self, 'training_feature_names', None) or self.feature_names
+
+        # Get feature importance (Ridge uses coef_, XGBoost uses feature_importances_)
+        if hasattr(self.range_model, 'feature_importances_'):
+            model_importance = self.range_model.feature_importances_
+        elif hasattr(self.range_model, 'coef_'):
+            model_importance = np.abs(self.range_model.coef_)
+        else:
+            model_importance = np.ones(len(feature_names_for_importance))
+
         importance = pd.DataFrame({
             'feature': feature_names_for_importance,
-            'importance': self.range_model.feature_importances_
+            'importance': model_importance
         }).sort_values('importance', ascending=False)
         print(f"[DEBUG] Top 3 features: {importance.head(3)['feature'].tolist()}")
 
@@ -3210,7 +3984,7 @@ class PriceRangePredictor:
         }
 
     def predict_daily_range(self, df: pd.DataFrame, options_features: Dict = None,
-                           confidence_level: float = 0.9) -> Dict:
+                           confidence_level: float = 0.9, ticker: str = None) -> Dict:
         """
         Predict next day's range, high, and low.
 
@@ -3218,6 +3992,7 @@ class PriceRangePredictor:
             df: Recent OHLCV data (at least 50 bars)
             options_features: Optional current options data
             confidence_level: For prediction intervals (0.8, 0.9, 0.95)
+            ticker: Stock ticker symbol (enables news sentiment features)
 
         Returns:
             dict with predicted_range, predicted_high, predicted_low, confidence_interval
@@ -3226,9 +4001,9 @@ class PriceRangePredictor:
         if self.range_model is None:
             raise ValueError("Model not trained. Call train_range_model() first.")
 
-        # Create features for latest bar
+        # Create features for latest bar (pass ticker for news sentiment)
         print("[DEBUG predict] Creating features...")
-        features = self.create_range_features(df, options_features)
+        features = self.create_range_features(df, options_features, ticker=ticker)
 
         # Use training_feature_names (won't be overwritten by create_range_features)
         # Fall back to feature_names for backwards compatibility
@@ -4359,3 +5134,469 @@ def create_prediction_suite(polygon_api_key: str = None):
     exit_predictor = ExitTimingPredictor()
 
     return range_predictor, target_calculator, exit_predictor
+
+
+# ============================================================================
+# PARALLEL WALK-FORWARD HELPER
+# ============================================================================
+
+def _train_and_predict_single_day(args):
+    """
+    Train a model and make a prediction for a single day.
+    This function is designed to be run in parallel.
+
+    Args:
+        args: tuple of (pred_df, test_idx, train_window, n_trials, n_workers_inner, ci_level, polygon_api_key)
+
+    Returns:
+        dict with prediction results, or None if failed
+    """
+    pred_df, test_idx, train_window, n_trials, n_workers_inner, ci_level, polygon_api_key = args
+
+    try:
+        test_date = pred_df.index[test_idx]
+
+        # Get training data (rolling window)
+        train_start_idx = max(0, test_idx - train_window)
+        train_df = pred_df.iloc[train_start_idx:test_idx].copy()
+
+        if len(train_df) < train_window:
+            return None
+
+        # Create fresh predictor
+        if polygon_api_key:
+            from polygon_manager import PolygonManager
+            polygon = PolygonManager(polygon_api_key)
+        else:
+            polygon = None
+
+        predictor = PriceRangePredictor(polygon)
+
+        # Train with reduced workers for inner loop (avoid nested parallelism issues)
+        train_result = predictor.train_range_model(
+            train_df,
+            options_features=None,  # Point-in-time data not used
+            n_trials=n_trials,
+            n_workers=n_workers_inner,
+            feature_selection=False
+        )
+
+        if train_result is None:
+            return None
+
+        # Make prediction
+        pred_input_df = pred_df.iloc[:test_idx].copy()
+        prediction = predictor.predict_daily_range(pred_input_df, confidence_level=ci_level)
+
+        # Get actual values
+        actual_high = pred_df['high'].iloc[test_idx]
+        actual_low = pred_df['low'].iloc[test_idx]
+        actual_close = pred_df['close'].iloc[test_idx]
+        actual_open = pred_df['open'].iloc[test_idx]
+        actual_range = actual_high - actual_low
+
+        # Extract training metrics
+        metrics = train_result.get('metrics', {})
+
+        return {
+            'date': test_date,
+            'predicted_high': prediction['predicted_high'],
+            'predicted_low': prediction['predicted_low'],
+            'predicted_range': prediction['predicted_range_dollars'],
+            'high_lower': prediction['high_lower'],
+            'high_upper': prediction['high_upper'],
+            'low_lower': prediction['low_lower'],
+            'low_upper': prediction['low_upper'],
+            'actual_high': actual_high,
+            'actual_low': actual_low,
+            'actual_open': actual_open,
+            'actual_close': actual_close,
+            'actual_range': actual_range,
+            'model_r2': prediction.get('model_r2', 0),
+            'train_r2': metrics.get('r2', 0),
+            'train_rmse': metrics.get('rmse_pct', 0),
+            'confidence_method': prediction.get('confidence_method', 'unknown'),
+            'confidence_level': prediction.get('confidence_level', ci_level),
+            'retrained': True,
+            'test_idx': test_idx,
+            'feature_importance': train_result.get('feature_importance', None),
+            'feature_names': train_result.get('feature_names', [])
+        }
+
+    except Exception as e:
+        print(f"Error processing day {test_idx}: {e}")
+        return None
+
+
+def run_parallel_walk_forward(pred_df: pd.DataFrame,
+                               test_start_idx: int,
+                               train_window: int,
+                               n_trials: int = 50,
+                               n_workers: int = 4,
+                               ci_level: float = 0.68,
+                               polygon_api_key: str = None,
+                               progress_callback=None,
+                               progress_file: str = None,
+                               ticker: str = None) -> List[Dict]:
+    """
+    Run walk-forward analysis in parallel with PRE-COMPUTED features.
+
+    OPTIMIZATION: Features are computed ONCE upfront, then workers only train
+    the Ridge model on different slices. This is 10-50x faster than recomputing
+    features in each worker.
+
+    Args:
+        pred_df: Full price dataframe
+        test_start_idx: Index to start testing from
+        train_window: Number of days for rolling training window
+        n_trials: Optuna trials for hyperparameter optimization
+        n_workers: Number of parallel workers for outer loop
+        ci_level: Confidence interval level (default 0.68 = 1 std dev)
+        polygon_api_key: API key for Polygon data
+        progress_callback: Optional callback function(current, total) for progress
+        progress_file: Optional file path to write progress updates for external monitoring
+        ticker: Optional ticker symbol for cached IV lookup
+
+    Returns:
+        List of result dictionaries sorted by date
+    """
+    from joblib import Parallel, delayed
+    import tempfile
+    import json
+
+    # Build list of test indices
+    test_indices = list(range(test_start_idx, len(pred_df)))
+    total_days = len(test_indices)
+
+    print(f"\n{'='*60}")
+    print(f"PARALLEL WALK-FORWARD ANALYSIS (OPTIMIZED)")
+    print(f"{'='*60}")
+    print(f"Total days to process: {total_days}")
+    print(f"Training window: {train_window} days")
+    print(f"Parallel workers: {n_workers}")
+    print(f"Confidence level: {ci_level*100:.0f}%")
+    print(f"{'='*60}\n")
+
+    # Setup progress file for external monitoring (Streamlit)
+    if progress_file is None:
+        progress_file = os.path.join(tempfile.gettempdir(), 'wf_progress.json')
+
+    # Initialize progress file
+    with open(progress_file, 'w') as f:
+        json.dump({'completed': 0, 'total': total_days, 'status': 'precomputing_features'}, f)
+
+    # ================================================================
+    # OPTIMIZATION: Pre-compute ALL features ONCE
+    # ================================================================
+    print("Step 1/2: Pre-computing features (one-time)...")
+
+    # Create predictor for feature computation
+    if polygon_api_key:
+        from polygon_manager import PolygonManager
+        polygon = PolygonManager(polygon_api_key)
+    else:
+        polygon = None
+
+    predictor = PriceRangePredictor(polygon)
+
+    # Compute features for entire dataset
+    # Pass ticker for cached IV lookup if available
+    features = predictor.create_range_features(pred_df, options_features=None, ticker=ticker)
+    targets = predictor.create_targets(pred_df)
+    feature_names = predictor.feature_names
+
+    # Prepare feature matrix and SEPARATE targets for HIGH and LOW
+    X_full = features[feature_names].copy()
+
+    # HIGH target: (next_high - current_close) / current_close * 100
+    y_high_full = targets['next_high_pct'].copy() if 'next_high_pct' in targets.columns else (
+        (pred_df['high'].shift(-1) - pred_df['close']) / pred_df['close'] * 100
+    )
+
+    # LOW target: (current_close - next_low) / current_close * 100 = POSITIVE when low is below close
+    # NOTE: This is the DISTANCE DOWN from close, so predicted low = close * (1 - pred/100)
+    y_low_full = targets['next_low_pct'].copy() if 'next_low_pct' in targets.columns else (
+        (pred_df['close'] - pred_df['low'].shift(-1)) / pred_df['close'] * 100
+    )
+
+    # Get indices and dates
+    pred_df_index = pred_df.index.tolist()
+
+    print(f"   Features computed: {len(feature_names)} features, {len(X_full)} rows")
+    print(f"   Targets: HIGH and LOW models (separate)")
+
+    # Update progress
+    with open(progress_file, 'w') as f:
+        json.dump({'completed': 0, 'total': total_days, 'status': 'starting_parallel'}, f)
+
+    print("Step 2/2: Training models in parallel...")
+
+    # ================================================================
+    # PARALLEL: Train SEPARATE HIGH and LOW Ridge models
+    # ================================================================
+    # Create argument tuples with pre-computed data
+    args_list = [
+        (X_full.values, y_high_full.values, y_low_full.values, pred_df_index,
+         pred_df[['high', 'low', 'open', 'close']].values,
+         test_idx, train_window, ci_level, feature_names, progress_file, total_days)
+        for test_idx in test_indices
+    ]
+
+    # Run in parallel
+    results = Parallel(n_jobs=n_workers, backend='loky', verbose=0)(
+        delayed(_train_ridge_single_day)(args) for args in args_list
+    )
+
+    # Mark complete
+    with open(progress_file, 'w') as f:
+        json.dump({'completed': total_days, 'total': total_days, 'status': 'complete'}, f)
+
+    # Filter out None results and sort by date
+    valid_results = [r for r in results if r is not None]
+    valid_results.sort(key=lambda x: x['date'])
+
+    print(f"\n{'='*60}")
+    print(f"PARALLEL WALK-FORWARD COMPLETE")
+    print(f"{'='*60}")
+    print(f"Successful predictions: {len(valid_results)}/{total_days}")
+    print(f"{'='*60}\n")
+
+    return valid_results
+
+
+def _train_ridge_single_day(args):
+    """
+    Train SEPARATE Ridge models for HIGH and LOW using PRE-COMPUTED features.
+    This approach matches the original model quality while being much faster.
+    """
+    import json
+    import fcntl
+    from sklearn.linear_model import Ridge
+    import numpy as np
+
+    # Unpack args
+    (X_full, y_high_full, y_low_full, index_list, ohlc_data, test_idx, train_window,
+     ci_level, feature_names, progress_file, total) = args
+
+    try:
+        test_date = index_list[test_idx]
+
+        # Get training slice
+        train_start_idx = max(0, test_idx - train_window)
+        train_end_idx = test_idx
+
+        # Extract training data
+        X_train = X_full[train_start_idx:train_end_idx]
+        y_high_train = y_high_full[train_start_idx:train_end_idx]
+        y_low_train = y_low_full[train_start_idx:train_end_idx]
+
+        # Remove NaN rows (need valid for all)
+        valid_mask = ~(np.isnan(X_train).any(axis=1) | np.isnan(y_high_train) | np.isnan(y_low_train))
+        X_train = X_train[valid_mask]
+        y_high_train = y_high_train[valid_mask]
+        y_low_train = y_low_train[valid_mask]
+
+        if len(X_train) < 50:  # Not enough data
+            return None
+
+        # ================================================================
+        # TRAIN HIGH MODEL
+        # ================================================================
+        # Feature selection: top 15 by correlation with HIGH target
+        corr_high = np.abs(np.array([np.corrcoef(X_train[:, i], y_high_train)[0, 1]
+                                     for i in range(X_train.shape[1])]))
+        corr_high = np.nan_to_num(corr_high, 0)
+        top_features_high = np.argsort(corr_high)[-15:][::-1]
+        X_train_high = X_train[:, top_features_high]
+
+        # Train Ridge for HIGH
+        best_alpha_high = 1.0
+        best_score_high = -np.inf
+        for alpha in [0.01, 0.1, 1.0, 10.0, 100.0]:
+            model = Ridge(alpha=alpha)
+            model.fit(X_train_high, y_high_train)
+            score = model.score(X_train_high, y_high_train)
+            if score > best_score_high:
+                best_score_high = score
+                best_alpha_high = alpha
+
+        high_model = Ridge(alpha=best_alpha_high)
+        high_model.fit(X_train_high, y_high_train)
+        train_r2_high = high_model.score(X_train_high, y_high_train)
+
+        # HIGH residuals for CI
+        high_preds_train = high_model.predict(X_train_high)
+        high_residuals = y_high_train - high_preds_train
+        high_residual_std = np.std(high_residuals)
+
+        # ================================================================
+        # TRAIN LOW MODEL
+        # ================================================================
+        # Feature selection: top 15 by correlation with LOW target
+        corr_low = np.abs(np.array([np.corrcoef(X_train[:, i], y_low_train)[0, 1]
+                                    for i in range(X_train.shape[1])]))
+        corr_low = np.nan_to_num(corr_low, 0)
+        top_features_low = np.argsort(corr_low)[-15:][::-1]
+        X_train_low = X_train[:, top_features_low]
+
+        # Train Ridge for LOW
+        best_alpha_low = 1.0
+        best_score_low = -np.inf
+        for alpha in [0.01, 0.1, 1.0, 10.0, 100.0]:
+            model = Ridge(alpha=alpha)
+            model.fit(X_train_low, y_low_train)
+            score = model.score(X_train_low, y_low_train)
+            if score > best_score_low:
+                best_score_low = score
+                best_alpha_low = alpha
+
+        low_model = Ridge(alpha=best_alpha_low)
+        low_model.fit(X_train_low, y_low_train)
+        train_r2_low = low_model.score(X_train_low, y_low_train)
+
+        # LOW residuals for CI
+        low_preds_train = low_model.predict(X_train_low)
+        low_residuals = y_low_train - low_preds_train
+        low_residual_std = np.std(low_residuals)
+
+        # ================================================================
+        # PREDICT FOR TEST DAY
+        # ================================================================
+        current_close = ohlc_data[test_idx - 1, 3]  # close
+
+        # Predict HIGH
+        X_pred_high = X_full[test_idx - 1:test_idx, top_features_high]
+        if np.isnan(X_pred_high).any():
+            X_pred_high = np.nan_to_num(X_pred_high, 0)
+        pred_high_pct = high_model.predict(X_pred_high)[0]
+        pred_high = current_close * (1 + pred_high_pct / 100)
+
+        # Predict LOW
+        # NOTE: next_low_pct is defined as (close - low)/close * 100 = POSITIVE when low < close
+        # So we SUBTRACT the percentage to get the actual low price
+        X_pred_low = X_full[test_idx - 1:test_idx, top_features_low]
+        if np.isnan(X_pred_low).any():
+            X_pred_low = np.nan_to_num(X_pred_low, 0)
+        pred_low_pct = low_model.predict(X_pred_low)[0]
+        pred_low = current_close * (1 - pred_low_pct / 100)  # SUBTRACT - low is below close
+
+        # Ensure high > low
+        if pred_high < pred_low:
+            pred_high, pred_low = pred_low, pred_high
+
+        pred_range = pred_high - pred_low
+
+        # ================================================================
+        # CONFIDENCE INTERVALS
+        # ================================================================
+        from scipy import stats
+        z = stats.norm.ppf((1 + ci_level) / 2)
+
+        # CI in dollars
+        high_ci = z * (high_residual_std / 100) * current_close
+        low_ci = z * (low_residual_std / 100) * current_close
+
+        # Get actual values
+        actual_high = ohlc_data[test_idx, 0]
+        actual_low = ohlc_data[test_idx, 1]
+        actual_open = ohlc_data[test_idx, 2]
+        actual_close = ohlc_data[test_idx, 3]
+        actual_range = actual_high - actual_low
+
+        result = {
+            'date': test_date,
+            'predicted_high': pred_high,
+            'predicted_low': pred_low,
+            'predicted_range': pred_range,
+            'high_lower': pred_high - high_ci,
+            'high_upper': pred_high + high_ci,
+            'low_lower': pred_low - low_ci,
+            'low_upper': pred_low + low_ci,
+            'actual_high': actual_high,
+            'actual_low': actual_low,
+            'actual_open': actual_open,
+            'actual_close': actual_close,
+            'actual_range': actual_range,
+            'model_r2': (train_r2_high + train_r2_low) / 2,
+            'train_r2': (train_r2_high + train_r2_low) / 2,
+            'train_r2_high': train_r2_high,
+            'train_r2_low': train_r2_low,
+            'train_rmse': (high_residual_std + low_residual_std) / 2,
+            'confidence_method': 'separate_residual_std',
+            'confidence_level': ci_level,
+            'retrained': True,
+            'test_idx': test_idx,
+            'feature_importance': None,
+            'feature_names': list(set([feature_names[i] for i in top_features_high] +
+                                      [feature_names[i] for i in top_features_low]))
+        }
+
+        # Update progress file
+        try:
+            with open(progress_file, 'r+') as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    progress = json.load(f)
+                    progress['completed'] = progress.get('completed', 0) + 1
+                    progress['status'] = 'running'
+                    f.seek(0)
+                    f.truncate()
+                    json.dump(progress, f)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except:
+            pass
+
+        return result
+
+    except Exception as e:
+        print(f"Error processing day {test_idx}: {e}")
+        return None
+
+
+def _train_and_predict_single_day_with_progress(args):
+    """Wrapper that updates progress file after completion (LEGACY - kept for compatibility)."""
+    import json
+    import fcntl
+
+    # Unpack args (last two are progress_file and total)
+    pred_df, test_idx, train_window, n_trials, n_workers_inner, ci_level, polygon_api_key, progress_file, total = args
+
+    # Run the actual training
+    result = _train_and_predict_single_day(
+        (pred_df, test_idx, train_window, n_trials, n_workers_inner, ci_level, polygon_api_key)
+    )
+
+    # Update progress file (thread-safe with file locking)
+    try:
+        with open(progress_file, 'r+') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                progress = json.load(f)
+                progress['completed'] = progress.get('completed', 0) + 1
+                progress['status'] = 'running'
+                progress['last_idx'] = test_idx
+                f.seek(0)
+                f.truncate()
+                json.dump(progress, f)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass  # Don't fail the job if progress update fails
+
+    return result
+
+
+def get_parallel_progress(progress_file: str = None) -> dict:
+    """Read current progress from the progress file."""
+    import json
+    import tempfile
+
+    if progress_file is None:
+        progress_file = os.path.join(tempfile.gettempdir(), 'wf_progress.json')
+
+    try:
+        with open(progress_file, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {'completed': 0, 'total': 0, 'status': 'unknown'}

@@ -53,7 +53,7 @@ from joblib import Parallel, delayed
 
 # Price prediction module
 try:
-    from price_prediction import PriceRangePredictor, PriceTargetCalculator, ExitTimingPredictor
+    from price_prediction import PriceRangePredictor, PriceTargetCalculator, ExitTimingPredictor, run_parallel_walk_forward
     PRICE_PREDICTION_AVAILABLE = True
 except ImportError:
     PRICE_PREDICTION_AVAILABLE = False
@@ -7289,6 +7289,18 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     help="50-68% = tight actionable bands for trading. 80-95% = wider bands for risk management."
                 )
 
+            # Parallel walk-forward option (only makes sense for daily retraining)
+            wf_col7, wf_col8 = st.columns(2)
+            with wf_col7:
+                wf_parallel_mode = st.checkbox(
+                    "Enable Parallel Walk-Forward",
+                    value=False,
+                    help="Run all days in parallel (requires daily retraining). Much faster with many cores but uses more memory."
+                )
+            with wf_col8:
+                if wf_parallel_mode and wf_retrain_freq != "Every Day":
+                    st.warning("Parallel mode works best with daily retraining. Consider switching to 'Every Day'.")
+
             st.markdown("---")
 
             # Run button
@@ -7319,137 +7331,327 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     last_train_idx = -999  # Force initial training
                     st.session_state['wf_train_r2_list'] = []  # Reset R² tracking for new run
 
-                    # Progress tracking
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    metrics_placeholder = st.empty()
+                    # ================================================================
+                    # PARALLEL WALK-FORWARD MODE
+                    # ================================================================
+                    if wf_parallel_mode and retrain_interval == 1:
+                        st.info(f"Running PARALLEL walk-forward with {wf_n_workers} workers...")
 
-                    # Walk forward loop
-                    for i, test_idx in enumerate(range(test_start_idx, len(pred_df))):
-                        test_date = pred_df.index[test_idx]
-                        progress = (i + 1) / wf_test_days
+                        # Get polygon API key for parallel function
+                        parallel_api_key = polygon_api_key if polygon_api_key else None
 
-                        # Check if we need to retrain
-                        days_since_train = test_idx - last_train_idx
-                        need_retrain = (current_model is None) or (days_since_train >= retrain_interval)
+                        # Setup progress tracking
+                        import tempfile
+                        import json
+                        import time as time_module
+                        progress_file = os.path.join(tempfile.gettempdir(), 'wf_progress.json')
 
-                        if need_retrain:
-                            status_text.text(f"Training model for {test_date.strftime('%Y-%m-%d')}... ({i+1}/{wf_test_days})")
+                        # Initialize progress file
+                        with open(progress_file, 'w') as f:
+                            json.dump({'completed': 0, 'total': wf_test_days, 'status': 'starting'}, f)
 
-                            # Get training data (ROLLING window - only last N days before test)
-                            # This matches comprehensive_walkforward_test.py and keeps model focused on recent data
-                            train_start_idx = max(0, test_idx - wf_min_train_days)
-                            train_df = pred_df.iloc[train_start_idx:test_idx].copy()
+                        # Create progress display
+                        progress_bar = st.progress(0)
+                        progress_text = st.empty()
+                        progress_text.text(f"Starting parallel training: 0/{wf_test_days} days completed...")
 
-                            if len(train_df) >= wf_min_train_days:
-                                try:
-                                    # Create fresh predictor and train
-                                    wf_predictor = PriceRangePredictor(polygon if polygon_api_key else None)
+                        # Start parallel execution in background
+                        import threading
+                        parallel_results = [None]
+                        parallel_error = [None]
 
-                                    # NOTE: Options features are NOT used for training (point-in-time data)
-                                    # VIX data is now cached at CLASS level, so no redundant fetches
-
-                                    # Train with reduced output
-                                    # IMPORTANT: Do NOT pass options_features to training!
-                                    # Options data is point-in-time, not historical.
-                                    # Passing it makes all IV features constant, breaking the model.
-                                    with st.spinner(f"Training on {len(train_df)} days..."):
-                                        train_result = wf_predictor.train_range_model(
-                                            train_df,
-                                            options_features=None,  # Don't use options for training!
-                                            n_trials=wf_n_trials,
-                                            n_workers=wf_n_workers,
-                                            feature_selection=False  # Disable for walk-forward stability
-                                        )
-
-                                    current_model = wf_predictor
-                                    last_train_idx = test_idx
-
-                                    # Store feature importances and R² for analysis
-                                    if train_result:
-                                        # Store R² from this training
-                                        # NOTE: metrics are nested under 'metrics' key in train_result
-                                        metrics = train_result.get('metrics', {})
-                                        train_r2 = metrics.get('r2', 0)
-                                        train_rmse = metrics.get('rmse_pct', 0)
-                                        if 'wf_train_r2_list' not in st.session_state:
-                                            st.session_state['wf_train_r2_list'] = []
-                                        st.session_state['wf_train_r2_list'].append({
-                                            'date': test_date,
-                                            'r2': train_r2,
-                                            'rmse_pct': train_rmse
-                                        })
-
-                                        if 'feature_importance' in train_result:
-                                            imp_df = train_result['feature_importance'].copy()
-                                            imp_df['train_date'] = test_date
-                                            imp_df['train_idx'] = test_idx
-                                            wf_feature_importances.append(imp_df)
-                                        if wf_feature_names is None:
-                                            wf_feature_names = train_result.get('feature_names', [])
-
-                                except Exception as train_err:
-                                    st.warning(f"Training failed at {test_date}: {train_err}")
-                                    continue
-                        else:
-                            status_text.text(f"Predicting {test_date.strftime('%Y-%m-%d')}... ({i+1}/{wf_test_days})")
-
-                        # Make prediction for this day (using data up to previous day)
-                        if current_model is not None:
+                        def run_parallel():
                             try:
-                                # Use data up to the day BEFORE test_date for prediction
-                                pred_input_df = pred_df.iloc[:test_idx].copy()
-
-                                # Get prediction with user-selected confidence level
-                                prediction = current_model.predict_daily_range(
-                                    pred_input_df,
-                                    confidence_level=wf_ci_level
+                                parallel_results[0] = run_parallel_walk_forward(
+                                    pred_df=pred_df,
+                                    test_start_idx=test_start_idx,
+                                    train_window=wf_min_train_days,
+                                    n_trials=wf_n_trials,
+                                    n_workers=wf_n_workers,
+                                    ci_level=wf_ci_level,
+                                    polygon_api_key=parallel_api_key,
+                                    progress_file=progress_file,
+                                    ticker=pred_ticker  # For cached IV lookup
                                 )
+                            except Exception as e:
+                                parallel_error[0] = e
 
-                                # Get actual values for test_date
-                                actual_high = pred_df['high'].iloc[test_idx]
-                                actual_low = pred_df['low'].iloc[test_idx]
-                                actual_close = pred_df['close'].iloc[test_idx]
-                                actual_open = pred_df['open'].iloc[test_idx]
-                                actual_range = actual_high - actual_low
+                        # Start thread
+                        thread = threading.Thread(target=run_parallel)
+                        thread.start()
 
-                                # Store result
-                                wf_results.append({
-                                    'date': test_date,
-                                    'predicted_high': prediction['predicted_high'],
-                                    'predicted_low': prediction['predicted_low'],
-                                    'predicted_range': prediction['predicted_range_dollars'],
-                                    'high_lower': prediction['high_lower'],
-                                    'high_upper': prediction['high_upper'],
-                                    'low_lower': prediction['low_lower'],
-                                    'low_upper': prediction['low_upper'],
-                                    'actual_high': actual_high,
-                                    'actual_low': actual_low,
-                                    'actual_open': actual_open,
-                                    'actual_close': actual_close,
-                                    'actual_range': actual_range,
-                                    'model_r2': prediction.get('model_r2', 0),
-                                    'confidence_method': prediction.get('confidence_method', 'unknown'),
-                                    'confidence_level': prediction.get('confidence_level', wf_ci_level),
-                                    'retrained': need_retrain
+                        # Monitor progress
+                        start_time = time_module.time()
+                        feature_time = None
+                        while thread.is_alive():
+                            try:
+                                with open(progress_file, 'r') as f:
+                                    progress = json.load(f)
+                                completed = progress.get('completed', 0)
+                                total = progress.get('total', wf_test_days)
+                                status = progress.get('status', 'starting')
+                                pct = completed / total if total > 0 else 0
+
+                                elapsed = time_module.time() - start_time
+
+                                if status == 'precomputing_features':
+                                    progress_bar.progress(0.0)
+                                    progress_text.text(f"Step 1/2: Pre-computing features (one-time)... | Elapsed: {elapsed:.0f}s")
+                                elif status == 'starting_parallel':
+                                    if feature_time is None:
+                                        feature_time = elapsed
+                                    progress_bar.progress(0.05)
+                                    progress_text.text(f"Step 2/2: Starting parallel training... | Features took {feature_time:.0f}s")
+                                elif completed > 0:
+                                    # Adjust progress to account for feature computation phase
+                                    adjusted_pct = 0.05 + (pct * 0.95)
+                                    progress_bar.progress(min(adjusted_pct, 1.0))
+
+                                    if feature_time is None:
+                                        feature_time = 0
+                                    train_elapsed = elapsed - feature_time
+                                    rate = completed / train_elapsed if train_elapsed > 0 else 0
+                                    remaining = (total - completed) / rate if rate > 0 else 0
+                                    progress_text.text(f"Training: {completed}/{total} days ({pct*100:.0f}%) | Elapsed: {elapsed:.0f}s | ETA: {remaining:.0f}s")
+                                else:
+                                    progress_text.text(f"Initializing... | Elapsed: {elapsed:.0f}s")
+                            except:
+                                pass
+                            time_module.sleep(0.5)
+
+                        thread.join()
+                        progress_bar.progress(1.0)
+                        progress_text.text(f"Complete! {wf_test_days} days processed in {time_module.time() - start_time:.1f}s")
+
+                        if parallel_error[0]:
+                            raise parallel_error[0]
+
+                        parallel_results = parallel_results[0]
+
+                        # Process parallel results
+                        if parallel_results:
+                            for r in parallel_results:
+                                # Extract feature importance for tracking
+                                if r.get('feature_importance') is not None:
+                                    imp_df = r['feature_importance'].copy()
+                                    imp_df['train_date'] = r['date']
+                                    imp_df['train_idx'] = r['test_idx']
+                                    wf_feature_importances.append(imp_df)
+
+                                # Track feature names
+                                if wf_feature_names is None and r.get('feature_names'):
+                                    wf_feature_names = r['feature_names']
+
+                                # Track training R²
+                                st.session_state['wf_train_r2_list'].append({
+                                    'date': r['date'],
+                                    'r2': r.get('train_r2', 0),
+                                    'rmse_pct': r.get('train_rmse', 0)
                                 })
 
-                            except Exception as pred_err:
-                                st.warning(f"Prediction failed at {test_date}: {pred_err}")
+                                # Build result dict (without internal tracking fields)
+                                wf_results.append({
+                                    'date': r['date'],
+                                    'predicted_high': r['predicted_high'],
+                                    'predicted_low': r['predicted_low'],
+                                    'predicted_range': r['predicted_range'],
+                                    'high_lower': r['high_lower'],
+                                    'high_upper': r['high_upper'],
+                                    'low_lower': r['low_lower'],
+                                    'low_upper': r['low_upper'],
+                                    'actual_high': r['actual_high'],
+                                    'actual_low': r['actual_low'],
+                                    'actual_open': r['actual_open'],
+                                    'actual_close': r['actual_close'],
+                                    'actual_range': r['actual_range'],
+                                    'model_r2': r.get('model_r2', 0),
+                                    'confidence_method': r.get('confidence_method', 'unknown'),
+                                    'confidence_level': r.get('confidence_level', wf_ci_level),
+                                    'retrained': True
+                                })
 
-                        progress_bar.progress(progress)
+                            st.success(f"Parallel walk-forward complete! {len(wf_results)} predictions generated.")
 
-                        # Update live metrics every 10 days
-                        if len(wf_results) > 0 and len(wf_results) % 10 == 0:
-                            temp_df = pd.DataFrame(wf_results)
-                            temp_high_in_range = ((temp_df['actual_high'] >= temp_df['high_lower']) &
-                                                  (temp_df['actual_high'] <= temp_df['high_upper'])).mean() * 100
-                            temp_low_in_range = ((temp_df['actual_low'] >= temp_df['low_lower']) &
-                                                 (temp_df['actual_low'] <= temp_df['low_upper'])).mean() * 100
-                            metrics_placeholder.markdown(f"**Running Metrics:** High in range: {temp_high_in_range:.1f}% | Low in range: {temp_low_in_range:.1f}%")
+                            # Train a final model for "Predict Tomorrow's Range" feature
+                            with st.spinner("Training final model for tomorrow's prediction..."):
+                                try:
+                                    # Train on most recent data (same as last walk-forward window)
+                                    final_train_start = max(0, len(pred_df) - wf_min_train_days)
+                                    final_train_df = pred_df.iloc[final_train_start:].copy()
 
-                    progress_bar.progress(1.0)
-                    status_text.text("Walk forward analysis complete!")
+                                    final_predictor = PriceRangePredictor(polygon if polygon_api_key else None)
+                                    final_result = final_predictor.train_range_model(
+                                        final_train_df,
+                                        options_features=None,
+                                        n_trials=wf_n_trials,
+                                        n_workers=4,  # Use fewer workers for single model
+                                        feature_selection=False
+                                    )
+
+                                    print(f"[DEBUG] Final model result: {final_result is not None}")
+                                    if final_result:
+                                        # Set current_model so it's stored correctly at line 7646
+                                        current_model = final_predictor
+                                        print(f"[DEBUG] current_model set to final_predictor: {type(current_model)}")
+                                        st.info("✅ Model ready for 'Predict Tomorrow's Range'")
+
+                                        # Use final model's feature importance for Feature Analysis
+                                        # (parallel workers don't return individual feature importances)
+                                        if final_result.get('feature_importance') is not None:
+                                            imp_df = final_result['feature_importance'].copy()
+                                            imp_df['train_date'] = pred_df.index[-1]
+                                            imp_df['train_idx'] = len(pred_df) - 1
+                                            wf_feature_importances = [imp_df]
+                                            print(f"[DEBUG] Feature importance set from final model: {len(imp_df)} features")
+
+                                        # Set feature names from final model
+                                        if wf_feature_names is None:
+                                            wf_feature_names = final_result.get('feature_names', final_predictor.feature_names)
+                                            print(f"[DEBUG] Feature names set: {len(wf_feature_names) if wf_feature_names else 0}")
+                                    else:
+                                        print("[DEBUG] final_result was falsy!")
+                                        st.warning("Final model training returned no result")
+                                except Exception as model_err:
+                                    print(f"[DEBUG] Final model training exception: {model_err}")
+                                    import traceback
+                                    traceback.print_exc()
+                                    st.warning(f"Could not train final model: {model_err}")
+
+                    # ================================================================
+                    # SEQUENTIAL WALK-FORWARD MODE (original code)
+                    # ================================================================
+                    else:
+                        # Progress tracking
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        metrics_placeholder = st.empty()
+
+                        # Walk forward loop
+                        for i, test_idx in enumerate(range(test_start_idx, len(pred_df))):
+                            test_date = pred_df.index[test_idx]
+                            progress = (i + 1) / wf_test_days
+
+                            # Check if we need to retrain
+                            days_since_train = test_idx - last_train_idx
+                            need_retrain = (current_model is None) or (days_since_train >= retrain_interval)
+
+                            if need_retrain:
+                                status_text.text(f"Training model for {test_date.strftime('%Y-%m-%d')}... ({i+1}/{wf_test_days})")
+
+                                # Get training data (ROLLING window - only last N days before test)
+                                # This matches comprehensive_walkforward_test.py and keeps model focused on recent data
+                                train_start_idx = max(0, test_idx - wf_min_train_days)
+                                train_df = pred_df.iloc[train_start_idx:test_idx].copy()
+
+                                if len(train_df) >= wf_min_train_days:
+                                    try:
+                                        # Create fresh predictor and train
+                                        wf_predictor = PriceRangePredictor(polygon if polygon_api_key else None)
+
+                                        # NOTE: Options features are NOT used for training (point-in-time data)
+                                        # VIX data is now cached at CLASS level, so no redundant fetches
+
+                                        # Train with reduced output
+                                        # IMPORTANT: Do NOT pass options_features to training!
+                                        # Options data is point-in-time, not historical.
+                                        # Passing it makes all IV features constant, breaking the model.
+                                        with st.spinner(f"Training on {len(train_df)} days..."):
+                                            train_result = wf_predictor.train_range_model(
+                                                train_df,
+                                                options_features=None,  # Don't use options for training!
+                                                n_trials=wf_n_trials,
+                                                n_workers=wf_n_workers,
+                                                feature_selection=False  # Disable for walk-forward stability
+                                            )
+
+                                        current_model = wf_predictor
+                                        last_train_idx = test_idx
+
+                                        # Store feature importances and R² for analysis
+                                        if train_result:
+                                            # Store R² from this training
+                                            # NOTE: metrics are nested under 'metrics' key in train_result
+                                            metrics = train_result.get('metrics', {})
+                                            train_r2 = metrics.get('r2', 0)
+                                            train_rmse = metrics.get('rmse_pct', 0)
+                                            if 'wf_train_r2_list' not in st.session_state:
+                                                st.session_state['wf_train_r2_list'] = []
+                                            st.session_state['wf_train_r2_list'].append({
+                                                'date': test_date,
+                                                'r2': train_r2,
+                                                'rmse_pct': train_rmse
+                                            })
+
+                                            if 'feature_importance' in train_result:
+                                                imp_df = train_result['feature_importance'].copy()
+                                                imp_df['train_date'] = test_date
+                                                imp_df['train_idx'] = test_idx
+                                                wf_feature_importances.append(imp_df)
+                                            if wf_feature_names is None:
+                                                wf_feature_names = train_result.get('feature_names', [])
+
+                                    except Exception as train_err:
+                                        st.warning(f"Training failed at {test_date}: {train_err}")
+                                        continue
+                            else:
+                                status_text.text(f"Predicting {test_date.strftime('%Y-%m-%d')}... ({i+1}/{wf_test_days})")
+
+                            # Make prediction for this day (using data up to previous day)
+                            if current_model is not None:
+                                try:
+                                    # Use data up to the day BEFORE test_date for prediction
+                                    pred_input_df = pred_df.iloc[:test_idx].copy()
+
+                                    # Get prediction with user-selected confidence level
+                                    prediction = current_model.predict_daily_range(
+                                        pred_input_df,
+                                        confidence_level=wf_ci_level
+                                    )
+
+                                    # Get actual values for test_date
+                                    actual_high = pred_df['high'].iloc[test_idx]
+                                    actual_low = pred_df['low'].iloc[test_idx]
+                                    actual_close = pred_df['close'].iloc[test_idx]
+                                    actual_open = pred_df['open'].iloc[test_idx]
+                                    actual_range = actual_high - actual_low
+
+                                    # Store result
+                                    wf_results.append({
+                                        'date': test_date,
+                                        'predicted_high': prediction['predicted_high'],
+                                        'predicted_low': prediction['predicted_low'],
+                                        'predicted_range': prediction['predicted_range_dollars'],
+                                        'high_lower': prediction['high_lower'],
+                                        'high_upper': prediction['high_upper'],
+                                        'low_lower': prediction['low_lower'],
+                                        'low_upper': prediction['low_upper'],
+                                        'actual_high': actual_high,
+                                        'actual_low': actual_low,
+                                        'actual_open': actual_open,
+                                        'actual_close': actual_close,
+                                        'actual_range': actual_range,
+                                        'model_r2': prediction.get('model_r2', 0),
+                                        'confidence_method': prediction.get('confidence_method', 'unknown'),
+                                        'confidence_level': prediction.get('confidence_level', wf_ci_level),
+                                        'retrained': need_retrain
+                                    })
+
+                                except Exception as pred_err:
+                                    st.warning(f"Prediction failed at {test_date}: {pred_err}")
+
+                            progress_bar.progress(progress)
+
+                            # Update live metrics every 10 days
+                            if len(wf_results) > 0 and len(wf_results) % 10 == 0:
+                                temp_df = pd.DataFrame(wf_results)
+                                temp_high_in_range = ((temp_df['actual_high'] >= temp_df['high_lower']) &
+                                                      (temp_df['actual_high'] <= temp_df['high_upper'])).mean() * 100
+                                temp_low_in_range = ((temp_df['actual_low'] >= temp_df['low_lower']) &
+                                                     (temp_df['actual_low'] <= temp_df['low_upper'])).mean() * 100
+                                metrics_placeholder.markdown(f"**Running Metrics:** High in range: {temp_high_in_range:.1f}% | Low in range: {temp_low_in_range:.1f}%")
+
+                        progress_bar.progress(1.0)
+                        status_text.text("Walk forward analysis complete!")
 
                     # Store results in session state
                     if wf_results:

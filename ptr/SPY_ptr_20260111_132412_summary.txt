@@ -1,7 +1,7 @@
 ================================================================================
 PREDICT TOMORROW'S RANGE - SUMMARY
 ================================================================================
-Generated: 2026-01-12 06:53:44
+Generated: 2026-01-11 13:24:12
 Ticker: SPY
 Prediction For: 2026-01-12
 
@@ -13,40 +13,40 @@ Current Close: $694.07
 ================================================================================
 POINT PREDICTIONS
 ================================================================================
-Predicted High: $696.92 (+0.41% from close)
-Predicted Low: $693.63 (+0.06% below close)
-Predicted Range: $3.14
+Predicted High: $697.07 (+0.43% from close)
+Predicted Low: $691.62 (+0.35% below close)
+Predicted Range: $5.45
 
 ================================================================================
 CONFIDENCE BANDS (68% CI)
 ================================================================================
-High Upper Bound: $697.43
-High Lower Bound: $694.38
-Low Upper Bound: $692.95
-Low Lower Bound: $690.72
-High Band Width: $3.05
-Low Band Width: $2.23
+High Upper Bound: $702.43
+High Lower Bound: $694.74
+Low Upper Bound: $694.74
+Low Lower Bound: $685.45
+High Band Width: $7.69
+Low Band Width: $9.30
 
 ================================================================================
 MODEL INFO
 ================================================================================
-Model R²: -0.5820802884225658
-Model RMSE: 0.3818977685623879
-Features Used: 257
-Training Samples: 80
+Model R²: 0.27426627092440425
+Model RMSE: 0.469702354284634
+Features Used: 228
+Training Samples: 344
 
 ================================================================================
 TRADING LEVELS
 ================================================================================
-Resistance (High Upper): $697.43
-Target High: $696.92
+Resistance (High Upper): $702.43
+Target High: $697.07
 Current: $694.07
-Target Low: $693.63
-Support (Low Lower): $690.72
+Target Low: $691.62
+Support (Low Lower): $685.45
 
 ================================================================================
 FILES
 ================================================================================
-CSV Data: ptr/SPY_ptr_20260112_065344.csv
-Summary: ptr/SPY_ptr_20260112_065344_summary.txt
+CSV Data: ptr/SPY_ptr_20260111_132412.csv
+Summary: ptr/SPY_ptr_20260111_132412_summary.txt
 ================================================================================

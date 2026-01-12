@@ -613,6 +613,43 @@ def calculate_velocity_signals(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         raw_buy = raw_buy & (df['close'] < bb_lower)
         raw_sell = raw_sell & (df['close'] > bb_upper)
 
+    # News sentiment filter - blocks trades during high-risk news conditions
+    use_news_filter = config.get('use_news_filter', False)
+    news_risk_threshold = config.get('news_risk_threshold', 60)  # Block if risk > threshold
+
+    if use_news_filter:
+        try:
+            from news_features import NewsTradeFilter
+            ticker = config.get('ticker', 'SPY')
+            news_filter = NewsTradeFilter()
+
+            # Check news conditions for the most recent bar (live trading decision)
+            # For historical backtest bars, we don't have historical news risk, so allow those
+            filter_result = news_filter.check_entry(ticker, direction='long')
+
+            if not filter_result['allow_entry'] and filter_result['risk_details'].get('risk_score', 0) > news_risk_threshold:
+                # Only block the LAST row (live signal) - historical signals remain for backtest consistency
+                if len(df) > 0:
+                    last_idx = df.index[-1]
+                    # Store original last signal for logging
+                    original_buy = raw_buy.loc[last_idx] if isinstance(raw_buy, pd.Series) else raw_buy.iloc[-1]
+                    original_sell = raw_sell.loc[last_idx] if isinstance(raw_sell, pd.Series) else raw_sell.iloc[-1]
+
+                    if original_buy or original_sell:
+                        print(f"[NEWS FILTER] Blocking signal - {filter_result['reason']} (risk: {filter_result['risk_details'].get('risk_score', 0)})")
+
+                    # Create a copy to modify the last value
+                    if isinstance(raw_buy, pd.Series):
+                        raw_buy = raw_buy.copy()
+                        raw_buy.loc[last_idx] = False
+                    if isinstance(raw_sell, pd.Series):
+                        raw_sell = raw_sell.copy()
+                        raw_sell.loc[last_idx] = False
+        except ImportError:
+            pass  # news_features module not available
+        except Exception as e:
+            print(f"[NEWS FILTER] Warning: {e}")
+
     df['buy_signal'] = raw_buy
     df['sell_signal'] = raw_sell
 
