@@ -319,20 +319,26 @@ def load_config(config_path: str = "production_env/velocity_config.json") -> dic
 def fetch_price_data(ticker: str, api_key: str = None, days: int = 200, interval: str = "1d",
                      use_cache: bool = True) -> pd.DataFrame:
     """
-    Fetch historical price data using yfinance with optional caching.
-    Uses EXACT same method as Streamlit (oscillator_predictor_page.py line 1238-1242)
+    Fetch historical price data using Polygon (for crypto) or yfinance with optional caching.
 
     Args:
         ticker: The ticker symbol
-        api_key: Not used (kept for compatibility)
+        api_key: Polygon API key (used for crypto)
         days: Number of days of data to fetch
         interval: Data interval ('1d', '1h', etc.)
         use_cache: If True, use local SQLite cache to reduce API calls
     """
+    # Check if this is a crypto ticker
+    is_crypto = '-USD' in ticker or ticker in ['BTC', 'ETH', 'BTCUSD', 'ETHUSD']
+
+    # For crypto, yfinance actually has more current data than Polygon (tested Jan 2026)
+    # Polygon crypto daily bars have ~24hr delay, yfinance has same-day data
+    # So we skip Polygon for crypto and use yfinance directly
+
     if not YFINANCE_AVAILABLE:
         raise RuntimeError("yfinance not installed. Run: pip install yfinance")
 
-    # Try to use cached data first
+    # Try to use cached data first (for non-crypto or if Polygon failed)
     if use_cache:
         try:
             from data_cache import fetch_and_cache
@@ -368,11 +374,132 @@ def fetch_price_data(ticker: str, api_key: str = None, days: int = 200, interval
     return df
 
 
+def _fetch_crypto_from_polygon(ticker: str, api_key: str, days: int = 200, interval: str = "1d") -> pd.DataFrame:
+    """
+    Fetch crypto data from Polygon API (faster updates than yfinance).
+    Polygon crypto candles update within minutes of close vs yfinance's 12-24 hour delay.
+    """
+    from polygon import RESTClient
+
+    client = RESTClient(api_key)
+
+    # Convert ticker to Polygon format (BTC-USD -> X:BTCUSD)
+    if '-USD' in ticker:
+        polygon_ticker = f"X:{ticker.replace('-USD', 'USD')}"
+    elif ticker in ['BTC', 'ETH']:
+        polygon_ticker = f"X:{ticker}USD"
+    else:
+        polygon_ticker = f"X:{ticker}"
+
+    # Map interval to Polygon timespan
+    timespan_map = {'1d': 'day', '1h': 'hour', '4h': 'hour', '15m': 'minute'}
+    timespan = timespan_map.get(interval, 'day')
+    multiplier = 4 if interval == '4h' else (15 if interval == '15m' else 1)
+
+    # Use tomorrow as end date to ensure we get all available data
+    end_date = datetime.now() + timedelta(days=1)
+    start_date = datetime.now() - timedelta(days=days + 10)  # Extra buffer
+
+    print(f"📊 Fetching {ticker} via Polygon API ({days} days, {interval})")
+
+    aggs = client.get_aggs(
+        ticker=polygon_ticker,
+        multiplier=multiplier,
+        timespan=timespan,
+        from_=start_date.strftime('%Y-%m-%d'),
+        to=end_date.strftime('%Y-%m-%d'),
+        adjusted=False,
+        sort='asc',
+        limit=50000
+    )
+
+    if not aggs:
+        return pd.DataFrame()
+
+    # Convert to DataFrame - Polygon timestamps are UTC!
+    # For daily crypto bars, the timestamp represents the START of the bar (00:00 UTC)
+    data = []
+    for bar in aggs:
+        # Use UTC timestamp directly (Polygon returns UTC for crypto)
+        bar_date = datetime.utcfromtimestamp(bar.timestamp / 1000)
+        data.append({
+            'date': bar_date,
+            'open': bar.open,
+            'high': bar.high,
+            'low': bar.low,
+            'close': bar.close,
+            'volume': bar.volume
+        })
+
+    df = pd.DataFrame(data)
+    df.set_index('date', inplace=True)
+    df.index = pd.to_datetime(df.index)
+
+    return df
+
+
 def fetch_realtime_price(ticker: str) -> float:
     """
     Fetch real-time/current price for display purposes.
     This is separate from daily bar data - used to show actual current price.
+
+    For crypto: Uses Coinbase API (US-friendly, real-time) with Kraken/CoinGecko fallbacks
+    For stocks: Uses yfinance
     """
+    is_crypto = '-USD' in ticker or ticker in ['BTC', 'ETH', 'BTCUSD', 'ETHUSD']
+
+    # For crypto, use US-friendly APIs (Coinbase, Kraken, CoinGecko)
+    if is_crypto:
+        # Extract base symbol (BTC-USD -> BTC)
+        if '-USD' in ticker:
+            base_symbol = ticker.replace('-USD', '')
+        else:
+            base_symbol = ticker
+
+        # Try Coinbase first (most accurate for US users, free, no auth needed)
+        try:
+            url = f"https://api.coinbase.com/v2/prices/{base_symbol}-USD/spot"
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                price = float(data.get('data', {}).get('amount', 0))
+                if price > 0:
+                    return price
+        except Exception as e:
+            print(f"   ⚠ Coinbase API failed: {e}, trying Kraken...")
+
+        # Fallback to Kraken (also US-friendly)
+        try:
+            # Kraken uses XBT for Bitcoin
+            kraken_symbol = 'XBT' if base_symbol == 'BTC' else base_symbol
+            url = f"https://api.kraken.com/0/public/Ticker?pair={kraken_symbol}USD"
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                result = data.get('result', {})
+                # Kraken returns different key formats (XXBTZUSD or XBTUSD)
+                for key in result:
+                    if 'USD' in key:
+                        price = float(result[key]['c'][0])  # 'c' is last trade closed [price, lot volume]
+                        if price > 0:
+                            return price
+        except Exception as e:
+            print(f"   ⚠ Kraken API failed: {e}, trying CoinGecko...")
+
+        # Fallback to CoinGecko
+        try:
+            coin_id = 'bitcoin' if base_symbol == 'BTC' else 'ethereum' if base_symbol == 'ETH' else base_symbol.lower()
+            url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                price = data.get(coin_id, {}).get('usd', 0)
+                if price > 0:
+                    return float(price)
+        except Exception as e:
+            print(f"   ⚠ CoinGecko API failed: {e}, trying yfinance...")
+
+    # For stocks or as final fallback, use yfinance
     try:
         t = yf.Ticker(ticker)
         # Try multiple fields in order of preference
@@ -1215,6 +1342,7 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
 
     # Add NEW entries from fresh backtest (only entries AFTER latest exit date)
     new_entries_added = 0
+    skipped_overlap = 0
     for entry in backtest.get('entries', []):
         entry_date = entry['date']
         entry_date_str = str(entry_date)[:10]
@@ -1237,6 +1365,21 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
                 print(f"   ⏭️  Skipping backtest entry {entry_date} (conflicts with tracked position)")
                 continue
 
+        # VALIDATION: Check if there's already an unexited entry in locked backtest
+        # We can't enter a new position if we're already in one
+        existing_entry_dates = {str(e.get('date', ''))[:10] for e in locked["entries"]}
+        existing_exit_entry_dates = {str(e.get('entry_date', ''))[:10] for e in locked["exits"]}
+        unexited_entries = existing_entry_dates - existing_exit_entry_dates
+
+        if unexited_entries:
+            # There's at least one unexited entry - check if this new entry would overlap
+            # Get the latest unexited entry date
+            latest_unexited = max(unexited_entries)
+            if entry_date_str > latest_unexited:
+                # This entry is after an unexited entry - skip it (can't enter while in position)
+                skipped_overlap += 1
+                continue
+
         locked["entries"].append({
             "date": str(entry['date']),
             "price": entry['price'],
@@ -1246,6 +1389,8 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
 
     if new_entries_added > 0:
         print(f"   ➕ Added {new_entries_added} new entries (after {latest_exit_date})")
+    if skipped_overlap > 0:
+        print(f"   ⏭️  Skipped {skipped_overlap} entries (already in position)")
 
     # Add NEW exits from fresh backtest (only exits AFTER latest exit date)
     new_exits_added = 0
@@ -1760,6 +1905,16 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
                                                   locked_backtest=locked_backtest)
         pos_section = build_position_section(current_price, trade_state, backtest, config)
 
+        # Check for stale data warning (data > 1 day behind)
+        data_stale_warning = ""
+        try:
+            data_end_date = df.index[-1].date() if hasattr(df.index[-1], 'date') else datetime.strptime(full_end, '%Y-%m-%d').date()
+            days_behind = (datetime.now().date() - data_end_date).days
+            if days_behind > 1:
+                data_stale_warning = f"\n⚠️ _Data is {days_behind} days behind (yfinance delay)_"
+        except:
+            pass
+
         msg_full = (
             f"**{title}: {strategy_label}** [1/2 Full Timeframe]\n"
             f"**Period:** {full_start} to {full_end} ({full_days} bars)\n"
@@ -1770,7 +1925,7 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
             f"• Trades: {backtest['num_trades']} | Win Rate: {backtest['win_rate']:.0f}%\n"
             f"• Return: {backtest['total_return']:.1f}% | PF: {backtest['profit_factor']:.1f}\n"
             f"---\n"
-            f"_Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}_"
+            f"_Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}_{data_stale_warning}"
         )
 
         send_discord_alert(webhook_url, msg_full, chart_buf_full, strategy_name=strategy_name)
@@ -1838,6 +1993,16 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
             # Position section stays the same (current position)
             pos_section_subset = build_position_section(current_price, trade_state, backtest_subset, config)
 
+            # Check for stale data warning (data > 1 day behind)
+            data_stale_warning = ""
+            try:
+                data_end_date = df_subset.index[-1].date() if hasattr(df_subset.index[-1], 'date') else datetime.strptime(period_end, '%Y-%m-%d').date()
+                days_behind = (datetime.now().date() - data_end_date).days
+                if days_behind > 1:
+                    data_stale_warning = f"\n⚠️ _Data is {days_behind} days behind (yfinance delay)_"
+            except:
+                pass
+
             msg_subset = (
                 f"**{title}: {strategy_label}** [2/2 {period_label}]\n"
                 f"**Period:** {period_start} to {period_end} ({len(df_subset)} bars)\n"
@@ -1848,7 +2013,7 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
                 f"• Trades: {backtest_subset['num_trades']} | Win Rate: {backtest_subset['win_rate']:.0f}%\n"
                 f"• Return: {backtest_subset['total_return']:.1f}% | PF: {backtest_subset['profit_factor']:.1f}\n"
                 f"---\n"
-                f"_Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}_"
+                f"_Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}_{data_stale_warning}"
             )
 
             send_discord_alert(webhook_url, msg_subset, chart_buf_subset, strategy_name=strategy_name)
@@ -2121,11 +2286,31 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
         price_diff_pct = abs(state_entry - backtest_entry) / state_entry if state_entry > 0 else 1
 
         # Parse dates for comparison
+        # NOTE: For crypto, UTC vs local time can differ by 1 day (midnight UTC = 7 PM ET previous day)
         state_date_str = str(state_time)[:10] if state_time else ''
         backtest_date_str = str(backtest_time)[:10] if backtest_time else ''
-        dates_differ = state_date_str != backtest_date_str
 
-        # Trigger sync if: prices differ by >0.5% OR dates are different
+        # Calculate day difference (allowing for timezone skew)
+        days_diff = 0
+        try:
+            if state_date_str and backtest_date_str:
+                state_date = pd.to_datetime(state_date_str).date()
+                backtest_date = pd.to_datetime(backtest_date_str).date()
+                days_diff = abs((backtest_date - state_date).days)
+        except:
+            days_diff = 1 if state_date_str != backtest_date_str else 0
+
+        # For crypto: allow 1-day tolerance if prices match closely (UTC vs local time issue)
+        # For stocks: strict date matching
+        is_crypto_ticker = '-USD' in ticker.upper() or ticker.upper() in ['BTC', 'ETH', 'SOL', 'DOGE']
+
+        # Log timezone tolerance usage
+        if is_crypto_ticker and days_diff == 1 and price_diff_pct <= 0.005:
+            print(f"   ℹ️  Date differs by 1 day but prices match (likely UTC vs local timezone) - NOT syncing")
+
+        dates_differ = days_diff > (1 if is_crypto_ticker and price_diff_pct <= 0.005 else 0)
+
+        # Trigger sync if: prices differ by >0.5% OR dates differ significantly
         if state_entry > 0 and (price_diff_pct > 0.005 or dates_differ):
             print(f"⚠️  STATE MISMATCH: Different entries detected!")
             print(f"   State says: {state_position.upper()} @ ${state_entry:.2f}")
@@ -2347,13 +2532,15 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             # If fresh data is available and more recent, use it for charts
             # Otherwise fall back to bundled data (charts may not show recent positions)
             chart_df = df  # Default to bundled
+            chart_data_source = "bundled"  # Track source for accurate logging
             try:
                 if fresh_backtest and fresh_df is not None and len(fresh_df) > 0:
                     bundled_end = df.index[-1] if len(df) > 0 else None
                     fresh_end = fresh_df.index[-1]
                     if bundled_end and fresh_end > bundled_end:
                         chart_df = fresh_df
-                        print(f"📊 Using fresh data for charts (bundled ends {bundled_end.strftime('%Y-%m-%d')}, fresh ends {fresh_end.strftime('%Y-%m-%d')})")
+                        chart_data_source = "fresh"
+                        print(f"📊 Using FRESH data for charts (bundled ends {bundled_end.strftime('%Y-%m-%d')}, fresh ends {fresh_end.strftime('%Y-%m-%d')})")
                     else:
                         print(f"📊 Using bundled data for charts (up to {bundled_end.strftime('%Y-%m-%d') if bundled_end else 'unknown'})")
                 else:
@@ -2417,7 +2604,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                                                    current_position=trade_state,
                                                    locked_backtest=locked_backtest,
                                                    full_period_backtest=locked_backtest)
-            print(f"✅ Generated recent {recent_days}-day chart (subset of bundled data, {recent_backtest['num_trades']} trades)")
+            print(f"✅ Generated recent {recent_days}-day chart ({chart_data_source} data, {recent_backtest['num_trades']} trades)")
 
             # Use recent chart for main display (full period chart can be added later)
             startup_chart = recent_chart
@@ -2456,6 +2643,37 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
     # Determine if this is a crypto or stock ticker for signal timing
     is_crypto = ticker.upper() in ['BTC-USD', 'ETH-USD', 'SOL-USD', 'DOGE-USD'] or '-USD' in ticker.upper()
+
+    # STARTUP CATCH-UP: If crypto and we just missed a scheduled update window, send immediately
+    # This handles cases where trader started at 6:51 AM but 6:00 AM window was missed
+    if is_crypto and backtest:
+        startup_now = datetime.now()
+        startup_hour = startup_now.hour
+        startup_minute = startup_now.minute
+
+        # Check if we're within 2 hours AFTER a scheduled crypto update time (0, 6, 12, 18)
+        # e.g., if current time is 7:30, we missed the 6:00 update
+        scheduled_hours = [0, 6, 12, 18]
+        for sched_hour in scheduled_hours:
+            # Check if current time is between sched_hour:45 and sched_hour+2:00
+            # (i.e., we're past the 45-min window but within 2 hours of the scheduled time)
+            hours_after = (startup_hour - sched_hour) % 24
+            if hours_after == 0 and startup_minute >= 45:
+                # We're in the same hour but past the 45-min window
+                print(f"🔔 STARTUP CATCH-UP: Missed {sched_hour}:00 update (now {startup_hour}:{startup_minute:02d})")
+                send_status_update(webhook_url, fresh_df if fresh_backtest else df, fresh_backtest or backtest, config, ticker,
+                                 f"🔔 Startup Catch-up ({sched_hour}:00)", trade_state, strategy_name=strategy_name)
+                day_str = startup_now.strftime('%Y-%m-%d')
+                daily_alerts.add(f"{day_str}_CRYPTO_{sched_hour:02d}")
+                break
+            elif hours_after == 1 and startup_minute < 30:
+                # We're 1 hour after (e.g., 7:15 after 6:00 update)
+                print(f"🔔 STARTUP CATCH-UP: Missed {sched_hour}:00 update (now {startup_hour}:{startup_minute:02d})")
+                send_status_update(webhook_url, fresh_df if fresh_backtest else df, fresh_backtest or backtest, config, ticker,
+                                 f"🔔 Startup Catch-up ({sched_hour}:00)", trade_state, strategy_name=strategy_name)
+                day_str = startup_now.strftime('%Y-%m-%d')
+                daily_alerts.add(f"{day_str}_CRYPTO_{sched_hour:02d}")
+                break
 
     while True:
         try:
@@ -2536,8 +2754,8 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             status_backtest = None
             try:
                 status_backtest = run_historical_backtest(df, config)
-            except:
-                pass
+            except Exception as e:
+                print(f"   ⚠️ Backtest failed: {e}")
 
             # Check for position sync issues - warn if backtest shows position but we're not tracking
             if status_backtest and status_backtest.get('current_position'):
@@ -2587,11 +2805,29 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             # Midnight Update (for both crypto and stocks - crypto uses local time, stocks use ET)
             if hour == 0 and minute < 5:
                 key = f"{day_str}_MIDNIGHT"
+                print(f"   🕛 Midnight window detected! Key: {key}, already_sent: {key in daily_alerts}, has_backtest: {status_backtest is not None}")
                 if key not in daily_alerts and status_backtest:
                     send_status_update(webhook_url, df, status_backtest, config, ticker,
                                      "🌙 Midnight Update", trade_state, strategy_name=strategy_name,
                                      realtime_price=realtime_price)
                     daily_alerts.add(key)
+                    print(f"   ✅ Midnight update sent!")
+                elif key in daily_alerts:
+                    print(f"   ⏭️ Midnight update already sent for {day_str}")
+                elif not status_backtest:
+                    print(f"   ⚠️ Midnight update skipped - no backtest data")
+
+            # Crypto: 6-hourly updates (00:00, 06:00, 12:00, 18:00 local time)
+            # Extended window to 45 minutes to avoid missing updates (e.g., trader started late)
+            if is_crypto and hour in [0, 6, 12, 18] and minute < 45:
+                key = f"{day_str}_CRYPTO_{hour:02d}"
+                if key not in daily_alerts and status_backtest:
+                    update_names = {0: "🌙 Midnight", 6: "🌅 Morning", 12: "☀️ Midday", 18: "🌆 Evening"}
+                    send_status_update(webhook_url, df, status_backtest, config, ticker,
+                                     f"{update_names[hour]} Update", trade_state, strategy_name=strategy_name,
+                                     realtime_price=realtime_price)
+                    daily_alerts.add(key)
+                    print(f"   ✅ Crypto {hour}:00 update sent!")
 
             # Check for exit conditions first (if in position)
             if trade_state['position'] == 'long':

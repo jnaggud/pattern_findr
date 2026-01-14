@@ -26,5 +26,20 @@
     "exit_reason": "Take Profit (4.62%)",
     "pnl_pct": 4.618673376531554,
     "pnl_dollars": 461.8673376531554
+  },
+  {
+    "id": 3,
+    "ticker": "BTC-USD",
+    "strategy_name": "velocity_BTC_1y",
+    "type": "LONG",
+    "entry_price": 91192.9921875,
+    "exit_price": 95332.63,
+    "entry_time": "2026-01-12 00:00:00",
+    "exit_time": "2026-01-13 00:00:00",
+    "entry_signal_bar": "2026-01-12 00:00:00",
+    "exit_signal_bar": "2026-01-13 00:00:00",
+    "exit_reason": "Take Profit (4.54%)",
+    "pnl_pct": 4.539425358462394,
+    "pnl_dollars": 4139.637812500005
   }
 ]

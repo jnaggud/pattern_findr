@@ -1,5 +1,5 @@
 {
-  "locked_at": "2026-01-08T09:10:14.096607",
+  "locked_at": "2026-01-13T08:20:39.399363",
   "entries": [
     {
       "date": "2025-06-26 00:00:00",
@@ -83,7 +83,7 @@
     },
     {
       "date": "2026-01-08 00:00:00",
-      "price": 694.07,
+      "price": 689.510009765625,
       "position": "long"
     }
   ],
@@ -219,12 +219,11 @@
   ],
   "current_position": {
     "position": "long",
-    "entry_price": 694.07,
+    "entry_price": 689.510009765625,
     "entry_date": "2026-01-08 00:00:00"
   },
   "num_trades": 16,
   "win_rate": 100.0,
   "total_return": 29.238878462943063,
-  "profit_factor": 26000.28892911596,
-  "num_missed": 0
+  "profit_factor": Infinity
 }

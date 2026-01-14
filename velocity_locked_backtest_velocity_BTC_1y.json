@@ -1,5 +1,5 @@
 {
-  "locked_at": "2026-01-08T09:09:34.279592",
+  "locked_at": "2026-01-13T08:19:41.037519",
   "entries": [
     {
       "date": "2025-06-23 00:00:00",
@@ -124,6 +124,11 @@
     {
       "date": "2025-12-25 00:00:00",
       "price": 87234.7421875,
+      "position": "long"
+    },
+    {
+      "date": "2026-01-12 00:00:00",
+      "price": 91192.9921875,
       "position": "long"
     }
   ],
@@ -327,11 +332,20 @@
       "reason": "Opposite Signal",
       "entry_price": 87234.7421875,
       "entry_date": "2025-12-25 00:00:00"
+    },
+    {
+      "date": "2026-01-13 00:00:00",
+      "price": 95332.63,
+      "pnl": 4.539425358462394,
+      "reason": "Take Profit (4.54%)",
+      "entry_price": 91192.9921875,
+      "entry_date": "2026-01-12 00:00:00"
     }
   ],
   "current_position": null,
-  "num_trades": 25,
-  "win_rate": 92.0,
-  "total_return": 87.68060819287133,
-  "profit_factor": 26.231300935302507
+  "num_trades": 26,
+  "win_rate": 92.3076923076923,
+  "total_return": 96.20022931409497,
+  "profit_factor": 28.012132219388693,
+  "num_missed": 0
 }

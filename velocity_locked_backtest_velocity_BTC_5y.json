@@ -1,5 +1,5 @@
 {
-  "locked_at": "2026-01-08T09:09:02.125963",
+  "locked_at": "2026-01-13T08:17:39.772938",
   "entries": [
     {
       "date": "2020-12-27 00:00:00",
@@ -1359,6 +1359,11 @@
     {
       "date": "2025-12-23 00:00:00",
       "price": 87414.0,
+      "position": "long"
+    },
+    {
+      "date": "2026-01-12 00:00:00",
+      "price": 91192.9921875,
       "position": "long"
     }
   ],
@@ -3540,7 +3545,11 @@
       "entry_date": "2025-12-23 00:00:00"
     }
   ],
-  "current_position": null,
+  "current_position": {
+    "position": "long",
+    "entry_price": 91192.9921875,
+    "entry_date": "2026-01-12 00:00:00"
+  },
   "num_trades": 272,
   "win_rate": 78.67647058823529,
   "total_return": 328468.10187516164,

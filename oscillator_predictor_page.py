@@ -238,6 +238,9 @@ def export_walkforward_results(wf_df: pd.DataFrame, metrics: dict, settings: dic
         f"Confidence Level: {settings.get('confidence_level', 'N/A')}",
         f"Optuna Trials: {settings.get('n_trials', 'N/A')}",
         f"Parallel Workers: {settings.get('n_workers', 'N/A')}",
+        f"Model Mode: {settings.get('model_mode', 'N/A')}",
+        f"HIGH Model: {settings.get('high_model_type', 'N/A')} (Top {settings.get('high_top_n', 'N/A')} features)",
+        f"LOW Model: {settings.get('low_model_type', 'N/A')} (Top {settings.get('low_top_n', 'N/A')} features)",
         "",
         "=" * 80,
         "CONTAINMENT METRICS",
@@ -7301,6 +7304,282 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                 if wf_parallel_mode and wf_retrain_freq != "Every Day":
                     st.warning("Parallel mode works best with daily retraining. Consider switching to 'Every Day'.")
 
+            # Model configuration - CORRECTED R² values (no data leakage)
+            st.markdown("##### Model Configuration")
+            st.caption("*R² values from Jan 2026 model comparison (60-day test, 250-day train, dynamic feature selection)*")
+
+            # Model performance data from comprehensive_model_comparison.py results
+            MODEL_STATS = {
+                # Single models - sorted by R²
+                'RIDGE_Top30': {'r2_high': 0.301, 'r2_low': 0.045, 'cont_high': 93.3, 'cont_low': 96.7, 'mae_high': 2.23, 'mae_low': 3.25, 'type': 'ridge', 'top_n': 30, 'ci_mult_high': 1.0, 'ci_mult_low': 0.8},
+                'RIDGE_Top50': {'r2_high': 0.293, 'r2_low': 0.030, 'cont_high': 88.3, 'cont_low': 85.0, 'mae_high': 2.36, 'mae_low': 3.03, 'type': 'ridge', 'top_n': 50, 'ci_mult_high': 1.0, 'ci_mult_low': 0.8},
+                'RIDGE_Top20': {'r2_high': 0.278, 'r2_low': 0.414, 'cont_high': 95.0, 'cont_low': 100.0, 'mae_high': 2.25, 'mae_low': 2.54, 'type': 'ridge', 'top_n': 20, 'ci_mult_high': 1.0, 'ci_mult_low': 0.8},
+                'XGBOOST_ALL': {'r2_high': 0.272, 'r2_low': 0.151, 'cont_high': 21.7, 'cont_low': 8.3, 'mae_high': 2.31, 'mae_low': 3.11, 'type': 'xgboost', 'top_n': 0, 'ci_mult_high': 5.1, 'ci_mult_low': 1.0},
+                'RIDGE_Top5': {'r2_high': 0.262, 'r2_low': -0.103, 'cont_high': 100.0, 'cont_low': 98.3, 'mae_high': 2.48, 'mae_low': 3.42, 'type': 'ridge', 'top_n': 5, 'ci_mult_high': 1.0, 'ci_mult_low': 1.0},
+                'RIDGE_Top15': {'r2_high': 0.246, 'r2_low': 0.387, 'cont_high': 95.0, 'cont_low': 100.0, 'mae_high': 2.37, 'mae_low': 2.60, 'type': 'ridge', 'top_n': 15, 'ci_mult_high': 1.0, 'ci_mult_low': 0.8},
+                'XGBOOST_Top15': {'r2_high': 0.235, 'r2_low': 0.241, 'cont_high': 63.3, 'cont_low': 40.0, 'mae_high': 2.32, 'mae_low': 2.83, 'type': 'xgboost', 'top_n': 15, 'ci_mult_high': 2.0, 'ci_mult_low': 1.5},
+                'XGBOOST_Top50': {'r2_high': 0.231, 'r2_low': 0.224, 'cont_high': 35.0, 'cont_low': 30.0, 'mae_high': 2.38, 'mae_low': 2.82, 'type': 'xgboost', 'top_n': 50, 'ci_mult_high': 3.0, 'ci_mult_low': 2.0},
+                'XGBOOST_Top20': {'r2_high': 0.164, 'r2_low': 0.277, 'cont_high': 50.0, 'cont_low': 41.7, 'mae_high': 2.51, 'mae_low': 2.63, 'type': 'xgboost', 'top_n': 20, 'ci_mult_high': 2.5, 'ci_mult_low': 1.5},
+                # Ensemble models - sorted by R²
+                'Ridge+XGB_Top50': {'r2_high': 0.398, 'r2_low': 0.282, 'cont_high': 91.7, 'cont_low': 88.3, 'mae_high': 2.14, 'mae_low': 2.72, 'type': 'ensemble', 'ensemble': ['ridge', 'xgboost'], 'top_n': 50, 'ci_mult_high': 1.2, 'ci_mult_low': 1.0},
+                'Ridge+XGB_Top15': {'r2_high': 0.330, 'r2_low': 0.360, 'cont_high': 95.0, 'cont_low': 100.0, 'mae_high': 2.22, 'mae_low': 2.66, 'type': 'ensemble', 'ensemble': ['ridge', 'xgboost'], 'top_n': 15, 'ci_mult_high': 1.0, 'ci_mult_low': 0.8},
+                'Ridge+LGB_Top5': {'r2_high': 0.305, 'r2_low': -0.176, 'cont_high': 100.0, 'cont_low': 96.7, 'mae_high': 2.36, 'mae_low': 3.59, 'type': 'ensemble', 'ensemble': ['ridge', 'lightgbm'], 'top_n': 5, 'ci_mult_high': 1.0, 'ci_mult_low': 1.0},
+                'Ridge+XGB_Top20': {'r2_high': 0.290, 'r2_low': 0.401, 'cont_high': 93.3, 'cont_low': 98.3, 'mae_high': 2.31, 'mae_low': 2.48, 'type': 'ensemble', 'ensemble': ['ridge', 'xgboost'], 'top_n': 20, 'ci_mult_high': 1.0, 'ci_mult_low': 0.8},
+                'Ridge+XGB+LGB_Top50': {'r2_high': 0.283, 'r2_low': 0.311, 'cont_high': 90.0, 'cont_low': 93.3, 'mae_high': 2.30, 'mae_low': 2.66, 'type': 'ensemble', 'ensemble': ['ridge', 'xgboost', 'lightgbm'], 'top_n': 50, 'ci_mult_high': 1.2, 'ci_mult_low': 1.0},
+                'Ridge+XGB_Top30': {'r2_high': 0.263, 'r2_low': 0.255, 'cont_high': 95.0, 'cont_low': 96.7, 'mae_high': 2.22, 'mae_low': 2.81, 'type': 'ensemble', 'ensemble': ['ridge', 'xgboost'], 'top_n': 30, 'ci_mult_high': 1.0, 'ci_mult_low': 0.9},
+                'Ridge+XGB+LGB_Top15': {'r2_high': 0.252, 'r2_low': 0.334, 'cont_high': 91.7, 'cont_low': 100.0, 'mae_high': 2.30, 'mae_low': 2.66, 'type': 'ensemble', 'ensemble': ['ridge', 'xgboost', 'lightgbm'], 'top_n': 15, 'ci_mult_high': 1.0, 'ci_mult_low': 0.8},
+                'Ridge+LGB_Top30': {'r2_high': 0.239, 'r2_low': 0.275, 'cont_high': 93.3, 'cont_low': 95.0, 'mae_high': 2.32, 'mae_low': 2.72, 'type': 'ensemble', 'ensemble': ['ridge', 'lightgbm'], 'top_n': 30, 'ci_mult_high': 1.0, 'ci_mult_low': 0.9},
+                'Ridge+LGB_Top20': {'r2_high': 0.192, 'r2_low': 0.374, 'cont_high': 91.7, 'cont_low': 98.3, 'mae_high': 2.44, 'mae_low': 2.60, 'type': 'ensemble', 'ensemble': ['ridge', 'lightgbm'], 'top_n': 20, 'ci_mult_high': 1.0, 'ci_mult_low': 0.8},
+            }
+
+            # Regime-adaptive model stats
+            # NOTE: Jan 2026 analysis found low_vol with many features HURTS performance
+            # Best configs: range_bound=Top15, trending=Top20, low_vol=Top5 (fewer features!)
+            REGIME_STATS = {
+                'REGIME_Optimized_Jan2026': {
+                    'r2_high': 0.35, 'r2_low': 0.15, 'cont_high': 85.0, 'cont_low': 75.0, 'mae_high': 2.10, 'mae_low': 2.80,
+                    'description': 'RECOMMENDED: Based on Jan 2026 analysis - fewer features in calm markets',
+                    'ci_mult_high': 1.0, 'ci_mult_low': 1.0,
+                    'configs': {
+                        # Low vol: FEWER features (Top5) - less signal, avoid overfitting
+                        'low_vol': {'model_type': 'ridge', 'top_n': 5},
+                        # Range bound: Top15 worked best (R²H=0.317, R²L=0.121)
+                        'range_bound': {'model_type': 'ridge', 'top_n': 15},
+                        # Trending up: Top20 worked great (R²H=0.479, R²L=0.262)
+                        'trending_up': {'model_type': 'ridge', 'top_n': 20},
+                        # Trending down: Use Top15 (more conservative, small sample showed Top20 poor)
+                        'trending_down': {'model_type': 'ridge', 'top_n': 15},
+                        # High vol: More features OK when there's signal
+                        'high_vol': {'model_type': 'ridge', 'top_n': 20},
+                        'unknown': {'model_type': 'ridge', 'top_n': 15},
+                    }
+                },
+                'REGIME_HighVol-XGB_LowVol-Ridge': {
+                    'r2_high': 0.397, 'r2_low': 0.068, 'cont_high': 85.0, 'cont_low': 78.3, 'mae_high': 2.21, 'mae_low': 3.12,
+                    'description': 'XGBoost ALL in high volatility, Ridge Top5 in low volatility',
+                    'ci_mult_high': 1.5, 'ci_mult_low': 1.0,
+                    'configs': {
+                        'high_vol': {'model_type': 'xgboost', 'top_n': 0},
+                        'low_vol': {'model_type': 'ridge', 'top_n': 5},
+                        'trending_up': {'model_type': 'xgboost', 'top_n': 20},
+                        'trending_down': {'model_type': 'xgboost', 'top_n': 20},
+                        'range_bound': {'model_type': 'ridge', 'top_n': 10},
+                        'unknown': {'model_type': 'ridge', 'top_n': 10},
+                    }
+                },
+                'REGIME_Conservative': {
+                    'r2_high': 0.30, 'r2_low': 0.12, 'cont_high': 90.0, 'cont_low': 85.0, 'mae_high': 2.20, 'mae_low': 2.90,
+                    'description': 'Conservative: Always Top15, best balance of R² and containment',
+                    'ci_mult_high': 1.0, 'ci_mult_low': 1.0,
+                    'configs': {
+                        # Use Top15 for everything - range_bound's winning config
+                        'low_vol': {'model_type': 'ridge', 'top_n': 15},
+                        'range_bound': {'model_type': 'ridge', 'top_n': 15},
+                        'trending_up': {'model_type': 'ridge', 'top_n': 15},
+                        'trending_down': {'model_type': 'ridge', 'top_n': 15},
+                        'high_vol': {'model_type': 'ridge', 'top_n': 15},
+                        'unknown': {'model_type': 'ridge', 'top_n': 15},
+                    }
+                },
+                'REGIME_Ridge_VaryFeatures_Fixed': {
+                    'r2_high': 0.30, 'r2_low': 0.15, 'cont_high': 85.0, 'cont_low': 80.0, 'mae_high': 2.15, 'mae_low': 2.85,
+                    'description': 'Fixed version: low_vol now uses Top5 instead of Top30',
+                    'ci_mult_high': 1.0, 'ci_mult_low': 1.0,
+                    'configs': {
+                        'high_vol': {'model_type': 'ridge', 'top_n': 10},
+                        'low_vol': {'model_type': 'ridge', 'top_n': 5},  # FIXED: was 30, now 5
+                        'trending_up': {'model_type': 'ridge', 'top_n': 20},
+                        'trending_down': {'model_type': 'ridge', 'top_n': 20},
+                        'range_bound': {'model_type': 'ridge', 'top_n': 15},
+                        'unknown': {'model_type': 'ridge', 'top_n': 10},
+                    }
+                },
+                'REGIME_XGB_Trending': {
+                    'r2_high': 0.35, 'r2_low': 0.20, 'cont_high': 70.0, 'cont_low': 60.0, 'mae_high': 2.25, 'mae_low': 2.70,
+                    'description': 'XGBoost for trending markets, Ridge for range-bound/low-vol',
+                    'ci_mult_high': 1.5, 'ci_mult_low': 1.2,
+                    'configs': {
+                        'high_vol': {'model_type': 'xgboost', 'top_n': 15},
+                        'low_vol': {'model_type': 'ridge', 'top_n': 5},
+                        'trending_up': {'model_type': 'xgboost', 'top_n': 20},
+                        'trending_down': {'model_type': 'xgboost', 'top_n': 20},
+                        'range_bound': {'model_type': 'ridge', 'top_n': 15},
+                        'unknown': {'model_type': 'ridge', 'top_n': 15},
+                    }
+                },
+                # NEW: News-enhanced regime strategy (validated Jan 2026)
+                # Uses sentiment×technical interactions for LOW_VOL (+1.2% R²) and RANGE_BOUND (+50% R²)
+                'REGIME_NewsSentiment_Enhanced': {
+                    'r2_high': 0.38, 'r2_low': 0.18, 'cont_high': 85.0, 'cont_low': 80.0, 'mae_high': 2.05, 'mae_low': 2.75,
+                    'description': 'NEWS ENHANCED: Sentiment features for LOW_VOL/RANGE_BOUND (+1-50% R² boost)',
+                    'ci_mult_high': 1.0, 'ci_mult_low': 1.0,
+                    'configs': {
+                        # Low vol: Use sent_cumsum_x_trend (validated +1.2% R² improvement)
+                        'low_vol': {
+                            'model_type': 'ridge',
+                            'top_n': 7,  # 5 base + 2 news features
+                            'force_include': ['news_sent_cumsum_x_trend', 'news_sent_x_volatility_20d']
+                        },
+                        # Range bound: Use sent_x_range_momentum (validated +50% R² improvement!)
+                        'range_bound': {
+                            'model_type': 'ridge',
+                            'top_n': 17,  # 15 base + 2 news features
+                            'force_include': ['news_sent_x_range_momentum', 'news_sent_cumsum_x_trend']
+                        },
+                        # Trending up: No news benefit - use standard features
+                        'trending_up': {'model_type': 'ridge', 'top_n': 20},
+                        # Trending down: No news benefit - use standard features
+                        'trending_down': {'model_type': 'ridge', 'top_n': 15},
+                        # High vol: Slight benefit from cumsum_x_trend
+                        'high_vol': {
+                            'model_type': 'ridge',
+                            'top_n': 21,
+                            'force_include': ['news_sent_cumsum_x_trend']
+                        },
+                        'unknown': {'model_type': 'ridge', 'top_n': 15},
+                    }
+                },
+            }
+
+            # Regime-adaptive toggle
+            wf_regime_adaptive = st.checkbox(
+                "Enable Regime-Adaptive Mode",
+                value=False,
+                disabled=not wf_parallel_mode,
+                help="Automatically switch models based on detected market regime (volatility, trend). When enabled, the system detects if market is in high/low volatility, trending, or range-bound and uses different model configurations accordingly."
+            )
+
+            if wf_regime_adaptive and wf_parallel_mode:
+                # Regime strategy selector
+                regime_options = list(REGIME_STATS.keys())
+                regime_labels = [f"{k} (R²H:{v['r2_high']:.2f}, R²L:{v['r2_low']:.2f})" for k, v in REGIME_STATS.items()]
+
+                wf_regime_strategy = st.selectbox(
+                    "Regime Strategy",
+                    options=regime_options,
+                    format_func=lambda x: f"{x} (R²H:{REGIME_STATS[x]['r2_high']:.2f}, R²L:{REGIME_STATS[x]['r2_low']:.2f})",
+                    index=0,
+                    help="Select a regime-adaptive strategy. Each strategy uses different models based on detected market conditions."
+                )
+
+                # Show regime strategy details
+                regime_info = REGIME_STATS[wf_regime_strategy]
+                st.caption(f"*{regime_info['description']}*")
+
+                # Display stats in columns
+                wf_col_r1, wf_col_r2, wf_col_r3, wf_col_r4 = st.columns(4)
+                with wf_col_r1:
+                    st.metric("R² HIGH", f"{regime_info['r2_high']:.3f}")
+                with wf_col_r2:
+                    st.metric("R² LOW", f"{regime_info['r2_low']:.3f}")
+                with wf_col_r3:
+                    st.metric("Containment", f"H:{regime_info['cont_high']:.0f}%/L:{regime_info['cont_low']:.0f}%")
+                with wf_col_r4:
+                    st.metric("MAE", f"H:${regime_info['mae_high']:.2f}/L:${regime_info['mae_low']:.2f}")
+
+                # Set model variables for regime mode
+                wf_high_model = wf_regime_strategy
+                wf_low_model = wf_regime_strategy
+                default_high_mult = regime_info['ci_mult_high']
+                default_low_mult = regime_info['ci_mult_low']
+
+            else:
+                # Standard mode - separate HIGH and LOW model selection
+                # Group models by type and sort by performance
+                high_single = [k for k, v in MODEL_STATS.items() if v['type'] in ['ridge', 'xgboost']]
+                high_single.sort(key=lambda x: MODEL_STATS[x]['r2_high'], reverse=True)
+                high_ensemble = [k for k, v in MODEL_STATS.items() if v['type'] == 'ensemble']
+                high_ensemble.sort(key=lambda x: MODEL_STATS[x]['r2_high'], reverse=True)
+
+                low_single = [k for k, v in MODEL_STATS.items() if v['type'] in ['ridge', 'xgboost']]
+                low_single.sort(key=lambda x: MODEL_STATS[x]['r2_low'], reverse=True)
+                low_ensemble = [k for k, v in MODEL_STATS.items() if v['type'] == 'ensemble']
+                low_ensemble.sort(key=lambda x: MODEL_STATS[x]['r2_low'], reverse=True)
+
+                # Create formatted option lists
+                high_options = (
+                    ["── Single Models ──"] + high_single[:6] +
+                    ["── Ensemble Models ──"] + high_ensemble[:6]
+                )
+                low_options = (
+                    ["── Single Models ──"] + low_single[:6] +
+                    ["── Ensemble Models ──"] + low_ensemble[:6]
+                )
+
+                wf_col9, wf_col10 = st.columns(2)
+                with wf_col9:
+                    wf_high_model = st.selectbox(
+                        "HIGH Model",
+                        options=[o for o in high_options if not o.startswith("──")],
+                        index=0,  # Default to best R² HIGH
+                        disabled=not wf_parallel_mode,
+                        format_func=lambda x: f"{x} (R²:{MODEL_STATS[x]['r2_high']:.2f}, Cont:{MODEL_STATS[x]['cont_high']:.0f}%)" if x in MODEL_STATS else x,
+                        help="Select model for HIGH prediction. Sorted by R² within each group."
+                    )
+                with wf_col10:
+                    wf_low_model = st.selectbox(
+                        "LOW Model",
+                        options=[o for o in low_options if not o.startswith("──")],
+                        index=0,  # Default to best R² LOW
+                        disabled=not wf_parallel_mode,
+                        format_func=lambda x: f"{x} (R²:{MODEL_STATS[x]['r2_low']:.2f}, Cont:{MODEL_STATS[x]['cont_low']:.0f}%)" if x in MODEL_STATS else x,
+                        help="Select model for LOW prediction. Sorted by R² within each group."
+                    )
+
+                # Display combined stats
+                if wf_parallel_mode and wf_high_model in MODEL_STATS and wf_low_model in MODEL_STATS:
+                    high_stats = MODEL_STATS[wf_high_model]
+                    low_stats = MODEL_STATS[wf_low_model]
+
+                    wf_col_s1, wf_col_s2, wf_col_s3, wf_col_s4 = st.columns(4)
+                    with wf_col_s1:
+                        st.metric("R² HIGH", f"{high_stats['r2_high']:.3f}")
+                    with wf_col_s2:
+                        st.metric("R² LOW", f"{low_stats['r2_low']:.3f}")
+                    with wf_col_s3:
+                        st.metric("Containment", f"H:{high_stats['cont_high']:.0f}%/L:{low_stats['cont_low']:.0f}%")
+                    with wf_col_s4:
+                        st.metric("MAE", f"H:${high_stats['mae_high']:.2f}/L:${low_stats['mae_low']:.2f}")
+
+                    default_high_mult = high_stats['ci_mult_high']
+                    default_low_mult = low_stats['ci_mult_low']
+                elif not wf_parallel_mode:
+                    st.caption("⚠️ Enable **Parallel Walk-Forward** to configure models")
+                    default_high_mult = 1.0
+                    default_low_mult = 1.0
+                else:
+                    default_high_mult = 1.0
+                    default_low_mult = 1.0
+
+            # CI Width Multipliers - compensate for over/under-confident residuals
+            if wf_parallel_mode:
+                st.markdown("##### Confidence Interval Calibration")
+                st.caption("*Adjust CI width to achieve target containment. Recommended values shown based on selected models.*")
+                wf_col12, wf_col13 = st.columns(2)
+                with wf_col12:
+                    wf_high_ci_mult = st.slider(
+                        "HIGH CI Multiplier",
+                        min_value=0.5,
+                        max_value=6.0,
+                        value=float(default_high_mult),
+                        step=0.1,
+                        help="Multiplier to widen/narrow HIGH prediction CI. Higher = wider bands = more containment."
+                    )
+                    st.caption(f"💡 Recommended for selected model: **{default_high_mult:.1f}x**")
+                with wf_col13:
+                    wf_low_ci_mult = st.slider(
+                        "LOW CI Multiplier",
+                        min_value=0.2,
+                        max_value=3.0,
+                        value=float(default_low_mult),
+                        step=0.1,
+                        help="Multiplier to widen/narrow LOW prediction CI. Lower = narrower bands."
+                    )
+                    st.caption(f"💡 Recommended for selected model: **{default_low_mult:.1f}x**")
+            else:
+                wf_high_ci_mult = 1.0
+                wf_low_ci_mult = 1.0
+
             st.markdown("---")
 
             # Run button
@@ -7335,14 +7614,100 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     # PARALLEL WALK-FORWARD MODE
                     # ================================================================
                     if wf_parallel_mode and retrain_interval == 1:
-                        st.info(f"Running PARALLEL walk-forward with {wf_n_workers} workers...")
+                        # Set model configs based on UI selection
+                        # Force reload to pick up any code changes
+                        import importlib
+                        import price_prediction
+                        importlib.reload(price_prediction)
+
+                        # Helper function to parse model config from name
+                        def parse_model_config(model_name, ci_mult):
+                            """Parse model name into config dict."""
+                            config = {'ridge_alpha': 1.0, 'ci_width_multiplier': ci_mult}
+
+                            # Check if it's in MODEL_STATS or REGIME_STATS
+                            if model_name in MODEL_STATS:
+                                stats = MODEL_STATS[model_name]
+                                config['top_n_features'] = stats['top_n']
+
+                                if stats['type'] == 'ensemble':
+                                    # Ensemble model - use first model type, mark as ensemble
+                                    config['model_type'] = 'ensemble'
+                                    config['ensemble_models'] = stats.get('ensemble', ['ridge', 'xgboost'])
+                                else:
+                                    # Single model
+                                    config['model_type'] = stats['type']
+
+                            elif model_name in REGIME_STATS:
+                                # Regime-adaptive model
+                                config['model_type'] = 'regime_adaptive'
+                                config['regime_configs'] = REGIME_STATS[model_name]['configs']
+                                config['top_n_features'] = 0  # Varies by regime
+
+                            else:
+                                # Fallback - parse from name
+                                if 'XGBOOST' in model_name:
+                                    config['model_type'] = 'xgboost'
+                                elif 'RIDGE' in model_name:
+                                    config['model_type'] = 'ridge'
+                                else:
+                                    config['model_type'] = 'ridge'
+
+                                # Parse top_n from name
+                                if 'ALL' in model_name or 'Top0' in model_name:
+                                    config['top_n_features'] = 0
+                                elif 'Top' in model_name:
+                                    try:
+                                        top_n = int(model_name.split('Top')[1].split('_')[0].split(' ')[0])
+                                        config['top_n_features'] = top_n
+                                    except:
+                                        config['top_n_features'] = 20
+                                else:
+                                    config['top_n_features'] = 20
+
+                            return config
+
+                        # Configure HIGH model
+                        high_config = parse_model_config(wf_high_model, wf_high_ci_mult)
+                        price_prediction.HIGH_MODEL_CONFIG = high_config
+
+                        # Configure LOW model
+                        low_config = parse_model_config(wf_low_model, wf_low_ci_mult)
+                        price_prediction.LOW_MODEL_CONFIG = low_config
+
+                        # Get display info
+                        if wf_high_model in MODEL_STATS:
+                            high_r2 = MODEL_STATS[wf_high_model]['r2_high']
+                            high_display = f"{wf_high_model} (R²={high_r2:.2f})"
+                        elif wf_high_model in REGIME_STATS:
+                            high_r2 = REGIME_STATS[wf_high_model]['r2_high']
+                            high_display = f"{wf_high_model} (R²={high_r2:.2f})"
+                        else:
+                            high_display = wf_high_model
+
+                        if wf_low_model in MODEL_STATS:
+                            low_r2 = MODEL_STATS[wf_low_model]['r2_low']
+                            low_display = f"{wf_low_model} (R²={low_r2:.2f})"
+                        elif wf_low_model in REGIME_STATS:
+                            low_r2 = REGIME_STATS[wf_low_model]['r2_low']
+                            low_display = f"{wf_low_model} (R²={low_r2:.2f})"
+                        else:
+                            low_display = wf_low_model
+
+                        price_prediction.SIMPLE_MODE = False  # Always use hybrid with UI-selected configs
+
+                        # Display mode info
+                        if wf_regime_adaptive:
+                            st.info(f"Running PARALLEL walk-forward with {wf_n_workers} workers | **REGIME-ADAPTIVE**: {wf_high_model} (CI×{wf_high_ci_mult:.1f}/{wf_low_ci_mult:.1f})")
+                        else:
+                            st.info(f"Running PARALLEL walk-forward with {wf_n_workers} workers | HIGH: **{high_display}** (CI×{wf_high_ci_mult:.1f}) | LOW: **{low_display}** (CI×{wf_low_ci_mult:.1f})")
 
                         # Get polygon API key for parallel function
                         parallel_api_key = polygon_api_key if polygon_api_key else None
 
                         # Setup progress tracking
                         import tempfile
-                        import json
+                        # Note: json is imported at module level (line 49), don't re-import here
                         import time as time_module
                         progress_file = os.path.join(tempfile.gettempdir(), 'wf_progress.json')
 
@@ -7362,7 +7727,8 @@ def render_strategy_discovery_section(df: pd.DataFrame):
 
                         def run_parallel():
                             try:
-                                parallel_results[0] = run_parallel_walk_forward(
+                                # Use reloaded module's function to get latest code
+                                parallel_results[0] = price_prediction.run_parallel_walk_forward(
                                     pred_df=pred_df,
                                     test_start_idx=test_start_idx,
                                     train_window=wf_min_train_days,
@@ -7467,7 +7833,14 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                     'model_r2': r.get('model_r2', 0),
                                     'confidence_method': r.get('confidence_method', 'unknown'),
                                     'confidence_level': r.get('confidence_level', wf_ci_level),
-                                    'retrained': True
+                                    'retrained': True,
+                                    # Model type tracking (for hybrid model verification)
+                                    'high_model_type': r.get('high_model_type', 'ridge'),
+                                    'high_top_n': r.get('high_top_n', 15),
+                                    'low_model_type': r.get('low_model_type', 'ridge'),
+                                    'low_top_n': r.get('low_top_n', 5),
+                                    # Regime tracking (for regime-adaptive models)
+                                    'detected_regime': r.get('detected_regime', None),
                                 })
 
                             st.success(f"Parallel walk-forward complete! {len(wf_results)} predictions generated.")
@@ -7829,12 +8202,24 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                         'quantile_pct': quantile_pct,
                     }
 
+                    # Extract model type info from results (if available)
+                    high_model_type = wf_df['high_model_type'].iloc[0] if 'high_model_type' in wf_df.columns else 'ridge'
+                    high_top_n = wf_df['high_top_n'].iloc[0] if 'high_top_n' in wf_df.columns else 15
+                    low_model_type = wf_df['low_model_type'].iloc[0] if 'low_model_type' in wf_df.columns else 'ridge'
+                    low_top_n = wf_df['low_top_n'].iloc[0] if 'low_top_n' in wf_df.columns else 5
+                    model_mode = "Hybrid" if high_model_type != low_model_type else "Simple"
+
                     wf_settings = {
                         'n_train_days': st.session_state.get('wf_min_train_days', wf_min_train_days),
                         'retrain_frequency': st.session_state.get('wf_retrain_freq', 'Daily'),
                         'confidence_level': f"{int(conf_level * 100)}%",
                         'n_trials': st.session_state.get('wf_n_trials', 100),
                         'n_workers': st.session_state.get('wf_n_workers', 4),
+                        'model_mode': model_mode,
+                        'high_model_type': high_model_type,
+                        'high_top_n': high_top_n,
+                        'low_model_type': low_model_type,
+                        'low_top_n': low_top_n,
                     }
 
                     wf_ticker = st.session_state.get('ticker', 'SPY')
@@ -9532,10 +9917,14 @@ features['volume_rel_velocity'] = volume_norm.diff()
 
             # Get all velocity strategies with metadata (same logic as Backtest tab)
             import glob
-            all_opt_strategy_dirs = sorted(glob.glob("velocity_strategies/*"), reverse=True)
+            # Use absolute path based on script location for reliability
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            velocity_strat_dir = os.path.join(script_dir, "velocity_strategies")
+            all_opt_strategy_dirs = sorted(glob.glob(os.path.join(velocity_strat_dir, "*")), reverse=True)
             all_opt_strategy_dirs = [d for d in all_opt_strategy_dirs if os.path.isdir(d)]
 
             opt_strategy_info = []
+            opt_load_errors = []  # Track any load errors
             for d in all_opt_strategy_dirs:
                 dir_name = os.path.basename(d)
                 config_path = os.path.join(d, 'velocity_config.json')
@@ -9549,8 +9938,8 @@ features['volume_rel_velocity'] = volume_norm.diff()
                             cfg = json.load(f)
                         ticker = cfg.get('ticker', 'Unknown')
                         signal = cfg.get('signal_mode', cfg.get('signal_type', 'unknown'))
-                    except:
-                        pass
+                    except Exception as e:
+                        opt_load_errors.append(f"{dir_name}: {str(e)[:50]}")
 
                 # Extract date from directory name
                 parts = dir_name.split('_')
@@ -9572,6 +9961,25 @@ features['volume_rel_velocity'] = volume_norm.diff()
                     'display': f"{dir_name} | {ticker} | {created}" if created else dir_name
                 })
 
+            # Debug: Show working directory and strategy count
+            with st.expander("🔧 Debug Info", expanded=False):
+                st.code(f"Working directory: {os.getcwd()}")
+                st.code(f"Script directory: {script_dir}")
+                st.code(f"Velocity strategies path: {velocity_strat_dir}")
+                st.code(f"Path exists: {os.path.exists(velocity_strat_dir)}")
+                st.code(f"Directories scanned: {len(all_opt_strategy_dirs)}")
+                st.code(f"Strategies with configs: {len(opt_strategy_info)}")
+                if opt_load_errors:
+                    st.error(f"Config load errors: {opt_load_errors}")
+                if opt_strategy_info:
+                    debug_df = pd.DataFrame([
+                        {'Directory': s['dir'], 'Ticker': s['ticker'], 'Signal': s['signal']}
+                        for s in opt_strategy_info[:10]  # Show first 10
+                    ])
+                    st.dataframe(debug_df, use_container_width=True)
+                else:
+                    st.warning("No strategies found! Check if velocity_strategies/ directory exists.")
+
             # Input row
             col1, col2 = st.columns([1, 1])
             with col1:
@@ -9586,15 +9994,18 @@ features['volume_rel_velocity'] = volume_norm.diff()
                     selected_strategy = opt_strategy_info[opt_strat_idx - 1]['dir']
                     opt_ticker = opt_strategy_info[opt_strat_idx - 1]['ticker']
                     st.caption(f"Ticker: {opt_ticker} | Signal: {opt_strategy_info[opt_strat_idx - 1]['signal']}")
+                    # Debug: Show selection details
+                    st.caption(f"[DEBUG] Index: {opt_strat_idx}, Info idx: {opt_strat_idx - 1}")
                 else:
                     selected_strategy = "None"
                     opt_ticker = "SPY"
 
             # Second row for range prediction selection
             pred_col1, pred_col2 = st.columns([3, 2])
+            predictions_dir = os.path.join(script_dir, "predictions")
             with pred_col1:
                 # Find all range predictions (not filtered by ticker)
-                prediction_files = sorted(glob.glob("predictions/*.json"), reverse=True)
+                prediction_files = sorted(glob.glob(os.path.join(predictions_dir, "*.json")), reverse=True)
                 prediction_options = ["None"] + [os.path.basename(f) for f in prediction_files]
                 selected_prediction = st.selectbox("Load Range Prediction", prediction_options, key="opt_prediction_select")
             with pred_col2:
@@ -9603,7 +10014,7 @@ features['volume_rel_velocity'] = volume_norm.diff()
             # Data Readiness Status
             has_strategy = selected_strategy != "None"
             has_prediction = selected_prediction != "None" and len(prediction_files) > 0
-            prediction_path = f"predictions/{selected_prediction}" if has_prediction else None
+            prediction_path = os.path.join(predictions_dir, selected_prediction) if has_prediction else None
 
             status_col1, status_col2, status_col3 = st.columns([1, 1, 2])
             with status_col1:
@@ -9638,12 +10049,17 @@ features['volume_rel_velocity'] = volume_norm.diff()
             with col1:
                 st.markdown("**Velocity Strategy**")
                 if selected_strategy != "None":
-                    strategy_path = f"velocity_strategies/{selected_strategy}"
+                    strategy_path = os.path.join(velocity_strat_dir, selected_strategy)
                     engine = OptionsStrategyEngine()
                     velocity_strategy = engine.load_velocity_strategy(strategy_path)
 
                     if velocity_strategy:
-                        st.success(f"Loaded: {velocity_strategy['strategy_id']}")
+                        # IMPORTANT: Override opt_ticker from loaded strategy (more reliable than dropdown list)
+                        loaded_ticker = velocity_strategy.get('ticker', '')
+                        if loaded_ticker:
+                            opt_ticker = loaded_ticker
+
+                        st.success(f"Loaded: {velocity_strategy['strategy_id']} | Ticker: {opt_ticker}")
                         params = velocity_strategy.get('parameters', {})
                         direction = velocity_strategy.get('direction', 'neutral')
 
@@ -10536,51 +10952,62 @@ features['volume_rel_velocity'] = volume_norm.diff()
                                         trade_dte = 14  # Default fallback
 
                                     direction = 'bullish'
+                                    # Calculate in percentage terms to work for any asset price level
                                     atm_premium_pct = 0.025 * (trade_dte / 21) ** 0.5
-                                    atm_premium = entry_price * atm_premium_pct
+                                    move_pct = (exit_price - entry_price) / entry_price  # Percentage move
+                                    abs_move_pct = abs(move_pct)
+
+                                    # Position size per trade: allocate fraction of capital
+                                    # Use 10% of capital per trade for position sizing
+                                    position_size = bt_capital * 0.10 * bt_contracts
 
                                     if strategy_type == 'single_leg':
-                                        underlying_move = exit_price - entry_price
+                                        # Single leg: delta exposure to the move, minus theta decay
                                         delta = 0.50
                                         if underlying_pnl_pct > 2:
                                             delta = 0.65
                                         elif underlying_pnl_pct < -2:
                                             delta = 0.35
-                                        option_value_change = delta * underlying_move * 100 * bt_contracts
-                                        option_cost = atm_premium * 100 * bt_contracts
-                                        option_pnl = max(-option_cost, option_value_change - (option_cost * 0.3))
-                                        max_loss = option_cost
+                                        # Option return = delta * move% - time decay (30% of premium)
+                                        option_return_pct = delta * move_pct - (atm_premium_pct * 0.3)
+                                        option_pnl = option_return_pct * position_size
+                                        option_pnl = max(-atm_premium_pct * position_size, option_pnl)  # Can't lose more than premium
+                                        max_loss = atm_premium_pct * position_size
 
                                     elif strategy_type == 'vertical_spread':
-                                        spread_width = 5.0
-                                        debit = spread_width * 0.45
-                                        short_strike = entry_price + spread_width
-                                        if exit_price >= short_strike:
-                                            option_pnl = (spread_width - debit) * 100 * bt_contracts
-                                        elif exit_price <= entry_price:
-                                            option_pnl = -debit * 100 * bt_contracts
-                                        else:
-                                            intrinsic = exit_price - entry_price
-                                            option_pnl = (intrinsic - debit) * 100 * bt_contracts
-                                        max_loss = debit * 100 * bt_contracts
+                                        # Vertical spread: capped profit/loss based on spread width
+                                        spread_width_pct = 5.0 / entry_price  # $5 spread as % of price
+                                        debit_pct = spread_width_pct * 0.45  # Pay 45% of spread width
+                                        if move_pct >= spread_width_pct:  # Full profit
+                                            option_return_pct = spread_width_pct - debit_pct
+                                        elif move_pct <= 0:  # Full loss
+                                            option_return_pct = -debit_pct
+                                        else:  # Partial
+                                            option_return_pct = move_pct - debit_pct
+                                        option_pnl = option_return_pct * position_size
+                                        max_loss = debit_pct * position_size
 
                                     elif strategy_type == 'straddle':
-                                        total_premium = entry_price * 0.045 * (trade_dte / 21) ** 0.5
-                                        abs_move = abs(exit_price - entry_price)
-                                        if abs_move > total_premium:
-                                            option_pnl = (abs_move - total_premium) * 100 * bt_contracts
+                                        # Straddle: profit from big moves in either direction
+                                        straddle_premium_pct = 0.045 * (trade_dte / 21) ** 0.5
+                                        if abs_move_pct > straddle_premium_pct:
+                                            option_return_pct = abs_move_pct - straddle_premium_pct
                                         else:
-                                            option_pnl = max(-(total_premium - abs_move) * 100 * bt_contracts, -total_premium * 100 * bt_contracts)
-                                        max_loss = total_premium * 100 * bt_contracts
+                                            option_return_pct = -(straddle_premium_pct - abs_move_pct)
+                                        option_return_pct = max(option_return_pct, -straddle_premium_pct)
+                                        option_pnl = option_return_pct * position_size
+                                        max_loss = straddle_premium_pct * position_size
 
                                     elif strategy_type == 'strangle':
-                                        total_premium = entry_price * 0.030 * (trade_dte / 21) ** 0.5
-                                        abs_move = abs(exit_price - entry_price)
-                                        if abs_move > total_premium:
-                                            option_pnl = (abs_move - total_premium) * 100 * bt_contracts
+                                        # Strangle: cheaper premium but needs bigger move
+                                        strangle_premium_pct = 0.030 * (trade_dte / 21) ** 0.5
+                                        if abs_move_pct > strangle_premium_pct:
+                                            option_return_pct = abs_move_pct - strangle_premium_pct
                                         else:
-                                            option_pnl = max(-(total_premium - abs_move) * 100 * bt_contracts, -total_premium * 100 * bt_contracts)
-                                        max_loss = total_premium * 100 * bt_contracts
+                                            option_return_pct = -(strangle_premium_pct - abs_move_pct)
+                                        option_return_pct = max(option_return_pct, -strangle_premium_pct)
+                                        option_pnl = option_return_pct * position_size
+                                        max_loss = strangle_premium_pct * position_size
                                     else:
                                         option_pnl = 0
                                         max_loss = 0
@@ -10889,6 +11316,42 @@ features['volume_rel_velocity'] = volume_norm.diff()
             st.markdown("## 🔍 Find Best Strategy Combination")
             st.caption("Test ALL velocity strategies × ALL options types to find the optimal combination")
 
+            # Load previous results section
+            import glob as glob_module
+            saved_combo_files = sorted(glob_module.glob("combo_results/combo_test_*.json"), reverse=True)
+            if saved_combo_files:
+                with st.expander("📂 Load Previous Combo Test Results", expanded=False):
+                    load_col1, load_col2 = st.columns([3, 1])
+                    with load_col1:
+                        selected_combo_file = st.selectbox(
+                            "Select saved results",
+                            saved_combo_files,
+                            format_func=lambda x: f"{os.path.basename(x)} ({datetime.fromtimestamp(os.path.getmtime(x)).strftime('%Y-%m-%d %H:%M')})",
+                            key="load_combo_file"
+                        )
+                    with load_col2:
+                        if st.button("📥 Load Results", key="load_combo_btn"):
+                            try:
+                                with open(selected_combo_file, 'r') as f:
+                                    loaded_data = json.load(f)
+                                st.session_state.combo_results = loaded_data.get('results', [])
+                                st.session_state.loaded_combo_metadata = {
+                                    'timestamp': loaded_data.get('timestamp'),
+                                    'capital': loaded_data.get('capital'),
+                                    'contracts': loaded_data.get('contracts'),
+                                    'num_strategies': loaded_data.get('num_strategies_tested'),
+                                    'filename': selected_combo_file
+                                }
+                                st.success(f"Loaded {len(st.session_state.combo_results)} combinations from {os.path.basename(selected_combo_file)}")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error loading file: {e}")
+
+                    # Show metadata if loaded
+                    if 'loaded_combo_metadata' in st.session_state and st.session_state.loaded_combo_metadata:
+                        meta = st.session_state.loaded_combo_metadata
+                        st.caption(f"📊 Loaded: {meta.get('filename', 'N/A')} | Capital: ${meta.get('capital', 'N/A'):,} | Strategies: {meta.get('num_strategies', 'N/A')}")
+
             combo_col1, combo_col2 = st.columns([2, 1])
             with combo_col1:
                 combo_capital = st.number_input("Capital for Combo Test ($)", min_value=1000, max_value=100000, value=10000, key="combo_capital")
@@ -11031,48 +11494,59 @@ features['volume_rel_velocity'] = volume_norm.diff()
                                     hold_days = 5
                                     trade_dte = 14
 
+                                # Calculate in percentage terms to work for any asset price level
                                 atm_premium_pct = 0.025 * (trade_dte / 21) ** 0.5
-                                atm_premium = entry_price * atm_premium_pct
+                                move_pct = (exit_price - entry_price) / entry_price  # Percentage move
+                                abs_move_pct = abs(move_pct)
+
+                                # Position size per trade: allocate fraction of capital
+                                # Use 10% of capital per trade for position sizing
+                                position_size = combo_capital * 0.10 * combo_contracts
 
                                 # Calculate options P&L based on strategy type
                                 if opt_type == 'single_leg':
-                                    underlying_move = exit_price - entry_price
+                                    # Single leg: delta exposure to the move, minus theta decay
                                     delta = 0.50
                                     if underlying_pnl > 2:
                                         delta = 0.65
                                     elif underlying_pnl < -2:
                                         delta = 0.35
-                                    option_value_change = delta * underlying_move * 100 * combo_contracts
-                                    option_cost = atm_premium * 100 * combo_contracts
-                                    option_pnl = max(-option_cost, option_value_change - (option_cost * 0.3))
+                                    # Option return = delta * move% - time decay (30% of premium)
+                                    option_return_pct = delta * move_pct - (atm_premium_pct * 0.3)
+                                    option_pnl = option_return_pct * position_size
+                                    option_pnl = max(-atm_premium_pct * position_size, option_pnl)  # Can't lose more than premium
 
                                 elif opt_type == 'vertical_spread':
-                                    spread_width = 5.0
-                                    debit = spread_width * 0.45
-                                    short_strike = entry_price + spread_width
-                                    if exit_price >= short_strike:
-                                        option_pnl = (spread_width - debit) * 100 * combo_contracts
-                                    elif exit_price <= entry_price:
-                                        option_pnl = -debit * 100 * combo_contracts
-                                    else:
-                                        intrinsic = exit_price - entry_price
-                                        option_pnl = (intrinsic - debit) * 100 * combo_contracts
+                                    # Vertical spread: capped profit/loss based on spread width
+                                    spread_width_pct = 5.0 / entry_price  # $5 spread as % of price
+                                    debit_pct = spread_width_pct * 0.45  # Pay 45% of spread width
+                                    if move_pct >= spread_width_pct:  # Full profit
+                                        option_return_pct = spread_width_pct - debit_pct
+                                    elif move_pct <= 0:  # Full loss
+                                        option_return_pct = -debit_pct
+                                    else:  # Partial
+                                        option_return_pct = move_pct - debit_pct
+                                    option_pnl = option_return_pct * position_size
 
                                 elif opt_type == 'straddle':
-                                    total_premium = entry_price * 0.045 * (trade_dte / 21) ** 0.5
-                                    abs_move = abs(exit_price - entry_price)
-                                    if abs_move > total_premium:
-                                        option_pnl = (abs_move - total_premium) * 100 * combo_contracts
+                                    # Straddle: profit from big moves in either direction
+                                    straddle_premium_pct = 0.045 * (trade_dte / 21) ** 0.5
+                                    if abs_move_pct > straddle_premium_pct:
+                                        option_return_pct = abs_move_pct - straddle_premium_pct
                                     else:
-                                        option_pnl = max(-(total_premium - abs_move) * 100 * combo_contracts, -total_premium * 100 * combo_contracts)
+                                        option_return_pct = -(straddle_premium_pct - abs_move_pct)
+                                    option_return_pct = max(option_return_pct, -straddle_premium_pct)
+                                    option_pnl = option_return_pct * position_size
 
                                 elif opt_type == 'strangle':
-                                    total_premium = entry_price * 0.030 * (trade_dte / 21) ** 0.5
-                                    abs_move = abs(exit_price - entry_price)
-                                    if abs_move > total_premium:
-                                        option_pnl = (abs_move - total_premium) * 100 * combo_contracts
+                                    # Strangle: cheaper premium but needs bigger move
+                                    strangle_premium_pct = 0.030 * (trade_dte / 21) ** 0.5
+                                    if abs_move_pct > strangle_premium_pct:
+                                        option_return_pct = abs_move_pct - strangle_premium_pct
                                     else:
-                                        option_pnl = max(-(total_premium - abs_move) * 100 * combo_contracts, -total_premium * 100 * combo_contracts)
+                                        option_return_pct = -(strangle_premium_pct - abs_move_pct)
+                                    option_return_pct = max(option_return_pct, -strangle_premium_pct)
+                                    option_pnl = option_return_pct * position_size
                                 else:
                                     option_pnl = 0
 
@@ -11127,7 +11601,24 @@ features['volume_rel_velocity'] = volume_norm.diff()
                     if all_combos:
                         # Store results
                         st.session_state.combo_results = all_combos
+
+                        # Auto-save results to JSON file
+                        os.makedirs('combo_results', exist_ok=True)
+                        save_filename = f"combo_results/combo_test_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                        save_data = {
+                            'timestamp': datetime.now().isoformat(),
+                            'capital': combo_capital,
+                            'contracts': combo_contracts,
+                            'num_strategies_tested': len(all_strat_dirs),
+                            'num_combinations': len(all_combos),
+                            'results': all_combos
+                        }
+                        with open(save_filename, 'w') as f:
+                            json.dump(save_data, f, indent=2, default=str)
+                        st.session_state.last_combo_save_path = save_filename
+
                         st.success(f"Tested {len(all_combos)} combinations across {len(all_strat_dirs)} strategies!")
+                        st.info(f"📁 Results saved to: `{save_filename}`")
 
             # Display combo results if available
             if 'combo_results' in st.session_state and st.session_state.combo_results:
@@ -11174,6 +11665,95 @@ features['volume_rel_velocity'] = volume_norm.diff()
                     })
 
                 st.dataframe(pd.DataFrame(top10_data), use_container_width=True, hide_index=True)
+
+                # ========================================
+                # DETAILED ANALYSIS
+                # ========================================
+                with st.expander("📊 Detailed Analysis", expanded=False):
+                    analysis_tab1, analysis_tab2, analysis_tab3 = st.tabs(["By Ticker", "By Options Type", "Export Data"])
+
+                    with analysis_tab1:
+                        st.markdown("### Performance by Ticker")
+                        # Group by ticker
+                        ticker_stats = {}
+                        for combo in all_combos_sorted:
+                            t = combo['ticker']
+                            if t not in ticker_stats:
+                                ticker_stats[t] = {'combos': [], 'total_pnl': 0, 'total_trades': 0, 'wins': 0}
+                            ticker_stats[t]['combos'].append(combo)
+                            ticker_stats[t]['total_pnl'] += combo['total_pnl']
+                            ticker_stats[t]['total_trades'] += combo['num_trades']
+                            ticker_stats[t]['wins'] += combo['wins']
+
+                        ticker_df_data = []
+                        for t, stats in sorted(ticker_stats.items(), key=lambda x: x[1]['total_pnl'], reverse=True):
+                            best_combo = max(stats['combos'], key=lambda x: x['pct_return'])
+                            avg_win_rate = (stats['wins'] / stats['total_trades'] * 100) if stats['total_trades'] > 0 else 0
+                            ticker_df_data.append({
+                                'Ticker': t,
+                                'Best Strategy': best_combo['options_type'].replace('_', ' ').title(),
+                                'Best Return': f"{best_combo['pct_return']:.1f}%",
+                                'Avg Win Rate': f"{avg_win_rate:.1f}%",
+                                'Total Combos': len(stats['combos']),
+                                'Total P&L': f"${stats['total_pnl']:,.2f}"
+                            })
+                        st.dataframe(pd.DataFrame(ticker_df_data), use_container_width=True, hide_index=True)
+
+                    with analysis_tab2:
+                        st.markdown("### Performance by Options Strategy Type")
+                        # Group by options type
+                        opt_stats = {}
+                        for combo in all_combos_sorted:
+                            ot = combo['options_type']
+                            if ot not in opt_stats:
+                                opt_stats[ot] = {'combos': [], 'returns': [], 'win_rates': [], 'drawdowns': []}
+                            opt_stats[ot]['combos'].append(combo)
+                            opt_stats[ot]['returns'].append(combo['pct_return'])
+                            opt_stats[ot]['win_rates'].append(combo['win_rate'])
+                            opt_stats[ot]['drawdowns'].append(combo['max_drawdown'])
+
+                        opt_df_data = []
+                        for ot, stats in sorted(opt_stats.items(), key=lambda x: np.mean(x[1]['returns']), reverse=True):
+                            opt_df_data.append({
+                                'Options Type': ot.replace('_', ' ').title(),
+                                'Avg Return': f"{np.mean(stats['returns']):.1f}%",
+                                'Best Return': f"{max(stats['returns']):.1f}%",
+                                'Avg Win Rate': f"{np.mean(stats['win_rates']):.1f}%",
+                                'Avg Max DD': f"{np.mean(stats['drawdowns']):.1f}%",
+                                'Combos Tested': len(stats['combos'])
+                            })
+                        st.dataframe(pd.DataFrame(opt_df_data), use_container_width=True, hide_index=True)
+
+                    with analysis_tab3:
+                        st.markdown("### Export Full Results")
+
+                        # Create full export dataframe
+                        export_df = pd.DataFrame(all_combos_sorted)
+                        export_df['options_type'] = export_df['options_type'].str.replace('_', ' ').str.title()
+
+                        # CSV download
+                        csv_data = export_df.to_csv(index=False)
+                        st.download_button(
+                            "📥 Download Full Results (CSV)",
+                            csv_data,
+                            file_name=f"combo_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv",
+                            key="download_combo_csv"
+                        )
+
+                        st.caption(f"Total combinations: {len(all_combos_sorted)}")
+
+                        # Show full table with filtering
+                        filter_ticker = st.multiselect("Filter by Ticker", options=list(set(c['ticker'] for c in all_combos_sorted)), key="filter_ticker")
+                        filter_opt = st.multiselect("Filter by Options Type", options=['Single Leg', 'Vertical Spread', 'Straddle', 'Strangle'], key="filter_opt")
+
+                        filtered_df = export_df.copy()
+                        if filter_ticker:
+                            filtered_df = filtered_df[filtered_df['ticker'].isin(filter_ticker)]
+                        if filter_opt:
+                            filtered_df = filtered_df[filtered_df['options_type'].isin(filter_opt)]
+
+                        st.dataframe(filtered_df, use_container_width=True, hide_index=True, height=400)
 
                 # ========================================
                 # DEPLOY TO PRODUCTION

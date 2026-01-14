@@ -94,13 +94,8 @@ except ImportError:
     OPTUNA_WORKER_AVAILABLE = False
     print("Warning: optuna_worker not available, parallel optimization may be slow")
 
-# Import the main composite oscillator (source of truth - 15 components)
-try:
-    from oscillator_predictor_page import create_composite_oscillator
-    MAIN_COMPOSITE_AVAILABLE = True
-except ImportError:
-    MAIN_COMPOSITE_AVAILABLE = False
-    print("Warning: create_composite_oscillator not available, using simplified version")
+# NOTE: create_composite_oscillator is imported lazily (inside functions) to avoid circular import
+# with oscillator_predictor_page.py which imports from this file
 
 # Import Deep Learning Feature Extractor
 try:
@@ -176,28 +171,65 @@ FEATURE_CONFIG = {
 USE_NEW_CROSS_MARKET_FEATURES = True
 
 # =============================================================================
-# MODEL CONFIGURATION
-# Based on hypothesis testing results (test_model_hypotheses.py):
-# - Ridge (top 15 corr) achieves R²=0.5624 vs XGBoost (all) R²=0.3254
-# - Linear models handle collinear features better than tree-based
-# - Optimal feature count is 10-20 top correlated features
+# MODEL CONFIGURATION - Based on comprehensive_model_comparison.py results
 # =============================================================================
+# Testing 49 configurations (Ridge/XGBoost/LightGBM x Top5-50,ALL + Ensembles)
+# Key finding: HIGH and LOW predictions benefit from DIFFERENT models/features
+#
+# CORRECTED VALUES (Jan 2026): Previous R² values were inflated due to data
+# leakage (training included target day features). These are TRUE out-of-sample.
+#
+# SIMPLE_MODE: Use RIDGE_Top5 for both (100% containment, lower R²)
+# HYBRID_MODE: Use optimal model per target (better R², variable containment)
+# =============================================================================
+
+SIMPLE_MODE = False  # True = RIDGE_Top5 for both, False = optimal per target
+
+# HIGH_PRIORITIZE_CONTAINMENT: Switch between two HIGH model options
+#   False = XGBOOST_ALL (R²=0.42, Containment=18%) - best point accuracy
+#   True  = RIDGE_Top5  (R²=0.30, Containment=100%) - best bands/containment
+HIGH_PRIORITIZE_CONTAINMENT = False
+
+# HIGH MODEL CONFIG (predicting tomorrow's high)
+if HIGH_PRIORITIZE_CONTAINMENT:
+    # Best containment - reliable bands
+    HIGH_MODEL_CONFIG = {
+        'model_type': 'ridge',
+        'top_n_features': 5,
+        'ridge_alpha': 1.0,
+        'ci_width_multiplier': 1.0,  # Ridge residuals are calibrated
+    }
+else:
+    # Best R² - accurate point predictions
+    # NOTE: XGBoost training residuals underestimate true prediction error by ~3.4x
+    # CI multiplier adjusts for this overconfidence
+    HIGH_MODEL_CONFIG = {
+        'model_type': 'xgboost',
+        'top_n_features': 0,       # 0 = ALL features
+        'ridge_alpha': 1.0,
+        'ci_width_multiplier': 3.4,  # XGBoost CI is 3.4x too narrow
+    }
+
+# LOW MODEL CONFIG (predicting tomorrow's low)
+# Options (corrected R² / containment):
+#   - RIDGE_Top20:    R²=0.37, Containment=98% (BEST BALANCED)
+#   - RIDGE_Top5:     R²=-0.10, Containment=100% (bands only)
+#
+# Current: RIDGE_Top20 for best balance of accuracy + reliable bands
+LOW_MODEL_CONFIG = {
+    'model_type': 'ridge',     # Ridge is best for LOW
+    'top_n_features': 20,      # Top 20 features (was 5, now 20 for better R²)
+    'ridge_alpha': 1.0,        # Regularization strength
+    'ci_width_multiplier': 0.5,  # LOW CI is 2.2x too wide, shrink it
+}
+
+# Legacy MODEL_CONFIG for backward compatibility
+# Used by main train() method - will be updated to use HIGH/LOW configs
 MODEL_CONFIG = {
-    # Model type: 'ridge' (recommended), 'xgboost', or 'ensemble' (blend both)
     'model_type': 'ridge',
-
-    # Top-N correlation feature selection
-    # Hypothesis testing showed 15 is optimal (R²=0.5624)
     'top_n_features': 15,
-
-    # Ridge alpha (regularization strength)
-    # Testing showed alpha=1.0 works well for top-N features
     'ridge_alpha': 1.0,
-
-    # For ensemble mode: weight for Ridge vs XGBoost (0.0 = all XGB, 1.0 = all Ridge)
     'ridge_weight': 0.7,
-
-    # Whether to use correlation-based feature selection (recommended True)
     'use_correlation_selection': True,
 }
 
@@ -1961,55 +1993,54 @@ class PriceRangePredictor:
 
         # --- Composite Oscillator Features ---
         # Use the MAIN composite oscillator (15 components) for consistency with velocity trading
+        # Lazy import to avoid circular import with oscillator_predictor_page.py
         try:
-            if MAIN_COMPOSITE_AVAILABLE:
-                # Use the full 15-component composite from oscillator_predictor_page.py
-                df_with_osc = create_composite_oscillator(df)
-                features['composite_osc'] = df_with_osc['composite_oscillator']
-                features['composite_osc_smooth'] = df_with_osc['composite_smooth']
+            from oscillator_predictor_page import create_composite_oscillator
+            # Use the full 15-component composite from oscillator_predictor_page.py
+            df_with_osc = create_composite_oscillator(df)
+            features['composite_osc'] = df_with_osc['composite_oscillator']
+            features['composite_osc_smooth'] = df_with_osc['composite_smooth']
 
-                # Add individual normalized components for feature importance analysis
-                norm_cols = [c for c in df_with_osc.columns if c.endswith('_norm') or c in ['bb_position', 'adx_trend']]
-                for col in norm_cols:
-                    if col in df_with_osc.columns:
-                        features[col] = df_with_osc[col]
+            # Add individual normalized components for feature importance analysis
+            norm_cols = [c for c in df_with_osc.columns if c.endswith('_norm') or c in ['bb_position', 'adx_trend']]
+            for col in norm_cols:
+                if col in df_with_osc.columns:
+                    features[col] = df_with_osc[col]
 
-                print(f"   Main composite oscillator (15 components): {features['composite_osc_smooth'].iloc[-1]:.3f}")
-            else:
-                # Fallback to simplified 4-component version
-                delta = df['close'].diff()
-                gain = delta.where(delta > 0, 0).rolling(14).mean()
-                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-                rs = gain / (loss + 1e-10)
-                rsi = 100 - (100 / (1 + rs))
-                rsi_norm = (rsi - 50) / 50
+            print(f"   Main composite oscillator (15 components): {features['composite_osc_smooth'].iloc[-1]:.3f}")
+        except ImportError:
+            # Fallback to simplified 4-component version (only if main import fails)
+            print("   Warning: Using fallback 4-component oscillator (main import failed)")
+            delta = df['close'].diff()
+            gain = delta.where(delta > 0, 0).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            rs = gain / (loss + 1e-10)
+            rsi = 100 - (100 / (1 + rs))
+            rsi_norm = (rsi - 50) / 50
 
-                low_14 = df['low'].rolling(14).min()
-                high_14 = df['high'].rolling(14).max()
-                stoch_k = 100 * (df['close'] - low_14) / (high_14 - low_14 + 1e-10)
-                stoch_norm = (stoch_k - 50) / 50
+            low_14 = df['low'].rolling(14).min()
+            high_14 = df['high'].rolling(14).max()
+            stoch_k = 100 * (df['close'] - low_14) / (high_14 - low_14 + 1e-10)
+            stoch_norm = (stoch_k - 50) / 50
 
-                williams_r = -100 * (high_14 - df['close']) / (high_14 - low_14 + 1e-10)
-                williams_norm = (williams_r + 50) / 50
+            williams_r = -100 * (high_14 - df['close']) / (high_14 - low_14 + 1e-10)
+            williams_norm = (williams_r + 50) / 50
 
-                typical_price = (df['high'] + df['low'] + df['close']) / 3
-                cci = (typical_price - typical_price.rolling(20).mean()) / (0.015 * typical_price.rolling(20).std())
-                cci_norm = (cci / 100).clip(-1, 1)
+            typical_price = (df['high'] + df['low'] + df['close']) / 3
+            cci = (typical_price - typical_price.rolling(20).mean()) / (0.015 * typical_price.rolling(20).std())
+            cci_norm = (cci / 100).clip(-1, 1)
 
-                features['composite_osc'] = (rsi_norm * 0.3 + stoch_norm * 0.25 + williams_norm * 0.25 + cci_norm * 0.2)
-                features['composite_osc_smooth'] = features['composite_osc'].rolling(3).mean().fillna(features['composite_osc'])
-                print(f"   Fallback composite oscillator (4 components): {features['composite_osc'].iloc[-1]:.3f}")
-
-            # Composite velocity and acceleration (always calculated)
-            features['composite_velocity'] = features['composite_osc_smooth'].diff()
-            features['composite_accel'] = features['composite_velocity'].diff()
-
+            features['composite_osc'] = (rsi_norm * 0.3 + stoch_norm * 0.25 + williams_norm * 0.25 + cci_norm * 0.2)
+            features['composite_osc_smooth'] = features['composite_osc'].rolling(3).mean().fillna(features['composite_osc'])
+            print(f"   Fallback composite oscillator (4 components): {features['composite_osc'].iloc[-1]:.3f}")
         except Exception as comp_err:
             print(f"   Composite oscillator error: {comp_err}")
             features['composite_osc'] = 0
             features['composite_osc_smooth'] = 0
-            features['composite_velocity'] = 0
-            features['composite_accel'] = 0
+
+        # Composite velocity and acceleration (always calculated)
+        features['composite_velocity'] = features['composite_osc_smooth'].diff() if 'composite_osc_smooth' in features else 0
+        features['composite_accel'] = features['composite_velocity'].diff() if isinstance(features.get('composite_velocity'), pd.Series) else 0
 
         # --- Additional Volatility Predictors ---
         # Bollinger Band Width (volatility indicator)
@@ -4044,6 +4075,20 @@ class PriceRangePredictor:
             print(f"[DEBUG predict] Ensemble of {len(self.ensemble_models)} models averaged")
         else:
             predicted_range_pct = self.range_model.predict(X_scaled)[0]
+
+        # VALIDATION: Range must be positive (can't have negative range)
+        if predicted_range_pct < 0:
+            print(f"   ⚠️ WARNING: predicted_range_pct={predicted_range_pct:.3f}% is negative, using absolute value")
+            predicted_range_pct = abs(predicted_range_pct)
+
+        # SANITY CAP: Limit predictions to 3x ATR to prevent unrealistic extrapolations
+        atr_14_pct = features['atr_14_pct'].iloc[-1] if 'atr_14_pct' in features.columns else None
+        if atr_14_pct is not None and not np.isnan(atr_14_pct):
+            max_range_pct = atr_14_pct * 3  # Cap at 3x ATR
+            if predicted_range_pct > max_range_pct:
+                print(f"   ⚠️ WARNING: predicted_range_pct={predicted_range_pct:.3f}% exceeds 3x ATR ({max_range_pct:.2f}%), capping")
+                predicted_range_pct = max_range_pct
+
         predicted_range = predicted_range_pct / 100.0  # Convert from percentage to fraction
 
         print(f"[DEBUG predict] Predicted range: {predicted_range_pct:.3f}% ({predicted_range:.6f} fraction)")
@@ -4051,6 +4096,15 @@ class PriceRangePredictor:
         # Calculate predicted high/low
         predicted_high = current_close * (1 + predicted_range * high_ratio)
         predicted_low = current_close * (1 - predicted_range * low_ratio)
+
+        # VALIDATION: Ensure predicted_low <= current_close <= predicted_high
+        if predicted_low > current_close:
+            print(f"   ⚠️ WARNING: predicted_low ${predicted_low:.2f} > current_close ${current_close:.2f}, fixing")
+            predicted_low = current_close * 0.995
+        if predicted_high < current_close:
+            print(f"   ⚠️ WARNING: predicted_high ${predicted_high:.2f} < current_close ${current_close:.2f}, fixing")
+            predicted_high = current_close * 1.005
+
         print(f"[DEBUG predict] High: ${predicted_high:.2f}, Low: ${predicted_low:.2f}")
 
         # ==========================================================================
@@ -4163,11 +4217,46 @@ class PriceRangePredictor:
             else:
                 pred_low_pct = base_low_pct
 
+            # VALIDATION: Ensure predictions are positive (can't have negative distance from open)
+            # High must be >= 0 (high can't be below open)
+            # Low must be >= 0 (low can't be above open)
+            if pred_high_pct < 0:
+                print(f"   ⚠️ WARNING: pred_high_pct={pred_high_pct:.3f}% is negative, clipping to 0.1%")
+                pred_high_pct = 0.1  # Minimum positive value
+            if pred_low_pct < 0:
+                print(f"   ⚠️ WARNING: pred_low_pct={pred_low_pct:.3f}% is negative, clipping to 0.1%")
+                pred_low_pct = 0.1  # Minimum positive value
+
+            # SANITY CAP: Limit predictions to 3x ATR to prevent unrealistic extrapolations
+            atr_14_pct = features['atr_14_pct'].iloc[-1] if 'atr_14_pct' in features.columns else None
+            if atr_14_pct is not None and not np.isnan(atr_14_pct):
+                max_move_pct = atr_14_pct * 3  # Cap at 3x ATR
+                if pred_high_pct > max_move_pct:
+                    print(f"   ⚠️ WARNING: pred_high_pct={pred_high_pct:.3f}% exceeds 3x ATR ({max_move_pct:.2f}%), capping")
+                    pred_high_pct = max_move_pct
+                if pred_low_pct > max_move_pct:
+                    print(f"   ⚠️ WARNING: pred_low_pct={pred_low_pct:.3f}% exceeds 3x ATR ({max_move_pct:.2f}%), capping")
+                    pred_low_pct = max_move_pct
+
+            # Also validate quantile predictions
+            high_lower_pct = max(0, high_lower_pct)
+            high_upper_pct = max(0, high_upper_pct)
+            low_lower_pct = max(0, low_lower_pct)
+            low_upper_pct = max(0, low_upper_pct)
+
             # Convert percentages to prices
             # next_high_pct = (next_high - close) / close * 100
             # So: next_high = close * (1 + next_high_pct / 100)
             predicted_high = current_close * (1 + pred_high_pct / 100)
             predicted_low = current_close * (1 - pred_low_pct / 100)  # Note: low is subtracted
+
+            # VALIDATION: Ensure predicted_low <= current_close <= predicted_high
+            if predicted_low > current_close:
+                print(f"   ⚠️ WARNING: predicted_low ${predicted_low:.2f} > current_close ${current_close:.2f}, fixing")
+                predicted_low = current_close * 0.995  # Set to 0.5% below close
+            if predicted_high < current_close:
+                print(f"   ⚠️ WARNING: predicted_high ${predicted_high:.2f} < current_close ${current_close:.2f}, fixing")
+                predicted_high = current_close * 1.005  # Set to 0.5% above close
 
             high_lower = current_close * (1 + high_lower_pct / 100)
             high_upper = current_close * (1 + high_upper_pct / 100)
@@ -4215,11 +4304,22 @@ class PriceRangePredictor:
             print(f"[DEBUG predict] Fallback bands: RMSE={rmse:.4f}, z={base_z:.2f}")
 
         print(f"[DEBUG predict] Returning prediction dict...")
+
+        # Recalculate predicted_range from actual high/low predictions (more accurate than model's range prediction)
+        actual_range_dollars = predicted_high - predicted_low
+        actual_range_pct = actual_range_dollars / current_close
+
+        # VALIDATION: Range must be positive
+        if actual_range_dollars < 0:
+            print(f"   ⚠️ WARNING: predicted_range ${actual_range_dollars:.2f} is negative, using absolute value")
+            actual_range_dollars = abs(actual_range_dollars)
+            actual_range_pct = actual_range_dollars / current_close
+
         # Convert all values to Python floats to avoid numpy array issues
         result = {
             'current_close': float(current_close),
-            'predicted_range': float(predicted_range),
-            'predicted_range_dollars': float(current_close * predicted_range),
+            'predicted_range': float(actual_range_pct),  # Use consistent range from high-low
+            'predicted_range_dollars': float(actual_range_dollars),
             'predicted_high': float(predicted_high),
             'predicted_low': float(predicted_low),
             'high_lower': float(high_lower),
@@ -5228,6 +5328,52 @@ def _train_and_predict_single_day(args):
         return None
 
 
+def detect_regime(ohlc_data, current_idx: int, lookback: int = 20) -> str:
+    """
+    Detect market regime based on recent volatility and trend.
+
+    Args:
+        ohlc_data: numpy array with columns [high, low, open, close]
+        current_idx: Current index in the data
+        lookback: Number of days to look back for regime detection
+
+    Returns: 'high_vol', 'low_vol', 'trending_up', 'trending_down', 'range_bound', or 'unknown'
+    """
+    import numpy as np
+
+    if current_idx < lookback:
+        return 'unknown'
+
+    # Get recent data (exclude current day to avoid lookahead)
+    start_idx = current_idx - lookback
+    recent_high = ohlc_data[start_idx:current_idx, 0]  # high column
+    recent_low = ohlc_data[start_idx:current_idx, 1]   # low column
+    recent_close = ohlc_data[start_idx:current_idx, 3] # close column
+
+    # Volatility: ATR as % of price
+    atr = np.mean(recent_high - recent_low)
+    avg_price = np.mean(recent_close)
+    vol_pct = atr / avg_price * 100
+
+    # Trend: linear regression slope
+    x = np.arange(len(recent_close))
+    slope = np.polyfit(x, recent_close, 1)[0]
+    trend_pct = (slope * len(recent_close)) / avg_price * 100  # Total % move over period
+
+    # Classify regime
+    high_vol_threshold = 2.0  # >2% daily range = high vol
+    trend_threshold = 3.0     # >3% move over 20 days = trending
+
+    if vol_pct > high_vol_threshold:
+        return 'high_vol'
+    elif abs(trend_pct) > trend_threshold:
+        return 'trending_up' if trend_pct > 0 else 'trending_down'
+    elif vol_pct < 1.0:
+        return 'low_vol'
+    else:
+        return 'range_bound'
+
+
 def run_parallel_walk_forward(pred_df: pd.DataFrame,
                                test_start_idx: int,
                                train_window: int,
@@ -5268,9 +5414,24 @@ def run_parallel_walk_forward(pred_df: pd.DataFrame,
     test_indices = list(range(test_start_idx, len(pred_df)))
     total_days = len(test_indices)
 
+    # ================================================================
+    # MODEL CONFIGURATION - Use SIMPLE_MODE or HYBRID mode
+    # ================================================================
+    if SIMPLE_MODE:
+        # Simple mode: Ridge_Top5 for both (best containment)
+        high_config = {'model_type': 'ridge', 'top_n_features': 5}
+        low_config = {'model_type': 'ridge', 'top_n_features': 5}
+        mode_str = "SIMPLE (Ridge_Top5 for both)"
+    else:
+        # Hybrid mode: Different models for HIGH and LOW (from comparison testing)
+        high_config = HIGH_MODEL_CONFIG.copy()
+        low_config = LOW_MODEL_CONFIG.copy()
+        mode_str = f"HYBRID (HIGH: {high_config['model_type'].upper()}_Top{high_config['top_n_features']}, LOW: {low_config['model_type'].upper()}_Top{low_config['top_n_features']})"
+
     print(f"\n{'='*60}")
     print(f"PARALLEL WALK-FORWARD ANALYSIS (OPTIMIZED)")
     print(f"{'='*60}")
+    print(f"Mode: {mode_str}")
     print(f"Total days to process: {total_days}")
     print(f"Training window: {train_window} days")
     print(f"Parallel workers: {n_workers}")
@@ -5332,19 +5493,20 @@ def run_parallel_walk_forward(pred_df: pd.DataFrame,
     print("Step 2/2: Training models in parallel...")
 
     # ================================================================
-    # PARALLEL: Train SEPARATE HIGH and LOW Ridge models
+    # PARALLEL: Train SEPARATE HIGH and LOW models (hybrid or simple mode)
     # ================================================================
-    # Create argument tuples with pre-computed data
+    # Create argument tuples with pre-computed data AND model configs
     args_list = [
         (X_full.values, y_high_full.values, y_low_full.values, pred_df_index,
          pred_df[['high', 'low', 'open', 'close']].values,
-         test_idx, train_window, ci_level, feature_names, progress_file, total_days)
+         test_idx, train_window, ci_level, feature_names, progress_file, total_days,
+         high_config, low_config)  # Pass model configs
         for test_idx in test_indices
     ]
 
     # Run in parallel
     results = Parallel(n_jobs=n_workers, backend='loky', verbose=0)(
-        delayed(_train_ridge_single_day)(args) for args in args_list
+        delayed(_train_single_day)(args) for args in args_list
     )
 
     # Mark complete
@@ -5364,26 +5526,34 @@ def run_parallel_walk_forward(pred_df: pd.DataFrame,
     return valid_results
 
 
-def _train_ridge_single_day(args):
+def _train_single_day(args):
     """
-    Train SEPARATE Ridge models for HIGH and LOW using PRE-COMPUTED features.
-    This approach matches the original model quality while being much faster.
+    Train SEPARATE models for HIGH and LOW using PRE-COMPUTED features.
+    Supports hybrid mode: LightGBM for HIGH, Ridge for LOW (or Ridge for both in simple mode).
+
+    Model configs are passed via args to support multiprocessing.
     """
     import json
     import fcntl
+    import warnings
+    warnings.filterwarnings('ignore')
     from sklearn.linear_model import Ridge
+    from sklearn.preprocessing import StandardScaler
     import numpy as np
 
-    # Unpack args
+    # Unpack args - now includes model configs
     (X_full, y_high_full, y_low_full, index_list, ohlc_data, test_idx, train_window,
-     ci_level, feature_names, progress_file, total) = args
+     ci_level, feature_names, progress_file, total, high_config, low_config) = args
 
     try:
         test_date = index_list[test_idx]
 
         # Get training slice
+        # FIX: Exclude test_idx-1 from training to avoid data leakage
+        # y[test_idx-1] contains high[test_idx] which is the target we're predicting
+        # Including it in training would let the model "memorize" the answer
         train_start_idx = max(0, test_idx - train_window)
-        train_end_idx = test_idx
+        train_end_idx = test_idx - 1  # Exclusive slice, so train on [start, test_idx-2]
 
         # Extract training data
         X_train = X_full[train_start_idx:train_end_idx]
@@ -5400,62 +5570,207 @@ def _train_ridge_single_day(args):
             return None
 
         # ================================================================
-        # TRAIN HIGH MODEL
+        # REGIME DETECTION (for regime_adaptive models)
         # ================================================================
-        # Feature selection: top 15 by correlation with HIGH target
+        detected_regime = None
+        if high_config.get('model_type') == 'regime_adaptive' or low_config.get('model_type') == 'regime_adaptive':
+            # Detect current market regime using training data (avoid lookahead)
+            detected_regime = detect_regime(ohlc_data, test_idx - 1, lookback=20)
+
+        # ================================================================
+        # TRAIN HIGH MODEL (LightGBM, XGBoost, Ridge, Ensemble, or Regime-Adaptive)
+        # ================================================================
+        high_model_type = high_config.get('model_type', 'ridge')
+
+        # Handle regime_adaptive: select config based on detected regime
+        high_force_include = []  # Feature name patterns to force-include
+        if high_model_type == 'regime_adaptive':
+            regime_configs = high_config.get('regime_configs', {})
+            regime_cfg = regime_configs.get(detected_regime, regime_configs.get('unknown', {'model_type': 'ridge', 'top_n': 10}))
+            high_model_type = regime_cfg.get('model_type', 'ridge')
+            high_top_n = regime_cfg.get('top_n', 20)
+            high_force_include = regime_cfg.get('force_include', [])  # NEW: force-include patterns
+        else:
+            high_top_n = high_config.get('top_n_features', 30)
+
+        # Handle ALL features case (top_n = 0)
+        if high_top_n == 0:
+            high_top_n = X_train.shape[1]
+
+        # Feature selection: top N by correlation with HIGH target
+        # NEW: Support force-include patterns for specific features
         corr_high = np.abs(np.array([np.corrcoef(X_train[:, i], y_high_train)[0, 1]
                                      for i in range(X_train.shape[1])]))
         corr_high = np.nan_to_num(corr_high, 0)
-        top_features_high = np.argsort(corr_high)[-15:][::-1]
+
+        # Find force-include indices if patterns specified
+        forced_indices_high = set()
+        if high_force_include and feature_names:
+            for i, name in enumerate(feature_names):
+                for pattern in high_force_include:
+                    if pattern in name:
+                        forced_indices_high.add(i)
+                        break
+
+        # Select top N, but ensure forced features are included
+        if forced_indices_high:
+            remaining_slots = max(0, high_top_n - len(forced_indices_high))
+            available = [i for i in range(len(feature_names)) if i not in forced_indices_high]
+            available_corrs = [(i, corr_high[i]) for i in available]
+            available_corrs.sort(key=lambda x: x[1], reverse=True)
+            top_by_corr = [i for i, _ in available_corrs[:remaining_slots]]
+            top_features_high = np.array(list(forced_indices_high) + top_by_corr)
+        else:
+            top_features_high = np.argsort(corr_high)[-high_top_n:][::-1]
         X_train_high = X_train[:, top_features_high]
 
-        # Train Ridge for HIGH
-        best_alpha_high = 1.0
-        best_score_high = -np.inf
-        for alpha in [0.01, 0.1, 1.0, 10.0, 100.0]:
-            model = Ridge(alpha=alpha)
-            model.fit(X_train_high, y_high_train)
-            score = model.score(X_train_high, y_high_train)
-            if score > best_score_high:
-                best_score_high = score
-                best_alpha_high = alpha
+        # Scale features for HIGH model
+        scaler_high = StandardScaler()
+        X_train_high_scaled = scaler_high.fit_transform(X_train_high)
 
-        high_model = Ridge(alpha=best_alpha_high)
-        high_model.fit(X_train_high, y_high_train)
-        train_r2_high = high_model.score(X_train_high, y_high_train)
+        # Helper to train a single model
+        def train_single_model_internal(model_type, X_scaled, y_train):
+            """Train a single model and return (model, train_r2)."""
+            if model_type == 'lightgbm':
+                try:
+                    import lightgbm as lgb
+                    model = lgb.LGBMRegressor(
+                        n_estimators=100, max_depth=4, learning_rate=0.1,
+                        subsample=0.8, colsample_bytree=0.8,
+                        reg_alpha=0.1, reg_lambda=1.0,
+                        random_state=42, verbosity=-1, n_jobs=1, force_col_wise=True
+                    )
+                    model.fit(X_scaled, y_train)
+                    return model, model.score(X_scaled, y_train)
+                except ImportError:
+                    model_type = 'ridge'
+
+            if model_type == 'xgboost':
+                try:
+                    import xgboost as xgb
+                    model = xgb.XGBRegressor(
+                        n_estimators=100, max_depth=4, learning_rate=0.1,
+                        subsample=0.8, colsample_bytree=0.8,
+                        reg_alpha=0.1, reg_lambda=1.0,
+                        random_state=42, verbosity=0, n_jobs=1
+                    )
+                    model.fit(X_scaled, y_train)
+                    return model, model.score(X_scaled, y_train)
+                except ImportError:
+                    model_type = 'ridge'
+
+            # Default to Ridge
+            best_alpha = 1.0
+            best_score = -np.inf
+            for alpha in [0.01, 0.1, 1.0, 10.0, 100.0]:
+                m = Ridge(alpha=alpha)
+                m.fit(X_scaled, y_train)
+                score = m.score(X_scaled, y_train)
+                if score > best_score:
+                    best_score = score
+                    best_alpha = alpha
+            model = Ridge(alpha=best_alpha)
+            model.fit(X_scaled, y_train)
+            return model, model.score(X_scaled, y_train)
+
+        # Train HIGH model(s)
+        if high_model_type == 'ensemble':
+            # Ensemble: train multiple models and average predictions
+            ensemble_models_high = high_config.get('ensemble_models', ['ridge', 'xgboost'])
+            high_models = []
+            train_r2s = []
+            for m_type in ensemble_models_high:
+                try:
+                    m, r2 = train_single_model_internal(m_type, X_train_high_scaled, y_high_train)
+                    high_models.append((m_type, m))
+                    train_r2s.append(r2)
+                except:
+                    pass
+            train_r2_high = np.mean(train_r2s) if train_r2s else 0.0
+            # Use first model for residuals
+            high_model = high_models[0][1] if high_models else None
+        else:
+            high_model, train_r2_high = train_single_model_internal(high_model_type, X_train_high_scaled, y_high_train)
+            high_models = [(high_model_type, high_model)]
 
         # HIGH residuals for CI
-        high_preds_train = high_model.predict(X_train_high)
+        high_preds_train = high_model.predict(X_train_high_scaled)
         high_residuals = y_high_train - high_preds_train
         high_residual_std = np.std(high_residuals)
 
         # ================================================================
-        # TRAIN LOW MODEL
+        # TRAIN LOW MODEL (Ridge, XGBoost, Ensemble, or Regime-Adaptive)
         # ================================================================
-        # Feature selection: top 15 by correlation with LOW target
+        low_model_type = low_config.get('model_type', 'ridge')
+
+        # Handle regime_adaptive: select config based on detected regime
+        low_force_include = []  # Feature name patterns to force-include
+        if low_model_type == 'regime_adaptive':
+            regime_configs = low_config.get('regime_configs', {})
+            regime_cfg = regime_configs.get(detected_regime, regime_configs.get('unknown', {'model_type': 'ridge', 'top_n': 10}))
+            low_model_type = regime_cfg.get('model_type', 'ridge')
+            low_top_n = regime_cfg.get('top_n', 20)
+            low_force_include = regime_cfg.get('force_include', [])  # NEW: force-include patterns
+        else:
+            low_top_n = low_config.get('top_n_features', 5)
+
+        # Handle ALL features case (top_n = 0)
+        if low_top_n == 0:
+            low_top_n = X_train.shape[1]
+
+        # Feature selection: top N by correlation with LOW target
+        # NEW: Support force-include patterns for specific features
         corr_low = np.abs(np.array([np.corrcoef(X_train[:, i], y_low_train)[0, 1]
                                     for i in range(X_train.shape[1])]))
         corr_low = np.nan_to_num(corr_low, 0)
-        top_features_low = np.argsort(corr_low)[-15:][::-1]
+
+        # Find force-include indices if patterns specified
+        forced_indices_low = set()
+        if low_force_include and feature_names:
+            for i, name in enumerate(feature_names):
+                for pattern in low_force_include:
+                    if pattern in name:
+                        forced_indices_low.add(i)
+                        break
+
+        # Select top N, but ensure forced features are included
+        if forced_indices_low:
+            remaining_slots = max(0, low_top_n - len(forced_indices_low))
+            available = [i for i in range(len(feature_names)) if i not in forced_indices_low]
+            available_corrs = [(i, corr_low[i]) for i in available]
+            available_corrs.sort(key=lambda x: x[1], reverse=True)
+            top_by_corr = [i for i, _ in available_corrs[:remaining_slots]]
+            top_features_low = np.array(list(forced_indices_low) + top_by_corr)
+        else:
+            top_features_low = np.argsort(corr_low)[-low_top_n:][::-1]
         X_train_low = X_train[:, top_features_low]
 
-        # Train Ridge for LOW
-        best_alpha_low = 1.0
-        best_score_low = -np.inf
-        for alpha in [0.01, 0.1, 1.0, 10.0, 100.0]:
-            model = Ridge(alpha=alpha)
-            model.fit(X_train_low, y_low_train)
-            score = model.score(X_train_low, y_low_train)
-            if score > best_score_low:
-                best_score_low = score
-                best_alpha_low = alpha
+        # Scale features for LOW model
+        scaler_low = StandardScaler()
+        X_train_low_scaled = scaler_low.fit_transform(X_train_low)
 
-        low_model = Ridge(alpha=best_alpha_low)
-        low_model.fit(X_train_low, y_low_train)
-        train_r2_low = low_model.score(X_train_low, y_low_train)
+        # Train LOW model(s)
+        if low_model_type == 'ensemble':
+            # Ensemble: train multiple models and average predictions
+            ensemble_models_low = low_config.get('ensemble_models', ['ridge', 'xgboost'])
+            low_models = []
+            train_r2s = []
+            for m_type in ensemble_models_low:
+                try:
+                    m, r2 = train_single_model_internal(m_type, X_train_low_scaled, y_low_train)
+                    low_models.append((m_type, m))
+                    train_r2s.append(r2)
+                except:
+                    pass
+            train_r2_low = np.mean(train_r2s) if train_r2s else 0.0
+            # Use first model for residuals
+            low_model = low_models[0][1] if low_models else None
+        else:
+            low_model, train_r2_low = train_single_model_internal(low_model_type, X_train_low_scaled, y_low_train)
+            low_models = [(low_model_type, low_model)]
 
         # LOW residuals for CI
-        low_preds_train = low_model.predict(X_train_low)
+        low_preds_train = low_model.predict(X_train_low_scaled)
         low_residuals = y_low_train - low_preds_train
         low_residual_std = np.std(low_residuals)
 
@@ -5464,21 +5779,51 @@ def _train_ridge_single_day(args):
         # ================================================================
         current_close = ohlc_data[test_idx - 1, 3]  # close
 
-        # Predict HIGH
+        # Predict HIGH (handle ensemble by averaging predictions)
         X_pred_high = X_full[test_idx - 1:test_idx, top_features_high]
         if np.isnan(X_pred_high).any():
             X_pred_high = np.nan_to_num(X_pred_high, 0)
-        pred_high_pct = high_model.predict(X_pred_high)[0]
+        X_pred_high_scaled = scaler_high.transform(X_pred_high)
+
+        if high_model_type == 'ensemble' and len(high_models) > 1:
+            # Average predictions from all ensemble models
+            preds = [m.predict(X_pred_high_scaled)[0] for _, m in high_models]
+            pred_high_pct = np.mean(preds)
+        else:
+            pred_high_pct = high_model.predict(X_pred_high_scaled)[0]
+
+        # VALIDATION: High pct must be positive (high can't be below close)
+        if pred_high_pct < 0:
+            pred_high_pct = 0.1  # Minimum positive
+
         pred_high = current_close * (1 + pred_high_pct / 100)
 
-        # Predict LOW
+        # Predict LOW (handle ensemble by averaging predictions)
         # NOTE: next_low_pct is defined as (close - low)/close * 100 = POSITIVE when low < close
         # So we SUBTRACT the percentage to get the actual low price
         X_pred_low = X_full[test_idx - 1:test_idx, top_features_low]
         if np.isnan(X_pred_low).any():
             X_pred_low = np.nan_to_num(X_pred_low, 0)
-        pred_low_pct = low_model.predict(X_pred_low)[0]
+        X_pred_low_scaled = scaler_low.transform(X_pred_low)
+
+        if low_model_type == 'ensemble' and len(low_models) > 1:
+            # Average predictions from all ensemble models
+            preds = [m.predict(X_pred_low_scaled)[0] for _, m in low_models]
+            pred_low_pct = np.mean(preds)
+        else:
+            pred_low_pct = low_model.predict(X_pred_low_scaled)[0]
+
+        # VALIDATION: Low pct must be positive (low can't be above close)
+        if pred_low_pct < 0:
+            pred_low_pct = 0.1  # Minimum positive
+
         pred_low = current_close * (1 - pred_low_pct / 100)  # SUBTRACT - low is below close
+
+        # VALIDATION: Ensure predicted_low <= current_close <= predicted_high
+        if pred_low > current_close:
+            pred_low = current_close * 0.995
+        if pred_high < current_close:
+            pred_high = current_close * 1.005
 
         # Ensure high > low
         if pred_high < pred_low:
@@ -5492,9 +5837,13 @@ def _train_ridge_single_day(args):
         from scipy import stats
         z = stats.norm.ppf((1 + ci_level) / 2)
 
-        # CI in dollars
-        high_ci = z * (high_residual_std / 100) * current_close
-        low_ci = z * (low_residual_std / 100) * current_close
+        # Get CI width multipliers (compensate for overconfident/underconfident residuals)
+        high_ci_mult = high_config.get('ci_width_multiplier', 1.0)
+        low_ci_mult = low_config.get('ci_width_multiplier', 1.0)
+
+        # CI in dollars (with multiplier adjustment)
+        high_ci = z * (high_residual_std / 100) * current_close * high_ci_mult
+        low_ci = z * (low_residual_std / 100) * current_close * low_ci_mult
 
         # Get actual values
         actual_high = ohlc_data[test_idx, 0]
@@ -5528,7 +5877,14 @@ def _train_ridge_single_day(args):
             'test_idx': test_idx,
             'feature_importance': None,
             'feature_names': list(set([feature_names[i] for i in top_features_high] +
-                                      [feature_names[i] for i in top_features_low]))
+                                      [feature_names[i] for i in top_features_low])),
+            'high_model_type': high_model_type,
+            'high_top_n': high_top_n,
+            'low_model_type': low_model_type,
+            'low_top_n': low_top_n,
+            'high_ci_multiplier': high_ci_mult,
+            'low_ci_multiplier': low_ci_mult,
+            'detected_regime': detected_regime,  # None if not using regime-adaptive
         }
 
         # Update progress file
