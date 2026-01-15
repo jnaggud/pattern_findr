@@ -53,10 +53,12 @@ from joblib import Parallel, delayed
 
 # Price prediction module
 try:
+    import price_prediction
     from price_prediction import PriceRangePredictor, PriceTargetCalculator, ExitTimingPredictor, run_parallel_walk_forward
     PRICE_PREDICTION_AVAILABLE = True
 except ImportError:
     PRICE_PREDICTION_AVAILABLE = False
+    price_prediction = None
 
 # Polygon API for options data
 try:
@@ -192,138 +194,156 @@ def ensure_export_directories():
 
 
 def export_walkforward_results(wf_df: pd.DataFrame, metrics: dict, settings: dict, ticker: str) -> tuple:
-    """
-    Export walk-forward analysis results to CSV and create summary text.
-
-    Returns: (csv_path, summary_path, latest_path)
-    """
+    """Export walk-forward analysis results to CSV and create summary text."""
     ensure_export_directories()
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     date_range = f"{wf_df['date'].iloc[0].strftime('%Y%m%d')}_to_{wf_df['date'].iloc[-1].strftime('%Y%m%d')}"
 
-    # === CSV Export ===
+    # CSV Export
     csv_filename = f"walk_forward/{ticker}_wf_{date_range}_{timestamp}.csv"
-
-    # Add computed columns to export
     export_df = wf_df.copy()
     export_df['high_error'] = export_df['predicted_high'] - export_df['actual_high']
     export_df['low_error'] = export_df['predicted_low'] - export_df['actual_low']
-    export_df['high_in_range'] = ((export_df['actual_high'] >= export_df['high_lower']) &
-                                   (export_df['actual_high'] <= export_df['high_upper']))
-    export_df['low_in_range'] = ((export_df['actual_low'] >= export_df['low_lower']) &
-                                  (export_df['actual_low'] <= export_df['low_upper']))
-    export_df['full_containment'] = ((export_df['actual_high'] <= export_df['high_upper']) &
-                                      (export_df['actual_low'] >= export_df['low_lower']))
-
+    export_df['high_in_range'] = (export_df['actual_high'] >= export_df['high_lower']) & (export_df['actual_high'] <= export_df['high_upper'])
+    export_df['low_in_range'] = (export_df['actual_low'] >= export_df['low_lower']) & (export_df['actual_low'] <= export_df['low_upper'])
+    export_df['full_containment'] = (export_df['actual_high'] <= export_df['high_upper']) & (export_df['actual_low'] >= export_df['low_lower'])
     export_df.to_csv(csv_filename, index=False)
 
-    # === Summary Text Export ===
+    # Summary Text Export
     summary_filename = f"walk_forward/{ticker}_wf_{date_range}_{timestamp}_summary.txt"
 
-    summary_lines = [
-        "=" * 80,
-        "WALK-FORWARD ANALYSIS SUMMARY",
-        "=" * 80,
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"Ticker: {ticker}",
-        f"Test Period: {wf_df['date'].iloc[0].strftime('%Y-%m-%d')} to {wf_df['date'].iloc[-1].strftime('%Y-%m-%d')}",
-        f"Total Predictions: {len(wf_df)}",
-        "",
-        "=" * 80,
-        "SETTINGS",
-        "=" * 80,
-        f"Training Days: {settings.get('n_train_days', 'N/A')}",
-        f"Retrain Frequency: {settings.get('retrain_frequency', 'N/A')}",
-        f"Confidence Level: {settings.get('confidence_level', 'N/A')}",
-        f"Optuna Trials: {settings.get('n_trials', 'N/A')}",
-        f"Parallel Workers: {settings.get('n_workers', 'N/A')}",
-        f"Model Mode: {settings.get('model_mode', 'N/A')}",
-        f"HIGH Model: {settings.get('high_model_type', 'N/A')} (Top {settings.get('high_top_n', 'N/A')} features)",
-        f"LOW Model: {settings.get('low_model_type', 'N/A')} (Top {settings.get('low_top_n', 'N/A')} features)",
-        "",
-        "=" * 80,
-        "CONTAINMENT METRICS",
-        "=" * 80,
-        f"High in Confidence Range: {metrics.get('high_in_range', 0):.2f}%",
-        f"Low in Confidence Range: {metrics.get('low_in_range', 0):.2f}%",
-        f"Full Containment: {metrics.get('full_containment', 0):.2f}%",
-        "",
-        "=" * 80,
-        "ERROR METRICS",
-        "=" * 80,
-        f"High MAE: ${metrics.get('high_mae', 0):.2f}",
-        f"Low MAE: ${metrics.get('low_mae', 0):.2f}",
-        f"High Bias: ${metrics.get('high_bias', 0):+.2f}",
-        f"Low Bias: ${metrics.get('low_bias', 0):+.2f}",
-        f"Range MAE: ${metrics.get('range_mae', 0):.2f}",
-        f"Range MAPE: {metrics.get('range_mape', 0):.2f}%",
-        "",
-        "=" * 80,
-        "R-SQUARED METRICS",
-        "=" * 80,
-        f"Test R² High: {metrics.get('test_r2_high', 0):.4f}",
-        f"Test R² Low: {metrics.get('test_r2_low', 0):.4f}",
-        f"Train R² (avg): {metrics.get('train_r2_avg', 0):.4f}",
-        f"Train RMSE (avg): {metrics.get('train_rmse_avg', 0):.4f}%",
-        "",
-        "=" * 80,
-        "CONFIDENCE BAND INFO",
-        "=" * 80,
-        f"Method: {metrics.get('confidence_method', 'N/A')}",
-        f"Quantile Regression %: {metrics.get('quantile_pct', 0):.1f}%",
-        "",
-        "=" * 80,
-        "PREDICTION STATISTICS",
-        "=" * 80,
-        f"Avg Predicted High: ${export_df['predicted_high'].mean():.2f}",
-        f"Avg Actual High: ${export_df['actual_high'].mean():.2f}",
-        f"Avg Predicted Low: ${export_df['predicted_low'].mean():.2f}",
-        f"Avg Actual Low: ${export_df['actual_low'].mean():.2f}",
-        f"Avg High Error: ${export_df['high_error'].mean():+.2f}",
-        f"Avg Low Error: ${export_df['low_error'].mean():+.2f}",
-        f"Std High Error: ${export_df['high_error'].std():.2f}",
-        f"Std Low Error: ${export_df['low_error'].std():.2f}",
-        "",
-        "=" * 80,
-        "RETRAINING INFO",
-        "=" * 80,
-        f"Total Retrains: {export_df['retrained'].sum()}",
-        f"Retrain Dates: {', '.join(export_df[export_df['retrained']]['date'].dt.strftime('%Y-%m-%d').tolist()[:10])}{'...' if export_df['retrained'].sum() > 10 else ''}",
-        "",
-        "=" * 80,
-        "DAILY PREDICTIONS TABLE (Last 10 Days)",
-        "=" * 80,
-    ]
+    # Build summary lines
+    lines = []
+    lines.append("=" * 80)
+    lines.append("WALK-FORWARD ANALYSIS SUMMARY")
+    lines.append("=" * 80)
+    lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"Ticker: {ticker}")
+    lines.append(f"Test Period: {wf_df['date'].iloc[0].strftime('%Y-%m-%d')} to {wf_df['date'].iloc[-1].strftime('%Y-%m-%d')}")
+    lines.append(f"Total Predictions: {len(wf_df)}")
+    lines.append("")
+    lines.append("=" * 80)
+    lines.append("SETTINGS")
+    lines.append("=" * 80)
+    lines.append(f"Training Days: {settings.get('n_train_days', 'N/A')}")
+    lines.append(f"Retrain Frequency: {settings.get('retrain_frequency', 'N/A')}")
+    lines.append(f"Confidence Level: {settings.get('confidence_level', 'N/A')}")
+    lines.append(f"Optuna Trials: {settings.get('n_trials', 'N/A')}")
+    lines.append(f"Parallel Workers: {settings.get('n_workers', 'N/A')}")
+    lines.append(f"Model Mode: {settings.get('model_mode', 'N/A')}")
+    lines.append(f"HIGH Model: {settings.get('high_model_type', 'N/A')} (Top {settings.get('high_top_n', 'N/A')} features)")
+    lines.append(f"LOW Model: {settings.get('low_model_type', 'N/A')} (Top {settings.get('low_top_n', 'N/A')} features)")
+    regime_status = "ENABLED" if settings.get('regime_adaptive', False) else "DISABLED"
+    lines.append(f"Regime-Adaptive: {regime_status}")
 
-    # Add last 10 days of predictions
-    last_10 = export_df.tail(10)
-    summary_lines.append(f"{'Date':<12} {'PredHigh':>10} {'ActHigh':>10} {'HiErr':>8} {'PredLow':>10} {'ActLow':>10} {'LoErr':>8} {'HiOK':>6} {'LoOK':>6}")
-    summary_lines.append("-" * 90)
-    for _, row in last_10.iterrows():
-        summary_lines.append(
-            f"{row['date'].strftime('%Y-%m-%d'):<12} "
-            f"${row['predicted_high']:>9.2f} ${row['actual_high']:>9.2f} {row['high_error']:>+8.2f} "
-            f"${row['predicted_low']:>9.2f} ${row['actual_low']:>9.2f} {row['low_error']:>+8.2f} "
-            f"{'Yes' if row['high_in_range'] else 'No':>6} {'Yes' if row['low_in_range'] else 'No':>6}"
-        )
+    # Add regime breakdown if regime-adaptive was used
+    if settings.get('regime_adaptive', False):
+        lines.append(f"Regime Strategy: {settings.get('regime_strategy', 'Unknown')}")
+        regime_breakdown = settings.get('regime_breakdown', {})
+        if regime_breakdown:
+            lines.append("Regime Distribution:")
+            total_count = sum(regime_breakdown.values())
+            for regime, count in sorted(regime_breakdown.items(), key=lambda x: x[1], reverse=True):
+                pct = 100 * count / total_count if total_count > 0 else 0
+                lines.append(f"  - {regime}: {count} days ({pct:.1f}%)")
+        lines.append("")
+        lines.append("** NOTE: Model configs vary by regime. HIGH/LOW models above are first-day defaults.")
+    else:
+        lines.append("")
 
-    summary_lines.extend([
-        "",
-        "=" * 80,
-        "FILES",
-        "=" * 80,
-        f"CSV Data: {csv_filename}",
-        f"Summary: {summary_filename}",
-        "=" * 80,
-    ])
+    # Containment metrics
+    lines.append("=" * 80)
+    lines.append("CONTAINMENT METRICS")
+    lines.append("=" * 80)
+    lines.append(f"High in Confidence Range: {metrics.get('high_in_range', 0):.2f}%")
+    lines.append(f"Low in Confidence Range: {metrics.get('low_in_range', 0):.2f}%")
+    lines.append(f"Full Containment: {metrics.get('full_containment', 0):.2f}%")
+    lines.append("")
 
-    summary_text = "\n".join(summary_lines)
+    # Error metrics
+    lines.append("=" * 80)
+    lines.append("ERROR METRICS")
+    lines.append("=" * 80)
+    lines.append(f"High MAE: ${metrics.get('high_mae', 0):.2f}")
+    lines.append(f"Low MAE: ${metrics.get('low_mae', 0):.2f}")
+    lines.append(f"High Bias: ${metrics.get('high_bias', 0):+.2f}")
+    lines.append(f"Low Bias: ${metrics.get('low_bias', 0):+.2f}")
+    lines.append(f"Range MAE: ${metrics.get('range_mae', 0):.2f}")
+    lines.append(f"Range MAPE: {metrics.get('range_mape', 0):.2f}%")
+    lines.append("")
+
+    # R-squared metrics
+    lines.append("=" * 80)
+    lines.append("R-SQUARED METRICS")
+    lines.append("=" * 80)
+    lines.append(f"Test R2 High: {metrics.get('test_r2_high', 0):.4f}")
+    lines.append(f"Test R2 Low: {metrics.get('test_r2_low', 0):.4f}")
+    lines.append(f"Train R2 (avg): {metrics.get('train_r2_avg', 0):.4f}")
+    lines.append(f"Train RMSE (avg): {metrics.get('train_rmse_avg', 0):.4f}%")
+    lines.append("")
+
+    # Confidence band info
+    lines.append("=" * 80)
+    lines.append("CONFIDENCE BAND INFO")
+    lines.append("=" * 80)
+    lines.append(f"Method: {metrics.get('confidence_method', 'N/A')}")
+    lines.append(f"Quantile Regression %: {metrics.get('quantile_pct', 0):.1f}%")
+    lines.append("")
+
+    # Prediction statistics
+    lines.append("=" * 80)
+    lines.append("PREDICTION STATISTICS")
+    lines.append("=" * 80)
+    lines.append(f"Avg Predicted High: ${export_df['predicted_high'].mean():.2f}")
+    lines.append(f"Avg Actual High: ${export_df['actual_high'].mean():.2f}")
+    lines.append(f"Avg Predicted Low: ${export_df['predicted_low'].mean():.2f}")
+    lines.append(f"Avg Actual Low: ${export_df['actual_low'].mean():.2f}")
+    lines.append(f"Avg High Error: ${export_df['high_error'].mean():+.2f}")
+    lines.append(f"Avg Low Error: ${export_df['low_error'].mean():+.2f}")
+    lines.append(f"Std High Error: ${export_df['high_error'].std():.2f}")
+    lines.append(f"Std Low Error: ${export_df['low_error'].std():.2f}")
+    lines.append("")
+
+    # Retraining info
+    lines.append("=" * 80)
+    lines.append("RETRAINING INFO")
+    lines.append("=" * 80)
+    lines.append(f"Total Retrains: {export_df['retrained'].sum()}")
+    retrain_dates = export_df[export_df['retrained']]['date'].dt.strftime('%Y-%m-%d').tolist()[:10]
+    dates_str = ', '.join(retrain_dates)
+    if export_df['retrained'].sum() > 10:
+        dates_str += '...'
+    lines.append(f"Retrain Dates: {dates_str}")
+    lines.append("")
+
+    # Daily predictions table
+    lines.append("=" * 80)
+    lines.append("DAILY PREDICTIONS TABLE (Last 10 Days)")
+    lines.append("=" * 80)
+    header = f"{'Date':<12} {'PredHigh':>10} {'ActHigh':>10} {'HiErr':>8} {'PredLow':>10} {'ActLow':>10} {'LoErr':>8} {'HiOK':>6} {'LoOK':>6}"
+    lines.append(header)
+    lines.append("-" * 90)
+    for _, row in export_df.tail(10).iterrows():
+        hi_ok = 'Yes' if row['high_in_range'] else 'No'
+        lo_ok = 'Yes' if row['low_in_range'] else 'No'
+        line = f"{row['date'].strftime('%Y-%m-%d'):<12} ${row['predicted_high']:>9.2f} ${row['actual_high']:>9.2f} {row['high_error']:>+8.2f} ${row['predicted_low']:>9.2f} ${row['actual_low']:>9.2f} {row['low_error']:>+8.2f} {hi_ok:>6} {lo_ok:>6}"
+        lines.append(line)
+
+    # Files section
+    lines.append("")
+    lines.append("=" * 80)
+    lines.append("FILES")
+    lines.append("=" * 80)
+    lines.append(f"CSV Data: {csv_filename}")
+    lines.append(f"Summary: {summary_filename}")
+    lines.append("=" * 80)
+
+    summary_text = "\n".join(lines)
 
     with open(summary_filename, 'w') as f:
         f.write(summary_text)
 
-    # === Update Latest File ===
     latest_path = f"walk_forward/LATEST_{ticker}_summary.txt"
     with open(latest_path, 'w') as f:
         f.write(summary_text)
@@ -7292,17 +7312,12 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     help="50-68% = tight actionable bands for trading. 80-95% = wider bands for risk management."
                 )
 
-            # Parallel walk-forward option (only makes sense for daily retraining)
-            wf_col7, wf_col8 = st.columns(2)
-            with wf_col7:
-                wf_parallel_mode = st.checkbox(
-                    "Enable Parallel Walk-Forward",
-                    value=False,
-                    help="Run all days in parallel (requires daily retraining). Much faster with many cores but uses more memory."
-                )
-            with wf_col8:
-                if wf_parallel_mode and wf_retrain_freq != "Every Day":
-                    st.warning("Parallel mode works best with daily retraining. Consider switching to 'Every Day'.")
+            # Always use parallel mode now (removed checkbox per user request)
+            wf_parallel_mode = True  # Hardcoded - sequential mode removed
+
+            # Warning if not daily retraining
+            if wf_retrain_freq != "Every Day":
+                st.warning("⚠️ Walk-forward uses parallel execution which works best with daily retraining. Consider switching to 'Every Day'.")
 
             # Model configuration - CORRECTED R² values (no data leakage)
             st.markdown("##### Model Configuration")
@@ -7441,26 +7456,56 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                 },
             }
 
-            # Regime-adaptive toggle
-            wf_regime_adaptive = st.checkbox(
-                "Enable Regime-Adaptive Mode",
-                value=False,
-                disabled=not wf_parallel_mode,
-                help="Automatically switch models based on detected market regime (volatility, trend). When enabled, the system detects if market is in high/low volatility, trending, or range-bound and uses different model configurations accordingly."
+            # ==================== SIMPLIFIED MODEL CONFIGURATION ====================
+            # Initialize wf_config - single source of truth for all walk-forward settings
+            if 'wf_config' not in st.session_state:
+                st.session_state['wf_config'] = {
+                    'mode': 'fixed',  # 'fixed' or 'regime_adaptive'
+                    'high_model': 'RIDGE_Top20',
+                    'low_model': 'RIDGE_Top20',
+                    'high_ci_mult': 1.0,
+                    'low_ci_mult': 0.8,
+                    'regime_strategy': 'REGIME_Optimized_Jan2026',
+                    'source': 'manual',  # 'manual', 'find_best_model', 'find_best_regime'
+                }
+
+            # Mode selection via radio button - clear mutual exclusion
+            st.markdown("---")
+            wf_mode = st.radio(
+                "Model Selection Mode",
+                options=["Fixed Model", "Regime-Adaptive"],
+                index=0 if st.session_state['wf_config']['mode'] == 'fixed' else 1,
+                horizontal=True,
+                help="**Fixed:** Same HIGH/LOW models for all days. **Regime-Adaptive:** Automatically switch models based on detected market conditions (volatility, trend).",
+                key="wf_mode_radio"
             )
 
-            if wf_regime_adaptive and wf_parallel_mode:
-                # Regime strategy selector
+            # Update config mode based on radio selection
+            st.session_state['wf_config']['mode'] = 'fixed' if wf_mode == "Fixed Model" else 'regime_adaptive'
+            wf_regime_adaptive = (wf_mode == "Regime-Adaptive")
+
+            # Mode-specific configuration
+            if wf_regime_adaptive:
+                # ==================== REGIME-ADAPTIVE MODE ====================
                 regime_options = list(REGIME_STATS.keys())
-                regime_labels = [f"{k} (R²H:{v['r2_high']:.2f}, R²L:{v['r2_low']:.2f})" for k, v in REGIME_STATS.items()]
+
+                # Get current selection from wf_config
+                current_regime = st.session_state['wf_config'].get('regime_strategy', regime_options[0])
+                regime_default_idx = regime_options.index(current_regime) if current_regime in regime_options else 0
 
                 wf_regime_strategy = st.selectbox(
                     "Regime Strategy",
                     options=regime_options,
+                    index=regime_default_idx,
                     format_func=lambda x: f"{x} (R²H:{REGIME_STATS[x]['r2_high']:.2f}, R²L:{REGIME_STATS[x]['r2_low']:.2f})",
-                    index=0,
-                    help="Select a regime-adaptive strategy. Each strategy uses different models based on detected market conditions."
+                    help="Select a regime-adaptive strategy. Each strategy uses different models based on detected market conditions.",
+                    key="wf_regime_strategy_select"
                 )
+
+                # Update wf_config with selection
+                st.session_state['wf_config']['regime_strategy'] = wf_regime_strategy
+                if st.session_state['wf_config']['source'] == 'manual':
+                    st.session_state['wf_config']['source'] = 'manual'  # Keep as manual unless Find Best sets it
 
                 # Show regime strategy details
                 regime_info = REGIME_STATS[wf_regime_strategy]
@@ -7484,7 +7529,7 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                 default_low_mult = regime_info['ci_mult_low']
 
             else:
-                # Standard mode - separate HIGH and LOW model selection
+                # ==================== FIXED MODEL MODE ====================
                 # Group models by type and sort by performance
                 high_single = [k for k, v in MODEL_STATS.items() if v['type'] in ['ridge', 'xgboost']]
                 high_single.sort(key=lambda x: MODEL_STATS[x]['r2_high'], reverse=True)
@@ -7496,38 +7541,43 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                 low_ensemble = [k for k, v in MODEL_STATS.items() if v['type'] == 'ensemble']
                 low_ensemble.sort(key=lambda x: MODEL_STATS[x]['r2_low'], reverse=True)
 
-                # Create formatted option lists
-                high_options = (
-                    ["── Single Models ──"] + high_single[:6] +
-                    ["── Ensemble Models ──"] + high_ensemble[:6]
-                )
-                low_options = (
-                    ["── Single Models ──"] + low_single[:6] +
-                    ["── Ensemble Models ──"] + low_ensemble[:6]
-                )
+                # Get available options
+                high_opts = high_single[:6] + high_ensemble[:6]
+                low_opts = low_single[:6] + low_ensemble[:6]
+
+                # Get current selection from wf_config
+                current_high = st.session_state['wf_config'].get('high_model', high_opts[0])
+                current_low = st.session_state['wf_config'].get('low_model', low_opts[0])
+                high_default_idx = high_opts.index(current_high) if current_high in high_opts else 0
+                low_default_idx = low_opts.index(current_low) if current_low in low_opts else 0
 
                 wf_col9, wf_col10 = st.columns(2)
+
                 with wf_col9:
                     wf_high_model = st.selectbox(
                         "HIGH Model",
-                        options=[o for o in high_options if not o.startswith("──")],
-                        index=0,  # Default to best R² HIGH
-                        disabled=not wf_parallel_mode,
+                        options=high_opts,
+                        index=high_default_idx,
                         format_func=lambda x: f"{x} (R²:{MODEL_STATS[x]['r2_high']:.2f}, Cont:{MODEL_STATS[x]['cont_high']:.0f}%)" if x in MODEL_STATS else x,
-                        help="Select model for HIGH prediction. Sorted by R² within each group."
+                        help="Select model for HIGH prediction. Sorted by R² within each group.",
+                        key="wf_high_model_select"
                     )
                 with wf_col10:
                     wf_low_model = st.selectbox(
                         "LOW Model",
-                        options=[o for o in low_options if not o.startswith("──")],
-                        index=0,  # Default to best R² LOW
-                        disabled=not wf_parallel_mode,
+                        options=low_opts,
+                        index=low_default_idx,
                         format_func=lambda x: f"{x} (R²:{MODEL_STATS[x]['r2_low']:.2f}, Cont:{MODEL_STATS[x]['cont_low']:.0f}%)" if x in MODEL_STATS else x,
-                        help="Select model for LOW prediction. Sorted by R² within each group."
+                        help="Select model for LOW prediction. Sorted by R² within each group.",
+                        key="wf_low_model_select"
                     )
 
+                # Update wf_config with selections
+                st.session_state['wf_config']['high_model'] = wf_high_model
+                st.session_state['wf_config']['low_model'] = wf_low_model
+
                 # Display combined stats
-                if wf_parallel_mode and wf_high_model in MODEL_STATS and wf_low_model in MODEL_STATS:
+                if wf_high_model in MODEL_STATS and wf_low_model in MODEL_STATS:
                     high_stats = MODEL_STATS[wf_high_model]
                     low_stats = MODEL_STATS[wf_low_model]
 
@@ -7543,42 +7593,511 @@ def render_strategy_discovery_section(df: pd.DataFrame):
 
                     default_high_mult = high_stats['ci_mult_high']
                     default_low_mult = low_stats['ci_mult_low']
-                elif not wf_parallel_mode:
-                    st.caption("⚠️ Enable **Parallel Walk-Forward** to configure models")
-                    default_high_mult = 1.0
-                    default_low_mult = 1.0
                 else:
                     default_high_mult = 1.0
                     default_low_mult = 1.0
 
             # CI Width Multipliers - compensate for over/under-confident residuals
-            if wf_parallel_mode:
-                st.markdown("##### Confidence Interval Calibration")
-                st.caption("*Adjust CI width to achieve target containment. Recommended values shown based on selected models.*")
-                wf_col12, wf_col13 = st.columns(2)
-                with wf_col12:
-                    wf_high_ci_mult = st.slider(
-                        "HIGH CI Multiplier",
-                        min_value=0.5,
-                        max_value=6.0,
-                        value=float(default_high_mult),
-                        step=0.1,
-                        help="Multiplier to widen/narrow HIGH prediction CI. Higher = wider bands = more containment."
+            st.markdown("##### Confidence Interval Calibration")
+            st.caption("*Adjust CI width to achieve target containment. Recommended values shown based on selected models.*")
+            wf_col12, wf_col13 = st.columns(2)
+            with wf_col12:
+                # Get current CI mult from wf_config, fall back to model default
+                current_high_ci = st.session_state['wf_config'].get('high_ci_mult', default_high_mult)
+                wf_high_ci_mult = st.slider(
+                    "HIGH CI Multiplier",
+                    min_value=0.5,
+                    max_value=6.0,
+                    value=float(current_high_ci),
+                    step=0.1,
+                    help="Multiplier to widen/narrow HIGH prediction CI. Higher = wider bands = more containment.",
+                    key="wf_high_ci_slider"
+                )
+                st.caption(f"💡 Recommended for selected model: **{default_high_mult:.1f}x**")
+            with wf_col13:
+                current_low_ci = st.session_state['wf_config'].get('low_ci_mult', default_low_mult)
+                wf_low_ci_mult = st.slider(
+                    "LOW CI Multiplier",
+                    min_value=0.2,
+                    max_value=3.0,
+                    value=float(current_low_ci),
+                    step=0.1,
+                    help="Multiplier to widen/narrow LOW prediction CI. Lower = narrower bands.",
+                    key="wf_low_ci_slider"
+                )
+                st.caption(f"💡 Recommended for selected model: **{default_low_mult:.1f}x**")
+
+            # Update wf_config with CI values
+            st.session_state['wf_config']['high_ci_mult'] = wf_high_ci_mult
+            st.session_state['wf_config']['low_ci_mult'] = wf_low_ci_mult
+
+            # ==================== "WILL RUN WITH" SUMMARY BOX ====================
+            st.markdown("---")
+            config = st.session_state['wf_config']
+            with st.container(border=True):
+                st.markdown("##### Will Run With:")
+                if config['mode'] == 'fixed':
+                    col_sum1, col_sum2 = st.columns(2)
+                    with col_sum1:
+                        st.markdown(f"**Mode:** Fixed Model")
+                        st.markdown(f"**HIGH:** {config['high_model']} (CI×{config['high_ci_mult']:.1f})")
+                    with col_sum2:
+                        st.markdown(f"**Source:** {config['source']}")
+                        st.markdown(f"**LOW:** {config['low_model']} (CI×{config['low_ci_mult']:.1f})")
+                else:
+                    col_sum1, col_sum2 = st.columns(2)
+                    with col_sum1:
+                        st.markdown(f"**Mode:** Regime-Adaptive")
+                        st.markdown(f"**Strategy:** {config['regime_strategy']}")
+                    with col_sum2:
+                        st.markdown(f"**Source:** {config['source']}")
+                        regime_info = REGIME_STATS.get(config['regime_strategy'], {})
+                        st.markdown(f"**R²:** H:{regime_info.get('r2_high', 0):.2f} / L:{regime_info.get('r2_low', 0):.2f}")
+
+            # ==================== FIND BEST MODEL SECTION ====================
+            st.markdown("---")
+            st.markdown("##### Find Best Model Configuration")
+            st.caption("*Test all model combinations (Ridge, XGBoost, LightGBM, Ensembles × Top5-50, ALL features) and rank by R²*")
+
+            fbm_col1, fbm_col2, fbm_col3, fbm_col4 = st.columns([2, 2, 2, 2])
+            with fbm_col1:
+                fbm_test_days = st.number_input(
+                    "Test Days",
+                    min_value=20,
+                    max_value=120,
+                    value=60,
+                    help="Number of days to test on (more = longer but more reliable)"
+                )
+            with fbm_col2:
+                fbm_train_window = st.number_input(
+                    "Train Window",
+                    min_value=100,
+                    max_value=500,
+                    value=250,
+                    help="Rolling training window size in days"
+                )
+            with fbm_col3:
+                fbm_workers = st.number_input(
+                    "Workers",
+                    min_value=1,
+                    max_value=32,
+                    value=min(8, max(1, (os.cpu_count() or 4) - 1)),
+                    help="Parallel workers for testing"
+                )
+            with fbm_col4:
+                fbm_ci_level = st.selectbox(
+                    "CI Level",
+                    options=[0.50, 0.68, 0.80, 0.90],
+                    index=1,
+                    format_func=lambda x: f"{int(x*100)}%",
+                    key="fbm_ci_level"
+                )
+
+            fbm_btn_col1, fbm_btn_col2, fbm_btn_col3 = st.columns([1, 1, 1])
+            with fbm_btn_col1:
+                find_best_model_btn = st.button(
+                    "🔍 Find Best Fixed Model",
+                    type="secondary",
+                    use_container_width=True,
+                    help="Test ALL fixed model configurations and rank by R². Use this when Regime-Adaptive is DISABLED."
+                )
+            with fbm_btn_col2:
+                find_best_regime_btn = st.button(
+                    "🔄 Find Best Regime Config",
+                    type="secondary",
+                    use_container_width=True,
+                    help="Test different model assignments per regime to optimize Regime-Adaptive mode. Use this when Regime-Adaptive is ENABLED."
+                )
+            with fbm_btn_col3:
+                # Load previous results
+                model_comparison_files = sorted([f for f in os.listdir('.') if f.startswith('model_comparison_') and f.endswith('.json')], reverse=True)
+                if model_comparison_files:
+                    selected_comparison_file = st.selectbox(
+                        "Load Previous Results",
+                        options=[""] + model_comparison_files,
+                        format_func=lambda x: "Select saved results..." if x == "" else x,
+                        key="load_model_comparison"
                     )
-                    st.caption(f"💡 Recommended for selected model: **{default_high_mult:.1f}x**")
-                with wf_col13:
-                    wf_low_ci_mult = st.slider(
-                        "LOW CI Multiplier",
-                        min_value=0.2,
-                        max_value=3.0,
-                        value=float(default_low_mult),
-                        step=0.1,
-                        help="Multiplier to widen/narrow LOW prediction CI. Lower = narrower bands."
+                else:
+                    selected_comparison_file = ""
+                    st.caption("No saved results found")
+
+            # Handle Find Best Model button
+            if find_best_model_btn:
+                if len(pred_df) < fbm_train_window + fbm_test_days:
+                    st.error(f"Insufficient data. Need at least {fbm_train_window + fbm_test_days} days, have {len(pred_df)}.")
+                else:
+                    st.info(f"Testing all model combinations on {fbm_test_days} days with {fbm_train_window}-day training window...")
+
+                    # Setup progress tracking
+                    import tempfile
+                    import time as time_module
+                    fbm_progress_file = os.path.join(tempfile.gettempdir(), 'find_best_model_progress.json')
+
+                    # Initialize progress file
+                    with open(fbm_progress_file, 'w') as f:
+                        json.dump({'completed': 0, 'total': 0, 'status': 'starting'}, f)
+
+                    # Create progress display
+                    fbm_progress_bar = st.progress(0)
+                    fbm_progress_text = st.empty()
+                    fbm_progress_text.text("Starting model comparison...")
+
+                    # Run in background thread
+                    import threading
+                    fbm_results = [None]
+                    fbm_error = [None]
+
+                    # Capture values for thread closure
+                    _pred_df = pred_df.copy()
+                    _ticker = st.session_state.get('ticker', 'SPY')
+                    _test_days = fbm_test_days
+                    _train_window = fbm_train_window
+                    _ci_level = fbm_ci_level
+                    _n_workers = fbm_workers
+                    _progress_file = fbm_progress_file
+
+                    def run_find_best():
+                        try:
+                            # Import inside thread to avoid scoping issues
+                            from price_prediction import run_all_model_combinations
+                            fbm_results[0] = run_all_model_combinations(
+                                df=_pred_df,
+                                ticker=_ticker,
+                                test_days=_test_days,
+                                train_window=_train_window,
+                                ci_level=_ci_level,
+                                n_workers=_n_workers,
+                                progress_file=_progress_file
+                            )
+                        except Exception as e:
+                            import traceback
+                            fbm_error[0] = f"{str(e)}\n{traceback.format_exc()}"
+
+                    fbm_thread = threading.Thread(target=run_find_best)
+                    fbm_thread.start()
+
+                    # Monitor progress
+                    while fbm_thread.is_alive():
+                        time_module.sleep(0.5)
+                        try:
+                            with open(fbm_progress_file, 'r') as f:
+                                progress = json.load(f)
+                            completed = progress.get('completed', 0)
+                            total = progress.get('total', 1)
+                            status = progress.get('status', 'running')
+
+                            if total > 0:
+                                pct = min(completed / total, 1.0)
+                                fbm_progress_bar.progress(pct)
+                                fbm_progress_text.text(f"{status}: {completed}/{total} configurations tested ({pct*100:.0f}%)")
+                        except:
+                            pass
+
+                    fbm_thread.join()
+
+                    if fbm_error[0]:
+                        st.error(f"Error: {fbm_error[0]}")
+                    elif fbm_results[0]:
+                        # Store results in session state
+                        st.session_state['model_comparison_results'] = fbm_results[0]
+                        st.success(f"Complete! Tested {len(fbm_results[0])} configurations.")
+
+                        # Auto-save results
+                        from price_prediction import save_model_comparison_results
+                        ticker = st.session_state.get('ticker', 'SPY')
+                        save_path = save_model_comparison_results(fbm_results[0], ticker)
+                        st.info(f"Results saved to: {save_path}")
+
+                        st.rerun()
+
+            # Handle Find Best Regime Config button
+            if find_best_regime_btn:
+                if len(pred_df) < fbm_train_window + fbm_test_days:
+                    st.error(f"Insufficient data. Need at least {fbm_train_window + fbm_test_days} days, have {len(pred_df)}.")
+                else:
+                    st.info(f"Testing regime-adaptive configurations on {fbm_test_days} days using ALL CPU cores...")
+
+                    # Define regime types and candidate models per regime
+                    regimes = ['low_vol', 'range_bound', 'trending_up', 'trending_down']
+
+                    # For simplicity, test a curated set of regime configurations
+                    regime_configs_to_test = [
+                        {
+                            'name': 'Conservative (All Top5)',
+                            'configs': {r: {'model_type': 'ridge', 'top_n': 5} for r in regimes}
+                        },
+                        {
+                            'name': 'Balanced (Top15 everywhere)',
+                            'configs': {r: {'model_type': 'ridge', 'top_n': 15} for r in regimes}
+                        },
+                        {
+                            'name': 'Aggressive (Top20 everywhere)',
+                            'configs': {r: {'model_type': 'ridge', 'top_n': 20} for r in regimes}
+                        },
+                        {
+                            'name': 'Adaptive_v1 (Jan2026 Optimized)',
+                            'configs': {
+                                'low_vol': {'model_type': 'ridge', 'top_n': 5},
+                                'range_bound': {'model_type': 'ridge', 'top_n': 15},
+                                'trending_up': {'model_type': 'ridge', 'top_n': 20},
+                                'trending_down': {'model_type': 'ridge', 'top_n': 15},
+                            }
+                        },
+                        {
+                            'name': 'Adaptive_v2 (More Features for Trends)',
+                            'configs': {
+                                'low_vol': {'model_type': 'ridge', 'top_n': 10},
+                                'range_bound': {'model_type': 'ridge', 'top_n': 15},
+                                'trending_up': {'model_type': 'ridge', 'top_n': 30},
+                                'trending_down': {'model_type': 'ridge', 'top_n': 20},
+                            }
+                        },
+                        {
+                            'name': 'Adaptive_v3 (Minimal Complexity)',
+                            'configs': {
+                                'low_vol': {'model_type': 'ridge', 'top_n': 5},
+                                'range_bound': {'model_type': 'ridge', 'top_n': 10},
+                                'trending_up': {'model_type': 'ridge', 'top_n': 15},
+                                'trending_down': {'model_type': 'ridge', 'top_n': 10},
+                            }
+                        },
+                    ]
+
+                    st.markdown(f"Testing **{len(regime_configs_to_test)} regime configurations** in parallel...")
+
+                    # Progress display
+                    regime_progress = st.progress(0)
+                    regime_status = st.empty()
+
+                    # Import the parallel function
+                    from price_prediction import run_parallel_regime_config_test
+                    import threading
+                    import time as time_module
+
+                    # Setup progress file for monitoring
+                    import tempfile
+                    regime_progress_file = os.path.join(tempfile.gettempdir(), 'regime_config_progress.json')
+
+                    # Run in background thread for UI responsiveness
+                    regime_results = [None]
+                    regime_error = [None]
+
+                    def run_parallel_regime_test():
+                        try:
+                            regime_results[0] = run_parallel_regime_config_test(
+                                pred_df=pred_df,
+                                test_days=fbm_test_days,
+                                train_window=fbm_train_window,
+                                regime_configs=regime_configs_to_test,
+                                n_workers=fbm_workers,
+                                progress_file=regime_progress_file
+                            )
+                        except Exception as e:
+                            import traceback
+                            regime_error[0] = f"{str(e)}\n{traceback.format_exc()}"
+
+                    regime_thread = threading.Thread(target=run_parallel_regime_test)
+                    regime_thread.start()
+
+                    # Monitor progress
+                    while regime_thread.is_alive():
+                        time_module.sleep(0.5)
+                        try:
+                            with open(regime_progress_file, 'r') as f:
+                                progress = json.load(f)
+                            completed = progress.get('completed', 0)
+                            total = progress.get('total', 1)
+                            status = progress.get('status', 'running')
+
+                            if total > 0:
+                                pct = min(completed / total, 1.0)
+                                regime_progress.progress(pct)
+                                regime_status.text(f"{status}: {completed}/{total} configs ({pct*100:.0f}%)")
+                        except:
+                            pass
+
+                    regime_thread.join()
+
+                    # Clear progress
+                    regime_progress.empty()
+                    regime_status.empty()
+
+                    if regime_error[0]:
+                        st.error(f"Error: {regime_error[0]}")
+                    elif regime_results[0]:
+                        # Store in session state
+                        st.session_state['regime_config_results'] = regime_results[0]
+                        st.success(f"Regime config testing complete! Tested {len(regime_results[0])} configurations in parallel.")
+                        st.rerun()
+
+            # Display regime config results if available
+            regime_config_results = st.session_state.get('regime_config_results')
+            if regime_config_results:
+                st.markdown("##### Regime Configuration Results")
+                st.caption("*Optimal model assignments per market regime*")
+
+                # Display as table
+                regime_df = pd.DataFrame([{
+                    'Config': r['name'],
+                    'R² Avg': r['r2_avg'],
+                    'R² HIGH': r['r2_high'],
+                    'R² LOW': r['r2_low'],
+                    'MAE HIGH': r['mae_high'],
+                    'MAE LOW': r['mae_low'],
+                    'N': r['n_predictions']
+                } for r in regime_config_results])
+
+                st.dataframe(
+                    regime_df.style.format({
+                        'R² Avg': '{:.4f}',
+                        'R² HIGH': '{:.4f}',
+                        'R² LOW': '{:.4f}',
+                        'MAE HIGH': '{:.4f}',
+                        'MAE LOW': '{:.4f}',
+                        'N': '{:.0f}'
+                    }).background_gradient(subset=['R² Avg'], cmap='Greens'),
+                    use_container_width=True,
+                    height=250
+                )
+
+                # Best config details
+                best_regime = regime_config_results[0]
+                st.markdown(f"**Best Regime Config: {best_regime['name']}**")
+
+                # Show config breakdown
+                if 'configs' in best_regime:
+                    config_str = " | ".join([f"{r}: Top{c['top_n']}" for r, c in best_regime['configs'].items()])
+                    st.info(f"**Configuration:** {config_str}")
+
+                # Apply button for regime config
+                if st.button("Use Selected Regime Config", type="primary", key="apply_regime_config"):
+                    # Update wf_config - single source of truth
+                    st.session_state['wf_config']['mode'] = 'regime_adaptive'
+                    st.session_state['wf_config']['regime_strategy'] = best_regime['name']
+                    st.session_state['wf_config']['source'] = 'find_best_regime'
+                    st.success(f"✅ Configuration updated: **{best_regime['name']}**")
+                    st.rerun()
+
+            # Load previous results if selected
+            if selected_comparison_file and selected_comparison_file != "":
+                try:
+                    from price_prediction import load_model_comparison_results
+                    loaded_results = load_model_comparison_results(selected_comparison_file)
+                    st.session_state['model_comparison_results'] = loaded_results
+                    st.success(f"Loaded {len(loaded_results)} results from {selected_comparison_file}")
+                except Exception as e:
+                    st.error(f"Error loading: {e}")
+
+            # Display results if available
+            model_comparison_results = st.session_state.get('model_comparison_results')
+            if model_comparison_results:
+                st.markdown("##### Model Comparison Results")
+                st.caption(f"*Sorted by R² Average (best first) - {len(model_comparison_results)} configurations tested*")
+
+                # Convert to dataframe for display
+                results_df = pd.DataFrame(model_comparison_results)
+
+                # Format columns
+                display_cols = ['name', 'r2_avg', 'r2_high', 'r2_low', 'mae_high', 'mae_low',
+                               'containment_high', 'containment_low', 'bias_high', 'bias_low', 'n_predictions']
+
+                if all(col in results_df.columns for col in display_cols):
+                    display_df = results_df[display_cols].copy()
+                    display_df.columns = ['Model', 'R² Avg', 'R² HIGH', 'R² LOW', 'MAE HIGH', 'MAE LOW',
+                                         'Cont HIGH%', 'Cont LOW%', 'Bias HIGH', 'Bias LOW', 'N']
+
+                    # Highlight best model
+                    st.dataframe(
+                        display_df.style.format({
+                            'R² Avg': '{:.4f}',
+                            'R² HIGH': '{:.4f}',
+                            'R² LOW': '{:.4f}',
+                            'MAE HIGH': '{:.4f}',
+                            'MAE LOW': '{:.4f}',
+                            'Cont HIGH%': '{:.1f}',
+                            'Cont LOW%': '{:.1f}',
+                            'Bias HIGH': '{:.4f}',
+                            'Bias LOW': '{:.4f}',
+                            'N': '{:.0f}'
+                        }).background_gradient(subset=['R² Avg'], cmap='Greens'),
+                        use_container_width=True,
+                        height=400
                     )
-                    st.caption(f"💡 Recommended for selected model: **{default_low_mult:.1f}x**")
-            else:
-                wf_high_ci_mult = 1.0
-                wf_low_ci_mult = 1.0
+
+                    # Best model details
+                    best = model_comparison_results[0]
+                    st.markdown(f"**Best Model: {best['name']}**")
+
+                    best_cols = st.columns(4)
+                    with best_cols[0]:
+                        st.metric("R² Average", f"{best['r2_avg']:.4f}")
+                    with best_cols[1]:
+                        st.metric("R² HIGH", f"{best['r2_high']:.4f}")
+                    with best_cols[2]:
+                        st.metric("R² LOW", f"{best['r2_low']:.4f}")
+                    with best_cols[3]:
+                        st.metric("Containment", f"H:{best['containment_high']:.0f}% / L:{best['containment_low']:.0f}%")
+
+                    # Selection to apply config
+                    st.markdown("---")
+                    apply_col1, apply_col2 = st.columns([3, 1])
+
+                    with apply_col1:
+                        selected_model_idx = st.selectbox(
+                            "Select model to apply",
+                            options=range(len(model_comparison_results)),
+                            format_func=lambda i: f"{i+1}. {model_comparison_results[i]['name']} (R²={model_comparison_results[i]['r2_avg']:.4f})",
+                            key="selected_model_to_apply"
+                        )
+
+                    with apply_col2:
+                        if st.button("Use Selected Model", type="primary", use_container_width=True):
+                            selected = model_comparison_results[selected_model_idx]
+
+                            # Update wf_config - single source of truth
+                            st.session_state['wf_config']['mode'] = 'fixed'
+                            st.session_state['wf_config']['high_model'] = selected['name']
+                            st.session_state['wf_config']['low_model'] = selected['name']
+                            st.session_state['wf_config']['source'] = 'find_best_model'
+
+                            # Set CI multipliers from model stats if available
+                            if selected['name'] in MODEL_STATS:
+                                st.session_state['wf_config']['high_ci_mult'] = MODEL_STATS[selected['name']]['ci_mult_high']
+                                st.session_state['wf_config']['low_ci_mult'] = MODEL_STATS[selected['name']]['ci_mult_low']
+
+                            # Also save to file for persistence
+                            save_config = {
+                                'name': selected['name'],
+                                'wf_config': st.session_state['wf_config'].copy(),
+                                'metrics': {
+                                    'r2_high': selected['r2_high'],
+                                    'r2_low': selected['r2_low'],
+                                    'r2_avg': selected['r2_avg'],
+                                    'mae_high': selected['mae_high'],
+                                    'mae_low': selected['mae_low'],
+                                    'containment_high': selected['containment_high'],
+                                    'containment_low': selected['containment_low'],
+                                },
+                                'timestamp': datetime.now().isoformat(),
+                                'ticker': st.session_state.get('ticker', 'SPY')
+                            }
+                            ticker = st.session_state.get('ticker', 'SPY')
+                            config_path = f"saved_model_config_{ticker}.json"
+                            with open(config_path, 'w') as f:
+                                json.dump(save_config, f, indent=2)
+
+                            st.success(f"✅ Configuration updated: **{selected['name']}**")
+                            st.rerun()  # Refresh to update UI
+
+                    # Export button
+                    csv_export = results_df.to_csv(index=False)
+                    st.download_button(
+                        "📥 Download Full Results CSV",
+                        csv_export,
+                        file_name=f"model_comparison_{st.session_state.get('ticker', 'SPY')}_{datetime.now().strftime('%Y%m%d')}.csv",
+                        mime="text/csv"
+                    )
 
             st.markdown("---")
 
@@ -7611,9 +8130,9 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     st.session_state['wf_train_r2_list'] = []  # Reset R² tracking for new run
 
                     # ================================================================
-                    # PARALLEL WALK-FORWARD MODE
+                    # PARALLEL WALK-FORWARD MODE (Daily Retraining)
                     # ================================================================
-                    if wf_parallel_mode and retrain_interval == 1:
+                    if retrain_interval == 1:  # Parallel mode for daily retraining
                         # Set model configs based on UI selection
                         # Force reload to pick up any code changes
                         import importlib
@@ -7845,6 +8364,24 @@ def render_strategy_discovery_section(df: pd.DataFrame):
 
                             st.success(f"Parallel walk-forward complete! {len(wf_results)} predictions generated.")
 
+                            # Display prominent MODE indicator
+                            wf_df_temp = pd.DataFrame(wf_results)
+                            if 'detected_regime' in wf_df_temp.columns and wf_df_temp['detected_regime'].nunique() > 1:
+                                # Regime-adaptive was used
+                                regime_counts = wf_df_temp['detected_regime'].value_counts()
+                                regime_str = ", ".join([f"{r}: {c}" for r, c in regime_counts.items()])
+                                st.info(f"🔄 **MODE: REGIME-ADAPTIVE** | Models varied by detected market regime | Breakdown: {regime_str}")
+                            elif 'high_top_n' in wf_df_temp.columns and wf_df_temp['high_top_n'].nunique() > 1:
+                                # Regime-adaptive was used (detected via varying configs)
+                                st.info(f"🔄 **MODE: REGIME-ADAPTIVE** | Model configurations varied during analysis")
+                            else:
+                                # Fixed model was used
+                                h_model = wf_df_temp['high_model_type'].iloc[0] if 'high_model_type' in wf_df_temp.columns else 'ridge'
+                                h_topn = wf_df_temp['high_top_n'].iloc[0] if 'high_top_n' in wf_df_temp.columns else '?'
+                                l_model = wf_df_temp['low_model_type'].iloc[0] if 'low_model_type' in wf_df_temp.columns else 'ridge'
+                                l_topn = wf_df_temp['low_top_n'].iloc[0] if 'low_top_n' in wf_df_temp.columns else '?'
+                                st.info(f"📌 **MODE: FIXED MODEL** | HIGH: {h_model} Top{h_topn} | LOW: {l_model} Top{l_topn}")
+
                             # Train a final model for "Predict Tomorrow's Range" feature
                             with st.spinner("Training final model for tomorrow's prediction..."):
                                 try:
@@ -7891,9 +8428,9 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                     st.warning(f"Could not train final model: {model_err}")
 
                     # ================================================================
-                    # SEQUENTIAL WALK-FORWARD MODE (original code)
+                    # SEQUENTIAL WALK-FORWARD MODE (Weekly/Monthly Retraining)
                     # ================================================================
-                    else:
+                    else:  # Weekly or Monthly retraining - run sequentially
                         # Progress tracking
                         progress_bar = st.progress(0)
                         status_text = st.empty()
@@ -8207,7 +8744,36 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     high_top_n = wf_df['high_top_n'].iloc[0] if 'high_top_n' in wf_df.columns else 15
                     low_model_type = wf_df['low_model_type'].iloc[0] if 'low_model_type' in wf_df.columns else 'ridge'
                     low_top_n = wf_df['low_top_n'].iloc[0] if 'low_top_n' in wf_df.columns else 5
-                    model_mode = "Hybrid" if high_model_type != low_model_type else "Simple"
+
+                    # Detect if regime-adaptive mode was actually used by checking for varying configs
+                    regime_adaptive_used = False
+                    regime_strategy_name = None
+                    regime_breakdown = {}
+
+                    if 'detected_regime' in wf_df.columns:
+                        unique_regimes = wf_df['detected_regime'].dropna().unique()
+                        if len(unique_regimes) > 1:
+                            regime_adaptive_used = True
+                            # Count regime occurrences
+                            regime_counts = wf_df['detected_regime'].value_counts()
+                            regime_breakdown = regime_counts.to_dict()
+
+                    # Also check if high_top_n or low_top_n varies (another indicator of regime-adaptive)
+                    if 'high_top_n' in wf_df.columns and wf_df['high_top_n'].nunique() > 1:
+                        regime_adaptive_used = True
+                    if 'low_top_n' in wf_df.columns and wf_df['low_top_n'].nunique() > 1:
+                        regime_adaptive_used = True
+
+                    # Determine model mode
+                    if regime_adaptive_used:
+                        model_mode = "Regime-Adaptive"
+                        # Try to identify which regime strategy was used
+                        if 'detected_regime' in wf_df.columns:
+                            regime_strategy_name = st.session_state.get('wf_regime_strategy', 'REGIME_Optimized_Jan2026')
+                    elif high_model_type != low_model_type:
+                        model_mode = "Hybrid"
+                    else:
+                        model_mode = "Simple"
 
                     wf_settings = {
                         'n_train_days': st.session_state.get('wf_min_train_days', wf_min_train_days),
@@ -8220,6 +8786,9 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                         'high_top_n': high_top_n,
                         'low_model_type': low_model_type,
                         'low_top_n': low_top_n,
+                        'regime_adaptive': regime_adaptive_used,
+                        'regime_strategy': regime_strategy_name,
+                        'regime_breakdown': regime_breakdown,
                     }
 
                     wf_ticker = st.session_state.get('ticker', 'SPY')

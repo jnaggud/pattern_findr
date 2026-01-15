@@ -5956,3 +5956,857 @@ def get_parallel_progress(progress_file: str = None) -> dict:
             return json.load(f)
     except Exception:
         return {'completed': 0, 'total': 0, 'status': 'unknown'}
+
+
+# =============================================================================
+# FIND BEST MODEL - Run All Combinations
+# =============================================================================
+
+def generate_model_configs() -> list:
+    """
+    Generate all model configurations to test.
+    Returns list of dicts with 'name', 'high_config', 'low_config'.
+    """
+    configs = []
+
+    # Feature selection levels
+    top_n_values = [5, 10, 15, 20, 30, 50, 0]  # 0 = ALL
+
+    # Single models
+    single_models = ['ridge']
+    if XGB_AVAILABLE:
+        single_models.append('xgboost')
+    if LGBM_AVAILABLE:
+        single_models.append('lightgbm')
+
+    for model_type in single_models:
+        for top_n in top_n_values:
+            top_n_str = "ALL" if top_n == 0 else f"Top{top_n}"
+            configs.append({
+                'name': f"{model_type.upper()}_{top_n_str}",
+                'high_config': {'model_type': model_type, 'top_n_features': top_n},
+                'low_config': {'model_type': model_type, 'top_n_features': top_n},
+            })
+
+    # Ensemble combinations (HIGH and LOW use same ensemble)
+    ensemble_combos = []
+    if XGB_AVAILABLE and LGBM_AVAILABLE:
+        ensemble_combos = [
+            (['ridge', 'xgboost'], 'Ridge+XGB'),
+            (['ridge', 'lightgbm'], 'Ridge+LGB'),
+            (['xgboost', 'lightgbm'], 'XGB+LGB'),
+            (['ridge', 'xgboost', 'lightgbm'], 'Ridge+XGB+LGB'),
+        ]
+    elif XGB_AVAILABLE:
+        ensemble_combos = [
+            (['ridge', 'xgboost'], 'Ridge+XGB'),
+        ]
+    elif LGBM_AVAILABLE:
+        ensemble_combos = [
+            (['ridge', 'lightgbm'], 'Ridge+LGB'),
+        ]
+
+    for models, name_prefix in ensemble_combos:
+        for top_n in top_n_values:
+            top_n_str = "ALL" if top_n == 0 else f"Top{top_n}"
+            configs.append({
+                'name': f"{name_prefix}_{top_n_str}",
+                'high_config': {'model_type': 'ensemble', 'ensemble_models': models, 'top_n_features': top_n},
+                'low_config': {'model_type': 'ensemble', 'ensemble_models': models, 'top_n_features': top_n},
+            })
+
+    return configs
+
+
+def run_all_model_combinations(
+    df: pd.DataFrame,
+    ticker: str,
+    test_days: int = 60,
+    train_window: int = 250,
+    ci_level: float = 0.68,
+    n_workers: int = 4,
+    progress_callback=None,
+    progress_file: str = None
+) -> list:
+    """
+    Run walk-forward analysis for ALL model combinations and return ranked results.
+
+    Args:
+        df: Price dataframe with OHLCV data
+        ticker: Ticker symbol
+        test_days: Number of days to test on
+        train_window: Rolling training window size
+        ci_level: Confidence interval level
+        n_workers: Number of parallel workers
+        progress_callback: Optional callback(current, total, status) for progress updates
+        progress_file: Optional file path for progress JSON
+
+    Returns:
+        List of result dicts sorted by R² (best first), each containing:
+        - name: Configuration name
+        - r2_high, r2_low, r2_avg: R² metrics
+        - mae_high, mae_low: Mean Absolute Error
+        - containment_high, containment_low: % of actual within predicted bands
+        - bias_high, bias_low: Average prediction bias
+        - n_predictions: Number of valid predictions
+        - high_config, low_config: The model configurations used
+    """
+    from joblib import Parallel, delayed
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import r2_score, mean_absolute_error
+    import tempfile
+    import json
+
+    # Setup progress file
+    if progress_file is None:
+        progress_file = os.path.join(tempfile.gettempdir(), 'find_best_model_progress.json')
+
+    # Generate all configurations
+    configs = generate_model_configs()
+    total_configs = len(configs)
+
+    print(f"\n{'='*70}")
+    print(f"FIND BEST MODEL - Running {total_configs} Configurations")
+    print(f"{'='*70}")
+    print(f"Test period: {test_days} days | Train window: {train_window} days")
+    print(f"Workers: {n_workers} | Confidence: {ci_level*100:.0f}%")
+    print(f"{'='*70}\n")
+
+    # Initialize progress
+    with open(progress_file, 'w') as f:
+        json.dump({'completed': 0, 'total': total_configs, 'status': 'precomputing_features'}, f)
+
+    if progress_callback:
+        progress_callback(0, total_configs, 'precomputing_features')
+
+    # ================================================================
+    # PRE-COMPUTE FEATURES (do this once for all configs)
+    # ================================================================
+    print("Step 1/3: Pre-computing features...")
+
+    predictor = PriceRangePredictor()
+    features = predictor.create_range_features(df.copy(), options_features=None, ticker=ticker)
+    targets = predictor.create_targets(df)
+    feature_names = predictor.feature_names
+
+    # Prepare matrices
+    X_full = features[feature_names].values
+
+    # HIGH target: (next_high - current_close) / current_close * 100
+    y_high_full = targets['next_high_pct'].values if 'next_high_pct' in targets.columns else (
+        (df['high'].shift(-1) - df['close']) / df['close'] * 100
+    ).values
+
+    # LOW target: (current_close - next_low) / current_close * 100
+    y_low_full = targets['next_low_pct'].values if 'next_low_pct' in targets.columns else (
+        (df['close'] - df['low'].shift(-1)) / df['close'] * 100
+    ).values
+
+    # Get OHLC for actual price calculations
+    ohlc_data = df[['high', 'low', 'open', 'close']].values
+    index_list = df.index.tolist()
+    close_prices = df['close'].values
+
+    # Test start index
+    test_start_idx = len(df) - test_days
+
+    print(f"   Features: {len(feature_names)} | Data rows: {len(X_full)}")
+    print(f"   Test period: {index_list[test_start_idx]} to {index_list[-1]}")
+
+    n_features = X_full.shape[1]
+
+    # Update progress
+    with open(progress_file, 'w') as f:
+        json.dump({'completed': 0, 'total': total_configs, 'status': 'running_configs'}, f)
+
+    if progress_callback:
+        progress_callback(0, total_configs, 'running_configs')
+
+    # ================================================================
+    # RUN ALL CONFIGURATIONS IN PARALLEL
+    # ================================================================
+    print(f"Step 2/2: Running {total_configs} model configurations with DYNAMIC feature selection...")
+    print(f"   (Correlations recalculated at each training window - no lookahead bias)")
+
+    def run_single_config(config, config_idx):
+        """Run walk-forward for a single configuration with DYNAMIC feature selection."""
+        try:
+            predictions = []
+
+            high_cfg = config['high_config']
+            low_cfg = config['low_config']
+
+            top_n_high = high_cfg.get('top_n_features', 0)
+            top_n_low = low_cfg.get('top_n_features', 0)
+
+            # Walk-forward loop with DYNAMIC feature selection
+            for test_idx in range(test_start_idx, len(index_list)):
+                try:
+                    # Training data (exclude test_idx-1 to avoid target leakage)
+                    train_start = max(0, test_idx - train_window)
+                    train_end = test_idx - 1
+
+                    # Get raw training window data
+                    X_train_window = X_full[train_start:train_end]
+                    y_high_train_raw = y_high_full[train_start:train_end]
+                    y_low_train_raw = y_low_full[train_start:train_end]
+
+                    # ============================================================
+                    # DYNAMIC FEATURE SELECTION - recalculate correlations each window
+                    # This avoids lookahead bias by only using data available at this point
+                    # ============================================================
+                    if top_n_high > 0 or top_n_low > 0:
+                        # Calculate correlations on THIS training window only
+                        valid_mask = ~(np.isnan(X_train_window).any(axis=1) |
+                                      np.isnan(y_high_train_raw) | np.isnan(y_low_train_raw))
+                        X_valid = X_train_window[valid_mask]
+                        y_high_valid = y_high_train_raw[valid_mask]
+                        y_low_valid = y_low_train_raw[valid_mask]
+
+                        if len(X_valid) < 50:
+                            continue
+
+                        # Calculate per-feature correlations on this window
+                        window_corr_high = np.zeros(n_features)
+                        window_corr_low = np.zeros(n_features)
+                        for i in range(n_features):
+                            if np.std(X_valid[:, i]) > 1e-10:
+                                window_corr_high[i] = np.abs(np.corrcoef(X_valid[:, i], y_high_valid)[0, 1])
+                                window_corr_low[i] = np.abs(np.corrcoef(X_valid[:, i], y_low_valid)[0, 1])
+                        window_corr_high = np.nan_to_num(window_corr_high, 0)
+                        window_corr_low = np.nan_to_num(window_corr_low, 0)
+
+                        # Select top N features based on THIS window's correlations
+                        if top_n_high > 0:
+                            feature_idx_high = np.argsort(window_corr_high)[-top_n_high:][::-1]
+                        else:
+                            feature_idx_high = np.arange(n_features)
+
+                        if top_n_low > 0:
+                            feature_idx_low = np.argsort(window_corr_low)[-top_n_low:][::-1]
+                        else:
+                            feature_idx_low = np.arange(n_features)
+                    else:
+                        # Use ALL features
+                        feature_idx_high = np.arange(n_features)
+                        feature_idx_low = np.arange(n_features)
+
+                    # Extract training data with selected features
+                    X_train_high = X_train_window[:, feature_idx_high]
+                    X_train_low = X_train_window[:, feature_idx_low]
+                    y_high_train = y_high_train_raw
+                    y_low_train = y_low_train_raw
+
+                    # Remove NaN rows
+                    valid_h = ~(np.isnan(X_train_high).any(axis=1) | np.isnan(y_high_train))
+                    valid_l = ~(np.isnan(X_train_low).any(axis=1) | np.isnan(y_low_train))
+
+                    X_train_high = X_train_high[valid_h]
+                    y_high_train = y_high_train[valid_h]
+                    X_train_low = X_train_low[valid_l]
+                    y_low_train = y_low_train[valid_l]
+
+                    if len(X_train_high) < 50 or len(X_train_low) < 50:
+                        continue
+
+                    # Scale features
+                    scaler_h = StandardScaler()
+                    scaler_l = StandardScaler()
+                    X_train_h_scaled = scaler_h.fit_transform(X_train_high)
+                    X_train_l_scaled = scaler_l.fit_transform(X_train_low)
+
+                    # Train models
+                    high_model = _train_model(high_cfg, X_train_h_scaled, y_high_train)
+                    low_model = _train_model(low_cfg, X_train_l_scaled, y_low_train)
+
+                    # Get prediction features (test_idx - 1 because we predict NEXT day)
+                    X_test_high = X_full[test_idx - 1, feature_idx_high].reshape(1, -1)
+                    X_test_low = X_full[test_idx - 1, feature_idx_low].reshape(1, -1)
+
+                    if np.isnan(X_test_high).any() or np.isnan(X_test_low).any():
+                        continue
+
+                    X_test_h_scaled = scaler_h.transform(X_test_high)
+                    X_test_l_scaled = scaler_l.transform(X_test_low)
+
+                    # Predict
+                    pred_high_pct = _predict_model(high_model, high_cfg, X_test_h_scaled)
+                    pred_low_pct = _predict_model(low_model, low_cfg, X_test_l_scaled)
+
+                    # Get actual values
+                    current_close = close_prices[test_idx - 1]
+                    actual_high = ohlc_data[test_idx, 0]
+                    actual_low = ohlc_data[test_idx, 1]
+
+                    # Convert to price
+                    pred_high = current_close * (1 + pred_high_pct / 100)
+                    pred_low = current_close * (1 - pred_low_pct / 100)
+
+                    # Calculate residuals for confidence bands
+                    residuals_high = y_high_train - high_model.predict(X_train_h_scaled) if hasattr(high_model, 'predict') else []
+                    residuals_low = y_low_train - low_model.predict(X_train_l_scaled) if hasattr(low_model, 'predict') else []
+
+                    if len(residuals_high) > 0:
+                        high_std = np.std(residuals_high)
+                        low_std = np.std(residuals_low)
+                    else:
+                        high_std = low_std = 1.0
+
+                    # CI bounds (in percentage points)
+                    from scipy import stats
+                    z_score = stats.norm.ppf((1 + ci_level) / 2)
+
+                    high_upper_pct = pred_high_pct + z_score * high_std
+                    high_lower_pct = pred_high_pct - z_score * high_std
+                    low_upper_pct = pred_low_pct + z_score * low_std
+                    low_lower_pct = pred_low_pct - z_score * low_std
+
+                    # Convert to prices
+                    high_upper = current_close * (1 + high_upper_pct / 100)
+                    high_lower = current_close * (1 + high_lower_pct / 100)
+                    low_upper = current_close * (1 - low_lower_pct / 100)
+                    low_lower = current_close * (1 - low_upper_pct / 100)
+
+                    predictions.append({
+                        'date': index_list[test_idx],
+                        'actual_high': actual_high,
+                        'actual_low': actual_low,
+                        'pred_high': pred_high,
+                        'pred_low': pred_low,
+                        'high_upper': high_upper,
+                        'high_lower': high_lower,
+                        'low_upper': low_upper,
+                        'low_lower': low_lower,
+                        'actual_high_pct': (actual_high - current_close) / current_close * 100,
+                        'actual_low_pct': (current_close - actual_low) / current_close * 100,
+                        'pred_high_pct': pred_high_pct,
+                        'pred_low_pct': pred_low_pct,
+                    })
+
+                except Exception:
+                    continue
+
+            if len(predictions) < 10:
+                return None
+
+            # Calculate metrics
+            actual_high_pct = [p['actual_high_pct'] for p in predictions]
+            actual_low_pct = [p['actual_low_pct'] for p in predictions]
+            pred_high_pct = [p['pred_high_pct'] for p in predictions]
+            pred_low_pct = [p['pred_low_pct'] for p in predictions]
+
+            r2_high = r2_score(actual_high_pct, pred_high_pct)
+            r2_low = r2_score(actual_low_pct, pred_low_pct)
+            r2_avg = (r2_high + r2_low) / 2
+
+            mae_high = mean_absolute_error(actual_high_pct, pred_high_pct)
+            mae_low = mean_absolute_error(actual_low_pct, pred_low_pct)
+
+            # Containment: % of actuals within confidence bands
+            high_contained = sum(1 for p in predictions
+                                if p['high_lower'] <= p['actual_high'] <= p['high_upper'])
+            low_contained = sum(1 for p in predictions
+                               if p['low_lower'] <= p['actual_low'] <= p['low_upper'])
+
+            containment_high = high_contained / len(predictions) * 100
+            containment_low = low_contained / len(predictions) * 100
+
+            # Bias: average (predicted - actual)
+            bias_high = np.mean([p['pred_high_pct'] - p['actual_high_pct'] for p in predictions])
+            bias_low = np.mean([p['pred_low_pct'] - p['actual_low_pct'] for p in predictions])
+
+            return {
+                'name': config['name'],
+                'r2_high': r2_high,
+                'r2_low': r2_low,
+                'r2_avg': r2_avg,
+                'mae_high': mae_high,
+                'mae_low': mae_low,
+                'containment_high': containment_high,
+                'containment_low': containment_low,
+                'bias_high': bias_high,
+                'bias_low': bias_low,
+                'n_predictions': len(predictions),
+                'high_config': high_cfg,
+                'low_config': low_cfg,
+            }
+
+        except Exception as e:
+            print(f"   Error in config {config['name']}: {e}")
+            return None
+
+    # Run all configs in parallel
+    results = []
+    completed = 0
+
+    # Use joblib for parallelization
+    parallel_results = Parallel(n_jobs=n_workers, backend='loky', verbose=0)(
+        delayed(run_single_config)(config, i) for i, config in enumerate(configs)
+    )
+
+    # Collect valid results
+    for i, result in enumerate(parallel_results):
+        if result is not None:
+            results.append(result)
+
+        completed = i + 1
+        with open(progress_file, 'w') as f:
+            json.dump({'completed': completed, 'total': total_configs, 'status': 'running_configs'}, f)
+
+        if progress_callback:
+            progress_callback(completed, total_configs, 'running_configs')
+
+    # Sort by R² average (best first)
+    results.sort(key=lambda x: x['r2_avg'], reverse=True)
+
+    # Mark complete
+    with open(progress_file, 'w') as f:
+        json.dump({'completed': total_configs, 'total': total_configs, 'status': 'complete'}, f)
+
+    if progress_callback:
+        progress_callback(total_configs, total_configs, 'complete')
+
+    print(f"\n{'='*70}")
+    print(f"FIND BEST MODEL COMPLETE - {len(results)} configurations tested")
+    print(f"{'='*70}")
+    if results:
+        best = results[0]
+        print(f"BEST: {best['name']}")
+        print(f"  R² HIGH: {best['r2_high']:.4f} | R² LOW: {best['r2_low']:.4f} | R² AVG: {best['r2_avg']:.4f}")
+        print(f"  MAE HIGH: {best['mae_high']:.4f} | MAE LOW: {best['mae_low']:.4f}")
+        print(f"  Containment: HIGH {best['containment_high']:.1f}% | LOW {best['containment_low']:.1f}%")
+    print(f"{'='*70}\n")
+
+    return results
+
+
+def _train_model(config: dict, X_train: np.ndarray, y_train: np.ndarray):
+    """Train a single model based on configuration."""
+    model_type = config.get('model_type', 'ridge')
+
+    if model_type == 'ridge':
+        # Quick alpha search
+        best_alpha = 1.0
+        best_score = -np.inf
+        for alpha in [0.01, 0.1, 1.0, 10.0, 100.0]:
+            model = Ridge(alpha=alpha)
+            model.fit(X_train, y_train)
+            score = model.score(X_train, y_train)
+            if score > best_score:
+                best_score = score
+                best_alpha = alpha
+        model = Ridge(alpha=best_alpha)
+        model.fit(X_train, y_train)
+        return model
+
+    elif model_type == 'xgboost' and XGB_AVAILABLE:
+        import xgboost as xgb
+        model = xgb.XGBRegressor(
+            n_estimators=100,
+            max_depth=4,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
+            random_state=42,
+            verbosity=0,
+            n_jobs=1
+        )
+        model.fit(X_train, y_train)
+        return model
+
+    elif model_type == 'lightgbm' and LGBM_AVAILABLE:
+        import lightgbm as lgb
+        model = lgb.LGBMRegressor(
+            n_estimators=100,
+            max_depth=4,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
+            random_state=42,
+            verbosity=-1,
+            n_jobs=1,
+            force_col_wise=True
+        )
+        model.fit(X_train, y_train)
+        return model
+
+    elif model_type == 'ensemble':
+        # Train ensemble of models and average predictions
+        ensemble_models = config.get('ensemble_models', ['ridge', 'xgboost'])
+        models = []
+        for m_type in ensemble_models:
+            try:
+                sub_config = {'model_type': m_type}
+                m = _train_model(sub_config, X_train, y_train)
+                models.append(m)
+            except Exception:
+                pass
+
+        if not models:
+            # Fallback to ridge
+            model = Ridge(alpha=1.0)
+            model.fit(X_train, y_train)
+            return model
+
+        # Return a wrapper that averages predictions
+        class EnsembleModel:
+            def __init__(self, models):
+                self.models = models
+
+            def predict(self, X):
+                preds = [m.predict(X) for m in self.models]
+                return np.mean(preds, axis=0)
+
+            def score(self, X, y):
+                pred = self.predict(X)
+                return r2_score(y, pred)
+
+        return EnsembleModel(models)
+
+    else:
+        # Fallback to ridge
+        model = Ridge(alpha=1.0)
+        model.fit(X_train, y_train)
+        return model
+
+
+def _predict_model(model, config: dict, X: np.ndarray) -> float:
+    """Get prediction from model."""
+    pred = model.predict(X)
+    return float(pred[0]) if hasattr(pred, '__len__') else float(pred)
+
+
+def save_model_comparison_results(results: list, ticker: str, filepath: str = None) -> str:
+    """Save model comparison results to JSON file."""
+    import json
+    from datetime import datetime
+
+    if filepath is None:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filepath = f"model_comparison_{ticker}_{timestamp}.json"
+
+    save_data = {
+        'ticker': ticker,
+        'timestamp': datetime.now().isoformat(),
+        'n_configs_tested': len(results),
+        'results': results
+    }
+
+    with open(filepath, 'w') as f:
+        json.dump(save_data, f, indent=2, default=str)
+
+    print(f"Model comparison results saved to: {filepath}")
+    return filepath
+
+
+def load_model_comparison_results(filepath: str) -> list:
+    """Load model comparison results from JSON file."""
+    import json
+
+    with open(filepath, 'r') as f:
+        data = json.load(f)
+
+    return data.get('results', [])
+
+
+def _test_single_regime_config(args):
+    """
+    Test a single regime configuration in parallel.
+    Worker function for run_parallel_regime_config_test.
+
+    Trains models on percentage-change targets, converts predictions to dollar values,
+    then computes R² against actual high/low prices.
+    """
+    import warnings
+    warnings.filterwarnings('ignore')
+    from sklearn.linear_model import Ridge
+    from sklearn.preprocessing import StandardScaler
+    import numpy as np
+
+    # Unpack args
+    (X_full, y_high_pct, y_low_pct, close_prices, actual_highs, actual_lows,
+     ohlc_df, test_start_idx, test_end_idx, train_window, regime_config,
+     feature_names, config_idx, total_configs, progress_file) = args
+
+    config_name = regime_config['name']
+    regime_configs = regime_config['configs']
+
+    try:
+        predictions_high = []
+        predictions_low = []
+        actuals_high = []
+        actuals_low = []
+
+        for test_idx in range(test_start_idx, test_end_idx):
+            # Get training slice - exclude test_idx-1 to avoid data leakage
+            # (y[test_idx-1] contains high[test_idx] which is what we're predicting)
+            train_start = max(0, test_idx - train_window)
+            train_end = test_idx - 1
+
+            X_train = X_full[train_start:train_end]
+            y_high_train = y_high_pct[train_start:train_end]
+            y_low_train = y_low_pct[train_start:train_end]
+
+            # Remove NaN rows
+            valid_mask = ~(np.isnan(X_train).any(axis=1) | np.isnan(y_high_train) | np.isnan(y_low_train))
+            X_train = X_train[valid_mask]
+            y_high_train = y_high_train[valid_mask]
+            y_low_train = y_low_train[valid_mask]
+
+            if len(X_train) < 50:
+                continue
+
+            # Check test point validity
+            X_test = X_full[test_idx:test_idx + 1]
+            if np.isnan(X_test).any():
+                continue
+
+            # Get the close price from the PREVIOUS day (test_idx - 1) for conversion
+            # because we're predicting next day's high/low relative to previous close
+            prev_close = close_prices[test_idx - 1]
+            if np.isnan(prev_close):
+                continue
+
+            # Detect regime using training data (avoid lookahead)
+            detected_regime = detect_regime(ohlc_df.values, test_idx - 1, lookback=20)
+
+            # Get model config for this regime
+            model_config = regime_configs.get(detected_regime, {'model_type': 'ridge', 'top_n': 15})
+            top_n = model_config.get('top_n', 15)
+
+            # Feature selection - top N by correlation
+            top_n = min(top_n, X_train.shape[1])
+            corr_high = np.array([np.corrcoef(X_train[:, i], y_high_train)[0, 1]
+                                  if np.std(X_train[:, i]) > 0 else 0
+                                  for i in range(X_train.shape[1])])
+            top_idx_high = np.argsort(np.abs(corr_high))[-top_n:]
+
+            corr_low = np.array([np.corrcoef(X_train[:, i], y_low_train)[0, 1]
+                                 if np.std(X_train[:, i]) > 0 else 0
+                                 for i in range(X_train.shape[1])])
+            top_idx_low = np.argsort(np.abs(corr_low))[-top_n:]
+
+            # Scale features
+            scaler_high = StandardScaler()
+            scaler_low = StandardScaler()
+
+            X_train_high = scaler_high.fit_transform(X_train[:, top_idx_high])
+            X_train_low = scaler_low.fit_transform(X_train[:, top_idx_low])
+
+            # Train Ridge models (on percentage targets)
+            model_high = Ridge(alpha=1.0)
+            model_low = Ridge(alpha=1.0)
+
+            model_high.fit(X_train_high, y_high_train)
+            model_low.fit(X_train_low, y_low_train)
+
+            # Predict on test point (predictions are in percentage)
+            X_test_high = scaler_high.transform(X_test[:, top_idx_high])
+            X_test_low = scaler_low.transform(X_test[:, top_idx_low])
+
+            pred_high_pct = float(model_high.predict(X_test_high)[0])
+            pred_low_pct = float(model_low.predict(X_test_low)[0])
+
+            # Convert percentage predictions to dollar values
+            # HIGH: pred_high = prev_close * (1 + pred_high_pct/100)
+            # LOW: pred_low = prev_close * (1 - pred_low_pct/100)  # Note: low_pct is distance DOWN
+            pred_high_dollar = prev_close * (1 + pred_high_pct / 100)
+            pred_low_dollar = prev_close * (1 - pred_low_pct / 100)
+
+            # Get actual high/low for this test day
+            actual_high = actual_highs[test_idx]
+            actual_low = actual_lows[test_idx]
+
+            if not np.isnan(actual_high) and not np.isnan(actual_low):
+                predictions_high.append(pred_high_dollar)
+                predictions_low.append(pred_low_dollar)
+                actuals_high.append(actual_high)
+                actuals_low.append(actual_low)
+
+        if len(predictions_high) == 0:
+            return {
+                'name': config_name,
+                'r2_high': -999,
+                'r2_low': -999,
+                'r2_avg': -999,
+                'mae_high': 999,
+                'mae_low': 999,
+                'configs': regime_configs,
+                'n_predictions': 0,
+                'error': 'No valid predictions'
+            }
+
+        # Calculate metrics on dollar values
+        pred_h = np.array(predictions_high)
+        pred_l = np.array(predictions_low)
+        act_h = np.array(actuals_high)
+        act_l = np.array(actuals_low)
+
+        # R²
+        ss_res_h = ((act_h - pred_h) ** 2).sum()
+        ss_tot_h = ((act_h - act_h.mean()) ** 2).sum()
+        r2_h = 1 - (ss_res_h / ss_tot_h) if ss_tot_h > 0 else 0
+
+        ss_res_l = ((act_l - pred_l) ** 2).sum()
+        ss_tot_l = ((act_l - act_l.mean()) ** 2).sum()
+        r2_l = 1 - (ss_res_l / ss_tot_l) if ss_tot_l > 0 else 0
+
+        # MAE (in dollars)
+        mae_h = np.abs(act_h - pred_h).mean()
+        mae_l = np.abs(act_l - pred_l).mean()
+
+        # Update progress file
+        if progress_file:
+            try:
+                import json
+                import fcntl
+                with open(progress_file, 'r+') as f:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                    progress = json.load(f)
+                    progress['completed'] = progress.get('completed', 0) + 1
+                    f.seek(0)
+                    json.dump(progress, f)
+                    f.truncate()
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except:
+                pass
+
+        return {
+            'name': config_name,
+            'r2_high': r2_h,
+            'r2_low': r2_l,
+            'r2_avg': (r2_h + r2_l) / 2,
+            'mae_high': mae_h,
+            'mae_low': mae_l,
+            'configs': regime_configs,
+            'n_predictions': len(predictions_high)
+        }
+
+    except Exception as e:
+        return {
+            'name': config_name,
+            'r2_high': -999,
+            'r2_low': -999,
+            'r2_avg': -999,
+            'mae_high': 999,
+            'mae_low': 999,
+            'configs': regime_configs,
+            'n_predictions': 0,
+            'error': str(e)
+        }
+
+
+def run_parallel_regime_config_test(pred_df: pd.DataFrame,
+                                     test_days: int,
+                                     train_window: int,
+                                     regime_configs: list,
+                                     n_workers: int = 4,
+                                     progress_file: str = None) -> list:
+    """
+    Test multiple regime configurations in parallel.
+
+    Args:
+        pred_df: Full price dataframe with features
+        test_days: Number of days to test
+        train_window: Rolling training window size
+        regime_configs: List of regime config dicts, each with 'name' and 'configs' keys
+        n_workers: Number of parallel workers
+        progress_file: Optional file path for progress updates
+
+    Returns:
+        List of result dicts sorted by r2_avg (descending)
+    """
+    from joblib import Parallel, delayed
+    import tempfile
+    import json
+
+    print(f"\n{'='*60}")
+    print(f"PARALLEL REGIME CONFIG TESTING")
+    print(f"{'='*60}")
+    print(f"Configs to test: {len(regime_configs)}")
+    print(f"Test days: {test_days}")
+    print(f"Train window: {train_window}")
+    print(f"Parallel workers: {n_workers}")
+    print(f"{'='*60}\n")
+
+    # Setup progress file
+    if progress_file is None:
+        progress_file = os.path.join(tempfile.gettempdir(), 'regime_config_progress.json')
+
+    # Initialize progress
+    with open(progress_file, 'w') as f:
+        json.dump({'completed': 0, 'total': len(regime_configs), 'status': 'precomputing_features'}, f)
+
+    # Pre-compute features ONCE
+    print("Step 1/2: Pre-computing features...")
+    predictor = PriceRangePredictor(None)
+    features = predictor.create_range_features(pred_df, options_features=None)
+    targets = predictor.create_targets(pred_df)
+    feature_names = predictor.feature_names
+
+    # Prepare feature matrix
+    X_full = features[feature_names].values
+
+    # Prepare targets (percentage change format for training)
+    # HIGH target: (next_high - current_close) / current_close * 100
+    y_high_pct = targets['next_high_pct'].values if 'next_high_pct' in targets.columns else (
+        (pred_df['high'].shift(-1) - pred_df['close']) / pred_df['close'] * 100
+    ).values
+
+    # LOW target: (current_close - next_low) / current_close * 100 = POSITIVE when low is below close
+    y_low_pct = targets['next_low_pct'].values if 'next_low_pct' in targets.columns else (
+        (pred_df['close'] - pred_df['low'].shift(-1)) / pred_df['close'] * 100
+    ).values
+
+    # Actual prices for R² calculation (dollar values)
+    close_prices = pred_df['close'].values
+    actual_highs = pred_df['high'].values
+    actual_lows = pred_df['low'].values
+
+    # Get test indices
+    test_start_idx = len(pred_df) - test_days
+    test_end_idx = len(pred_df)
+
+    # OHLC data for regime detection
+    ohlc_df = pred_df[['open', 'high', 'low', 'close']].copy()
+
+    print(f"   Features computed: {len(feature_names)} features, {len(X_full)} rows")
+    print(f"   Targets: HIGH (pct up from close) and LOW (pct down from close)")
+
+    # Update progress
+    with open(progress_file, 'w') as f:
+        json.dump({'completed': 0, 'total': len(regime_configs), 'status': 'testing_configs'}, f)
+
+    print(f"Step 2/2: Testing {len(regime_configs)} configs in parallel...")
+
+    # Build args for each config
+    args_list = [
+        (X_full, y_high_pct, y_low_pct, close_prices, actual_highs, actual_lows,
+         ohlc_df, test_start_idx, test_end_idx, train_window, config,
+         feature_names, idx, len(regime_configs), progress_file)
+        for idx, config in enumerate(regime_configs)
+    ]
+
+    # Run in parallel
+    results = Parallel(n_jobs=n_workers, backend='loky', verbose=1)(
+        delayed(_test_single_regime_config)(args) for args in args_list
+    )
+
+    # Mark complete
+    with open(progress_file, 'w') as f:
+        json.dump({'completed': len(regime_configs), 'total': len(regime_configs), 'status': 'complete'}, f)
+
+    # Sort by R² avg (descending)
+    results.sort(key=lambda x: x['r2_avg'], reverse=True)
+
+    print(f"\n{'='*60}")
+    print(f"REGIME CONFIG TESTING COMPLETE")
+    print(f"{'='*60}")
+    print(f"Best config: {results[0]['name']} (R² avg: {results[0]['r2_avg']:.4f})")
+    print(f"{'='*60}\n")
+
+    return results
