@@ -1637,8 +1637,21 @@ def render_oscillator_predictor_page():
     # ========== SIDEBAR: DATA & PARAMETERS ==========
     st.sidebar.header("Settings")
 
-    # Data settings
-    ticker = st.sidebar.text_input("Ticker Symbol", value="SPY")
+    # Data settings - Ticker selector with common options
+    ticker_options = ["SPY", "^GSPC", "SPX", "^SPX", "ES=F", "QQQ", "IWM", "DIA", "GC=F", "GLD", "SI=F", "BTC-USD", "ETH-USD", "Custom..."]
+    ticker_selection = st.sidebar.selectbox(
+        "Ticker Symbol",
+        ticker_options,
+        index=0,
+        help="Select a common ticker or choose 'Custom...' to enter any symbol"
+    )
+
+    # Handle custom ticker input
+    if ticker_selection == "Custom...":
+        ticker = st.sidebar.text_input("Enter Ticker", value="SPY", key="custom_ticker")
+    else:
+        ticker = ticker_selection
+
     st.session_state['ticker'] = ticker  # Store for access in sub-functions
 
     # Starting capital
@@ -1843,6 +1856,14 @@ def render_oscillator_predictor_page():
         market_status = is_market_open(ticker)
         include_today = not market_status.get('is_open', True)  # Include today if market closed
         market_status_str = "CLOSED" if include_today else "OPEN"
+
+    # Force refresh button to clear cache for this ticker
+    refresh_col1, refresh_col2 = st.columns([1, 4])
+    with refresh_col1:
+        if st.button("🔄 Force Refresh", help="Clear cached data and fetch fresh from yfinance"):
+            load_data.clear()  # Clear the @st.cache_data for this function
+            st.success("Cache cleared! Reloading fresh data...")
+            st.rerun()
 
     with st.spinner(f"Loading {ticker} data ({interval_display})..."):
         raw_data = load_data(ticker, years, interval, include_today=include_today)
@@ -7548,6 +7569,14 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                 # Get current selection from wf_config
                 current_high = st.session_state['wf_config'].get('high_model', high_opts[0])
                 current_low = st.session_state['wf_config'].get('low_model', low_opts[0])
+
+                # IMPORTANT: If current selection came from Find Best Model and isn't in opts, add it
+                # This prevents the dropdown from silently switching to a different model
+                if current_high and current_high not in high_opts:
+                    high_opts = [current_high] + high_opts  # Add at beginning
+                if current_low and current_low not in low_opts:
+                    low_opts = [current_low] + low_opts  # Add at beginning
+
                 high_default_idx = high_opts.index(current_high) if current_high in high_opts else 0
                 low_default_idx = low_opts.index(current_low) if current_low in low_opts else 0
 
@@ -7572,9 +7601,21 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                         key="wf_low_model_select"
                     )
 
-                # Update wf_config with selections
-                st.session_state['wf_config']['high_model'] = wf_high_model
-                st.session_state['wf_config']['low_model'] = wf_low_model
+                # Update wf_config with selections - BUT only if user manually changed dropdown
+                # Don't overwrite if model was set programmatically (via Find Best Model, Run All, etc.)
+                config_source = st.session_state['wf_config'].get('source', '')
+                programmatic_sources = ['find_best_model', 'run_all_best', 'run_all_selected']
+
+                if config_source not in programmatic_sources:
+                    st.session_state['wf_config']['high_model'] = wf_high_model
+                    st.session_state['wf_config']['low_model'] = wf_low_model
+                else:
+                    # Show info that we're using a programmatic selection
+                    fbm_high = st.session_state['wf_config'].get('high_model', 'unknown')
+                    fbm_low = st.session_state['wf_config'].get('low_model', 'unknown')
+                    source_name = config_source.replace('_', ' ').title()
+                    st.info(f"📌 Using **{source_name}** selection: HIGH={fbm_high}, LOW={fbm_low}")
+                    st.caption("Clear this by selecting a different model from the dropdowns above, then refresh.")
 
                 # Display combined stats
                 if wf_high_model in MODEL_STATS and wf_low_model in MODEL_STATS:
@@ -7709,18 +7750,24 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     help="Test different model assignments per regime to optimize Regime-Adaptive mode. Use this when Regime-Adaptive is ENABLED."
                 )
             with fbm_btn_col3:
-                # Load previous results
-                model_comparison_files = sorted([f for f in os.listdir('.') if f.startswith('model_comparison_') and f.endswith('.json')], reverse=True)
-                if model_comparison_files:
-                    selected_comparison_file = st.selectbox(
-                        "Load Previous Results",
-                        options=[""] + model_comparison_files,
-                        format_func=lambda x: "Select saved results..." if x == "" else x,
-                        key="load_model_comparison"
-                    )
-                else:
-                    selected_comparison_file = ""
-                    st.caption("No saved results found")
+                run_all_btn = st.button(
+                    "🚀 RUN ALL & FIND BEST",
+                    type="primary",
+                    use_container_width=True,
+                    help="Test BOTH fixed models AND regime configs, then show a unified comparison table with the best overall model."
+                )
+
+            # Load previous results dropdown
+            model_comparison_files = sorted([f for f in os.listdir('.') if f.startswith('model_comparison_') and f.endswith('.json')], reverse=True)
+            if model_comparison_files:
+                selected_comparison_file = st.selectbox(
+                    "Load Previous Results",
+                    options=[""] + model_comparison_files,
+                    format_func=lambda x: "Select saved results..." if x == "" else x,
+                    key="load_model_comparison"
+                )
+            else:
+                selected_comparison_file = ""
 
             # Handle Find Best Model button
             if find_best_model_btn:
@@ -7930,6 +7977,308 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                         st.session_state['regime_config_results'] = regime_results[0]
                         st.success(f"Regime config testing complete! Tested {len(regime_results[0])} configurations in parallel.")
                         st.rerun()
+
+            # ==================== RUN ALL & FIND BEST ====================
+            if run_all_btn:
+                if len(pred_df) < fbm_train_window + fbm_test_days:
+                    st.error(f"Insufficient data. Need at least {fbm_train_window + fbm_test_days} days, have {len(pred_df)}.")
+                else:
+                    st.markdown("### 🚀 Running Complete Model Comparison")
+                    st.info(f"Testing ALL fixed models + ALL regime configs on {fbm_test_days} days...")
+
+                    import threading
+                    import time as time_module
+                    import tempfile
+
+                    # ===== PHASE 1: FIXED MODELS =====
+                    st.markdown("#### Phase 1/2: Testing Fixed Models...")
+                    fbm_progress_file = os.path.join(tempfile.gettempdir(), 'find_best_model_progress.json')
+                    with open(fbm_progress_file, 'w') as f:
+                        json.dump({'completed': 0, 'total': 0, 'status': 'starting'}, f)
+
+                    fixed_progress_bar = st.progress(0)
+                    fixed_progress_text = st.empty()
+                    fixed_progress_text.text("Starting fixed model tests...")
+
+                    fixed_results = [None]
+                    fixed_error = [None]
+
+                    _pred_df = pred_df.copy()
+                    _ticker = st.session_state.get('ticker', 'SPY')
+                    _test_days = fbm_test_days
+                    _train_window = fbm_train_window
+                    _ci_level = fbm_ci_level
+                    _n_workers = fbm_workers
+                    _progress_file = fbm_progress_file
+
+                    def run_fixed_models():
+                        try:
+                            from price_prediction import run_all_model_combinations
+                            fixed_results[0] = run_all_model_combinations(
+                                df=_pred_df,
+                                ticker=_ticker,
+                                test_days=_test_days,
+                                train_window=_train_window,
+                                ci_level=_ci_level,
+                                n_workers=_n_workers,
+                                progress_file=_progress_file
+                            )
+                        except Exception as e:
+                            import traceback
+                            fixed_error[0] = f"{str(e)}\n{traceback.format_exc()}"
+
+                    fixed_thread = threading.Thread(target=run_fixed_models)
+                    fixed_thread.start()
+
+                    while fixed_thread.is_alive():
+                        time_module.sleep(0.5)
+                        try:
+                            with open(fbm_progress_file, 'r') as f:
+                                progress = json.load(f)
+                            completed = progress.get('completed', 0)
+                            total = progress.get('total', 1)
+                            status = progress.get('status', 'running')
+                            if total > 0:
+                                pct = min(completed / total, 1.0)
+                                fixed_progress_bar.progress(pct)
+                                fixed_progress_text.text(f"Fixed Models: {completed}/{total} ({pct*100:.0f}%)")
+                        except:
+                            pass
+
+                    fixed_thread.join()
+                    fixed_progress_bar.progress(1.0)
+                    fixed_progress_text.text("Fixed models complete!")
+
+                    if fixed_error[0]:
+                        st.error(f"Fixed model error: {fixed_error[0]}")
+                        fixed_results[0] = []
+
+                    # ===== PHASE 2: REGIME CONFIGS =====
+                    st.markdown("#### Phase 2/2: Testing Regime Configs...")
+
+                    regimes = ['low_vol', 'range_bound', 'trending_up', 'trending_down']
+                    regime_configs_to_test = [
+                        {'name': 'REGIME: Conservative (All Top5)', 'configs': {r: {'model_type': 'ridge', 'top_n': 5} for r in regimes}},
+                        {'name': 'REGIME: Balanced (Top15)', 'configs': {r: {'model_type': 'ridge', 'top_n': 15} for r in regimes}},
+                        {'name': 'REGIME: Aggressive (Top20)', 'configs': {r: {'model_type': 'ridge', 'top_n': 20} for r in regimes}},
+                        {'name': 'REGIME: Adaptive_v1', 'configs': {
+                            'low_vol': {'model_type': 'ridge', 'top_n': 5},
+                            'range_bound': {'model_type': 'ridge', 'top_n': 15},
+                            'trending_up': {'model_type': 'ridge', 'top_n': 20},
+                            'trending_down': {'model_type': 'ridge', 'top_n': 15},
+                        }},
+                        {'name': 'REGIME: Adaptive_v2', 'configs': {
+                            'low_vol': {'model_type': 'ridge', 'top_n': 10},
+                            'range_bound': {'model_type': 'ridge', 'top_n': 15},
+                            'trending_up': {'model_type': 'ridge', 'top_n': 30},
+                            'trending_down': {'model_type': 'ridge', 'top_n': 20},
+                        }},
+                        {'name': 'REGIME: Minimal', 'configs': {
+                            'low_vol': {'model_type': 'ridge', 'top_n': 5},
+                            'range_bound': {'model_type': 'ridge', 'top_n': 10},
+                            'trending_up': {'model_type': 'ridge', 'top_n': 15},
+                            'trending_down': {'model_type': 'ridge', 'top_n': 10},
+                        }},
+                    ]
+
+                    regime_progress_file = os.path.join(tempfile.gettempdir(), 'regime_config_progress.json')
+                    regime_progress_bar = st.progress(0)
+                    regime_progress_text = st.empty()
+                    regime_progress_text.text("Starting regime config tests...")
+
+                    regime_results = [None]
+                    regime_error = [None]
+
+                    def run_regime_configs():
+                        try:
+                            from price_prediction import run_parallel_regime_config_test
+                            regime_results[0] = run_parallel_regime_config_test(
+                                pred_df=pred_df,
+                                test_days=fbm_test_days,
+                                train_window=fbm_train_window,
+                                regime_configs=regime_configs_to_test,
+                                n_workers=fbm_workers,
+                                progress_file=regime_progress_file
+                            )
+                        except Exception as e:
+                            import traceback
+                            regime_error[0] = f"{str(e)}\n{traceback.format_exc()}"
+
+                    regime_thread = threading.Thread(target=run_regime_configs)
+                    regime_thread.start()
+
+                    while regime_thread.is_alive():
+                        time_module.sleep(0.5)
+                        try:
+                            with open(regime_progress_file, 'r') as f:
+                                progress = json.load(f)
+                            completed = progress.get('completed', 0)
+                            total = progress.get('total', 1)
+                            if total > 0:
+                                pct = min(completed / total, 1.0)
+                                regime_progress_bar.progress(pct)
+                                regime_progress_text.text(f"Regime Configs: {completed}/{total} ({pct*100:.0f}%)")
+                        except:
+                            pass
+
+                    regime_thread.join()
+                    regime_progress_bar.progress(1.0)
+                    regime_progress_text.text("Regime configs complete!")
+
+                    if regime_error[0]:
+                        st.error(f"Regime config error: {regime_error[0]}")
+                        regime_results[0] = []
+
+                    # ===== COMBINE RESULTS =====
+                    all_results = []
+
+                    # Add fixed model results
+                    if fixed_results[0]:
+                        for r in fixed_results[0]:
+                            all_results.append({
+                                'Type': 'FIXED',
+                                'Name': r.get('name', 'Unknown'),
+                                'R² Avg': r.get('r2_avg', 0),
+                                'R² HIGH': r.get('r2_high', 0),
+                                'R² LOW': r.get('r2_low', 0),
+                                'MAE HIGH': r.get('mae_high', 0),
+                                'MAE LOW': r.get('mae_low', 0),
+                                'N': r.get('n_predictions', 0),
+                                'raw_result': r
+                            })
+
+                    # Add regime config results
+                    if regime_results[0]:
+                        for r in regime_results[0]:
+                            all_results.append({
+                                'Type': 'REGIME',
+                                'Name': r.get('name', 'Unknown'),
+                                'R² Avg': r.get('r2_avg', 0),
+                                'R² HIGH': r.get('r2_high', 0),
+                                'R² LOW': r.get('r2_low', 0),
+                                'MAE HIGH': r.get('mae_high', 0),
+                                'MAE LOW': r.get('mae_low', 0),
+                                'N': r.get('n_predictions', 0),
+                                'raw_result': r
+                            })
+
+                    # Sort by R² Avg
+                    all_results.sort(key=lambda x: x['R² Avg'], reverse=True)
+
+                    # Store in session state
+                    st.session_state['all_model_results'] = all_results
+                    st.session_state['model_comparison_results'] = fixed_results[0] if fixed_results[0] else []
+                    st.session_state['regime_config_results'] = regime_results[0] if regime_results[0] else []
+
+                    st.success(f"Complete! Tested {len(fixed_results[0] or [])} fixed models + {len(regime_results[0] or [])} regime configs.")
+                    st.rerun()
+
+            # ==================== DISPLAY UNIFIED RESULTS ====================
+            all_model_results = st.session_state.get('all_model_results')
+            if all_model_results:
+                st.markdown("---")
+                st.markdown("### 🏆 UNIFIED MODEL COMPARISON")
+                st.caption(f"*All {len(all_model_results)} configurations ranked by R² Average*")
+
+                # Create display dataframe
+                display_df = pd.DataFrame([{
+                    'Rank': i + 1,
+                    'Type': r['Type'],
+                    'Name': r['Name'],
+                    'R² Avg': r['R² Avg'],
+                    'R² HIGH': r['R² HIGH'],
+                    'R² LOW': r['R² LOW'],
+                    'MAE HIGH': r['MAE HIGH'],
+                    'MAE LOW': r['MAE LOW'],
+                    'N': r['N']
+                } for i, r in enumerate(all_model_results)])
+
+                # Style the table
+                def highlight_best(row):
+                    if row['Rank'] == 1:
+                        return ['background-color: #90EE90'] * len(row)
+                    elif row['Type'] == 'REGIME':
+                        return ['background-color: #E6E6FA'] * len(row)
+                    else:
+                        return [''] * len(row)
+
+                styled_df = display_df.style.apply(highlight_best, axis=1).format({
+                    'R² Avg': '{:.4f}',
+                    'R² HIGH': '{:.4f}',
+                    'R² LOW': '{:.4f}',
+                    'MAE HIGH': '${:.2f}',
+                    'MAE LOW': '${:.2f}',
+                    'N': '{:.0f}'
+                })
+
+                st.dataframe(styled_df, use_container_width=True, height=400)
+
+                # Show the winner
+                winner = all_model_results[0]
+                st.markdown("---")
+                st.markdown(f"## 🥇 BEST OVERALL: **{winner['Name']}** ({winner['Type']})")
+
+                winner_cols = st.columns(4)
+                with winner_cols[0]:
+                    st.metric("R² Average", f"{winner['R² Avg']:.4f}")
+                with winner_cols[1]:
+                    st.metric("R² HIGH", f"{winner['R² HIGH']:.4f}")
+                with winner_cols[2]:
+                    st.metric("R² LOW", f"{winner['R² LOW']:.4f}")
+                with winner_cols[3]:
+                    st.metric("MAE Avg", f"${(winner['MAE HIGH'] + winner['MAE LOW'])/2:.2f}")
+
+                # Quick apply button for winner
+                if st.button(f"✅ USE BEST MODEL: {winner['Name']}", type="primary", use_container_width=True, key="apply_best_overall"):
+                    if winner['Type'] == 'FIXED':
+                        st.session_state['wf_config']['mode'] = 'fixed'
+                        st.session_state['wf_config']['high_model'] = winner['Name']
+                        st.session_state['wf_config']['low_model'] = winner['Name']
+                        st.session_state['wf_config']['source'] = 'run_all_best'
+                    else:
+                        st.session_state['wf_config']['mode'] = 'regime_adaptive'
+                        st.session_state['wf_config']['regime_strategy'] = winner['Name'].replace('REGIME: ', '')
+                        st.session_state['wf_config']['source'] = 'run_all_best'
+
+                    st.success(f"✅ Applied best model: **{winner['Name']}**")
+                    st.rerun()
+
+                # Option to select different model
+                st.markdown("---")
+                st.markdown("##### Or select a different model:")
+                select_col1, select_col2 = st.columns([3, 1])
+                with select_col1:
+                    selected_idx = st.selectbox(
+                        "Choose model to apply",
+                        options=range(len(all_model_results)),
+                        format_func=lambda i: f"#{i+1} {all_model_results[i]['Type']}: {all_model_results[i]['Name']} (R²={all_model_results[i]['R² Avg']:.4f})",
+                        key="select_from_all_results"
+                    )
+                with select_col2:
+                    if st.button("Apply Selected", type="secondary", use_container_width=True, key="apply_selected_from_all"):
+                        selected = all_model_results[selected_idx]
+                        if selected['Type'] == 'FIXED':
+                            st.session_state['wf_config']['mode'] = 'fixed'
+                            st.session_state['wf_config']['high_model'] = selected['Name']
+                            st.session_state['wf_config']['low_model'] = selected['Name']
+                            st.session_state['wf_config']['source'] = 'run_all_selected'
+                        else:
+                            st.session_state['wf_config']['mode'] = 'regime_adaptive'
+                            st.session_state['wf_config']['regime_strategy'] = selected['Name'].replace('REGIME: ', '')
+                            st.session_state['wf_config']['source'] = 'run_all_selected'
+
+                        st.success(f"✅ Applied: **{selected['Name']}**")
+                        st.rerun()
+
+                # Clear results button
+                if st.button("🗑️ Clear All Results", key="clear_all_model_results"):
+                    if 'all_model_results' in st.session_state:
+                        del st.session_state['all_model_results']
+                    if 'model_comparison_results' in st.session_state:
+                        del st.session_state['model_comparison_results']
+                    if 'regime_config_results' in st.session_state:
+                        del st.session_state['regime_config_results']
+                    st.rerun()
 
             # Display regime config results if available
             regime_config_results = st.session_state.get('regime_config_results')

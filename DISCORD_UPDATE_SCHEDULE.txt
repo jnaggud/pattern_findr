@@ -1,0 +1,57 @@
+================================================================================
+                        DISCORD UPDATE SCHEDULE
+================================================================================
+
+STOCK TICKERS (SPY, QQQ, IWM, ES=F, etc.)
+--------------------------------------------------------------------------------
+All times in Eastern Time (ET). For Central Time (CST), subtract 1 hour.
+
+Time (ET)       Time (CST)      Update Name
+--------------------------------------------------------------------------------
+08:30-08:45     07:30-07:45     Market Open Update
+09:00-09:14     08:00-08:14     9:00 ET Market Update
+10:00-10:14     09:00-09:14     10:00 ET Market Update
+11:00-11:15     10:00-10:15     Mid-Day Update
+12:00-12:14     11:00-11:14     12:00 ET Market Update
+13:00-13:14     12:00-12:14     13:00 ET Market Update
+14:00-14:14     13:00-13:14     14:00 ET Market Update
+15:00-15:15     14:00-14:15     Afternoon Update
+16:00-16:15     15:00-15:15     Market Close Update      <-- AT ACTUAL CLOSE
+16:30-17:00     15:30-16:00     End of Day Summary       <-- FINAL SUMMARY
+
+
+CRYPTO TICKERS (BTC-USD, ETH-USD, etc.)
+--------------------------------------------------------------------------------
+Crypto uses 6-hourly updates (24/7 markets)
+
+Time (Local)    Update Name
+--------------------------------------------------------------------------------
+00:00-00:45     Midnight Update
+06:00-06:45     Morning Update
+12:00-12:45     Midday Update
+18:00-18:45     Evening Update
+
+
+SIGNAL ALERTS
+--------------------------------------------------------------------------------
+Trade signals are sent IMMEDIATELY when detected:
+  - Entry signals: BUY/LONG alerts
+  - Exit signals: SELL/Close position alerts
+  - Missed signals: Catch-up alerts on restart
+
+
+ACTIVE INSTANCES
+--------------------------------------------------------------------------------
+Channel         Ticker      Timeframe   Strategy
+--------------------------------------------------------------------------------
+spy-5yr         SPY         5 Year      any_reversal
+spy-2yr         SPY         2 Year      any_reversal
+spy-1yr         SPY         1 Year      any_reversal
+btc-5yr         BTC-USD     5 Year      any_reversal
+btc-2yr         BTC-USD     2 Year      any_reversal
+btc-1yr         BTC-USD     1 Year      any_reversal
+
+
+================================================================================
+Last updated: 2026-01-15
+================================================================================

@@ -1354,9 +1354,13 @@ class PriceRangePredictor:
                 ], axis=1).max(axis=1)
                 features[f'atr_{period}'] = tr.rolling(period).mean()
 
-        # ATR as percentage of close
+        # ATR as percentage of close (NORMALIZED - critical for cross-asset compatibility)
+        # These percentage-based features ensure models work across different price scales
+        # (e.g., SPY ~$690 vs ES=F ~$6000 vs BTC ~$100,000)
+        features['atr_7_pct'] = features['atr_7'] / df['close'] * 100
         features['atr_14_pct'] = features['atr_14'] / df['close'] * 100
-        features['atr_ratio_7_21'] = features['atr_7'] / features['atr_21']
+        features['atr_21_pct'] = features['atr_21'] / df['close'] * 100
+        features['atr_ratio_7_21'] = features['atr_7'] / features['atr_21']  # Already dimensionless
 
         # --- Historical range percentiles ---
         features['range_percentile_5d'] = features['daily_range'].rolling(5).apply(
@@ -1489,10 +1493,10 @@ class PriceRangePredictor:
             features['atr_pct_over_rsi'] = features['atr_14_pct'] / rsi_safe
 
             # === EXPANDED RSI-NORMALIZED FEATURES ===
-            # ATR variants normalized by RSI
-            features['atr_7_over_rsi'] = features['atr_7'] / rsi_safe
-            features['atr_14_over_rsi'] = features['atr_14'] / rsi_safe
-            features['atr_21_over_rsi'] = features['atr_21'] / rsi_safe
+            # ATR variants normalized by RSI (using percentage ATR for scale-independence)
+            features['atr_7_over_rsi'] = features['atr_7_pct'] / rsi_safe
+            features['atr_14_over_rsi'] = features['atr_14_pct'] / rsi_safe
+            features['atr_21_over_rsi'] = features['atr_21_pct'] / rsi_safe
 
             # Volatility metrics normalized by RSI
             features['vol_5d_over_rsi'] = features['volatility_5d'] / rsi_safe * 100
@@ -1586,11 +1590,11 @@ class PriceRangePredictor:
         # 8. daily_range + upside_potential → 0.678 correlation
         features['daily_range_plus_upside'] = features['daily_range'] + features['upside_potential']
 
-        # 9. upside_potential * atr_7 → 0.673 correlation
-        features['upside_times_atr7'] = features['upside_potential'] * features['atr_7']
+        # 9. upside_potential * atr_7 → 0.673 correlation (using % ATR for scale-independence)
+        features['upside_times_atr7'] = features['upside_potential'] * features['atr_7_pct']
 
-        # 10. upside_potential * atr_14 → 0.668 correlation
-        features['upside_times_atr14'] = features['upside_potential'] * features['atr_14']
+        # 10. upside_potential * atr_14 → 0.668 correlation (using % ATR for scale-independence)
+        features['upside_times_atr14'] = features['upside_potential'] * features['atr_14_pct']
 
         # Additional high-correlation interactions discovered
         features['upside_plus_range_mean20'] = features['upside_potential'] + features['range_mean_20d']
@@ -1610,24 +1614,24 @@ class PriceRangePredictor:
             # Downtrend-specific volume (volume matters more in downtrends)
             features['downtrend_volume'] = features['is_downtrend'] * features['volume_rel']
 
-            # Downtrend ATR (ATR more predictive in downtrends)
-            features['downtrend_atr'] = features['is_downtrend'] * features['atr_7']
-            features['downtrend_atr_14'] = features['is_downtrend'] * features['atr_14']
+            # Downtrend ATR (ATR more predictive in downtrends) - using % ATR for scale-independence
+            features['downtrend_atr'] = features['is_downtrend'] * features['atr_7_pct']
+            features['downtrend_atr_14'] = features['is_downtrend'] * features['atr_14_pct']
 
             # Downtrend momentum (ROC stronger signal in downtrends)
             features['downtrend_roc_5'] = features['is_downtrend'] * abs(df['close'].pct_change(5) * 100)
             features['downtrend_roc_10'] = features['is_downtrend'] * abs(df['close'].pct_change(10) * 100)
 
-            # Uptrend-specific features (for symmetric treatment)
+            # Uptrend-specific features (for symmetric treatment) - using % ATR for scale-independence
             features['uptrend_volume'] = features['is_uptrend'] * features['volume_rel']
-            features['uptrend_atr'] = features['is_uptrend'] * features['atr_14']
+            features['uptrend_atr'] = features['is_uptrend'] * features['atr_14_pct']
             features['uptrend_momentum'] = features['is_uptrend'] * abs(df['close'].pct_change(5) * 100)
 
             # Range lagged interactions (yesterday's range predicts today's)
             features['range_lag_x_mean'] = features.get('range_lag_1', features['daily_range'].shift(1)) * features['range_mean_5d']
 
-            # ATR lagged interaction
-            features['atr_lag_x_current'] = features.get('atr_14_lag_1', features['atr_14'].shift(1)) * features['atr_14']
+            # ATR lagged interaction (using % ATR for scale-independence)
+            features['atr_lag_x_current'] = features.get('atr_14_pct_lag_1', features['atr_14_pct'].shift(1)) * features['atr_14_pct']
 
         # --- Momentum features ---
         features['roc_5'] = df['close'].pct_change(5) * 100
@@ -2872,7 +2876,7 @@ class PriceRangePredictor:
         if FEATURE_CONFIG.get('lag_features', False):
             for lag in [1, 2, 3]:
                 features[f'range_lag_{lag}'] = features['daily_range'].shift(lag)
-                features[f'atr_14_lag_{lag}'] = features['atr_14'].shift(lag)
+                features[f'atr_14_pct_lag_{lag}'] = features['atr_14_pct'].shift(lag)  # Use % ATR for scale-independence
 
             # VIX lagged features (if available)
             if 'vix' in features.columns and features['vix'].notna().any():
@@ -3066,9 +3070,18 @@ class PriceRangePredictor:
                 print(f"   Pruned {pruned_count} zero-importance features")
                 _training_summary.data['features_pruned_zero_imp'] = pruned_count
 
-        # Store feature names (excluding target-related columns)
-        self.feature_names = [col for col in features.columns
-                             if col not in ['close', 'daily_range', 'daily_range_pct']]
+        # Store feature names (excluding target-related columns and absolute-scale features)
+        # Exclude raw ATR values (atr_7, atr_14, atr_21) to ensure scale-independence across tickers
+        # Exclude absolute volume features (volume_velocity, volume_accel) - use volume_rel instead
+        # Exclude absolute options strike prices - use distance features instead
+        # Only percentage/ratio versions should be used for cross-ticker compatibility
+        excluded_cols = [
+            'close', 'daily_range', 'daily_range_pct',  # Target-related
+            'atr_7', 'atr_14', 'atr_21',  # Use atr_X_pct instead
+            'volume_velocity', 'volume_velocity_5d', 'volume_accel', 'volume_accel_5d',  # Absolute volume
+            'max_pain', 'high_call_strike', 'high_put_strike',  # Use distance features instead
+        ]
+        self.feature_names = [col for col in features.columns if col not in excluded_cols]
 
         print(f"   Total features created: {len(self.feature_names)}")
 
@@ -6295,12 +6308,19 @@ def run_all_model_combinations(
             pred_high_pct = [p['pred_high_pct'] for p in predictions]
             pred_low_pct = [p['pred_low_pct'] for p in predictions]
 
+            # R² on percentage changes
             r2_high = r2_score(actual_high_pct, pred_high_pct)
             r2_low = r2_score(actual_low_pct, pred_low_pct)
             r2_avg = (r2_high + r2_low) / 2
 
-            mae_high = mean_absolute_error(actual_high_pct, pred_high_pct)
-            mae_low = mean_absolute_error(actual_low_pct, pred_low_pct)
+            # MAE on DOLLAR values (for consistent display with REGIME models)
+            actual_high_dollars = [p['actual_high'] for p in predictions]
+            actual_low_dollars = [p['actual_low'] for p in predictions]
+            pred_high_dollars = [p['pred_high'] for p in predictions]
+            pred_low_dollars = [p['pred_low'] for p in predictions]
+
+            mae_high = mean_absolute_error(actual_high_dollars, pred_high_dollars)
+            mae_low = mean_absolute_error(actual_low_dollars, pred_low_dollars)
 
             # Containment: % of actuals within confidence bands
             high_contained = sum(1 for p in predictions
@@ -6622,10 +6642,27 @@ def _test_single_regime_config(args):
             actual_low = actual_lows[test_idx]
 
             if not np.isnan(actual_high) and not np.isnan(actual_low):
-                predictions_high.append(pred_high_dollar)
-                predictions_low.append(pred_low_dollar)
-                actuals_high.append(actual_high)
-                actuals_low.append(actual_low)
+                # Store both percentage and dollar values for metrics
+                # Actual percentages (same basis as predictions)
+                actual_high_pct = (actual_high - prev_close) / prev_close * 100
+                actual_low_pct = (prev_close - actual_low) / prev_close * 100
+
+                predictions_high.append({
+                    'pct': pred_high_pct,
+                    'dollar': pred_high_dollar
+                })
+                predictions_low.append({
+                    'pct': pred_low_pct,
+                    'dollar': pred_low_dollar
+                })
+                actuals_high.append({
+                    'pct': actual_high_pct,
+                    'dollar': actual_high
+                })
+                actuals_low.append({
+                    'pct': actual_low_pct,
+                    'dollar': actual_low
+                })
 
         if len(predictions_high) == 0:
             return {
@@ -6640,24 +6677,26 @@ def _test_single_regime_config(args):
                 'error': 'No valid predictions'
             }
 
-        # Calculate metrics on dollar values
-        pred_h = np.array(predictions_high)
-        pred_l = np.array(predictions_low)
-        act_h = np.array(actuals_high)
-        act_l = np.array(actuals_low)
+        # Extract percentage and dollar values
+        pred_h_pct = np.array([p['pct'] for p in predictions_high])
+        pred_l_pct = np.array([p['pct'] for p in predictions_low])
+        act_h_pct = np.array([a['pct'] for a in actuals_high])
+        act_l_pct = np.array([a['pct'] for a in actuals_low])
 
-        # R²
-        ss_res_h = ((act_h - pred_h) ** 2).sum()
-        ss_tot_h = ((act_h - act_h.mean()) ** 2).sum()
-        r2_h = 1 - (ss_res_h / ss_tot_h) if ss_tot_h > 0 else 0
+        pred_h_dollar = np.array([p['dollar'] for p in predictions_high])
+        pred_l_dollar = np.array([p['dollar'] for p in predictions_low])
+        act_h_dollar = np.array([a['dollar'] for a in actuals_high])
+        act_l_dollar = np.array([a['dollar'] for a in actuals_low])
 
-        ss_res_l = ((act_l - pred_l) ** 2).sum()
-        ss_tot_l = ((act_l - act_l.mean()) ** 2).sum()
-        r2_l = 1 - (ss_res_l / ss_tot_l) if ss_tot_l > 0 else 0
+        # R² on PERCENTAGE values (same as FIXED model calculation)
+        # This makes the metrics comparable across model types
+        from sklearn.metrics import r2_score
+        r2_h = r2_score(act_h_pct, pred_h_pct) if len(act_h_pct) > 1 else 0
+        r2_l = r2_score(act_l_pct, pred_l_pct) if len(act_l_pct) > 1 else 0
 
-        # MAE (in dollars)
-        mae_h = np.abs(act_h - pred_h).mean()
-        mae_l = np.abs(act_l - pred_l).mean()
+        # MAE on DOLLAR values (practical interpretation)
+        mae_h = np.abs(act_h_dollar - pred_h_dollar).mean()
+        mae_l = np.abs(act_l_dollar - pred_l_dollar).mean()
 
         # Update progress file
         if progress_file:

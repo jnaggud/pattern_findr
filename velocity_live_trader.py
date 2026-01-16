@@ -316,6 +316,97 @@ def load_config(config_path: str = "production_env/velocity_config.json") -> dic
         return json.load(f)
 
 
+def is_last_bar_incomplete(df: pd.DataFrame, interval: str, ticker: str) -> bool:
+    """
+    Check if the last bar in the DataFrame is incomplete (still forming).
+
+    For daily intervals:
+    - Stocks: Bar is incomplete if it's today AND market hasn't closed (before 4:30 PM ET with buffer)
+    - Crypto: Bar is incomplete if it's today (in UTC) since daily bars close at midnight UTC
+
+    This prevents false signals from being detected on startup when the current
+    day's bar is still forming.
+
+    Edge cases handled:
+    - Restart during market hours → exclude today's incomplete bar
+    - Restart after market close same day → include today's completed bar
+    - Restart before market open → include yesterday's completed bar
+    - Restart on weekend/holiday → include last trading day's completed bar
+    - Crypto restart any time during day → exclude today's incomplete bar
+    - Crypto restart after midnight UTC (with 30-min buffer) → include yesterday's bar
+
+    Returns True if the last bar should be excluded from backtest sync.
+    """
+    # Only apply to daily intervals
+    if interval != "1d" or df.empty:
+        return False
+
+    # Determine if this is a crypto ticker
+    is_crypto = '-USD' in ticker.upper() or ticker.upper() in ['BTC', 'ETH', 'BTCUSD', 'ETHUSD']
+
+    # Get the last bar's timestamp
+    last_bar_time = df.index[-1]
+
+    # Convert to date, handling both timezone-aware and naive timestamps
+    if hasattr(last_bar_time, 'date') and callable(last_bar_time.date):
+        last_bar_date = last_bar_time.date()
+    else:
+        last_bar_date = pd.to_datetime(last_bar_time).date()
+
+    if is_crypto:
+        # Crypto: Daily bars close at 00:00 UTC
+        # Bar is incomplete if its date is today (UTC) or later
+        from datetime import timezone
+        utc_now = datetime.now(timezone.utc)
+        today_utc = utc_now.date()
+
+        if last_bar_date > today_utc:
+            # Future date (shouldn't happen but be safe)
+            return True
+        elif last_bar_date == today_utc:
+            # Today's bar in UTC - still forming
+            return True
+        elif last_bar_date == today_utc - timedelta(days=1):
+            # Yesterday's bar - check if we're within 30-min buffer after midnight
+            # During this buffer, data might not be fully finalized
+            if utc_now.hour == 0 and utc_now.minute < 30:
+                # Within buffer but bar IS complete, include it
+                # (Being conservative here - if data shows yesterday, it's finalized)
+                return False
+            return False
+        else:
+            # Older bar, definitely complete
+            return False
+    else:
+        # Stocks: Daily bars close at 4:00 PM ET
+        # Use get_market_time() to get current Eastern Time
+        market_time = get_market_time()
+        today_et = market_time.date()
+
+        if last_bar_date > today_et:
+            # Future date (shouldn't happen but be safe)
+            return True
+        elif last_bar_date == today_et:
+            # It's today's bar - check if market has closed
+            # Market closes at 4 PM ET, add 30 min buffer for data finalization
+            market_close_hour = 16
+            buffer_minutes = 30
+
+            if market_time.hour < market_close_hour:
+                # Market still open, bar incomplete
+                return True
+            elif market_time.hour == market_close_hour and market_time.minute < buffer_minutes:
+                # Within buffer period after close, be conservative
+                return True
+            else:
+                # Market closed and buffer passed, bar is complete
+                return False
+        else:
+            # Past date (could be yesterday, Friday if weekend, etc.)
+            # Bar is complete
+            return False
+
+
 def fetch_price_data(ticker: str, api_key: str = None, days: int = 200, interval: str = "1d",
                      use_cache: bool = True) -> pd.DataFrame:
     """
@@ -2156,19 +2247,33 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
     print(f"\n🔄 Fetching FRESH data for state sync check...")
     fresh_backtest = None
     fresh_df = pd.DataFrame()  # Initialize empty to prevent NameError
+    excluded_incomplete_bar = False  # Track if we excluded a bar
     try:
         import time
         time.sleep(1)  # Small delay to avoid rate limiting
         fresh_df = fetch_price_data(ticker, api_key, days=200, interval=interval)
         if not fresh_df.empty:
-            fresh_df = calculate_composite_oscillator(fresh_df, config)
-            fresh_backtest = run_historical_backtest(fresh_df, config)
+            # CRITICAL: Exclude incomplete current bar to prevent false signals on startup
+            # For daily intervals, if the market hasn't closed, today's bar is still forming
+            # and shouldn't be used for position sync (matches behavior of normal signal detection)
+            if is_last_bar_incomplete(fresh_df, interval, ticker):
+                excluded_bar_date = fresh_df.index[-1].strftime('%Y-%m-%d')
+                fresh_df = fresh_df.iloc[:-1]
+                excluded_incomplete_bar = True
+                print(f"   ⏳ Excluded incomplete bar ({excluded_bar_date}) - market still open")
+
+            if fresh_df.empty:
+                print(f"   ⚠️ No completed bars available after excluding incomplete bar")
+                fresh_backtest = None
+            else:
+                fresh_df = calculate_composite_oscillator(fresh_df, config)
+                fresh_backtest = run_historical_backtest(fresh_df, config)
 
             # Show fresh data position vs bundled data position
-            fresh_pos = fresh_backtest.get('current_position')
+            fresh_pos = fresh_backtest.get('current_position') if fresh_backtest else None
             bundled_pos = backtest.get('current_position') if backtest else None
 
-            print(f"   Fresh data range: {fresh_df.index[0].strftime('%Y-%m-%d')} to {fresh_df.index[-1].strftime('%Y-%m-%d')}")
+            print(f"   Fresh data range: {fresh_df.index[0].strftime('%Y-%m-%d')} to {fresh_df.index[-1].strftime('%Y-%m-%d')}" if not fresh_df.empty else "   Fresh data: empty after exclusion")
 
             # Show ACTUAL current position status (from fresh data)
             if fresh_pos:
@@ -2782,8 +2887,17 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                                      realtime_price=realtime_price)
                     daily_alerts.add(key)
 
-            # Market Close Update (15:00-15:15 PM ET for stocks)
+            # Afternoon Update (15:00-15:15 PM ET for stocks - 1 hour before close)
             if "15:00" <= hm <= "15:15" and not is_crypto:
+                key = f"{day_str}_AFTERNOON"
+                if key not in daily_alerts and status_backtest:
+                    send_status_update(webhook_url, df, status_backtest, config, ticker,
+                                     "🌅 Afternoon Update", trade_state, strategy_name=strategy_name,
+                                     realtime_price=realtime_price)
+                    daily_alerts.add(key)
+
+            # Market Close Update (16:00-16:15 ET for stocks - actual market close time)
+            if "16:00" <= hm <= "16:15" and not is_crypto:
                 key = f"{day_str}_CLOSE"
                 if key not in daily_alerts and status_backtest:
                     send_status_update(webhook_url, df, status_backtest, config, ticker,
@@ -2791,16 +2905,33 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                                      realtime_price=realtime_price)
                     daily_alerts.add(key)
 
-            # Hourly Updates (9:00 - 16:00 ET for stocks, except 11 and 15 which have special alerts)
+            # Hourly Updates (9:00 - 14:00 ET for stocks, except 11 which has special alert)
             # Window is first 15 minutes of each hour to ensure it gets hit
-            if 9 <= hour <= 16 and minute < 15 and not is_crypto:
-                if hour not in [11, 15]:
+            # Excludes 15 (afternoon) and 16 (close) which have dedicated updates
+            if 9 <= hour <= 14 and minute < 15 and not is_crypto:
+                if hour != 11:
                     key = f"{day_str}_HOUR_{hour}"
                     if key not in daily_alerts and status_backtest:
                         send_status_update(webhook_url, df, status_backtest, config, ticker,
                                          f"⏱️ {hour}:00 ET Market Update", trade_state, strategy_name=strategy_name,
                                          realtime_price=realtime_price)
                         daily_alerts.add(key)
+
+            # END OF DAY Update (16:30-17:00 ET for stocks - after market close + data finalization)
+            # This is the ACTUAL end of day summary, sent after market closes and data settles
+            if "16:30" <= hm <= "17:00" and not is_crypto:
+                key = f"{day_str}_EOD"
+                print(f"   📊 EOD window detected! Time={hm}, Key={key}, already_sent={key in daily_alerts}, has_backtest={status_backtest is not None}")
+                if key not in daily_alerts and status_backtest:
+                    send_status_update(webhook_url, df, status_backtest, config, ticker,
+                                     "📊 End of Day Summary", trade_state, strategy_name=strategy_name,
+                                     realtime_price=realtime_price)
+                    daily_alerts.add(key)
+                    print(f"   ✅ End of Day summary sent!")
+                elif key in daily_alerts:
+                    print(f"   ⏭️ EOD update already sent for {day_str}")
+                elif not status_backtest:
+                    print(f"   ⚠️ EOD update skipped - no backtest data")
 
             # Midnight Update (for both crypto and stocks - crypto uses local time, stocks use ET)
             if hour == 0 and minute < 5:
