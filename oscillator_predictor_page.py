@@ -2698,11 +2698,15 @@ def render_oscillator_predictor_page():
             # Suppress Optuna logs
             optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-            # Prepare test data once
-            test_df_grid = df.loc[X_test.index].copy()
-            osc_col = 'composite_smooth' if 'composite_smooth' in test_df_grid.columns else 'composite_oscillator'
-            close_prices = test_df_grid['close'].values
-            osc_values = test_df_grid[osc_col].values
+            # Prepare TRAINING data for optimization (NOT test data!)
+            # This prevents overfitting - we optimize on train, evaluate on test
+            train_indices = df.index.difference(X_test.index)
+            train_df_grid = df.loc[train_indices].copy()
+            osc_col = 'composite_smooth' if 'composite_smooth' in train_df_grid.columns else 'composite_oscillator'
+            close_prices = train_df_grid['close'].values
+            osc_values = train_df_grid[osc_col].values
+
+            st.info(f"🎯 Optimizing on TRAINING data ({len(train_df_grid)} bars) to prevent overfitting")
 
             # Pre-calculate ALL oscillator types for optimization search
             all_oscillators = {'composite_smooth': osc_values}
@@ -2710,14 +2714,14 @@ def render_oscillator_predictor_page():
             if NOVEL_INDICATORS_AVAILABLE:
                 st.info("🔬 Pre-calculating novel oscillators for optimization search...")
                 try:
-                    all_oscillators['arwo'] = calculate_arwo(test_df_grid).values
-                    all_oscillators['dco'] = calculate_dco(test_df_grid).values
-                    all_oscillators['vcmo'] = calculate_vcmo(test_df_grid).values
-                    all_oscillators['ics'] = calculate_ics(test_df_grid).values
-                    all_oscillators['mji'] = calculate_mji(test_df_grid).values
-                    all_oscillators['prf'] = calculate_prf(test_df_grid).values
-                    all_oscillators['ewaf'] = calculate_ewaf(test_df_grid).values
-                    kfif_val, _, _ = calculate_kfif(test_df_grid)
+                    all_oscillators['arwo'] = calculate_arwo(train_df_grid).values
+                    all_oscillators['dco'] = calculate_dco(train_df_grid).values
+                    all_oscillators['vcmo'] = calculate_vcmo(train_df_grid).values
+                    all_oscillators['ics'] = calculate_ics(train_df_grid).values
+                    all_oscillators['mji'] = calculate_mji(train_df_grid).values
+                    all_oscillators['prf'] = calculate_prf(train_df_grid).values
+                    all_oscillators['ewaf'] = calculate_ewaf(train_df_grid).values
+                    kfif_val, _, _ = calculate_kfif(train_df_grid)
                     all_oscillators['kfif'] = kfif_val.values
                     st.success(f"✅ Pre-calculated {len(all_oscillators)} oscillator types for search")
                 except Exception as e:
@@ -2777,15 +2781,15 @@ def render_oscillator_predictor_page():
                 trials_per_worker = grid_iterations // n_workers
 
                 # Console output
-                opt_start_date = test_df_grid.index[0].strftime('%Y-%m-%d')
-                opt_end_date = test_df_grid.index[-1].strftime('%Y-%m-%d')
-                opt_period_days = (test_df_grid.index[-1] - test_df_grid.index[0]).days
+                opt_start_date = train_df_grid.index[0].strftime('%Y-%m-%d')
+                opt_end_date = train_df_grid.index[-1].strftime('%Y-%m-%d')
+                opt_period_days = (train_df_grid.index[-1] - train_df_grid.index[0]).days
                 print(f"\n{'='*60}", flush=True)
                 print(f"🚀 VELOCITY OPTIMIZATION STARTING", flush=True)
                 print(f"   Total trials: {grid_iterations:,} ({trials_per_worker:,} per worker)", flush=True)
                 print(f"   Parallel workers: {n_workers}", flush=True)
                 print(f"   Optimizing for: {optimize_metric}", flush=True)
-                print(f"   Date range: {opt_start_date} to {opt_end_date} ({opt_period_days} days, {len(test_df_grid)} bars)", flush=True)
+                print(f"   Date range: {opt_start_date} to {opt_end_date} ({opt_period_days} days, {len(train_df_grid)} bars)", flush=True)
                 print(f"{'='*60}", flush=True)
 
                 # Run parallel studies using joblib with loky backend (uses spawn)
@@ -2821,10 +2825,10 @@ def render_oscillator_predictor_page():
                 print(f"✅ OPTIMIZATION COMPLETE", flush=True)
                 print(f"   Total results: {len(all_results):,}", flush=True)
                 # Show date period for the optimization
-                start_date = test_df_grid.index[0].strftime('%Y-%m-%d')
-                end_date = test_df_grid.index[-1].strftime('%Y-%m-%d')
-                period_days = (test_df_grid.index[-1] - test_df_grid.index[0]).days
-                print(f"   Date range: {start_date} to {end_date} ({period_days} days, {len(test_df_grid)} bars)", flush=True)
+                start_date = train_df_grid.index[0].strftime('%Y-%m-%d')
+                end_date = train_df_grid.index[-1].strftime('%Y-%m-%d')
+                period_days = (train_df_grid.index[-1] - train_df_grid.index[0]).days
+                print(f"   Date range: {start_date} to {end_date} ({period_days} days, {len(train_df_grid)} bars)", flush=True)
                 # Show timing info
                 print(f"   Duration: {optimization_duration:.1f}s ({trials_per_min:.0f} trials/min)", flush=True)
                 if all_results:
