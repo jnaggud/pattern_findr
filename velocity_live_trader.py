@@ -3968,6 +3968,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     pnl_dollars = current_price - entry_price  # LONG: profit when price goes up
 
                     exit_msg = (
+                        f"@here\n"
                         f"📤 **[{strategy_label}] LONG EXIT** {pnl_emoji}\n"
                         f"**Reason:** {exit_reason}\n"
                         f"---\n"
@@ -4224,6 +4225,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     entry_tp_price = current_price * (1 + take_profit_pct / 100)
 
                     buy_msg = (
+                        f"@here\n"
                         f"📈 **[{strategy_label}] BUY SIGNAL**{signal_note}\n"
                         f"**Signal Time:** {signal_time}\n"
                         f"**Entry Price:** ${current_price:,.2f}\n"
