@@ -2250,8 +2250,67 @@ def append_to_locked_backtest(entry: dict = None, exit_trade: dict = None,
         json.dump(locked, f, indent=2, default=str)
 
 
+def count_potential_missed_signals(locked_backtest: dict, fresh_backtest: dict) -> int:
+    """Count signals that may have occurred while bot was down (READ-ONLY).
+
+    This function ONLY counts potential missed signals for informational purposes.
+    It does NOT modify any data files (anti-repainting policy).
+
+    Args:
+        locked_backtest: The locked backtest dict (source of truth)
+        fresh_backtest: Dict with 'entries' and 'exits' from fresh backtest
+
+    Returns: Approximate count of signals that may have been missed
+    """
+    if not locked_backtest or not fresh_backtest:
+        return 0
+
+    # Find the last signal date in locked backtest
+    last_locked_date = None
+    for entry in locked_backtest.get('entries', []):
+        entry_date = normalize_tz(pd.to_datetime(entry['date'])) if entry.get('date') else None
+        if entry_date and (last_locked_date is None or entry_date > last_locked_date):
+            last_locked_date = entry_date
+    for exit_t in locked_backtest.get('exits', []):
+        exit_date = normalize_tz(pd.to_datetime(exit_t['date'])) if exit_t.get('date') else None
+        if exit_date and (last_locked_date is None or exit_date > last_locked_date):
+            last_locked_date = exit_date
+
+    if last_locked_date is None:
+        return 0
+
+    # Get existing timestamps from locked backtest
+    existing_timestamps = set()
+    for entry in locked_backtest.get('entries', []):
+        if entry.get('date'):
+            existing_timestamps.add(str(entry['date'])[:19])
+    for exit_t in locked_backtest.get('exits', []):
+        if exit_t.get('date'):
+            existing_timestamps.add(str(exit_t['date'])[:19])
+
+    # Count signals in fresh backtest that are AFTER last_locked_date and NOT in existing
+    count = 0
+    for entry in fresh_backtest.get('entries', []):
+        entry_date = normalize_tz(pd.to_datetime(entry['date'])) if entry.get('date') else None
+        if entry_date and entry_date > last_locked_date:
+            timestamp_str = str(entry['date'])[:19]
+            if timestamp_str not in existing_timestamps:
+                count += 1
+
+    for exit_t in fresh_backtest.get('exits', []):
+        exit_date = normalize_tz(pd.to_datetime(exit_t['date'])) if exit_t.get('date') else None
+        if exit_date and exit_date > last_locked_date:
+            timestamp_str = str(exit_t['date'])[:19]
+            if timestamp_str not in existing_timestamps:
+                count += 1
+
+    return count
+
+
 def detect_and_add_missed_signals(fresh_backtest: dict, strategy_name: str = None, ticker: str = None, trade_state: dict = None) -> int:
-    """Detect signals that occurred while bot was down and add them as missed.
+    """DEPRECATED - This function is no longer called due to anti-repainting policy.
+
+    Detect signals that occurred while bot was down and add them as missed.
 
     Compares fresh backtest entries/exits with locked_backtest to find signals
     that occurred after the last tracked signal. Adds them with missed=True.
@@ -3200,13 +3259,19 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             locked_backtest = save_locked_backtest(fresh_backtest, strategy_name=strategy_name, ticker=ticker, trade_state=trade_state)
             print(f"📁 Locked backtest file: {locked_backtest_path}")
 
-    # Detect missed signals during downtime (but respect tracked position)
+    # ANTI-REPAINTING: Do NOT add missed signals to locked_backtest
+    # The locked_backtest should ONLY contain signals that were detected in real-time
+    # while the bot was running. Adding "missed" signals after the fact causes:
+    # 1. Charts to change on every restart (repainting)
+    # 2. Stats to change retroactively
+    # 3. Loss of trader credibility
+    #
+    # Instead, we just WARN about potential missed signals without modifying data
     if locked_backtest and fresh_backtest:
-        num_missed = detect_and_add_missed_signals(fresh_backtest, strategy_name=strategy_name, ticker=ticker, trade_state=trade_state)
-        if num_missed > 0:
-            print(f"🟠 Found {num_missed} missed signal(s) during downtime - marked in orange on charts")
-            # Reload the locked backtest to get the updated version with missed signals
-            locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
+        potential_missed = count_potential_missed_signals(locked_backtest, fresh_backtest)
+        if potential_missed > 0:
+            print(f"⚠️  Approximately {potential_missed} signal(s) may have occurred while bot was offline")
+            print(f"   These are NOT added to your tracked stats (anti-repainting policy)")
 
     # Validate locked backtest data integrity
     if locked_backtest:
