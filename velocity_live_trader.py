@@ -37,7 +37,7 @@ try:
         safe_json_write, safe_json_read, get_logger,
         is_market_open, get_market_time, HeartbeatMonitor,
         load_webhook_from_env, print_signal_only_disclaimer,
-        SIGNAL_ONLY_DISCLAIMER
+        SIGNAL_ONLY_DISCLAIMER, is_market_holiday
     )
     PRODUCTION_UTILS_AVAILABLE = True
 except ImportError:
@@ -53,6 +53,8 @@ except ImportError:
         return None
     def print_signal_only_disclaimer():
         print("WARNING: This is a SIGNAL-ONLY system. It does NOT execute trades.")
+    def is_market_holiday(date_to_check=None, ticker="SPY"):
+        return False, None
 
 # Import oscillator calculations directly from Streamlit source of truth
 from oscillator_predictor_page import (
@@ -119,11 +121,105 @@ HAUS_HEDGE_WEBHOOKS = {
     "velocity_BTC_1y": "",
     "velocity_BTC_2y": "",
     "velocity_BTC_5y": "",
+    "velocity_ES=F_15m": "",
+    "velocity_ES=F_velocity_crossover_or_zone_15min": "",
+    # BTC 15-min intraday
+    "velocity_BTC-USD_15m": "",
+    "velocity_BTC_15m": "",
+    "velocity_BTC-USD_any_reversal_15min": "",
 }
 
 # Strategy storage directories
 VELOCITY_STRATEGIES_DIR = "velocity_strategies"
 PRODUCTION_CONFIG_PATH = "production_env/velocity_config.json"
+
+# Sierra Chart Bridge Configuration (opt-in via environment variable)
+SIERRA_BRIDGE_ENABLED = os.environ.get("SIERRA_BRIDGE_ENABLED", "false").lower() == "true"
+SIERRA_SIGNAL_FILE = os.environ.get("SIERRA_SIGNAL_FILE", os.path.expanduser("~/pfr_signals.json"))
+
+# Import Sierra Chart bridge if enabled
+if SIERRA_BRIDGE_ENABLED:
+    try:
+        from sierra_chart_bridge import publish_signal_to_sierra, build_sierra_signal
+        print(f"Sierra Chart bridge enabled. Signals will be published to: {SIERRA_SIGNAL_FILE}")
+    except ImportError:
+        print("Warning: sierra_chart_bridge.py not found. Sierra Chart integration disabled.")
+        SIERRA_BRIDGE_ENABLED = False
+
+
+def is_data_stale_for_futures(data_end_date, ticker=""):
+    """
+    Check if futures data is genuinely stale vs normal weekend/holiday gap.
+
+    CME Globex schedule:
+    - Opens: Sunday 6:00 PM ET
+    - Closes: Friday 5:00 PM ET
+    - Saturday: CLOSED
+    - Holidays: Various closures (MLK Day, etc.)
+
+    Returns: (is_stale: bool, warning_msg: str or None)
+    """
+    today = datetime.now().date()
+    days_behind = (today - data_end_date).days
+    weekday = today.weekday()  # 0=Monday, 5=Saturday, 6=Sunday
+
+    # Data from today or yesterday is never considered stale
+    if days_behind <= 1:
+        return False, None
+
+    # Check if today is a holiday - if so, data being behind is expected
+    is_holiday_today, holiday_name = is_market_holiday(today, ticker)
+    if is_holiday_today:
+        # On a holiday, data from 2-3 days ago is normal
+        if days_behind <= 3:
+            return False, None
+
+    # Check if yesterday was a holiday (day after holiday, data might be 2+ days old)
+    yesterday = today - timedelta(days=1)
+    is_holiday_yesterday, _ = is_market_holiday(yesterday, ticker)
+    if is_holiday_yesterday:
+        # Day after holiday, data being 2-3 days old is normal
+        if days_behind <= 3:
+            return False, None
+
+    # On Saturday: data from Friday (1 day behind) is normal
+    # On Sunday before 6PM ET: data from Friday (2 days behind) is normal
+    if weekday == 5:  # Saturday
+        # Friday data is expected (1-2 days behind)
+        if days_behind <= 2:
+            return False, None
+    elif weekday == 6:  # Sunday
+        # Friday data is expected (2 days behind is normal)
+        if days_behind <= 2:
+            return False, None
+    elif weekday == 0:  # Monday
+        # Friday data might still be showing early Monday (3 days behind before market opens)
+        hour = datetime.now().hour
+        if days_behind <= 3 and hour < 10:  # Before 10 AM
+            return False, None
+
+    # Long weekends (holiday + weekend combo like MLK Day Monday)
+    # Check if there's been a recent holiday within the gap
+    for i in range(days_behind):
+        check_date = today - timedelta(days=i)
+        is_holiday_in_gap, _ = is_market_holiday(check_date, ticker)
+        if is_holiday_in_gap:
+            # If there was a holiday in the gap, allow extra days
+            if days_behind <= 4:
+                return False, None
+
+    # If we get here, data is genuinely stale
+    return True, f"\n⚠️ _Data is {days_behind} days behind (yfinance delay)_"
+
+
+def normalize_tz(ts):
+    """Convert timestamp to tz-naive for comparison (handles both tz-aware and tz-naive)."""
+    if ts is None:
+        return None
+    ts = pd.to_datetime(ts)
+    if ts.tzinfo is not None:
+        return ts.tz_localize(None)
+    return ts
 
 
 def ensure_strategies_dir():
@@ -270,27 +366,9 @@ def select_strategy_interactive(default_config_path: str = None) -> str:
             strategy_config_path = selected['config_path']
             print(f"   Using config: {strategy_config_path}")
 
-            # Check if there's an existing state file for this strategy and offer to reset
-            ticker = selected['ticker']
-            strat_name = selected.get('strategy_name', selected['name'])
-            state_file = get_state_file_path(strategy_name=strat_name, ticker=ticker)
-            if os.path.exists(state_file):
-                try:
-                    with open(state_file, 'r') as f:
-                        existing_state = json.load(f)
-                    if existing_state.get('position'):
-                        print(f"\n⚠️  Existing position found for {strat_name}:")
-                        print(f"   Position: {existing_state.get('position').upper()}")
-                        print(f"   Entry: ${existing_state.get('entry_price', 0):.2f}")
-                        print(f"   Time: {existing_state.get('entry_time', 'Unknown')}")
-                        reset = input("\n   Reset trading state? (y/N): ").strip().lower()
-                        if reset == 'y':
-                            os.remove(state_file)
-                            print(f"   ✅ State reset - will sync with backtest on startup")
-                        else:
-                            print(f"   ℹ️  Keeping existing position")
-                except:
-                    pass
+            # NOTE: Position state handling is now done during startup with the STATE MISMATCH check
+            # which provides detailed context and clear Keep/Clear options. The early "Reset?" prompt
+            # was removed to avoid confusing duplicate prompts and accidental state deletion.
 
             return strategy_config_path
         else:
@@ -419,6 +497,23 @@ def fetch_price_data(ticker: str, api_key: str = None, days: int = 200, interval
         interval: Data interval ('1d', '1h', etc.)
         use_cache: If True, use local SQLite cache to reduce API calls
     """
+    # yfinance has limits on intraday data history
+    # Cap days based on interval to avoid API errors
+    intraday_limits = {
+        '1m': 7,      # 7 days max
+        '2m': 60,     # 60 days max
+        '5m': 60,     # 60 days max
+        '15m': 60,    # 60 days max
+        '30m': 60,    # 60 days max
+        '1h': 730,    # ~2 years max
+        '90m': 60,    # 60 days max
+    }
+    if interval in intraday_limits:
+        max_days = intraday_limits[interval]
+        if days > max_days:
+            print(f"   ⚠️ {interval} data limited to {max_days} days (requested {days})")
+            days = max_days
+
     # Check if this is a crypto ticker
     is_crypto = '-USD' in ticker or ticker in ['BTC', 'ETH', 'BTCUSD', 'ETHUSD']
 
@@ -874,11 +969,117 @@ def calculate_velocity_signals(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     return df
 
 
+def generate_trade_log_csv(locked_backtest: dict, num_trades: int = 10, trade_state: dict = None) -> io.BytesIO:
+    """Generate a CSV file of the last N trades from locked backtest.
+
+    Args:
+        locked_backtest: Dict containing 'exits' list with trade data
+        num_trades: Number of recent trades to include (default 10)
+        trade_state: Optional current trade state - if provided, excludes trades
+                     that conflict with the tracked position
+
+    Returns:
+        BytesIO buffer containing CSV data, or None if no trades
+    """
+    if not locked_backtest or not locked_backtest.get('exits'):
+        return None
+
+    exits = locked_backtest['exits']
+
+    # Get tracked position entry time for filtering
+    tracked_entry_dt = None
+    if trade_state and trade_state.get('position'):
+        tracked_entry_time = trade_state.get('entry_time') or trade_state.get('entry_signal_bar')
+        if tracked_entry_time:
+            try:
+                tracked_entry_dt = normalize_tz(pd.to_datetime(tracked_entry_time))
+            except:
+                pass
+
+    # Sort by date and take last N trades (exclude missed trades and conflicting trades)
+    valid_exits = []
+    for e in exits:
+        # Skip missed trades
+        if e.get('missed'):
+            continue
+        # Skip trades whose entry is after the tracked position entry
+        if tracked_entry_dt:
+            exit_entry_date = e.get('entry_date')
+            if exit_entry_date:
+                try:
+                    exit_entry_dt = normalize_tz(pd.to_datetime(exit_entry_date))
+                    if exit_entry_dt > tracked_entry_dt:
+                        continue  # Skip this conflicting trade
+                except:
+                    pass
+        valid_exits.append(e)
+
+    if not valid_exits:
+        return None
+
+    sorted_exits = sorted(valid_exits, key=lambda x: str(x.get('date', '')))
+    recent_trades = sorted_exits[-num_trades:]
+
+    if not recent_trades:
+        return None
+
+    # Build CSV content
+    csv_lines = ["#,Entry Time,Entry $,Exit Time,Exit $,P&L,Result"]
+
+    for i, trade in enumerate(recent_trades, 1):
+        exit_date = trade.get('date', '')
+        exit_price = trade.get('price', 0)
+        entry_price = trade.get('entry_price', 0)
+        pnl = trade.get('pnl', 0)
+
+        # Format entry time from entry_date field
+        entry_date_raw = trade.get('entry_date', '')
+        if entry_date_raw:
+            if hasattr(entry_date_raw, 'strftime'):
+                entry_time = entry_date_raw.strftime('%Y-%m-%d %H:%M')
+            else:
+                # String format - extract datetime portion
+                entry_time = str(entry_date_raw)[:16].replace('T', ' ')
+        else:
+            entry_time = "N/A"
+
+        # Format exit time
+        if hasattr(exit_date, 'strftime'):
+            exit_time = exit_date.strftime('%Y-%m-%d %H:%M')
+        else:
+            # String format - extract datetime portion
+            exit_time = str(exit_date)[:16].replace('T', ' ') if exit_date else "N/A"
+
+        # Result indicator
+        result = "WIN" if pnl > 0 else "LOSS"
+
+        csv_lines.append(
+            f"{i},{entry_time},${entry_price:,.2f},{exit_time},${exit_price:,.2f},{pnl:+.2f}%,{result}"
+        )
+
+    # Create BytesIO buffer
+    csv_content = "\n".join(csv_lines)
+    csv_buf = io.BytesIO(csv_content.encode('utf-8'))
+    csv_buf.name = "trade_log.csv"
+    csv_buf.seek(0)  # Ensure buffer is ready to read
+
+    return csv_buf
+
+
 def send_discord_alert(webhook_url: str, message: str, chart_buf: io.BytesIO = None,
-                       include_disclaimer: bool = True, strategy_name: str = None):
-    """Send alert to Discord webhook with optional chart image.
+                       include_disclaimer: bool = True, strategy_name: str = None,
+                       csv_buf: io.BytesIO = None):
+    """Send alert to Discord webhook with optional chart image and CSV attachment.
 
     Also sends to secondary Haus Hedge webhook if strategy_name is provided.
+
+    Args:
+        webhook_url: Primary Discord webhook URL
+        message: Message content
+        chart_buf: Optional chart image BytesIO buffer
+        include_disclaimer: Whether to append legal disclaimer
+        strategy_name: Strategy name for secondary webhook lookup
+        csv_buf: Optional CSV file BytesIO buffer (e.g., trade log)
     """
     if not webhook_url:
         print(f"[ALERT] {message}")
@@ -888,12 +1089,22 @@ def send_discord_alert(webhook_url: str, message: str, chart_buf: io.BytesIO = N
     if include_disclaimer:
         message = message + LEGAL_DISCLAIMER
 
-    def post_to_webhook(url: str, msg: str, chart: io.BytesIO = None) -> bool:
-        """Helper to post to a single webhook."""
+    def post_to_webhook(url: str, msg: str, chart: io.BytesIO = None, csv: io.BytesIO = None) -> bool:
+        """Helper to post to a single webhook with optional file attachments."""
         try:
+            files = {}
+
+            # Add chart if provided
             if chart:
                 chart.seek(0)
-                files = {'file': ('chart.png', chart, 'image/png')}
+                files['file1'] = ('chart.png', chart, 'image/png')
+
+            # Add CSV if provided
+            if csv:
+                csv.seek(0)
+                files['file2'] = ('trade_log.csv', csv, 'text/csv')
+
+            if files:
                 payload = {'content': msg}
                 response = requests.post(url, data=payload, files=files)
             else:
@@ -910,17 +1121,21 @@ def send_discord_alert(webhook_url: str, message: str, chart_buf: io.BytesIO = N
             return False
 
     # Send to primary webhook
-    primary_success = post_to_webhook(webhook_url, message, chart_buf)
+    primary_success = post_to_webhook(webhook_url, message, chart_buf, csv_buf)
 
-    # Send to secondary Haus Hedge webhook if strategy exists
+    # Send to secondary Haus Hedge webhook if strategy exists AND it's a different URL
     if strategy_name and strategy_name in HAUS_HEDGE_WEBHOOKS:
         secondary_url = HAUS_HEDGE_WEBHOOKS[strategy_name]
-        # Reset chart buffer for second send
-        if chart_buf:
-            chart_buf.seek(0)
-        secondary_success = post_to_webhook(secondary_url, message, chart_buf)
-        if secondary_success:
-            print(f"   📤 Also posted to Haus Hedge server")
+        # Only post to secondary if it's a DIFFERENT webhook (avoid duplicates)
+        if secondary_url != webhook_url:
+            # Reset buffers for second send
+            if chart_buf:
+                chart_buf.seek(0)
+            if csv_buf:
+                csv_buf.seek(0)
+            secondary_success = post_to_webhook(secondary_url, message, chart_buf, csv_buf)
+            if secondary_success:
+                print(f"   📤 Also posted to Haus Hedge server")
 
     return primary_success
 
@@ -928,7 +1143,7 @@ def send_discord_alert(webhook_url: str, message: str, chart_buf: io.BytesIO = N
 def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, ticker: str,
                             title_suffix: str = "", trade_history: list = None,
                             current_position: dict = None, locked_backtest: dict = None,
-                            full_period_backtest: dict = None) -> io.BytesIO:
+                            full_period_backtest: dict = None, chart_type: str = "status") -> io.BytesIO:
     """Generate a velocity strategy chart for Discord.
 
     Args:
@@ -941,19 +1156,100 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
         current_position: Optional current position dict with entry_price, entry_signal_bar
         locked_backtest: Optional locked backtest dict with frozen entry/exit markers (prevents repainting)
         full_period_backtest: Optional full period backtest for showing both recent and full stats
+        chart_type: "signal" for focused entry/exit charts, "status" for broader status updates
     """
     try:
-        # Use all available data (full test period)
-        df_plot = df.copy()
+        # Determine interval and if intraday
+        interval = config.get('interval', '1d')
+        is_intraday = interval in ['1m', '5m', '15m', '30m', '1h', '90m', '4h']
+        is_crypto = any(ticker.upper().startswith(c) for c in ['BTC', 'ETH', 'DOGE', 'SOL', 'ADA'])
 
-        # Ensure we have a proper datetime index for plotting
-        if not isinstance(df_plot.index, pd.DatetimeIndex):
-            # Try to convert index to datetime if it's not already
-            try:
-                df_plot.index = pd.to_datetime(df_plot.index)
-            except:
-                # If conversion fails, reset to sequential integers
-                df_plot = df_plot.reset_index(drop=True)
+        # For INTRADAY data: limit to recent bars to avoid overcrowded charts
+        # Also plot by INDEX (not datetime) to eliminate market closure gaps
+        if is_intraday:
+            # Use different bar limits based on chart_type
+            if chart_type == "signal":
+                # Focused view for entry/exit signals (short timeframe)
+                if is_crypto:
+                    max_bars_map = {
+                        '1m': 300,    # ~5 hours
+                        '5m': 150,    # ~12 hours
+                        '15m': 150,   # ~2.5 hours (crypto 24/7)
+                        '30m': 100,   # ~50 hours
+                        '1h': 48,     # 2 days
+                        '90m': 32,    # 2 days
+                        '4h': 24,     # 4 days
+                    }
+                else:
+                    max_bars_map = {
+                        '1m': 300,    # ~45 minutes
+                        '5m': 150,    # ~2 hours
+                        '15m': 100,   # ~6 hours (stocks/futures)
+                        '30m': 80,    # ~6 hours
+                        '1h': 48,     # 2 days
+                        '90m': 32,    # 2 days
+                        '4h': 24,     # 4 days
+                    }
+            else:
+                # Broader view for status updates and startup
+                if is_crypto:
+                    max_bars_map = {
+                        '1m': 2000,   # ~33 hours
+                        '5m': 600,    # ~50 hours
+                        '15m': 400,   # ~4 days (crypto 24/7)
+                        '30m': 300,   # ~6 days
+                        '1h': 200,    # ~8 days
+                        '90m': 150,   # ~9 days
+                        '4h': 100,    # ~17 days
+                    }
+                else:
+                    max_bars_map = {
+                        '1m': 2000,   # ~5 days at 390 bars/day
+                        '5m': 500,    # ~6 days at 78 bars/day
+                        '15m': 260,   # ~2 days (stocks/futures)
+                        '30m': 200,   # ~3 days
+                        '1h': 168,    # ~1 week
+                        '90m': 150,   # ~7 days
+                        '4h': 100,    # ~14 days
+                    }
+            max_bars = max_bars_map.get(interval, 300 if chart_type == "signal" else 500)
+            df_plot = df.tail(max_bars).copy()
+
+            # For intraday, use sequential index to eliminate gaps from market closures
+            # Store original datetime for reference but plot by bar number
+            df_plot = df_plot.reset_index()
+            # Find the datetime column (could be 'index', 'date', 'datetime', or first column)
+            datetime_col = None
+            for col in df_plot.columns:
+                if col in ['index', 'date', 'datetime', 'Date', 'Datetime']:
+                    datetime_col = col
+                    break
+                # Check if column contains datetime values
+                if datetime_col is None and df_plot[col].dtype == 'datetime64[ns]':
+                    datetime_col = col
+                    break
+            if datetime_col is None and len(df_plot.columns) > 0:
+                # Assume first column is datetime after reset_index
+                first_col = df_plot.columns[0]
+                try:
+                    pd.to_datetime(df_plot[first_col].iloc[0])
+                    datetime_col = first_col
+                except:
+                    pass
+            df_plot['_datetime_col'] = datetime_col  # Store for later reference
+            df_plot['bar_num'] = range(len(df_plot))
+            plot_by_index = True
+        else:
+            # For daily data, keep datetime plotting
+            df_plot = df.copy()
+            plot_by_index = False
+
+            # Ensure we have a proper datetime index for plotting
+            if not isinstance(df_plot.index, pd.DatetimeIndex):
+                try:
+                    df_plot.index = pd.to_datetime(df_plot.index)
+                except:
+                    df_plot = df_plot.reset_index(drop=True)
 
         # Create figure with subplots - LARGER for Discord
         # Note: sharex=False because equity curve uses trade numbers, not dates
@@ -970,19 +1266,134 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
         # Import date formatting
         import matplotlib.dates as mdates
 
+        # Determine appropriate date formatting based on data range
+        if plot_by_index:
+            data_span_days = 7  # Approximate for intraday
+        else:
+            try:
+                data_span_days = (normalize_tz(df_plot.index[-1]) - normalize_tz(df_plot.index[0])).days if len(df_plot) > 1 else 1
+            except:
+                data_span_days = 60  # Default fallback
+
+        def format_xaxis(ax, show_dates=False):
+            """Apply appropriate x-axis formatting based on data characteristics."""
+            if plot_by_index:
+                # For intraday plotted by index: show date labels at key points
+                if show_dates and 'index' in df_plot.columns:
+                    # Add date labels at start of each day
+                    ax.tick_params(axis='x', labelsize=8)
+                    # Just use simple bar numbers, add date in title instead
+                else:
+                    ax.tick_params(axis='x', labelsize=8)
+            elif isinstance(df_plot.index, pd.DatetimeIndex):
+                if is_intraday and data_span_days <= 3:
+                    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d\n%H:%M'))
+                    ax.xaxis.set_major_locator(mdates.HourLocator(interval=4))
+                elif is_intraday and data_span_days <= 10:
+                    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
+                    ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
+                elif is_intraday and data_span_days <= 30:
+                    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
+                    ax.xaxis.set_major_locator(mdates.DayLocator(interval=2))
+                elif is_intraday or data_span_days <= 90:
+                    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
+                    ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
+                else:
+                    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %d'))
+                    ax.xaxis.set_major_locator(mdates.MonthLocator())
+                ax.tick_params(axis='x', labelsize=8)
+                plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+        # Determine x-axis values based on plotting mode
+        if plot_by_index:
+            x_axis = df_plot['bar_num']
+            # Create date-to-barnum mapping for markers
+            date_to_barnum = {}
+            datetime_col = df_plot['_datetime_col'].iloc[0] if '_datetime_col' in df_plot.columns else None
+            if datetime_col and datetime_col in df_plot.columns:
+                for i, row in df_plot.iterrows():
+                    try:
+                        dt = normalize_tz(pd.to_datetime(row[datetime_col]))
+                        date_to_barnum[dt] = row['bar_num']
+                    except:
+                        pass
+                print(f"   [Chart] Built date mapping with {len(date_to_barnum)} entries from column '{datetime_col}'")
+            else:
+                print(f"   [Chart] WARNING: Could not find datetime column for marker mapping")
+        else:
+            x_axis = df_plot.index
+            date_to_barnum = {}  # Not needed for datetime plotting
+
         # 1. Price Chart with Entry/Exit markers
         ax1 = axes[0]
-        ax1.plot(df_plot.index, df_plot['close'], color='white', linewidth=1.5, label='Price')
-        ax1.fill_between(df_plot.index, df_plot['low'], df_plot['high'], color='gray', alpha=0.2)
+        ax1.plot(x_axis, df_plot['close'], color='white', linewidth=1.5, label='Price')
+        ax1.fill_between(x_axis, df_plot['low'], df_plot['high'], color='gray', alpha=0.2)
 
         # Plot trade markers from LOCKED backtest (prevents repainting)
         # The locked_backtest is frozen at startup and only appended to when new signals occur.
         # This ensures historical markers never shift position.
         markers_source = locked_backtest if locked_backtest else backtest
 
-        # Get chart date range for filtering markers
-        chart_start = df_plot.index.min()
-        chart_end = df_plot.index.max()
+        # Get chart date range for filtering markers (normalize for tz comparison)
+        if plot_by_index and datetime_col and datetime_col in df_plot.columns:
+            chart_start = normalize_tz(pd.to_datetime(df_plot[datetime_col].iloc[0]))
+            chart_end = normalize_tz(pd.to_datetime(df_plot[datetime_col].iloc[-1]))
+            print(f"   [Chart] Date range: {chart_start} to {chart_end}")
+        else:
+            chart_start = normalize_tz(df_plot.index.min())
+            chart_end = normalize_tz(df_plot.index.max())
+
+        # Dynamic marker size based on number of trades (smaller for dense charts)
+        num_entries = len(markers_source.get('entries', [])) if markers_source else 0
+        if num_entries > 200:
+            marker_size = 30  # Very small for 200+ trades
+        elif num_entries > 100:
+            marker_size = 50  # Small for 100-200 trades
+        elif num_entries > 50:
+            marker_size = 70  # Medium for 50-100 trades
+        else:
+            marker_size = 100  # Normal size for <50 trades
+
+        # Helper function to find x-position for a given date
+        def get_x_position(target_date):
+            """Get x-axis position for a date. For intraday, maps to bar number."""
+            target_date = normalize_tz(target_date)
+            if plot_by_index:
+                # Look up in date_to_barnum mapping
+                if target_date in date_to_barnum:
+                    return date_to_barnum[target_date]
+                # Try to find closest date
+                closest_bar = None
+                min_diff = None
+                for dt, bar in date_to_barnum.items():
+                    diff = abs((dt - target_date).total_seconds())
+                    if min_diff is None or diff < min_diff:
+                        min_diff = diff
+                        closest_bar = bar
+                return closest_bar
+            else:
+                return target_date
+
+        # Debug: Show marker mapping info
+        entries_in_range = 0
+        entries_total = len(markers_source.get('entries', [])) if markers_source else 0
+        if plot_by_index and entries_total > 0:
+            sample_entries = [normalize_tz(pd.to_datetime(e['date'])) for e in markers_source['entries'][-5:]]
+            print(f"   [Chart] Chart range: {chart_start} to {chart_end}")
+            print(f"   [Chart] Sample entry dates (last 5): {sample_entries}")
+            print(f"   [Chart] Sample mapping keys (last 5): {list(date_to_barnum.keys())[-5:] if date_to_barnum else 'empty'}")
+
+        # Get tracked position entry time to filter out conflicting markers
+        # (entries/exits that occur after user's tracked entry shouldn't be drawn)
+        tracked_entry_dt = None
+        if current_position and current_position.get('position'):
+            tracked_entry_time = current_position.get('entry_time') or current_position.get('entry_signal_bar')
+            if tracked_entry_time:
+                try:
+                    tracked_entry_dt = normalize_tz(pd.to_datetime(tracked_entry_time))
+                except:
+                    pass
+        skipped_conflicting = 0
 
         if markers_source and markers_source.get('entries'):
             for entry in markers_source['entries']:
@@ -993,10 +1404,19 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                         entry_date = pd.to_datetime(entry_date)
                     except:
                         continue
+                entry_date = normalize_tz(entry_date)
 
                 # SKIP markers outside the chart's date range (prevents clustering at edges)
                 if entry_date < chart_start or entry_date > chart_end:
                     continue
+
+                # SKIP entries that conflict with tracked position
+                # (entries AFTER tracked entry time create confusing duplicate markers)
+                if tracked_entry_dt and entry_date > tracked_entry_dt:
+                    skipped_conflicting += 1
+                    continue
+
+                entries_in_range += 1
 
                 # LONG entries: green up triangle, SHORT entries: red down triangle
                 # MISSED entries: orange color
@@ -1008,18 +1428,16 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                 else:
                     marker_color = 'lime' if is_long else 'red'
 
-                if entry_date in df_plot.index:
-                    ax1.scatter(entry_date, entry['price'], marker=marker_shape, color=marker_color, s=100, zorder=5)
-                else:
-                    # Try to find the closest date within range
-                    try:
-                        closest_idx = df_plot.index.get_indexer([entry_date], method='nearest')[0]
-                        if 0 <= closest_idx < len(df_plot):
-                            closest_date = df_plot.index[closest_idx]
-                            ax1.scatter(closest_date, entry['price'], marker=marker_shape, color=marker_color, s=100, zorder=5)
-                    except:
-                        pass
+                # Get x-position (bar number for intraday, date for daily)
+                x_pos = get_x_position(entry_date)
+                if x_pos is not None:
+                    ax1.scatter(x_pos, entry['price'], marker=marker_shape, color=marker_color, s=marker_size, zorder=5)
 
+            if plot_by_index:
+                print(f"   [Chart] Entries: {entries_in_range}/{entries_total} in chart range")
+
+        exits_in_range = 0
+        exits_total = len(markers_source.get('exits', [])) if markers_source else 0
         if markers_source and markers_source.get('exits'):
             for exit_trade in markers_source['exits']:
                 # Handle both datetime objects and strings
@@ -1029,30 +1447,45 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                         exit_date = pd.to_datetime(exit_date)
                     except:
                         continue
+                exit_date = normalize_tz(exit_date)
 
                 # SKIP markers outside the chart's date range (prevents clustering at edges)
                 if exit_date < chart_start or exit_date > chart_end:
                     continue
+
+                # SKIP exits whose entry occurred AFTER tracked position entry
+                # (these are exits from conflicting positions that shouldn't be shown)
+                if tracked_entry_dt:
+                    exit_entry_date = exit_trade.get('entry_date')
+                    if exit_entry_date:
+                        try:
+                            exit_entry_dt = normalize_tz(pd.to_datetime(exit_entry_date))
+                            if exit_entry_dt > tracked_entry_dt:
+                                skipped_conflicting += 1
+                                continue
+                        except:
+                            pass
+
+                exits_in_range += 1
 
                 # MISSED exits: orange color
                 is_missed = exit_trade.get('missed', False)
                 if is_missed:
                     color = 'orange'
                 else:
-                    # LONG-only: All exits are dark green (forest green) down triangles
-                    color = '#228B22'  # Forest green for all long exits
+                    # LONG-only: Exits are red down triangles for visibility
+                    color = '#ff4444'  # Red for exits (contrasts with green entries)
 
-                if exit_date in df_plot.index:
-                    ax1.scatter(exit_date, exit_trade['price'], marker='v', color=color, s=100, zorder=5)
-                else:
-                    # Try to find the closest date within range
-                    try:
-                        closest_idx = df_plot.index.get_indexer([exit_date], method='nearest')[0]
-                        if 0 <= closest_idx < len(df_plot):
-                            closest_date = df_plot.index[closest_idx]
-                            ax1.scatter(closest_date, exit_trade['price'], marker='v', color=color, s=100, zorder=5)
-                    except:
-                        pass
+                # Get x-position (bar number for intraday, date for daily)
+                x_pos = get_x_position(exit_date)
+                if x_pos is not None:
+                    ax1.scatter(x_pos, exit_trade['price'], marker='v', color=color, s=marker_size, zorder=5)
+
+            if plot_by_index:
+                print(f"   [Chart] Exits: {exits_in_range}/{exits_total} in chart range")
+
+        if skipped_conflicting > 0:
+            print(f"   [Chart] Skipped {skipped_conflicting} markers that conflict with tracked position")
 
         # Mark current open position - use LOCKED trade_state (current_position) if provided
         # This ensures the entry line shows YOUR ACTUAL tracked position, not the recalculated one
@@ -1060,6 +1493,22 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
         if current_position and current_position.get('entry_price'):
             ax1.axhline(current_position['entry_price'], color='cyan', linestyle='--', alpha=0.7,
                        label=f"Entry ${current_position['entry_price']:.2f}")
+
+            # Add a STAR marker for the tracked position entry point
+            # This visually distinguishes the user's ACTUAL position from historical backtest markers
+            tracked_entry_time = current_position.get('entry_time') or current_position.get('entry_signal_bar')
+            if tracked_entry_time:
+                try:
+                    tracked_entry_dt = normalize_tz(pd.to_datetime(tracked_entry_time))
+                    tracked_x = get_x_position(tracked_entry_dt)
+                    if tracked_x is not None:
+                        # Large cyan star marker with white edge - stands out from regular triangles
+                        ax1.scatter(tracked_x, current_position['entry_price'],
+                                   marker='*', s=300, color='cyan', edgecolors='white',
+                                   linewidth=1.5, zorder=15, label='YOUR ENTRY')
+                except Exception as e:
+                    print(f"   [Chart] Warning: Could not plot tracked entry marker: {e}")
+
         elif locked_backtest and locked_backtest.get('current_position'):
             pos = locked_backtest['current_position']
             ax1.axhline(pos['entry_price'], color='cyan', linestyle='--', alpha=0.7, label=f"Entry ${pos['entry_price']:.2f}")
@@ -1067,55 +1516,48 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
             pos = backtest['current_position']
             ax1.axhline(pos['entry_price'], color='cyan', linestyle='--', alpha=0.7, label=f"Entry ${pos['entry_price']:.2f}")
 
-        ax1.set_title(f"{ticker} - JD Strategy{title_suffix}", color='white', fontsize=14, fontweight='bold')
+        # Build title with date range for intraday (since x-axis shows bar numbers)
+        if plot_by_index and datetime_col and datetime_col in df_plot.columns:
+            start_dt = pd.to_datetime(df_plot[datetime_col].iloc[0])
+            end_dt = pd.to_datetime(df_plot[datetime_col].iloc[-1])
+            date_range = f" ({start_dt.strftime('%m/%d')} - {end_dt.strftime('%m/%d %H:%M')})"
+            chart_title = f"{ticker} - JD Strategy{title_suffix}{date_range} ({len(df_plot)} bars)"
+        else:
+            chart_title = f"{ticker} - JD Strategy{title_suffix}"
+        ax1.set_title(chart_title, color='white', fontsize=14, fontweight='bold')
         ax1.set_ylabel("Price ($)", color='white')
         ax1.legend(loc='upper left', facecolor='#1a1a2e', labelcolor='white')
-        # Format x-axis with dates
-        if isinstance(df_plot.index, pd.DatetimeIndex):
-            ax1.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
-            ax1.xaxis.set_major_locator(mdates.MonthLocator())
-            ax1.tick_params(axis='x', labelsize=8)
-            plt.setp(ax1.xaxis.get_majorticklabels(), rotation=0)
+        format_xaxis(ax1)
 
         # 2. JD Oscillator with thresholds
         ax2 = axes[1]
         osc_col = 'osc_smooth' if 'osc_smooth' in df_plot.columns else 'composite_smooth'
         if osc_col in df_plot.columns:
-            ax2.plot(df_plot.index, df_plot[osc_col], color='#e94560', linewidth=1.5, label='JD_Osc')
+            ax2.plot(x_axis, df_plot[osc_col], color='#e94560', linewidth=1.5, label='JD_Osc')
             ax2.axhline(config.get('oversold_threshold', -0.3), color='lime', linestyle='--', alpha=0.7, label='Oversold')
             ax2.axhline(config.get('overbought_threshold', 0.3), color='red', linestyle='--', alpha=0.7, label='Overbought')
             ax2.axhline(0, color='gray', linestyle='-', alpha=0.5)
-            ax2.fill_between(df_plot.index, df_plot[osc_col], 0,
+            ax2.fill_between(x_axis, df_plot[osc_col], 0,
                             where=(df_plot[osc_col] < config.get('oversold_threshold', -0.3)),
                             color='lime', alpha=0.3)
-            ax2.fill_between(df_plot.index, df_plot[osc_col], 0,
+            ax2.fill_between(x_axis, df_plot[osc_col], 0,
                             where=(df_plot[osc_col] > config.get('overbought_threshold', 0.3)),
                             color='red', alpha=0.3)
         ax2.set_ylabel("JD_Osc", color='white')
         ax2.set_ylim(-1.2, 1.2)
         ax2.legend(loc='upper left', facecolor='#1a1a2e', labelcolor='white', fontsize='small')
-        # Format x-axis with dates
-        if isinstance(df_plot.index, pd.DatetimeIndex):
-            ax2.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
-            ax2.xaxis.set_major_locator(mdates.MonthLocator())
-            ax2.tick_params(axis='x', labelsize=8)
-            plt.setp(ax2.xaxis.get_majorticklabels(), rotation=0)
+        format_xaxis(ax2)
 
         # 3. JD Signal Indicators
         ax3 = axes[2]
         if 'velocity' in df_plot.columns:
-            ax3.plot(df_plot.index, df_plot['velocity'], color='#00d9ff', linewidth=1.2, label='JD_Signal')
+            ax3.plot(x_axis, df_plot['velocity'], color='#00d9ff', linewidth=1.2, label='JD_Signal')
         if 'acceleration' in df_plot.columns:
-            ax3.plot(df_plot.index, df_plot['acceleration'], color='#ffd700', linewidth=1.0, alpha=0.7, label='JD_Trend')
+            ax3.plot(x_axis, df_plot['acceleration'], color='#ffd700', linewidth=1.0, alpha=0.7, label='JD_Trend')
         ax3.axhline(0, color='gray', linestyle='-', alpha=0.5)
         ax3.set_ylabel("JD_Signal", color='white')
         ax3.legend(loc='upper left', facecolor='#1a1a2e', labelcolor='white', fontsize='small')
-        # Format x-axis with dates
-        if isinstance(df_plot.index, pd.DatetimeIndex):
-            ax3.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
-            ax3.xaxis.set_major_locator(mdates.MonthLocator())
-            ax3.tick_params(axis='x', labelsize=8)
-            plt.setp(ax3.xaxis.get_majorticklabels(), rotation=0)
+        format_xaxis(ax3)
 
         # 4. Equity Curve - Use backtest (period-specific) for equity to match displayed timeframe
         # Markers come from locked_backtest (filtered to chart range), but equity shows period stats
@@ -1426,7 +1868,7 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
     if trade_state and trade_state.get('position') and trade_state.get('entry_time'):
         try:
             tracked_entry_str = str(trade_state['entry_time']).split('.')[0]
-            tracked_entry_date = pd.to_datetime(tracked_entry_str)
+            tracked_entry_date = normalize_tz(pd.to_datetime(tracked_entry_str))
             print(f"   📍 Tracked position: {trade_state['position'].upper()} @ ${trade_state.get('entry_price', 0):.2f} on {tracked_entry_date}")
         except:
             pass
@@ -1434,9 +1876,20 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
     # Add NEW entries from fresh backtest (only entries AFTER latest exit date)
     new_entries_added = 0
     skipped_overlap = 0
+    skipped_timestamp_dupe = 0
+    skipped_tracked_conflict = set()  # Track entries skipped due to tracked position conflict
+    # Build set of existing entry timestamps for deduplication
+    existing_entry_timestamps = {str(e.get('date', ''))[:19] for e in locked["entries"]}
+
     for entry in backtest.get('entries', []):
         entry_date = entry['date']
         entry_date_str = str(entry_date)[:10]
+        entry_timestamp_str = str(entry_date)[:19]  # Full timestamp for dedup
+
+        # Skip if exact timestamp already exists (prevent duplicates)
+        if entry_timestamp_str in existing_entry_timestamps:
+            skipped_timestamp_dupe += 1
+            continue
 
         # Only add entries AFTER the latest exit in locked backtest
         # This prevents duplicates from overlapping data periods
@@ -1449,24 +1902,27 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
                 entry_date = pd.to_datetime(entry_date)
             except:
                 pass
+        entry_date = normalize_tz(entry_date) if hasattr(entry_date, 'tzinfo') else entry_date
 
         # Skip entries that conflict with tracked position
         if tracked_entry_date is not None and hasattr(entry_date, 'date'):
             if entry_date >= tracked_entry_date:
                 print(f"   ⏭️  Skipping backtest entry {entry_date} (conflicts with tracked position)")
+                skipped_tracked_conflict.add(str(entry_date)[:19])  # Track this entry so we skip its exit too
                 continue
 
         # VALIDATION: Check if there's already an unexited entry in locked backtest
         # We can't enter a new position if we're already in one
-        existing_entry_dates = {str(e.get('date', ''))[:10] for e in locked["entries"]}
-        existing_exit_entry_dates = {str(e.get('entry_date', ''))[:10] for e in locked["exits"]}
-        unexited_entries = existing_entry_dates - existing_exit_entry_dates
+        # Use full timestamps ([:19]) for intraday support, not just dates ([:10])
+        existing_entry_timestamps = {str(e.get('date', ''))[:19] for e in locked["entries"]}
+        existing_exit_entry_timestamps = {str(e.get('entry_date', ''))[:19] for e in locked["exits"]}
+        unexited_entry_timestamps = existing_entry_timestamps - existing_exit_entry_timestamps
 
-        if unexited_entries:
+        if unexited_entry_timestamps:
             # There's at least one unexited entry - check if this new entry would overlap
-            # Get the latest unexited entry date
-            latest_unexited = max(unexited_entries)
-            if entry_date_str > latest_unexited:
+            # Get the latest unexited entry timestamp
+            latest_unexited = max(unexited_entry_timestamps)
+            if entry_timestamp_str > latest_unexited:
                 # This entry is after an unexited entry - skip it (can't enter while in position)
                 skipped_overlap += 1
                 continue
@@ -1476,17 +1932,27 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
             "price": entry['price'],
             "position": entry.get('position', 'long')
         })
+        existing_entry_timestamps.add(entry_timestamp_str)  # Prevent within-batch duplicates
         new_entries_added += 1
 
     if new_entries_added > 0:
         print(f"   ➕ Added {new_entries_added} new entries (after {latest_exit_date})")
     if skipped_overlap > 0:
         print(f"   ⏭️  Skipped {skipped_overlap} entries (already in position)")
+    if skipped_timestamp_dupe > 0:
+        print(f"   ⏭️  Skipped {skipped_timestamp_dupe} duplicate entries (same timestamp)")
 
     # Add NEW exits from fresh backtest (only exits AFTER latest exit date)
     new_exits_added = 0
     skipped_same_day = 0
     skipped_duplicate = 0
+    skipped_end_of_period = 0
+    skipped_no_entry = 0
+
+    # Build set of entry timestamps in locked backtest for validation
+    locked_entry_timestamps = {str(e.get('date', ''))[:19] for e in locked["entries"]}
+    locked_entry_dates = {str(e.get('date', ''))[:10] for e in locked["entries"]}
+
     for exit_trade in backtest.get('exits', []):
         exit_date_str = str(exit_trade['date'])[:10]
         entry_date_str = str(exit_trade.get('entry_date', ''))[:10]
@@ -1495,19 +1961,41 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
         if latest_exit_date and exit_date_str <= latest_exit_date:
             continue
 
-        # VALIDATION 1: Reject same-day entry+exit (can't trade on same bar)
-        if exit_date_str == entry_date_str:
+        # VALIDATION 0: Reject "end_of_period" artificial exits (not real signals)
+        if exit_trade.get('reason') == 'end_of_period':
+            skipped_end_of_period += 1
+            continue
+
+        # VALIDATION 0b: Reject exits whose entries were skipped (tracked position conflict)
+        exit_entry_timestamp = str(exit_trade.get('entry_date', ''))[:19]
+        if exit_entry_timestamp in skipped_tracked_conflict:
+            print(f"   ⏭️  Skipping exit for entry {exit_entry_timestamp} (entry was skipped - tracked conflict)")
+            continue
+
+        # VALIDATION 1: Reject same-TIMESTAMP entry+exit (can't trade on same bar)
+        # Use full timestamp for intraday support - same day is valid, same bar is not
+        exit_timestamp_str = str(exit_trade['date'])[:19]
+        entry_ts_str = str(exit_trade.get('entry_date', ''))[:19]
+        if exit_timestamp_str == entry_ts_str:
             skipped_same_day += 1
             continue
 
         # VALIDATION 2: Reject duplicate exits (entry already has an exit)
+        # Use full timestamp ([:19]) for intraday support
+        entry_timestamp_str = str(exit_trade.get('entry_date', ''))[:19]
         entry_already_exited = any(
-            str(e.get('entry_date', ''))[:10] == entry_date_str and
+            str(e.get('entry_date', ''))[:19] == entry_timestamp_str and
             abs(e.get('entry_price', 0) - exit_trade.get('entry_price', 0)) < 0.01
             for e in locked["exits"]
         )
         if entry_already_exited:
             skipped_duplicate += 1
+            continue
+
+        # VALIDATION 3: Reject exits whose entries don't exist in locked backtest
+        entry_timestamp_str = str(exit_trade.get('entry_date', ''))[:19]
+        if entry_timestamp_str not in locked_entry_timestamps and entry_date_str not in locked_entry_dates:
+            skipped_no_entry += 1
             continue
 
         locked["exits"].append({
@@ -1526,13 +2014,19 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
         print(f"   ⚠️ Skipped {skipped_same_day} same-day entry+exit (invalid)")
     if skipped_duplicate > 0:
         print(f"   ⚠️ Skipped {skipped_duplicate} duplicate exits (entry already closed)")
+    if skipped_end_of_period > 0:
+        print(f"   ⏭️  Skipped {skipped_end_of_period} end_of_period exits (artificial backtest close)")
+    if skipped_no_entry > 0:
+        print(f"   ⚠️ Skipped {skipped_no_entry} orphan exits (no matching entry in locked backtest)")
 
     # Handle tracked position - add or update
     if trade_state and trade_state.get('position') and trade_state.get('entry_price'):
-        tracked_entry_str = str(trade_state.get('entry_time', ''))[:10]
+        # Use full timestamp for comparison (not just date) to support intraday strategies
+        tracked_entry_timestamp = str(trade_state.get('entry_time', ''))[:19]
 
-        # Remove any existing entries that match tracked position date (to avoid duplicates)
-        locked["entries"] = [e for e in locked["entries"] if str(e.get('date', ''))[:10] != tracked_entry_str]
+        # Remove any existing entries that match tracked position TIMESTAMP (not just date)
+        # This prevents removing other intraday entries from the same day
+        locked["entries"] = [e for e in locked["entries"] if str(e.get('date', ''))[:19] != tracked_entry_timestamp]
 
         # Add the tracked position as entry
         locked["entries"].append({
@@ -1595,6 +2089,52 @@ def load_locked_backtest(strategy_name: str = None, ticker: str = None) -> dict:
     return None
 
 
+def validate_locked_backtest(locked_backtest: dict) -> list:
+    """Validate locked backtest data integrity and return list of issues.
+
+    Checks for:
+    - Exits where entry_date == exit_date (invalid - can't trade same bar)
+    - More exits than entries (data corruption)
+    - Orphan exits (exit without matching entry timestamp)
+
+    Returns:
+        List of issue descriptions (empty if no issues)
+    """
+    if not locked_backtest:
+        return []
+
+    issues = []
+
+    # Check 1: Each exit should have valid entry_date (not same as exit date)
+    for exit_t in locked_backtest.get('exits', []):
+        entry_date = exit_t.get('entry_date')
+        exit_date = exit_t.get('date')
+        if entry_date and exit_date and str(entry_date)[:19] == str(exit_date)[:19]:
+            issues.append(f"Invalid exit: entry_date == exit_date at {exit_date}")
+
+    # Check 2: Entry count should be >= exit count
+    entry_count = len(locked_backtest.get('entries', []))
+    exit_count = len(locked_backtest.get('exits', []))
+    if exit_count > entry_count:
+        issues.append(f"More exits ({exit_count}) than entries ({entry_count})")
+
+    # Check 3: Orphan exits (exit without matching entry timestamp)
+    entry_timestamps = {str(e.get('date', ''))[:19] for e in locked_backtest.get('entries', [])}
+    for exit_t in locked_backtest.get('exits', []):
+        entry_ts = str(exit_t.get('entry_date', ''))[:19]
+        if entry_ts and entry_ts not in entry_timestamps:
+            # Try to find by price match instead (within 0.5%)
+            entry_price = exit_t.get('entry_price', 0)
+            price_match = any(
+                abs(e.get('price', 0) - entry_price) / entry_price < 0.005 if entry_price > 0 else False
+                for e in locked_backtest.get('entries', [])
+            )
+            if not price_match:
+                issues.append(f"Orphan exit at {exit_t.get('date')} - no matching entry for {entry_ts}")
+
+    return issues
+
+
 def append_to_locked_backtest(entry: dict = None, exit_trade: dict = None,
                                strategy_name: str = None, ticker: str = None,
                                missed: bool = False):
@@ -1617,8 +2157,20 @@ def append_to_locked_backtest(entry: dict = None, exit_trade: dict = None,
         return
 
     if entry:
+        entry_date_str = str(entry.get('date', ''))[:19]  # Normalize to "YYYY-MM-DD HH:MM:SS"
+        # Check for duplicate entries (same date)
+        existing_dates = {str(e.get('date', ''))[:19] for e in locked.get("entries", [])}
+        if entry_date_str in existing_dates:
+            print(f"   ⏭️  Skipping duplicate entry: {entry_date_str} (already exists)")
+            return  # Don't add duplicate
+
+        # Ensure date has UTC timezone for consistency
+        date_str = str(entry.get('date', ''))
+        if date_str and '+' not in date_str and 'Z' not in date_str:
+            date_str = date_str[:19] + '+00:00'
+
         entry_record = {
-            "date": str(entry.get('date', '')),
+            "date": date_str,
             "price": entry.get('price', 0),
             "position": entry.get('position', 'long')
         }
@@ -1629,13 +2181,28 @@ def append_to_locked_backtest(entry: dict = None, exit_trade: dict = None,
         print(f"   {label} Appended new entry to locked backtest: {entry.get('date')}")
 
     if exit_trade:
+        exit_date_str = str(exit_trade.get('date', ''))[:19]  # Normalize to "YYYY-MM-DD HH:MM:SS"
+        # Check for duplicate exits (same date)
+        existing_dates = {str(e.get('date', ''))[:19] for e in locked.get("exits", [])}
+        if exit_date_str in existing_dates:
+            print(f"   ⏭️  Skipping duplicate exit: {exit_date_str} (already exists)")
+            return  # Don't add duplicate
+
+        # Ensure dates have UTC timezone for consistency
+        date_str = str(exit_trade.get('date', ''))
+        if date_str and '+' not in date_str and 'Z' not in date_str:
+            date_str = date_str[:19] + '+00:00'
+        entry_date_str_tz = str(exit_trade.get('entry_date', ''))
+        if entry_date_str_tz and '+' not in entry_date_str_tz and 'Z' not in entry_date_str_tz:
+            entry_date_str_tz = entry_date_str_tz[:19] + '+00:00'
+
         exit_record = {
-            "date": str(exit_trade.get('date', '')),
+            "date": date_str,
             "price": exit_trade.get('price', 0),
             "pnl": exit_trade.get('pnl', 0),
             "reason": exit_trade.get('reason', ''),
             "entry_price": exit_trade.get('entry_price', 0),
-            "entry_date": str(exit_trade.get('entry_date', ''))
+            "entry_date": entry_date_str_tz
         }
         if missed:
             exit_record["missed"] = True
@@ -1683,11 +2250,21 @@ def append_to_locked_backtest(entry: dict = None, exit_trade: dict = None,
         json.dump(locked, f, indent=2, default=str)
 
 
-def detect_and_add_missed_signals(fresh_backtest: dict, strategy_name: str = None, ticker: str = None) -> int:
+def detect_and_add_missed_signals(fresh_backtest: dict, strategy_name: str = None, ticker: str = None, trade_state: dict = None) -> int:
     """Detect signals that occurred while bot was down and add them as missed.
 
     Compares fresh backtest entries/exits with locked_backtest to find signals
     that occurred after the last tracked signal. Adds them with missed=True.
+
+    IMPORTANT: If user has an active tracked position (trade_state), we skip
+    adding any missed entries that would overlap/conflict with that position.
+    The user's tracked position takes precedence over backtest detection.
+
+    Args:
+        fresh_backtest: Dict with 'entries' and 'exits' from fresh backtest
+        strategy_name: Strategy name for loading locked backtest
+        ticker: Ticker symbol
+        trade_state: Current trade state dict (if user has tracked position)
 
     Returns: Number of missed signals detected and added.
     """
@@ -1695,55 +2272,80 @@ def detect_and_add_missed_signals(fresh_backtest: dict, strategy_name: str = Non
     if locked is None or fresh_backtest is None:
         return 0
 
+    # Check if user has an active tracked position - if so, skip adding missed entries
+    # that would conflict with their position (user's position takes precedence)
+    skip_entries_after = None
+    if trade_state and trade_state.get('position'):
+        tracked_entry_time = trade_state.get('entry_time') or trade_state.get('entry_signal_bar')
+        if tracked_entry_time:
+            skip_entries_after = normalize_tz(pd.to_datetime(tracked_entry_time))
+            print(f"   📍 User has tracked position from {tracked_entry_time} - skipping conflicting missed entries")
+
     # Find the last tracked entry date in locked backtest
     locked_entries = locked.get('entries', [])
     locked_exits = locked.get('exits', [])
 
     last_locked_date = None
     for entry in locked_entries:
-        entry_date = pd.to_datetime(entry['date']) if entry.get('date') else None
+        entry_date = normalize_tz(pd.to_datetime(entry['date'])) if entry.get('date') else None
         if entry_date and (last_locked_date is None or entry_date > last_locked_date):
             last_locked_date = entry_date
     for exit_t in locked_exits:
-        exit_date = pd.to_datetime(exit_t['date']) if exit_t.get('date') else None
+        exit_date = normalize_tz(pd.to_datetime(exit_t['date'])) if exit_t.get('date') else None
         if exit_date and (last_locked_date is None or exit_date > last_locked_date):
             last_locked_date = exit_date
 
     if last_locked_date is None:
         return 0
 
-    # Get set of existing entry dates to avoid duplicates
-    existing_entry_dates = set()
+    # Get set of existing entry/exit timestamps to avoid duplicates
+    # Use full timestamps ([:19]) for intraday support
+    existing_entry_timestamps = set()
     for entry in locked_entries:
         if entry.get('date'):
-            existing_entry_dates.add(str(entry['date'])[:10])
+            existing_entry_timestamps.add(str(entry['date'])[:19])
 
-    existing_exit_dates = set()
+    existing_exit_timestamps = set()
     for exit_t in locked_exits:
         if exit_t.get('date'):
-            existing_exit_dates.add(str(exit_t['date'])[:10])
+            existing_exit_timestamps.add(str(exit_t['date'])[:19])
 
     missed_count = 0
+    skipped_count = 0
 
     # Check fresh backtest entries for missed signals
     for entry in fresh_backtest.get('entries', []):
-        entry_date = pd.to_datetime(entry['date']) if entry.get('date') else None
+        entry_date = normalize_tz(pd.to_datetime(entry['date'])) if entry.get('date') else None
         if entry_date and entry_date > last_locked_date:
-            date_str = str(entry['date'])[:10]
-            if date_str not in existing_entry_dates:
+            # Skip entries that conflict with user's tracked position
+            if skip_entries_after and entry_date >= skip_entries_after:
+                skipped_count += 1
+                continue
+
+            timestamp_str = str(entry['date'])[:19]
+            if timestamp_str not in existing_entry_timestamps:
                 append_to_locked_backtest(
                     entry={'date': entry['date'], 'price': entry['price'], 'position': entry.get('position', 'long')},
                     strategy_name=strategy_name, ticker=ticker, missed=True
                 )
-                existing_entry_dates.add(date_str)
+                existing_entry_timestamps.add(timestamp_str)
                 missed_count += 1
 
     # Check fresh backtest exits for missed signals
     for exit_t in fresh_backtest.get('exits', []):
-        exit_date = pd.to_datetime(exit_t['date']) if exit_t.get('date') else None
+        exit_date = normalize_tz(pd.to_datetime(exit_t['date'])) if exit_t.get('date') else None
         if exit_date and exit_date > last_locked_date:
-            date_str = str(exit_t['date'])[:10]
-            if date_str not in existing_exit_dates:
+            # Skip exits whose entry would be after tracked position entry
+            # (these exits belong to positions we didn't add)
+            exit_entry_date = exit_t.get('entry_date')
+            if skip_entries_after and exit_entry_date:
+                exit_entry_dt = normalize_tz(pd.to_datetime(exit_entry_date))
+                if exit_entry_dt >= skip_entries_after:
+                    skipped_count += 1
+                    continue
+
+            timestamp_str = str(exit_t['date'])[:19]
+            if timestamp_str not in existing_exit_timestamps:
                 append_to_locked_backtest(
                     exit_trade={
                         'date': exit_t['date'],
@@ -1755,8 +2357,11 @@ def detect_and_add_missed_signals(fresh_backtest: dict, strategy_name: str = Non
                     },
                     strategy_name=strategy_name, ticker=ticker, missed=True
                 )
-                existing_exit_dates.add(date_str)
+                existing_exit_timestamps.add(timestamp_str)
                 missed_count += 1
+
+    if skipped_count > 0:
+        print(f"   ⏭️  Skipped {skipped_count} signals that would conflict with tracked position")
 
     if missed_count > 0:
         print(f"   🟠 Detected and added {missed_count} missed signals from downtime")
@@ -1996,13 +2601,13 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
                                                   locked_backtest=locked_backtest)
         pos_section = build_position_section(current_price, trade_state, backtest, config)
 
-        # Check for stale data warning (data > 1 day behind)
+        # Check for stale data warning (accounts for weekend/futures market closure)
         data_stale_warning = ""
         try:
             data_end_date = df.index[-1].date() if hasattr(df.index[-1], 'date') else datetime.strptime(full_end, '%Y-%m-%d').date()
-            days_behind = (datetime.now().date() - data_end_date).days
-            if days_behind > 1:
-                data_stale_warning = f"\n⚠️ _Data is {days_behind} days behind (yfinance delay)_"
+            is_stale, warning = is_data_stale_for_futures(data_end_date, ticker)
+            if is_stale and warning:
+                data_stale_warning = warning
         except:
             pass
 
@@ -2022,28 +2627,44 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
         send_discord_alert(webhook_url, msg_full, chart_buf_full, strategy_name=strategy_name)
         print(f"✅ Sent full timeframe update: {title}")
 
-        # --- CHART 2: Recent Period (126 days = half trading year) ---
+        # --- CHART 2: Recent Period (126 bars) ---
         # Use SUBSET of bundled data to prevent repainting (NOT fresh data)
         min_bars_for_subset = 20  # Need at least 20 bars to make a meaningful subset
-        subset_days = 126  # Half a trading year
+        subset_bars = 126  # Number of bars to show
+
+        # Calculate actual days based on interval (bars per day varies by timeframe)
+        interval = config.get('interval', '1d')
+        bars_per_day_map = {
+            '1m': 390, '5m': 78, '15m': 26, '30m': 13, '1h': 7, '90m': 5, '4h': 2, '1d': 1
+        }
+        # Futures trade ~23 hours, Crypto trades 24/7
+        is_futures = ticker.endswith('=F') or ticker.startswith('^')
+        is_crypto = any(ticker.upper().startswith(c) for c in ['BTC', 'ETH', 'DOGE', 'SOL', 'ADA'])
+        bars_per_day = bars_per_day_map.get(interval, 1)
+        if is_crypto and interval not in ['1d']:
+            bars_per_day = int(bars_per_day * 3.7)  # Crypto trades 24/7
+        elif is_futures and interval not in ['1d']:
+            bars_per_day = int(bars_per_day * 3.5)  # Futures trade longer hours
 
         if len(df) > min_bars_for_subset:
-            if len(df) > subset_days:
-                period_label = f"Last {subset_days} Days"
+            if len(df) > subset_bars:
+                actual_days = max(1, subset_bars // bars_per_day) if bars_per_day > 1 else subset_bars
             else:
-                subset_days = len(df) // 2
-                period_label = f"Last {subset_days} Days"
+                subset_bars = len(df) // 2
+                actual_days = max(1, subset_bars // bars_per_day) if bars_per_day > 1 else subset_bars
+            day_word = "Day" if actual_days == 1 else "Days"
+            period_label = f"Last {actual_days} {day_word}"
 
             # Use SUBSET of bundled df (NOT run_backtest_for_period which causes repainting)
-            df_subset = df.iloc[-subset_days:].copy()
+            df_subset = df.iloc[-subset_bars:].copy()
 
             # Filter locked_backtest to get stats and exits for just the subset period
-            subset_start = df_subset.index[0]
+            subset_start = normalize_tz(df_subset.index[0])
             subset_exits = []
             if locked_backtest and locked_backtest.get('exits'):
                 for exit_trade in locked_backtest['exits']:
                     if not exit_trade.get('missed'):
-                        exit_date = pd.to_datetime(exit_trade['date'])
+                        exit_date = normalize_tz(pd.to_datetime(exit_trade['date']))
                         if exit_date >= subset_start:
                             subset_exits.append(exit_trade)
 
@@ -2055,7 +2676,7 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
                 'profit_factor': 0,
                 'exits': subset_exits,  # Include exits for equity curve
                 'current_position': locked_backtest.get('current_position') if locked_backtest else None,
-                'period_days': subset_days  # Store the period for label
+                'period_days': actual_days  # Store the actual days for label
             }
             if subset_exits:
                 winners = [e for e in subset_exits if e['pnl'] > 0]
@@ -2084,13 +2705,13 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
             # Position section stays the same (current position)
             pos_section_subset = build_position_section(current_price, trade_state, backtest_subset, config)
 
-            # Check for stale data warning (data > 1 day behind)
+            # Check for stale data warning (accounts for weekend/futures market closure)
             data_stale_warning = ""
             try:
                 data_end_date = df_subset.index[-1].date() if hasattr(df_subset.index[-1], 'date') else datetime.strptime(period_end, '%Y-%m-%d').date()
-                days_behind = (datetime.now().date() - data_end_date).days
-                if days_behind > 1:
-                    data_stale_warning = f"\n⚠️ _Data is {days_behind} days behind (yfinance delay)_"
+                is_stale, warning = is_data_stale_for_futures(data_end_date, ticker)
+                if is_stale and warning:
+                    data_stale_warning = warning
             except:
                 pass
 
@@ -2316,68 +2937,85 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
         save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
         print(f"✅ Initialized position from backtest: LONG @ ${pos['entry_price']:.2f}")
 
-    # Case 2: State shows position but backtest shows none - missed exit
+    # Case 2: State shows position but backtest shows none - POSSIBLE missed exit
+    # For intraday strategies, backtest may not perfectly align with real-time tracking
+    # ASK the user before automatically clearing the position
     elif state_position is not None and backtest_position is None:
         old_entry = trade_state.get('entry_price', 0)
         old_time = trade_state.get('entry_time', 'Unknown')
-        print(f"⚠️  STATE MISMATCH: State={state_position.upper()} @ ${old_entry:.2f}, Backtest=None")
-        print(f"   🔄 Missed exit detected - clearing state to sync with backtest")
+        print(f"\n⚠️  STATE MISMATCH: State={state_position.upper()} @ ${old_entry:.2f}, Backtest=None")
+        print(f"   Your tracked position: {state_position.upper()} @ ${old_entry:.2f} (entered {str(old_time)[:16]})")
+        print(f"   Backtest shows: No open position")
+        print(f"\n   This could mean:")
+        print(f"   1. The position was exited while trader was offline (missed exit)")
+        print(f"   2. The backtest data doesn't perfectly align with live trading (common for intraday)")
+        print(f"\n   Current price: ${sync_current_price:,.2f}")
+        if old_entry > 0:
+            current_pnl = ((sync_current_price - old_entry) / old_entry) * 100
+            print(f"   Unrealized P&L: {current_pnl:+.2f}%")
 
-        # Find and record the missed trade from backtest exits
-        missed_trade = None
-        if sync_backtest and sync_backtest.get('exits'):
-            # Parse entry time for date comparison
-            entry_date_str = str(old_time)[:10] if old_time else None
+        # Ask user what to do
+        print(f"\n   Options:")
+        print(f"   [K] Keep position - continue tracking your {state_position.upper()} position")
+        print(f"   [C] Clear position - sync with backtest (record as missed exit)")
+        user_choice = input(f"\n   Keep or Clear position? (K/c): ").strip().lower()
 
-            for exit_trade in sync_backtest['exits']:
-                # Match by entry price (within 0.5% tolerance)
-                if abs(exit_trade.get('entry_price', 0) - old_entry) / old_entry < 0.005:
-                    # ALSO validate exit date is AFTER entry date
-                    exit_date_str = str(exit_trade.get('date', ''))[:10]
-                    if entry_date_str and exit_date_str and exit_date_str >= entry_date_str:
-                        missed_trade = exit_trade
-                        break
-                    elif not entry_date_str:
-                        # If we can't parse entry date, accept the match (legacy behavior)
-                        missed_trade = exit_trade
-                        break
+        if user_choice == 'c':
+            print(f"   🔄 Clearing position to sync with backtest...")
 
-        if missed_trade:
-            # Record the missed trade to history
-            stats = log_closed_trade(
-                ticker=ticker,
-                position_type=state_position,
-                entry_price=old_entry,
-                exit_price=missed_trade.get('price', 0),
-                entry_time=str(old_time),
-                exit_time=str(missed_trade.get('date', '')),
-                exit_reason=f"[SYNC] {missed_trade.get('reason', 'Unknown')}",
-                pnl_pct=missed_trade.get('pnl', 0),
-                strategy_name=strategy_name,
-                entry_signal_bar=trade_state.get('entry_signal_bar'),  # Use stored signal bar if available
-                exit_signal_bar=str(missed_trade.get('date', ''))  # Exit bar from backtest
+            # Find and record the missed trade from backtest exits
+            missed_trade = None
+            if sync_backtest and sync_backtest.get('exits'):
+                entry_date_str = str(old_time)[:10] if old_time else None
+
+                for exit_trade in sync_backtest['exits']:
+                    if abs(exit_trade.get('entry_price', 0) - old_entry) / old_entry < 0.005:
+                        exit_date_str = str(exit_trade.get('date', ''))[:10]
+                        if entry_date_str and exit_date_str and exit_date_str >= entry_date_str:
+                            missed_trade = exit_trade
+                            break
+                        elif not entry_date_str:
+                            missed_trade = exit_trade
+                            break
+
+            if missed_trade:
+                stats = log_closed_trade(
+                    ticker=ticker,
+                    position_type=state_position,
+                    entry_price=old_entry,
+                    exit_price=missed_trade.get('price', 0),
+                    entry_time=str(old_time),
+                    exit_time=str(missed_trade.get('date', '')),
+                    exit_reason=f"[SYNC] {missed_trade.get('reason', 'Unknown')}",
+                    pnl_pct=missed_trade.get('pnl', 0),
+                    strategy_name=strategy_name,
+                    entry_signal_bar=trade_state.get('entry_signal_bar'),
+                    exit_signal_bar=str(missed_trade.get('date', ''))
+                )
+                print(f"   📝 Recorded missed trade: {missed_trade.get('pnl', 0):+.2f}% ({missed_trade.get('reason', 'Unknown')})")
+
+            trade_state = {'position': None, 'entry_price': None, 'entry_time': None, 'last_signal_time': None}
+            save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
+            print(f"   ✅ State synced - position cleared")
+
+            # Send Discord notification about missed exit
+            pnl_info = f"\n**Missed Trade P&L:** {missed_trade.get('pnl', 0):+.2f}%" if missed_trade else ""
+            sync_msg = (
+                f"⚠️ **[{strategy_label}] State Sync - Missed Exit**\n"
+                f"---\n"
+                f"**Previous tracking:** {state_position.upper()} @ ${old_entry:.2f}\n"
+                f"**Entry time:** {str(old_time)[:16]}{pnl_info}\n"
+                f"---\n"
+                f"**Backtest shows:** Position was closed\n"
+                f"**Action:** State cleared, now tracking no position\n"
+                f"**Current Price:** ${sync_current_price:,.2f}\n"
+                f"---\n"
+                f"_Trade recorded to history for accurate metrics._"
             )
-            print(f"   📝 Recorded missed trade: {missed_trade.get('pnl', 0):+.2f}% ({missed_trade.get('reason', 'Unknown')})")
-
-        trade_state = {'position': None, 'entry_price': None, 'entry_time': None, 'last_signal_time': None}
-        save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
-        print(f"   ✅ State synced - position cleared")
-
-        # Send Discord notification about missed exit
-        pnl_info = f"\n**Missed Trade P&L:** {missed_trade.get('pnl', 0):+.2f}%" if missed_trade else ""
-        sync_msg = (
-            f"⚠️ **[{strategy_label}] State Sync - Missed Exit**\n"
-            f"---\n"
-            f"**Previous tracking:** {state_position.upper()} @ ${old_entry:.2f}\n"
-            f"**Entry time:** {str(old_time)[:16]}{pnl_info}\n"
-            f"---\n"
-            f"**Backtest shows:** Position was closed\n"
-            f"**Action:** State cleared, now tracking no position\n"
-            f"**Current Price:** ${sync_current_price:,.2f}\n"
-            f"---\n"
-            f"_Trade recorded to history for accurate metrics._"
-        )
-        send_discord_alert(webhook_url, sync_msg, strategy_name=strategy_name)
+            send_discord_alert(webhook_url, sync_msg, strategy_name=strategy_name)
+        else:
+            print(f"   ✅ Keeping tracked position: {state_position.upper()} @ ${old_entry:.2f}")
+            print(f"   ℹ️  The trader will continue monitoring this position for exit signals")
 
     # Case 3: Both show position but entries differ - missed exit AND new entry
     elif state_position is not None and backtest_position is not None:
@@ -2503,10 +3141,58 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
             print(f"🔒 Loaded existing locked backtest from previous session")
     else:
-        # FIRST STARTUP - seed from bundled backtest (full historical data)
-        # This ensures we capture all historical trades, not just last 200 days
-        if backtest:
-            print(f"\n🔒 Creating initial locked backtest from full historical data...")
+        # FIRST STARTUP - seed from bundled backtest_results.json if available
+        # This ensures we use EXACT same trades as shown in Streamlit UI
+        bundle_name = config.get('bundle_name')
+        bundled_backtest_path = os.path.join(VELOCITY_STRATEGIES_DIR, bundle_name, "backtest_results.json") if bundle_name else None
+
+        if bundled_backtest_path and os.path.exists(bundled_backtest_path):
+            # Load pre-computed backtest results from Streamlit deploy
+            print(f"\n🔒 Loading backtest results from bundle: {bundled_backtest_path}")
+            try:
+                with open(bundled_backtest_path, 'r') as f:
+                    bundled_results = json.load(f)
+
+                # Calculate stats from exits
+                exits = bundled_results.get('exits', [])
+                if exits:
+                    pnls = [e.get('pnl', 0) for e in exits]
+                    wins = [e for e in exits if e.get('pnl', 0) > 0]
+                    losses = [e for e in exits if e.get('pnl', 0) <= 0]
+                    win_rate = (len(wins) / len(exits)) * 100 if exits else 0
+                    total_return = (np.prod([1 + p/100 for p in pnls]) - 1) * 100 if pnls else 0
+                    gross_profit = sum(e.get('pnl', 0) for e in wins) if wins else 0
+                    gross_loss = abs(sum(e.get('pnl', 0) for e in losses)) if losses else 0.001
+                    profit_factor = gross_profit / gross_loss if gross_loss > 0 else gross_profit
+                else:
+                    win_rate = total_return = profit_factor = 0
+
+                locked_backtest = {
+                    "locked_at": datetime.now().isoformat(),
+                    "entries": bundled_results.get('entries', []),
+                    "exits": exits,
+                    "current_position": bundled_results.get('current_position'),
+                    "num_trades": len(exits),
+                    "win_rate": win_rate,
+                    "total_return": total_return,
+                    "profit_factor": profit_factor,
+                }
+
+                # Save as the locked_backtest file
+                with open(locked_backtest_path, 'w') as f:
+                    json.dump(locked_backtest, f, indent=2)
+
+                print(f"✅ Loaded {len(exits)} trades from bundled backtest_results.json")
+                print(f"📁 Locked backtest file: {locked_backtest_path}")
+            except Exception as e:
+                print(f"⚠️ Could not load bundled backtest: {e}")
+                # Fall back to regenerated backtest
+                if backtest:
+                    print(f"🔒 Falling back to regenerated backtest...")
+                    locked_backtest = save_locked_backtest(backtest, strategy_name=strategy_name, ticker=ticker, trade_state=trade_state)
+        elif backtest:
+            # Fallback: seed from regenerated backtest (full historical data)
+            print(f"\n🔒 Creating initial locked backtest from regenerated data...")
             locked_backtest = save_locked_backtest(backtest, strategy_name=strategy_name, ticker=ticker, trade_state=trade_state)
             print(f"📁 Locked backtest file: {locked_backtest_path}")
         elif fresh_backtest:
@@ -2514,13 +3200,25 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             locked_backtest = save_locked_backtest(fresh_backtest, strategy_name=strategy_name, ticker=ticker, trade_state=trade_state)
             print(f"📁 Locked backtest file: {locked_backtest_path}")
 
-    # Detect missed signals during downtime
+    # Detect missed signals during downtime (but respect tracked position)
     if locked_backtest and fresh_backtest:
-        num_missed = detect_and_add_missed_signals(fresh_backtest, strategy_name=strategy_name, ticker=ticker)
+        num_missed = detect_and_add_missed_signals(fresh_backtest, strategy_name=strategy_name, ticker=ticker, trade_state=trade_state)
         if num_missed > 0:
             print(f"🟠 Found {num_missed} missed signal(s) during downtime - marked in orange on charts")
             # Reload the locked backtest to get the updated version with missed signals
             locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
+
+    # Validate locked backtest data integrity
+    if locked_backtest:
+        integrity_issues = validate_locked_backtest(locked_backtest)
+        if integrity_issues:
+            print(f"\n⚠️  DATA INTEGRITY ISSUES DETECTED ({len(integrity_issues)}):")
+            for issue in integrity_issues[:5]:  # Show first 5
+                print(f"   • {issue}")
+            if len(integrity_issues) > 5:
+                print(f"   ... and {len(integrity_issues) - 5} more issues")
+        else:
+            print(f"✅ Locked backtest data integrity validated")
 
     # Send startup notification with stats and chart
     startup_chart = None
@@ -2565,31 +3263,63 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 f"• _(Not included in main stats)_"
             )
 
-        # Calculate Recent 126 Days stats (half trading year) from locked_backtest
-        # This matches the chart's "Last 126 Days" period
-        # IMPORTANT: Use 126 TRADING days (rows), not calendar days, to match chart
+        # Calculate Recent stats from locked_backtest
+        # Adjust bars shown based on interval to match chart
         recent_stats = ""
-        recent_days = 126
+        interval = config.get('interval', '1d')
+
+        # Calculate actual days based on bars_per_day (accounting for futures/crypto extended hours)
+        # Stock market: ~6.5 hours/day, Futures: ~23 hours/day, Crypto: 24 hours/day
+        bars_per_day_map = {
+            '1m': 390, '5m': 78, '15m': 26, '30m': 13, '1h': 7, '90m': 5, '4h': 2, '1d': 1
+        }
+        is_futures = ticker.endswith('=F') or ticker.startswith('^')
+        is_crypto = any(ticker.upper().startswith(c) for c in ['BTC', 'ETH', 'DOGE', 'SOL', 'ADA'])
+        bars_per_day = bars_per_day_map.get(interval, 1)
+        if is_crypto and interval not in ['1d']:
+            # Crypto trades 24/7: multiply by ~3.7 (24 hours / 6.5 stock hours)
+            bars_per_day = int(bars_per_day * 3.7)
+        elif is_futures and interval not in ['1d']:
+            bars_per_day = int(bars_per_day * 3.5)  # Futures trade ~23 hours
+
+        if interval in ['15m', '5m', '1m']:
+            recent_bars = 260
+        elif interval in ['30m']:
+            recent_bars = 260
+        elif interval in ['1h', '90m']:
+            recent_bars = 260
+        else:
+            recent_bars = 126
+
+        # Calculate actual days label
+        actual_days = max(1, recent_bars // bars_per_day) if bars_per_day > 1 else recent_bars
+        day_word = "Day" if actual_days == 1 else "Days"
+        recent_label = f"{actual_days} {day_word}"
+
         if locked_backtest and locked_backtest.get('exits'):
             # Get the chart date range using same logic as chart generation
-            # Use the last 126 rows of price data (trading days) for consistency
             chart_df = fresh_df if fresh_backtest and not fresh_df.empty else df
-            if len(chart_df) > recent_days:
-                df_recent_for_stats = chart_df.iloc[-recent_days:]
+            if len(chart_df) > recent_bars:
+                df_recent_for_stats = chart_df.iloc[-recent_bars:]
             else:
                 df_recent_for_stats = chart_df
-            chart_start = df_recent_for_stats.index.min()
-            chart_end = df_recent_for_stats.index.max()
+            chart_start = normalize_tz(df_recent_for_stats.index.min())
+            chart_end = normalize_tz(df_recent_for_stats.index.max())
 
-            # Filter exits to 126-trading-day window (matches chart exactly)
+            # Filter exits to chart window (matches chart exactly)
+            # IMPORTANT: Exclude 'missed' trades to match chart legend stats
             recent_exits = []
             for exit_trade in locked_backtest['exits']:
+                # Skip missed trades (same as chart does)
+                if exit_trade.get('missed'):
+                    continue
                 exit_date = exit_trade.get('date', '')
                 if isinstance(exit_date, str):
                     try:
                         exit_date = pd.to_datetime(exit_date)
                     except:
                         continue
+                exit_date = normalize_tz(exit_date)
                 if exit_date >= chart_start and exit_date <= chart_end:
                     recent_exits.append(exit_trade)
 
@@ -2608,10 +3338,14 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 profit_factor = total_wins / total_losses if total_losses > 0 else total_wins
 
                 recent_stats = (
-                    f"\n📈 **Recent {recent_days} Days ({len(recent_exits)} trades):**\n"
+                    f"\n📈 **Recent {recent_label} ({len(recent_exits)} trades):**\n"
                     f"• Win Rate: {win_rate:.0f}% | Return: {total_return:.1f}%\n"
                     f"• Profit Factor: {profit_factor:.1f}"
                 )
+
+        # Calculate SL/TP dollar values
+        sl_price = current_price * (1 - stop_loss_pct / 100)
+        tp_price = current_price * (1 + take_profit_pct / 100)
 
         startup_msg = (
             f"🤖 **[{strategy_label}] Live Trader Started**\n"
@@ -2619,7 +3353,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             f"**Ticker:** {ticker}\n"
             f"**Current Price:** ${current_price:,.2f}\n"
             f"**Signal Type:** {config.get('signal_type')}\n"
-            f"**Risk:** SL={stop_loss_pct:.1f}%, TP={take_profit_pct:.1f}%\n"
+            f"**Risk:** SL={stop_loss_pct:.1f}% (${sl_price:,.2f}), TP={take_profit_pct:.1f}% (${tp_price:,.2f})\n"
             f"---\n"
             f"{full_period_stats}{missed_stats}{recent_stats}\n"
             f"---\n"
@@ -2640,8 +3374,8 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             chart_data_source = "bundled"  # Track source for accurate logging
             try:
                 if fresh_backtest and fresh_df is not None and len(fresh_df) > 0:
-                    bundled_end = df.index[-1] if len(df) > 0 else None
-                    fresh_end = fresh_df.index[-1]
+                    bundled_end = normalize_tz(df.index[-1]) if len(df) > 0 else None
+                    fresh_end = normalize_tz(fresh_df.index[-1])
                     if bundled_end and fresh_end > bundled_end:
                         chart_df = fresh_df
                         chart_data_source = "fresh"
@@ -2662,21 +3396,52 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                                                         full_period_backtest=backtest)
             print("✅ Generated full period chart")
 
-            # RECENT 126 days chart - subset of chart data
-            recent_days = 126  # Half a trading year
-            if len(chart_df) > recent_days:
-                df_recent = chart_df.iloc[-recent_days:].copy()
+            # RECENT chart - subset of chart data
+            # Adjust number of bars based on interval to show reasonable time period
+            interval = config.get('interval', '1d')
+
+            # Calculate actual days based on bars_per_day (accounting for futures/crypto extended hours)
+            bars_per_day_map = {
+                '1m': 390, '5m': 78, '15m': 26, '30m': 13, '1h': 7, '90m': 5, '4h': 2, '1d': 1
+            }
+            is_futures = ticker.endswith('=F') or ticker.startswith('^')
+            is_crypto = any(ticker.upper().startswith(c) for c in ['BTC', 'ETH', 'DOGE', 'SOL', 'ADA'])
+            bars_per_day = bars_per_day_map.get(interval, 1)
+            if is_crypto and interval not in ['1d']:
+                bars_per_day = int(bars_per_day * 3.7)  # Crypto trades 24/7
+            elif is_futures and interval not in ['1d']:
+                bars_per_day = int(bars_per_day * 3.5)  # Futures trade ~23 hours
+
+            if interval in ['15m', '5m', '1m']:
+                recent_bars = 260
+            elif interval in ['30m']:
+                recent_bars = 260
+            elif interval in ['1h', '90m']:
+                recent_bars = 260
+            else:
+                recent_bars = 126
+
+            # Calculate actual days label
+            actual_days = max(1, recent_bars // bars_per_day) if bars_per_day > 1 else recent_bars
+            day_word = "Day" if actual_days == 1 else "Days"
+            recent_label = f"{actual_days} {day_word}"
+
+            if len(chart_df) > recent_bars:
+                df_recent = chart_df.iloc[-recent_bars:].copy()
             else:
                 df_recent = chart_df.copy()
+                recent_label = "Full Period"
 
             # Calculate subset stats from locked_backtest for the recent period
-            recent_start = df_recent.index.min()
+            # Use BOTH start and end boundaries to match message stats exactly
+            recent_start = normalize_tz(df_recent.index.min())
+            recent_end = normalize_tz(df_recent.index.max())
             recent_exits = []
             if locked_backtest and locked_backtest.get('exits'):
                 for exit_trade in locked_backtest['exits']:
                     if not exit_trade.get('missed'):
-                        exit_date = pd.to_datetime(exit_trade['date'])
-                        if exit_date >= recent_start:
+                        exit_date = normalize_tz(pd.to_datetime(exit_trade['date']))
+                        if exit_date >= recent_start and exit_date <= recent_end:
                             recent_exits.append(exit_trade)
 
             # Build recent_backtest with exits for equity curve
@@ -2687,7 +3452,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 'profit_factor': 0,
                 'exits': recent_exits,  # Include exits for equity curve
                 'current_position': locked_backtest.get('current_position') if locked_backtest else None,
-                'period_days': recent_days  # Store the period for label
+                'period_days': actual_days  # Use calculated actual days, not raw bar count
             }
             if recent_exits:
                 winners = [e for e in recent_exits if e['pnl'] > 0]
@@ -2704,12 +3469,12 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 recent_backtest['profit_factor'] = total_wins / total_losses if total_losses > 0 else total_wins
 
             recent_chart = generate_velocity_chart(df_recent, recent_backtest, config, ticker,
-                                                   title_suffix=f" - Last {recent_days} Days",
+                                                   title_suffix=f" - Last {recent_label}",
                                                    trade_history=startup_trade_history,
                                                    current_position=trade_state,
                                                    locked_backtest=locked_backtest,
                                                    full_period_backtest=locked_backtest)
-            print(f"✅ Generated recent {recent_days}-day chart ({chart_data_source} data, {recent_backtest['num_trades']} trades)")
+            print(f"✅ Generated recent {recent_label} chart ({chart_data_source} data, {recent_backtest['num_trades']} trades)")
 
             # Use recent chart for main display (full period chart can be added later)
             startup_chart = recent_chart
@@ -2719,17 +3484,38 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             traceback.print_exc()
             startup_chart = None
     else:
+        # Get current price from available data for SL/TP calculations
+        fallback_price = df.iloc[-1]['close'] if not df.empty else 0
+        sl_price_fallback = fallback_price * (1 - stop_loss_pct / 100) if fallback_price > 0 else 0
+        tp_price_fallback = fallback_price * (1 + take_profit_pct / 100) if fallback_price > 0 else 0
+
+        if fallback_price > 0:
+            risk_line = f"**Risk:** SL={stop_loss_pct:.1f}% (${sl_price_fallback:,.2f}), TP={take_profit_pct:.1f}% (${tp_price_fallback:,.2f})"
+        else:
+            risk_line = f"**Risk:** SL={stop_loss_pct:.1f}%, TP={take_profit_pct:.1f}%"
+
         startup_msg = (
             f"🤖 **[{strategy_label}] Live Trader Started**\n"
             f"**Strategy:** {strategy_name}\n"
             f"**Ticker:** {ticker}\n"
             f"**Interval:** {interval}\n"
             f"**Signal Type:** {config.get('signal_type')}\n"
-            f"**Risk:** SL={stop_loss_pct}%, TP={take_profit_pct}%\n"
+            f"{risk_line}\n"
             f"---\n"
             f"_Monitoring for signals..._"
         )
-    send_discord_alert(webhook_url, startup_msg, startup_chart, strategy_name=strategy_name)
+
+    # Generate CSV trade log attachment (last 10 trades)
+    trade_log_csv = None
+    if locked_backtest:
+        try:
+            trade_log_csv = generate_trade_log_csv(locked_backtest, num_trades=10, trade_state=trade_state)
+            if trade_log_csv:
+                print("✅ Generated trade log CSV (last 10 trades)")
+        except Exception as e:
+            print(f"⚠️ Could not generate trade log CSV: {e}")
+
+    send_discord_alert(webhook_url, startup_msg, startup_chart, strategy_name=strategy_name, csv_buf=trade_log_csv)
 
     # Determine check interval based on data interval
     # Check frequently enough to catch scheduled update windows
@@ -2748,6 +3534,20 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
     # Determine if this is a crypto or stock ticker for signal timing
     is_crypto = ticker.upper() in ['BTC-USD', 'ETH-USD', 'SOL-USD', 'DOGE-USD'] or '-USD' in ticker.upper()
+
+    # Determine if this is an intraday strategy (15m, 1h, etc.) for more frequent status updates
+    # Note: Signal alerts (entry/exit) are posted immediately regardless - this is for STATUS updates
+    is_intraday = interval in ['1m', '5m', '15m', '30m', '1h', '90m', '4h']
+
+    # Intraday schedule: status updates at key market times
+    # ES futures trade 18:00-17:00 ET with 1hr break (17:00-18:00)
+    # These are STATUS updates - entry/exit SIGNALS are posted immediately when they occur
+    intraday_update_windows = [
+        ("07:30", "08:00", "🌅 Pre-Market Status"),        # Before stock market open
+        ("11:30", "12:00", "☀️ Mid-Day Status"),           # Late morning
+        ("15:30", "16:00", "🌇 Afternoon Status"),         # Near stock close
+        ("19:00", "19:30", "🌙 Evening Session Status"),   # After futures re-open
+    ]
 
     # STARTUP CATCH-UP: If crypto and we just missed a scheduled update window, send immediately
     # This handles cases where trader started at 6:51 AM but 6:00 AM window was missed
@@ -2855,6 +3655,19 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             hour = now.hour
             minute = now.minute
 
+            # Skip scheduled stock updates on weekends and holidays
+            skip_stock_updates = False
+            if not is_crypto:
+                is_holiday_today, holiday_name = is_market_holiday(now.date(), ticker)
+                if is_holiday_today:
+                    skip_stock_updates = True
+                    if minute == 0:  # Only log once per hour to avoid spam
+                        print(f"   🏖️ Skipping scheduled updates - {holiday_name}")
+                elif now.weekday() >= 5:  # Saturday or Sunday
+                    skip_stock_updates = True
+                    if minute == 0:  # Only log once per hour
+                        print(f"   📅 Skipping scheduled updates - Weekend")
+
             # Run backtest for status updates
             status_backtest = None
             try:
@@ -2870,7 +3683,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     print(f"   ⚠️  But trade_state has no position! Consider restarting to sync.")
 
             # Market Open Update (8:30-8:45 AM ET for stocks)
-            if "08:30" <= hm <= "08:45" and not is_crypto:
+            if "08:30" <= hm <= "08:45" and not is_crypto and not skip_stock_updates:
                 key = f"{day_str}_OPEN"
                 if key not in daily_alerts and status_backtest:
                     send_status_update(webhook_url, df, status_backtest, config, ticker,
@@ -2879,7 +3692,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     daily_alerts.add(key)
 
             # Mid-Day Update (11:00-11:15 AM ET for stocks)
-            if "11:00" <= hm <= "11:15" and not is_crypto:
+            if "11:00" <= hm <= "11:15" and not is_crypto and not skip_stock_updates:
                 key = f"{day_str}_MID"
                 if key not in daily_alerts and status_backtest:
                     send_status_update(webhook_url, df, status_backtest, config, ticker,
@@ -2888,7 +3701,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     daily_alerts.add(key)
 
             # Afternoon Update (15:00-15:15 PM ET for stocks - 1 hour before close)
-            if "15:00" <= hm <= "15:15" and not is_crypto:
+            if "15:00" <= hm <= "15:15" and not is_crypto and not skip_stock_updates:
                 key = f"{day_str}_AFTERNOON"
                 if key not in daily_alerts and status_backtest:
                     send_status_update(webhook_url, df, status_backtest, config, ticker,
@@ -2897,7 +3710,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     daily_alerts.add(key)
 
             # Market Close Update (16:00-16:15 ET for stocks - actual market close time)
-            if "16:00" <= hm <= "16:15" and not is_crypto:
+            if "16:00" <= hm <= "16:15" and not is_crypto and not skip_stock_updates:
                 key = f"{day_str}_CLOSE"
                 if key not in daily_alerts and status_backtest:
                     send_status_update(webhook_url, df, status_backtest, config, ticker,
@@ -2908,7 +3721,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             # Hourly Updates (9:00 - 14:00 ET for stocks, except 11 which has special alert)
             # Window is first 15 minutes of each hour to ensure it gets hit
             # Excludes 15 (afternoon) and 16 (close) which have dedicated updates
-            if 9 <= hour <= 14 and minute < 15 and not is_crypto:
+            if 9 <= hour <= 14 and minute < 15 and not is_crypto and not skip_stock_updates:
                 if hour != 11:
                     key = f"{day_str}_HOUR_{hour}"
                     if key not in daily_alerts and status_backtest:
@@ -2919,7 +3732,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
             # END OF DAY Update (16:30-17:00 ET for stocks - after market close + data finalization)
             # This is the ACTUAL end of day summary, sent after market closes and data settles
-            if "16:30" <= hm <= "17:00" and not is_crypto:
+            if "16:30" <= hm <= "17:00" and not is_crypto and not skip_stock_updates:
                 key = f"{day_str}_EOD"
                 print(f"   📊 EOD window detected! Time={hm}, Key={key}, already_sent={key in daily_alerts}, has_backtest={status_backtest is not None}")
                 if key not in daily_alerts and status_backtest:
@@ -2959,6 +3772,20 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                                      realtime_price=realtime_price)
                     daily_alerts.add(key)
                     print(f"   ✅ Crypto {hour}:00 update sent!")
+
+            # INTRADAY (15m, 1h, etc.): Status updates at key market times
+            # Entry/exit SIGNALS are posted immediately - these are STATUS updates only
+            if is_intraday and not is_crypto:
+                for start_time, end_time, title in intraday_update_windows:
+                    if start_time <= hm <= end_time:
+                        key = f"{day_str}_INTRADAY_{start_time.replace(':', '')}"
+                        if key not in daily_alerts and status_backtest:
+                            send_status_update(webhook_url, df, status_backtest, config, ticker,
+                                             title, trade_state, strategy_name=strategy_name,
+                                             realtime_price=realtime_price)
+                            daily_alerts.add(key)
+                            print(f"   ✅ Intraday {title} sent!")
+                        break  # Only one update per cycle
 
             # Check for exit conditions first (if in position)
             if trade_state['position'] == 'long':
@@ -3031,13 +3858,16 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                             'pnl': pnl_pct,
                             'reason': exit_reason,
                             'entry_price': entry_price,
+                            'entry_date': str(trade_state.get('entry_time', '')),
                         })
                         # Clear current_position since we're exiting
                         locked_backtest_with_exit['current_position'] = None
 
                         # Use locked backtest WITH current exit for markers
+                        # chart_type="signal" for focused view on exit signals
                         exit_chart = generate_velocity_chart(df, exit_backtest, config, ticker,
-                                                            locked_backtest=locked_backtest_with_exit)
+                                                            locked_backtest=locked_backtest_with_exit,
+                                                            chart_type="signal")
                     except Exception as e:
                         print(f"Could not generate exit chart: {e}")
 
@@ -3125,8 +3955,37 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
                     exit_msg += cumulative_section
 
-                    send_discord_alert(webhook_url, exit_msg, exit_chart, strategy_name=strategy_name)
+                    # Generate trade log CSV (use locked_backtest_with_exit to include this trade)
+                    exit_trade_log_csv = None
+                    try:
+                        exit_trade_log_csv = generate_trade_log_csv(locked_backtest_with_exit, num_trades=10)
+                    except Exception as e:
+                        print(f"⚠️ Could not generate exit trade log CSV: {e}")
+
+                    send_discord_alert(webhook_url, exit_msg, exit_chart, strategy_name=strategy_name, csv_buf=exit_trade_log_csv)
                     print(f"EXIT LONG: {exit_reason}")
+
+                    # Sierra Chart bridge (opt-in, fail-safe)
+                    if SIERRA_BRIDGE_ENABLED:
+                        try:
+                            sierra_signal = build_sierra_signal(
+                                signal_type="EXIT",
+                                direction="LONG",
+                                ticker=ticker,
+                                price=current_price,
+                                signal_time=current_time,
+                                strategy_name=strategy_name,
+                                config=config,
+                                exit_data={
+                                    "entry_price": entry_price,
+                                    "pnl_pct": pnl_pct,
+                                    "exit_reason": exit_reason
+                                }
+                            )
+                            publish_signal_to_sierra(sierra_signal, SIERRA_SIGNAL_FILE)
+                            print(f"   📊 Sierra Chart: Published EXIT signal")
+                        except Exception as e:
+                            print(f"   ⚠️ Sierra Chart bridge error (Discord unaffected): {e}")
 
                     trade_state['position'] = None
                     trade_state['entry_price'] = None
@@ -3167,14 +4026,23 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                                     should_check_signals = True
                                     print(f"   📊 [CRYPTO] Evaluating completed bar: {completed_bar_time} (UTC: {utc_now.strftime('%H:%M')})")
                             else:
-                                # Stocks (SPY): Only evaluate after market close (4 PM ET = 16:00)
-                                # market_time is already in Eastern Time via get_market_time()
-                                et_hour = market_time.hour
-                                if et_hour >= 16:
-                                    should_check_signals = True
-                                    print(f"   📊 [STOCK] Market closed ({market_time.strftime('%H:%M')} ET) - Evaluating completed bar: {completed_bar_time}")
+                                # Stocks (SPY): Check for holidays first
+                                is_holiday_today, holiday_name = is_market_holiday(market_time.date(), ticker)
+                                if is_holiday_today:
+                                    print(f"   🏖️ [STOCK] Market closed for {holiday_name} - No new data expected")
+                                    # Don't check signals on holidays
+                                elif market_time.weekday() >= 5:
+                                    print(f"   📅 [STOCK] Weekend - Market closed")
+                                    # Don't check signals on weekends
                                 else:
-                                    print(f"   ⏳ [STOCK] Market open ({market_time.strftime('%H:%M')} ET) - Waiting for 4 PM ET close to evaluate signals")
+                                    # Stocks (SPY): Only evaluate after market close (4 PM ET = 16:00)
+                                    # market_time is already in Eastern Time via get_market_time()
+                                    et_hour = market_time.hour
+                                    if et_hour >= 16:
+                                        should_check_signals = True
+                                        print(f"   📊 [STOCK] Market closed ({market_time.strftime('%H:%M')} ET) - Evaluating completed bar: {completed_bar_time}")
+                                    else:
+                                        print(f"   ⏳ [STOCK] Market open ({market_time.strftime('%H:%M')} ET) - Waiting for 4 PM ET close to evaluate signals")
                 else:
                     # For non-daily intervals, use existing logic
                     should_check_signals = True
@@ -3229,22 +4097,33 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 effective_buy = recent_buy_signal is not None
                 effective_sell = recent_sell_signal is not None
 
-                # Avoid duplicate signals
+                # Avoid duplicate/stale signals
+                # Skip signals that are AT OR BEFORE the last processed signal time
                 last_signal_time = trade_state.get('last_signal_time')
-                if last_signal_time and recent_buy_signal and str(recent_buy_signal['time']) == str(last_signal_time):
-                    effective_buy = False
-                if last_signal_time and recent_sell_signal and str(recent_sell_signal['time']) == str(last_signal_time):
-                    effective_sell = False
+                if last_signal_time:
+                    last_signal_dt = normalize_tz(pd.to_datetime(last_signal_time))
+                    if recent_buy_signal:
+                        buy_signal_dt = normalize_tz(pd.to_datetime(recent_buy_signal['time']))
+                        if buy_signal_dt <= last_signal_dt:
+                            effective_buy = False
+                            print(f"   ⏭️  Skipping stale BUY signal from {recent_buy_signal['time']} (last signal was {last_signal_time})")
+                    if recent_sell_signal:
+                        sell_signal_dt = normalize_tz(pd.to_datetime(recent_sell_signal['time']))
+                        if sell_signal_dt <= last_signal_dt:
+                            effective_sell = False
+                            print(f"   ⏭️  Skipping stale SELL signal from {recent_sell_signal['time']} (last signal was {last_signal_time})")
 
                 if effective_buy:
                     signal_bar = recent_buy_signal['bar']
                     signal_time = recent_buy_signal['time']
-                    signal_note = " (MISSED - acting now)" if recent_buy_signal['index'] < -1 else ""
+                    is_missed = recent_buy_signal['index'] < -1
+                    signal_note = f" (Signal from {signal_time} - entering at market)" if is_missed else ""
 
                     # Append new entry to locked backtest (for future charts)
+                    # Pass missed=True if signal was from a past bar
                     append_to_locked_backtest(
                         entry={'date': signal_time, 'price': current_price, 'position': 'long'},
-                        strategy_name=strategy_name, ticker=ticker
+                        strategy_name=strategy_name, ticker=ticker, missed=is_missed
                     )
                     # Reload the locked backtest with the new entry
                     locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
@@ -3255,8 +4134,10 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     try:
                         signal_backtest = run_historical_backtest(df, config)
                         # Use locked backtest for markers to prevent repainting
+                        # chart_type="signal" for focused view on entry signals
                         signal_chart = generate_velocity_chart(df, signal_backtest, config, ticker,
-                                                              locked_backtest=locked_backtest)
+                                                              locked_backtest=locked_backtest,
+                                                              chart_type="signal")
                     except Exception as e:
                         print(f"Could not generate signal chart: {e}")
 
@@ -3270,17 +4151,49 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                             f"• Total Return: {signal_backtest['total_return']:.1f}% | PF: {signal_backtest['profit_factor']:.1f}\n"
                         )
 
+                    # Build position status line
+                    position_status = "🟢 **Position: LONG**" if not is_missed else "🟡 **Position: LONG** (late entry)"
+
+                    # Calculate SL/TP prices
+                    entry_sl_price = current_price * (1 - stop_loss_pct / 100)
+                    entry_tp_price = current_price * (1 + take_profit_pct / 100)
+
                     buy_msg = (
                         f"📈 **[{strategy_label}] BUY SIGNAL**{signal_note}\n"
                         f"**Signal Time:** {signal_time}\n"
-                        f"**Entry Price:** ${current_price:.2f}\n"
+                        f"**Entry Price:** ${current_price:,.2f}\n"
+                        f"{position_status}\n"
                         f"{stats_section}"
                         f"---\n"
-                        f"_SL: ${current_price * (1 - stop_loss_pct/100):.2f} | TP: ${current_price * (1 + take_profit_pct/100):.2f}_"
+                        f"_SL: {stop_loss_pct:.1f}% (${entry_sl_price:,.2f}) | TP: {take_profit_pct:.1f}% (${entry_tp_price:,.2f})_"
                     )
 
-                    send_discord_alert(webhook_url, buy_msg, signal_chart, strategy_name=strategy_name)
+                    # Generate trade log CSV (last 10 completed trades)
+                    entry_trade_log_csv = None
+                    try:
+                        entry_trade_log_csv = generate_trade_log_csv(locked_backtest, num_trades=10)
+                    except Exception as e:
+                        print(f"⚠️ Could not generate entry trade log CSV: {e}")
+
+                    send_discord_alert(webhook_url, buy_msg, signal_chart, strategy_name=strategy_name, csv_buf=entry_trade_log_csv)
                     print(f"BUY SIGNAL SENT!{signal_note}")
+
+                    # Sierra Chart bridge (opt-in, fail-safe)
+                    if SIERRA_BRIDGE_ENABLED:
+                        try:
+                            sierra_signal = build_sierra_signal(
+                                signal_type="ENTRY",
+                                direction="LONG",
+                                ticker=ticker,
+                                price=current_price,
+                                signal_time=signal_time,
+                                strategy_name=strategy_name,
+                                config=config
+                            )
+                            publish_signal_to_sierra(sierra_signal, SIERRA_SIGNAL_FILE)
+                            print(f"   📊 Sierra Chart: Published ENTRY signal")
+                        except Exception as e:
+                            print(f"   ⚠️ Sierra Chart bridge error (Discord unaffected): {e}")
 
                     trade_state['position'] = 'long'
                     trade_state['entry_price'] = current_price
