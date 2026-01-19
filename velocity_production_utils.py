@@ -230,6 +230,169 @@ def safe_json_read(filepath: str, default: Any = None) -> Any:
 MARKET_TIMEZONE = "America/New_York"
 CRYPTO_TIMEZONE = "UTC"
 
+# US Stock Market Holidays (NYSE/NASDAQ)
+# https://www.nyse.com/markets/hours-calendars
+US_MARKET_HOLIDAYS = {
+    # 2025 Holidays
+    "2025-01-01": "New Year's Day",
+    "2025-01-20": "Martin Luther King Jr. Day",
+    "2025-02-17": "Presidents Day",
+    "2025-04-18": "Good Friday",
+    "2025-05-26": "Memorial Day",
+    "2025-06-19": "Juneteenth",
+    "2025-07-04": "Independence Day",
+    "2025-09-01": "Labor Day",
+    "2025-11-27": "Thanksgiving",
+    "2025-12-25": "Christmas Day",
+    # 2026 Holidays
+    "2026-01-01": "New Year's Day",
+    "2026-01-19": "Martin Luther King Jr. Day",  # 3rd Monday
+    "2026-02-16": "Presidents Day",              # 3rd Monday
+    "2026-04-03": "Good Friday",
+    "2026-05-25": "Memorial Day",                # Last Monday
+    "2026-06-19": "Juneteenth",
+    "2026-07-03": "Independence Day (observed)", # July 4 is Saturday
+    "2026-09-07": "Labor Day",                   # 1st Monday
+    "2026-11-26": "Thanksgiving",                # 4th Thursday
+    "2026-12-25": "Christmas Day",
+    # 2027 Holidays (for year-end 2026 lookups)
+    "2027-01-01": "New Year's Day",
+}
+
+# CME Futures Holidays (different from stocks - check CME Group calendar)
+# CME has some different closures and early closes
+CME_FUTURES_HOLIDAYS = {
+    # 2025
+    "2025-01-01": "New Year's Day",
+    "2025-01-20": "Martin Luther King Jr. Day",
+    "2025-02-17": "Presidents Day",
+    "2025-04-18": "Good Friday",
+    "2025-05-26": "Memorial Day",
+    "2025-07-04": "Independence Day",
+    "2025-09-01": "Labor Day",
+    "2025-11-27": "Thanksgiving",
+    "2025-12-25": "Christmas Day",
+    # 2026
+    "2026-01-01": "New Year's Day",
+    "2026-01-19": "Martin Luther King Jr. Day",
+    "2026-02-16": "Presidents Day",
+    "2026-04-03": "Good Friday",
+    "2026-05-25": "Memorial Day",
+    "2026-07-03": "Independence Day (observed)",
+    "2026-09-07": "Labor Day",
+    "2026-11-26": "Thanksgiving",
+    "2026-12-25": "Christmas Day",
+}
+
+# Half-Day / Early Close Days (NYSE closes at 1:00 PM ET)
+# https://www.nyse.com/markets/hours-calendars
+US_HALF_DAYS = {
+    # 2025 Half Days
+    "2025-07-03": {"close_time": "13:00", "reason": "Day before Independence Day"},
+    "2025-11-28": {"close_time": "13:00", "reason": "Day after Thanksgiving"},
+    "2025-12-24": {"close_time": "13:00", "reason": "Christmas Eve"},
+    # 2026 Half Days (July 4 is Saturday, so July 3 is the holiday, July 2 is early close)
+    "2026-07-02": {"close_time": "13:00", "reason": "Day before Independence Day weekend"},
+    "2026-11-27": {"close_time": "13:00", "reason": "Day after Thanksgiving"},
+    "2026-12-24": {"close_time": "13:00", "reason": "Christmas Eve"},
+    # 2027 Half Days (for year-end 2026 lookups)
+    "2027-07-02": {"close_time": "13:00", "reason": "Day before Independence Day"},
+}
+
+# CME Futures Early Closes (typically close early before holidays)
+CME_HALF_DAYS = {
+    # 2025
+    "2025-07-03": {"close_time": "12:00 CT", "reason": "Day before Independence Day"},
+    "2025-11-28": {"close_time": "12:15 CT", "reason": "Day after Thanksgiving"},
+    "2025-12-24": {"close_time": "12:00 CT", "reason": "Christmas Eve"},
+    "2025-12-31": {"close_time": "12:00 CT", "reason": "New Year's Eve"},
+    # 2026
+    "2026-07-02": {"close_time": "12:00 CT", "reason": "Day before Independence Day"},
+    "2026-11-27": {"close_time": "12:15 CT", "reason": "Day after Thanksgiving"},
+    "2026-12-24": {"close_time": "12:00 CT", "reason": "Christmas Eve"},
+    "2026-12-31": {"close_time": "12:00 CT", "reason": "New Year's Eve"},
+}
+
+
+def is_market_holiday(date_to_check=None, ticker: str = "SPY") -> tuple:
+    """
+    Check if a given date is a US market holiday.
+
+    Args:
+        date_to_check: Date to check (datetime, date, or string). Defaults to today.
+        ticker: Ticker symbol to determine which holiday calendar to use.
+
+    Returns:
+        Tuple of (is_holiday: bool, holiday_name: str or None)
+    """
+    if date_to_check is None:
+        date_to_check = datetime.now().date()
+    elif isinstance(date_to_check, datetime):
+        date_to_check = date_to_check.date()
+    elif isinstance(date_to_check, str):
+        date_to_check = datetime.strptime(date_to_check[:10], "%Y-%m-%d").date()
+
+    date_str = date_to_check.strftime("%Y-%m-%d")
+
+    # Crypto never has holidays
+    is_crypto = any(ticker.upper().startswith(c) for c in ['BTC', 'ETH', 'DOGE', 'SOL', 'ADA'])
+    if is_crypto:
+        return False, None
+
+    # Futures use CME calendar
+    is_futures = ticker.upper().endswith('=F') or ticker.upper() in ['ES', 'NQ', 'GC', 'CL', 'SI', 'RTY']
+    if is_futures:
+        if date_str in CME_FUTURES_HOLIDAYS:
+            return True, CME_FUTURES_HOLIDAYS[date_str]
+        return False, None
+
+    # Stocks use NYSE calendar
+    if date_str in US_MARKET_HOLIDAYS:
+        return True, US_MARKET_HOLIDAYS[date_str]
+
+    return False, None
+
+
+def is_early_close(date_to_check=None, ticker: str = "SPY") -> tuple:
+    """
+    Check if a given date is a half-day / early close day.
+
+    Args:
+        date_to_check: Date to check (datetime, date, or string). Defaults to today.
+        ticker: Ticker symbol to determine which calendar to use.
+
+    Returns:
+        Tuple of (is_early_close: bool, close_info: dict or None)
+        close_info has 'close_time' and 'reason' keys if early close
+    """
+    if date_to_check is None:
+        date_to_check = datetime.now().date()
+    elif isinstance(date_to_check, datetime):
+        date_to_check = date_to_check.date()
+    elif isinstance(date_to_check, str):
+        date_to_check = datetime.strptime(date_to_check[:10], "%Y-%m-%d").date()
+
+    date_str = date_to_check.strftime("%Y-%m-%d")
+
+    # Crypto never has early closes
+    is_crypto = any(ticker.upper().startswith(c) for c in ['BTC', 'ETH', 'DOGE', 'SOL', 'ADA'])
+    if is_crypto:
+        return False, None
+
+    # Futures use CME half-day calendar
+    is_futures = ticker.upper().endswith('=F') or ticker.upper() in ['ES', 'NQ', 'GC', 'CL', 'SI', 'RTY']
+    if is_futures:
+        if date_str in CME_HALF_DAYS:
+            return True, CME_HALF_DAYS[date_str]
+        return False, None
+
+    # Stocks use NYSE half-day calendar
+    if date_str in US_HALF_DAYS:
+        return True, US_HALF_DAYS[date_str]
+
+    return False, None
+
+
 def get_market_timezone():
     """Get the market timezone object."""
     if ZoneInfo:
@@ -296,6 +459,17 @@ def is_market_open(ticker: str = "SPY") -> Dict[str, Any]:
             "market_time": market_time,
             "reason": "Weekend - markets closed",
             "is_crypto": False
+        }
+
+    # Holiday check
+    is_holiday, holiday_name = is_market_holiday(market_time.date(), ticker)
+    if is_holiday:
+        return {
+            "is_open": False,
+            "market_time": market_time,
+            "reason": f"Holiday - {holiday_name}",
+            "is_crypto": False,
+            "holiday": holiday_name
         }
 
     # Pre-market

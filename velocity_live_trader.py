@@ -37,7 +37,7 @@ try:
         safe_json_write, safe_json_read, get_logger,
         is_market_open, get_market_time, HeartbeatMonitor,
         load_webhook_from_env, print_signal_only_disclaimer,
-        SIGNAL_ONLY_DISCLAIMER, is_market_holiday
+        SIGNAL_ONLY_DISCLAIMER, is_market_holiday, is_early_close
     )
     PRODUCTION_UTILS_AVAILABLE = True
 except ImportError:
@@ -54,6 +54,8 @@ except ImportError:
     def print_signal_only_disclaimer():
         print("WARNING: This is a SIGNAL-ONLY system. It does NOT execute trades.")
     def is_market_holiday(date_to_check=None, ticker="SPY"):
+        return False, None
+    def is_early_close(date_to_check=None, ticker="SPY"):
         return False, None
     def safe_json_write(filepath, data, indent=2):
         """Fallback: atomic JSON write with file locking."""
@@ -491,6 +493,91 @@ def normalize_tz(ts):
     if ts.tzinfo is not None:
         return ts.tz_localize(None)
     return ts
+
+
+def calculate_exit_stats(exits: list, exclude_missed: bool = True) -> dict:
+    """
+    Centralized stats calculation from a list of exit trades.
+
+    This is the SINGLE SOURCE OF TRUTH for calculating trading statistics.
+    All stats displayed on Discord, charts, and trade logs should use this function.
+
+    Args:
+        exits: List of exit trade dicts with 'pnl', 'date', 'reason' fields
+        exclude_missed: If True, filter out [SYNC]/[MISSED] trades from stats
+
+    Returns:
+        Dict with: num_trades, win_rate, total_return (compounded), profit_factor,
+                   winners, losers, avg_win, avg_loss
+    """
+    if not exits:
+        return {
+            'num_trades': 0,
+            'win_rate': 0,
+            'total_return': 0,
+            'profit_factor': 0,
+            'winners': 0,
+            'losers': 0,
+            'avg_win': 0,
+            'avg_loss': 0,
+        }
+
+    # Filter out missed/sync trades if requested
+    if exclude_missed:
+        filtered_exits = [
+            e for e in exits
+            if not e.get('missed')
+            and '[SYNC]' not in str(e.get('reason', ''))
+            and '[MISSED]' not in str(e.get('reason', ''))
+        ]
+    else:
+        filtered_exits = exits
+
+    if not filtered_exits:
+        return {
+            'num_trades': 0,
+            'win_rate': 0,
+            'total_return': 0,
+            'profit_factor': 0,
+            'winners': 0,
+            'losers': 0,
+            'avg_win': 0,
+            'avg_loss': 0,
+        }
+
+    # Calculate stats
+    winners = [e for e in filtered_exits if e.get('pnl', 0) > 0]
+    losers = [e for e in filtered_exits if e.get('pnl', 0) <= 0]
+
+    num_trades = len(filtered_exits)
+    win_rate = (len(winners) / num_trades) * 100 if num_trades > 0 else 0
+
+    # Compounded return (matches equity curve calculation)
+    sorted_exits = sorted(filtered_exits, key=lambda x: str(x.get('date', '')))
+    equity = 1.0
+    for exit_trade in sorted_exits:
+        equity *= (1 + exit_trade.get('pnl', 0) / 100)
+    total_return = (equity - 1) * 100
+
+    # Profit factor
+    total_wins = sum(e.get('pnl', 0) for e in winners) if winners else 0
+    total_losses = abs(sum(e.get('pnl', 0) for e in losers)) if losers else 0.001
+    profit_factor = total_wins / total_losses if total_losses > 0 else (999.99 if total_wins > 0 else 0)
+
+    # Averages
+    avg_win = total_wins / len(winners) if winners else 0
+    avg_loss = total_losses / len(losers) if losers else 0
+
+    return {
+        'num_trades': num_trades,
+        'win_rate': win_rate,
+        'total_return': total_return,
+        'profit_factor': profit_factor,
+        'winners': len(winners),
+        'losers': len(losers),
+        'avg_win': avg_win,
+        'avg_loss': avg_loss,
+    }
 
 
 def timestamps_equal(ts1, ts2) -> bool:
@@ -3134,28 +3221,17 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
                         subset_exits.append(exit_trade)
 
             # Build backtest_subset with exits for equity curve
+            # Use centralized stats calculation (R6.1: single source of truth)
+            stats = calculate_exit_stats(subset_exits, exclude_missed=False)  # Already filtered above
             backtest_subset = {
-                'num_trades': len(subset_exits),
-                'win_rate': 0,
-                'total_return': 0,
-                'profit_factor': 0,
+                'num_trades': stats['num_trades'],
+                'win_rate': stats['win_rate'],
+                'total_return': stats['total_return'],
+                'profit_factor': stats['profit_factor'],
                 'exits': subset_exits,  # Include exits for equity curve
                 'current_position': locked_backtest.get('current_position') if locked_backtest else None,
                 'period_days': actual_days  # Store the actual days for label
             }
-            if subset_exits:
-                winners = [e for e in subset_exits if e['pnl'] > 0]
-                losers = [e for e in subset_exits if e['pnl'] <= 0]
-                backtest_subset['win_rate'] = (len(winners) / len(subset_exits)) * 100
-                # Use COMPOUNDED return to match equity curve
-                sorted_exits = sorted(subset_exits, key=lambda x: str(x.get('date', '')))
-                equity = 1.0
-                for exit_trade in sorted_exits:
-                    equity *= (1 + exit_trade['pnl'] / 100)
-                backtest_subset['total_return'] = (equity - 1) * 100
-                total_wins = sum(e['pnl'] for e in winners) if winners else 0
-                total_losses = abs(sum(e['pnl'] for e in losers)) if losers else 0.001
-                backtest_subset['profit_factor'] = total_wins / total_losses if total_losses > 0 else total_wins
 
             # Calculate date range for subset window
             period_start = df_subset.index[0].strftime('%Y-%m-%d') if hasattr(df_subset.index[0], 'strftime') else str(df_subset.index[0])[:10]
@@ -3944,28 +4020,17 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         recent_exits.append(exit_trade)
 
             # Build recent_backtest with exits for equity curve
+            # Use centralized stats calculation (R6.1: single source of truth)
+            stats = calculate_exit_stats(recent_exits, exclude_missed=False)  # Already filtered above
             recent_backtest = {
-                'num_trades': len(recent_exits),
-                'win_rate': 0,
-                'total_return': 0,
-                'profit_factor': 0,
+                'num_trades': stats['num_trades'],
+                'win_rate': stats['win_rate'],
+                'total_return': stats['total_return'],
+                'profit_factor': stats['profit_factor'],
                 'exits': recent_exits,  # Include exits for equity curve
                 'current_position': locked_backtest.get('current_position') if locked_backtest else None,
                 'period_days': actual_days  # Use calculated actual days, not raw bar count
             }
-            if recent_exits:
-                winners = [e for e in recent_exits if e['pnl'] > 0]
-                losers = [e for e in recent_exits if e['pnl'] <= 0]
-                recent_backtest['win_rate'] = (len(winners) / len(recent_exits)) * 100
-                # Use COMPOUNDED return to match equity curve
-                sorted_exits = sorted(recent_exits, key=lambda x: str(x.get('date', '')))
-                equity = 1.0
-                for exit_trade in sorted_exits:
-                    equity *= (1 + exit_trade['pnl'] / 100)
-                recent_backtest['total_return'] = (equity - 1) * 100
-                total_wins = sum(e['pnl'] for e in winners) if winners else 0
-                total_losses = abs(sum(e['pnl'] for e in losers)) if losers else 0.001
-                recent_backtest['profit_factor'] = total_wins / total_losses if total_losses > 0 else total_wins
 
             recent_chart = generate_velocity_chart(df_recent, recent_backtest, config, ticker,
                                                    title_suffix=f" - Last {recent_label}",
