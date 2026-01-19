@@ -197,6 +197,23 @@ def fetch_and_cache(ticker: str, days: int = 200, interval: str = "1d",
     Returns:
         DataFrame with OHLCV data
     """
+    # yfinance has limits on intraday data history
+    # Cap days based on interval to avoid API errors
+    intraday_limits = {
+        '1m': 7,      # 7 days max
+        '2m': 60,     # 60 days max
+        '5m': 60,     # 60 days max
+        '15m': 60,    # 60 days max
+        '30m': 60,    # 60 days max
+        '1h': 730,    # ~2 years max
+        '90m': 60,    # 60 days max
+    }
+    if interval in intraday_limits:
+        max_days = intraday_limits[interval]
+        if days > max_days:
+            print(f"   ⚠️ {interval} data limited to {max_days} days (requested {days})")
+            days = max_days
+
     init_database(db_path)  # Ensure DB exists
 
     today = datetime.now().date()
@@ -209,18 +226,42 @@ def fetch_and_cache(ticker: str, days: int = 200, interval: str = "1d",
         cached_last = datetime.strptime(cached_info['last_date'], '%Y-%m-%d').date()
         cache_age_days = (today - cached_last).days
 
+        # For crypto (24/7 trading), always try to refresh if cache is >0 days old
+        # yfinance can have 12-24 hour delays for crypto daily candles
+        is_crypto = '-USD' in ticker or ticker in ['BTC', 'ETH']
+
         # If cache is fresh (same day for daily data), use it
         # For daily candles, we need today's data after midnight to detect new signals
         # cache_age_days == 0 means cache was updated today
         # cache_age_days == 1 means cache is from yesterday - needs refresh for today's completed candle
-        if cache_age_days == 0 and interval == '1d':
+        if cache_age_days == 0 and interval == '1d' and not is_crypto:
             print(f"   📦 Using cached data for {ticker} (last update: {cached_info['last_date']})")
             df = load_price_data(ticker, interval, start_date.strftime('%Y-%m-%d'), db_path=db_path)
             if len(df) >= days * 0.9:  # Have at least 90% of requested data
                 return df
 
-        # If cache is slightly stale, fetch only recent data
-        if cache_age_days <= 7:
+        # For crypto, always try to fetch fresh data
+        # BUT still use cached historical data - just update with recent bars
+        if is_crypto:
+            print(f"   📦 Crypto detected - updating cache (cache ends: {cached_info['last_date']})")
+            try:
+                # Fetch recent data to update cache
+                new_df = _fetch_from_yfinance(ticker, days=max(cache_age_days + 5, 10), interval=interval)
+                if not new_df.empty:
+                    save_price_data(new_df, ticker, interval, db_path)
+                # Return full cached data (now updated with recent bars)
+                df = load_price_data(ticker, interval, start_date.strftime('%Y-%m-%d'), db_path=db_path)
+                if len(df) >= days * 0.8:  # Have at least 80% of requested data
+                    return df
+                else:
+                    # Cache doesn't have enough historical data - fetch full range
+                    print(f"   📦 Cache only has {len(df)} bars, need {days} - fetching full history")
+            except Exception as e:
+                print(f"   ⚠️ Failed to update cache: {e}")
+            # Fall through to full fetch if cache is insufficient
+
+        # If cache is slightly stale (non-crypto), fetch only recent data
+        if not is_crypto and cache_age_days <= 7:
             print(f"   📦 Updating cache for {ticker} (fetching last {cache_age_days + 5} days)")
             try:
                 # Fetch recent data
@@ -251,15 +292,97 @@ def fetch_and_cache(ticker: str, days: int = 200, interval: str = "1d",
         return pd.DataFrame()
 
 
+def is_futures_market_closed(bar_timestamp, ticker: str = "") -> bool:
+    """
+    Check if a bar timestamp falls during futures market closure.
+
+    CME Globex Schedule (for ES, GC, CL, NQ, etc.):
+    - CLOSED: Friday 5:00 PM CT to Sunday 5:00 PM CT
+    - DST-aware: Uses Central Time (America/Chicago) for accurate calculations
+
+    Use this to detect and filter "phantom bars" - bars with forward-filled
+    stale prices that yfinance sometimes returns during market closure.
+    """
+    import pytz
+
+    # Check if this is a futures ticker
+    is_futures = any(x in ticker.upper() for x in ['=F', 'ES', 'GC', 'CL', 'NQ', 'YM', 'RTY', 'ZB', 'ZN', 'ZF'])
+    if not is_futures and ticker:
+        return False  # Not a futures ticker, no closure check needed
+
+    # Convert to pandas timestamp
+    ts = pd.to_datetime(bar_timestamp)
+
+    # Convert to Central Time (CME time) for DST-aware comparison
+    ct = pytz.timezone('America/Chicago')
+
+    if ts.tzinfo is None:
+        # Assume UTC if no timezone info
+        ts = pytz.utc.localize(ts)
+
+    # Convert to Central Time
+    ts_ct = ts.astimezone(ct)
+
+    weekday_ct = ts_ct.weekday()  # 0=Monday, 5=Saturday, 6=Sunday
+    hour_ct = ts_ct.hour
+
+    # CME Globex closes Friday 5:00 PM CT and reopens Sunday 5:00 PM CT
+    # CLOSED: Friday 17:00 CT to Sunday 17:00 CT
+
+    # Saturday: Always closed (all hours in CT)
+    if weekday_ct == 5:
+        return True
+
+    # Sunday before 5:00 PM CT (17:00)
+    if weekday_ct == 6 and hour_ct < 17:
+        return True
+
+    # Friday at or after 5:00 PM CT (17:00)
+    if weekday_ct == 4 and hour_ct >= 17:
+        return True
+
+    return False
+
+
+def filter_phantom_bars(df: pd.DataFrame, ticker: str = "") -> pd.DataFrame:
+    """
+    Filter out phantom bars (bars during futures market closure) from a DataFrame.
+
+    Phantom bars are bars with forward-filled stale prices that yfinance
+    sometimes returns during market closure. These cause false signals.
+    """
+    if df.empty:
+        return df
+
+    # Check if this is a futures ticker
+    is_futures = any(x in ticker.upper() for x in ['=F', 'ES', 'GC', 'CL', 'NQ', 'YM', 'RTY', 'ZB', 'ZN', 'ZF'])
+    if not is_futures:
+        return df  # Not futures, no filtering needed
+
+    # Create mask for valid bars (not during market closure)
+    valid_mask = ~df.index.to_series().apply(lambda ts: is_futures_market_closed(ts, ticker))
+    filtered_df = df[valid_mask]
+
+    removed_count = len(df) - len(filtered_df)
+    if removed_count > 0:
+        print(f"   ⚠️ Filtered {removed_count} phantom bars (market closure) from {ticker}")
+
+    return filtered_df
+
+
 def _fetch_from_yfinance(ticker: str, days: int = 200, interval: str = "1d") -> pd.DataFrame:
-    """Internal function to fetch data from yfinance."""
+    """Internal function to fetch data from yfinance.
+
+    Uses yf.download() instead of yf.Ticker().history() for more current data.
+    yf.download() typically returns same-day data while history() can lag by 1 day.
+    """
     import time
     time.sleep(0.5)  # Rate limiting
 
     print(f"   📊 Fetching {ticker} via yfinance ({days} days, {interval})")
 
     # Calculate date range
-    end_date = datetime.now()
+    end_date = datetime.now() + timedelta(days=1)  # Include today
 
     if interval == "1d":
         start_date = end_date - timedelta(days=days + 10)  # Extra buffer
@@ -269,14 +392,18 @@ def _fetch_from_yfinance(ticker: str, days: int = 200, interval: str = "1d") -> 
         start_date = end_date - timedelta(days=days)
 
     try:
-        ticker_obj = yf.Ticker(ticker)
-        df = ticker_obj.history(start=start_date, end=end_date, interval=interval)
+        # Use yf.download() for more current data (vs yf.Ticker().history())
+        df = yf.download(ticker, start=start_date, end=end_date, interval=interval, progress=False)
 
         if df.empty:
             print(f"   ⚠️ No data returned for {ticker}")
             return pd.DataFrame()
 
-        # Standardize column names
+        # Handle MultiIndex columns (yf.download returns MultiIndex for single ticker in newer versions)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        # Standardize column names to lowercase
         df.columns = [c.lower() for c in df.columns]
 
         # Keep only OHLCV
@@ -284,6 +411,9 @@ def _fetch_from_yfinance(ticker: str, days: int = 200, interval: str = "1d") -> 
         df = df[[c for c in cols_to_keep if c in df.columns]]
 
         print(f"   ✓ Loaded {len(df)} bars: {df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')}")
+
+        # Filter phantom bars for futures (weekend/closure data with stale prices)
+        df = filter_phantom_bars(df, ticker)
 
         return df
 
