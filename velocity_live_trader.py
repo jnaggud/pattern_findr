@@ -1881,6 +1881,15 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
     # Build set of existing entry timestamps for deduplication
     existing_entry_timestamps = {str(e.get('date', ''))[:19] for e in locked["entries"]}
 
+    # Build map of entry timestamp -> exit timestamp from fresh backtest
+    # Used to detect entries whose exits would overlap with tracked position
+    entry_to_exit_map = {}
+    for exit_t in backtest.get('exits', []):
+        entry_ts = str(exit_t.get('entry_date', ''))[:19]
+        exit_ts = str(exit_t.get('date', ''))[:19]
+        if entry_ts:
+            entry_to_exit_map[entry_ts] = exit_ts
+
     for entry in backtest.get('entries', []):
         entry_date = entry['date']
         entry_date_str = str(entry_date)[:10]
@@ -1905,11 +1914,26 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
         entry_date = normalize_tz(entry_date) if hasattr(entry_date, 'tzinfo') else entry_date
 
         # Skip entries that conflict with tracked position
+        # Case 1: Entry is at or after tracked entry time
+        # Case 2: Entry's exit would be at or after tracked entry time (overlapping trade)
         if tracked_entry_date is not None and hasattr(entry_date, 'date'):
+            # Case 1: Entry at or after tracked position
             if entry_date >= tracked_entry_date:
                 print(f"   ⏭️  Skipping backtest entry {entry_date} (conflicts with tracked position)")
                 skipped_tracked_conflict.add(str(entry_date)[:19])  # Track this entry so we skip its exit too
                 continue
+
+            # Case 2: Entry before tracked, but exit at or after tracked (overlapping trade)
+            exit_ts = entry_to_exit_map.get(entry_timestamp_str)
+            if exit_ts:
+                try:
+                    exit_dt = normalize_tz(pd.to_datetime(exit_ts))
+                    if exit_dt >= tracked_entry_date:
+                        print(f"   ⏭️  Skipping backtest entry {entry_date} (its exit {exit_ts} overlaps tracked position)")
+                        skipped_tracked_conflict.add(entry_timestamp_str)
+                        continue
+                except:
+                    pass
 
         # VALIDATION: Check if there's already an unexited entry in locked backtest
         # We can't enter a new position if we're already in one
@@ -4160,8 +4184,17 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     print(f"⚠️  Found missed SELL signal from {recent_sell_signal['time']}")
 
                 # Use most recent signal (prefer current bar, then recent bars)
-                effective_buy = recent_buy_signal is not None
-                effective_sell = recent_sell_signal is not None
+                # CRITICAL: Only consider buy signals if NOT already in a position
+                # CRITICAL: Only consider sell signals if IN a position
+                already_in_position = trade_state.get('position') is not None
+                effective_buy = recent_buy_signal is not None and not already_in_position
+                effective_sell = recent_sell_signal is not None and already_in_position
+
+                # Log if we're ignoring signals due to position state
+                if recent_buy_signal is not None and already_in_position:
+                    print(f"   ⏭️  Ignoring BUY signal from {recent_buy_signal['time']} (already in LONG position)")
+                if recent_sell_signal is not None and not already_in_position:
+                    print(f"   ⏭️  Ignoring SELL signal from {recent_sell_signal['time']} (no position to exit)")
 
                 # Avoid duplicate/stale signals
                 # Skip signals that are AT OR BEFORE the last processed signal time
