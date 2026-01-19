@@ -252,12 +252,64 @@ def is_data_stale_for_futures(data_end_date, ticker=""):
     return True, f"\n⚠️ _Data is {days_behind} days behind (yfinance delay)_"
 
 
+# =============================================================================
+# INSTRUMENT-SPECIFIC MARKET HOURS CONFIGURATION
+# =============================================================================
+
+MARKET_HOURS_CONFIG = {
+    # CME Globex Futures (ES, GC, CL, NQ, etc.)
+    # Open: Sunday 5:00 PM CT, Close: Friday 5:00 PM CT
+    # Daily break: 4:00 PM - 5:00 PM CT (maintenance)
+    'futures_cme': {
+        'type': 'futures',
+        'timezone': 'America/Chicago',
+        'weekend_close': {'day': 4, 'hour': 17},   # Friday 5 PM CT
+        'weekend_open': {'day': 6, 'hour': 17},    # Sunday 5 PM CT
+        'daily_break_start': {'hour': 16, 'minute': 0},   # 4:00 PM CT
+        'daily_break_end': {'hour': 17, 'minute': 0},     # 5:00 PM CT
+    },
+    # US Stock Market (SPY, QQQ, etc.)
+    # Open: 9:30 AM ET, Close: 4:00 PM ET
+    # Closed weekends
+    'stocks_us': {
+        'type': 'stocks',
+        'timezone': 'America/New_York',
+        'market_open': {'hour': 9, 'minute': 30},
+        'market_close': {'hour': 16, 'minute': 0},
+        'closed_weekends': True,
+    },
+    # Crypto (BTC-USD, ETH-USD, etc.)
+    # 24/7 trading
+    'crypto': {
+        'type': 'crypto',
+        'timezone': 'UTC',
+        'always_open': True,
+    },
+}
+
+def get_ticker_market_type(ticker: str) -> str:
+    """Determine the market type for a given ticker."""
+    ticker_upper = ticker.upper()
+
+    # Futures detection
+    if any(x in ticker_upper for x in ['=F', 'ES', 'GC', 'CL', 'NQ', 'YM', 'RTY', 'ZB', 'ZN', 'ZF', 'ZC', 'ZW', 'ZS']):
+        return 'futures_cme'
+
+    # Crypto detection
+    if any(x in ticker_upper for x in ['-USD', 'BTC', 'ETH', 'SOL', 'DOGE', 'XRP', 'ADA', 'AVAX', 'MATIC']):
+        return 'crypto'
+
+    # Default to US stocks
+    return 'stocks_us'
+
+
 def is_futures_market_closed(bar_timestamp, ticker: str = "") -> bool:
     """
     Check if a bar timestamp falls during futures market closure.
 
     CME Globex Schedule (for ES, GC, CL, NQ, etc.):
     - CLOSED: Friday 5:00 PM CT to Sunday 5:00 PM CT
+    - Daily maintenance break: 4:00 PM - 5:00 PM CT
     - DST-aware: Uses Central Time (America/Chicago) for accurate calculations
 
     Use this to detect and filter "phantom bars" - bars with forward-filled
@@ -292,6 +344,7 @@ def is_futures_market_closed(bar_timestamp, ticker: str = "") -> bool:
 
     weekday_ct = ts_ct.weekday()  # 0=Monday, 5=Saturday, 6=Sunday
     hour_ct = ts_ct.hour
+    minute_ct = ts_ct.minute
 
     # CME Globex closes Friday 5:00 PM CT and reopens Sunday 5:00 PM CT
     # CLOSED: Friday 17:00 CT to Sunday 17:00 CT
@@ -308,15 +361,98 @@ def is_futures_market_closed(bar_timestamp, ticker: str = "") -> bool:
     if weekday_ct == 4 and hour_ct >= 17:
         return True
 
+    # Daily maintenance break: 4:00 PM - 5:00 PM CT (weekdays)
+    # Note: For daily bars this doesn't matter, but for intraday it can cause phantom bars
+    if weekday_ct < 5:  # Monday-Friday
+        if hour_ct == 16:  # 4:00 PM - 4:59 PM CT
+            return True
+
     return False
+
+
+def is_stock_market_closed(bar_timestamp, ticker: str = "") -> bool:
+    """
+    Check if a bar timestamp falls outside US stock market hours.
+
+    NYSE/NASDAQ Schedule:
+    - Open: 9:30 AM ET, Close: 4:00 PM ET
+    - Closed: Weekends (Saturday/Sunday)
+    - DST-aware: Uses Eastern Time (America/New_York)
+
+    Args:
+        bar_timestamp: The timestamp of the bar
+        ticker: The ticker symbol
+
+    Returns:
+        True if outside market hours, False if during trading hours
+    """
+    import pytz
+
+    ts = pd.to_datetime(bar_timestamp)
+    et = pytz.timezone('America/New_York')
+
+    if ts.tzinfo is None:
+        ts = pytz.utc.localize(ts)
+
+    ts_et = ts.astimezone(et)
+    weekday = ts_et.weekday()
+    hour = ts_et.hour
+    minute = ts_et.minute
+
+    # Weekends: Closed
+    if weekday >= 5:  # Saturday=5, Sunday=6
+        return True
+
+    # Before market open (9:30 AM ET)
+    if hour < 9 or (hour == 9 and minute < 30):
+        return True
+
+    # At or after market close (4:00 PM ET)
+    if hour >= 16:
+        return True
+
+    return False
+
+
+def is_market_closed(bar_timestamp, ticker: str = "") -> bool:
+    """
+    Unified market hours check for any instrument type.
+
+    Routes to the appropriate market hours check based on ticker type:
+    - Futures: CME Globex schedule (with daily break)
+    - Stocks: NYSE/NASDAQ schedule (9:30 AM - 4:00 PM ET)
+    - Crypto: Always open (24/7)
+
+    Args:
+        bar_timestamp: The timestamp to check
+        ticker: The ticker symbol
+
+    Returns:
+        True if market is closed, False if open
+    """
+    market_type = get_ticker_market_type(ticker)
+
+    if market_type == 'futures_cme':
+        return is_futures_market_closed(bar_timestamp, ticker)
+    elif market_type == 'stocks_us':
+        return is_stock_market_closed(bar_timestamp, ticker)
+    elif market_type == 'crypto':
+        return False  # Crypto is 24/7
+    else:
+        return False  # Default: assume open
 
 
 def filter_phantom_bars(df: pd.DataFrame, ticker: str = "") -> pd.DataFrame:
     """
-    Filter out phantom bars (bars during futures market closure) from a DataFrame.
+    Filter out phantom bars (bars during market closure) from a DataFrame.
 
     Phantom bars are bars with forward-filled stale prices that yfinance
     sometimes returns during market closure. These cause false signals.
+
+    Uses instrument-specific market hours:
+    - Futures: CME Globex schedule (weekend + daily maintenance break)
+    - Stocks: NYSE/NASDAQ schedule (9:30 AM - 4:00 PM ET, weekends)
+    - Crypto: No filtering (24/7)
 
     Args:
         df: DataFrame with datetime index
@@ -328,19 +464,21 @@ def filter_phantom_bars(df: pd.DataFrame, ticker: str = "") -> pd.DataFrame:
     if df.empty:
         return df
 
-    # Check if this is a futures ticker
-    is_futures = any(x in ticker.upper() for x in ['=F', 'ES', 'GC', 'CL', 'NQ', 'YM', 'RTY', 'ZB', 'ZN', 'ZF'])
-    if not is_futures:
-        return df  # Not futures, no filtering needed
+    market_type = get_ticker_market_type(ticker)
+
+    # Crypto is 24/7, no filtering needed
+    if market_type == 'crypto':
+        return df
 
     # Create mask for valid bars (not during market closure)
-    valid_mask = ~df.index.to_series().apply(lambda ts: is_futures_market_closed(ts, ticker))
+    valid_mask = ~df.index.to_series().apply(lambda ts: is_market_closed(ts, ticker))
 
     filtered_df = df[valid_mask]
 
     removed_count = len(df) - len(filtered_df)
     if removed_count > 0:
-        print(f"   ⚠️ Filtered {removed_count} phantom bars (market closure) from {ticker}")
+        market_label = "market closure" if market_type == 'futures_cme' else "outside market hours"
+        print(f"   ⚠️ Filtered {removed_count} phantom bars ({market_label}) from {ticker}")
 
     return filtered_df
 
@@ -486,7 +624,7 @@ def select_strategy_interactive(default_config_path: str = None) -> str:
                 prod_config = json.load(f)
             print(f"  0. {PRODUCTION_CONFIG_PATH}")
             print(f"      Ticker: {prod_config.get('ticker')} | Signal: {prod_config.get('signal_type')}")
-        except:
+        except Exception:  # Catch all non-system exceptions
             print(f"  0. {PRODUCTION_CONFIG_PATH} (Could not load)")
     else:
         print(f"  0. {PRODUCTION_CONFIG_PATH} (Not found)")
@@ -1222,7 +1360,7 @@ def generate_trade_log_csv(locked_backtest: dict, num_trades: int = 10, trade_st
         if tracked_entry_time:
             try:
                 tracked_entry_dt = normalize_tz(pd.to_datetime(tracked_entry_time))
-            except:
+            except Exception:  # Catch all non-system exceptions
                 pass
 
     # Sort by date and take last N trades (exclude missed trades and conflicting trades)
@@ -1239,7 +1377,7 @@ def generate_trade_log_csv(locked_backtest: dict, num_trades: int = 10, trade_st
                     exit_entry_dt = normalize_tz(pd.to_datetime(exit_entry_date))
                     if exit_entry_dt > tracked_entry_dt:
                         continue  # Skip this conflicting trade
-                except:
+                except Exception:  # Catch all non-system exceptions
                     pass
         valid_exits.append(e)
 
@@ -1463,7 +1601,7 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                 try:
                     pd.to_datetime(df_plot[first_col].iloc[0])
                     datetime_col = first_col
-                except:
+                except Exception:  # Catch all non-system exceptions
                     pass
             df_plot['_datetime_col'] = datetime_col  # Store for later reference
             df_plot['bar_num'] = range(len(df_plot))
@@ -1477,7 +1615,7 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
             if not isinstance(df_plot.index, pd.DatetimeIndex):
                 try:
                     df_plot.index = pd.to_datetime(df_plot.index)
-                except:
+                except Exception:  # Catch all non-system exceptions
                     df_plot = df_plot.reset_index(drop=True)
 
         # Create figure with subplots - LARGER for Discord
@@ -1501,7 +1639,7 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
         else:
             try:
                 data_span_days = (normalize_tz(df_plot.index[-1]) - normalize_tz(df_plot.index[0])).days if len(df_plot) > 1 else 1
-            except:
+            except Exception:  # Catch all non-system exceptions
                 data_span_days = 60  # Default fallback
 
         def format_xaxis(ax, show_dates=False):
@@ -1544,7 +1682,7 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                     try:
                         dt = normalize_tz(pd.to_datetime(row[datetime_col]))
                         date_to_barnum[dt] = row['bar_num']
-                    except:
+                    except Exception:  # Catch all non-system exceptions
                         pass
                 print(f"   [Chart] Built date mapping with {len(date_to_barnum)} entries from column '{datetime_col}'")
             else:
@@ -1620,7 +1758,7 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
             if tracked_entry_time:
                 try:
                     tracked_entry_dt = normalize_tz(pd.to_datetime(tracked_entry_time))
-                except:
+                except Exception:  # Catch all non-system exceptions
                     pass
         skipped_conflicting = 0
 
@@ -1631,7 +1769,7 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                 if isinstance(entry_date, str):
                     try:
                         entry_date = pd.to_datetime(entry_date)
-                    except:
+                    except Exception:  # Catch all non-system exceptions
                         continue
                 entry_date = normalize_tz(entry_date)
 
@@ -1674,7 +1812,7 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                 if isinstance(exit_date, str):
                     try:
                         exit_date = pd.to_datetime(exit_date)
-                    except:
+                    except Exception:  # Catch all non-system exceptions
                         continue
                 exit_date = normalize_tz(exit_date)
 
@@ -1692,7 +1830,7 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                             if exit_entry_dt > tracked_entry_dt:
                                 skipped_conflicting += 1
                                 continue
-                        except:
+                        except Exception:  # Catch all non-system exceptions
                             pass
 
                 exits_in_range += 1
@@ -2099,7 +2237,7 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
             tracked_entry_str = str(trade_state['entry_time']).split('.')[0]
             tracked_entry_date = normalize_tz(pd.to_datetime(tracked_entry_str))
             print(f"   📍 Tracked position: {trade_state['position'].upper()} @ ${trade_state.get('entry_price', 0):.2f} on {tracked_entry_date}")
-        except:
+        except Exception:  # Catch all non-system exceptions
             pass
 
     # Add NEW entries from fresh backtest (only entries AFTER latest exit date)
@@ -2138,7 +2276,7 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
         if isinstance(entry_date, str):
             try:
                 entry_date = pd.to_datetime(entry_date)
-            except:
+            except Exception:  # Catch all non-system exceptions
                 pass
         entry_date = normalize_tz(entry_date) if hasattr(entry_date, 'tzinfo') else entry_date
 
@@ -2161,7 +2299,7 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
                         print(f"   ⏭️  Skipping backtest entry {entry_date} (its exit {exit_ts} overlaps tracked position)")
                         skipped_tracked_conflict.add(entry_timestamp_str)
                         continue
-                except:
+                except Exception:  # Catch all non-system exceptions
                     pass
 
         # VALIDATION: Check if there's already an unexited entry in locked backtest
@@ -2735,7 +2873,7 @@ def load_trade_history(strategy_name: str = None, ticker: str = None, history_pa
         try:
             with open(history_path, 'r') as f:
                 return json.load(f)
-        except:
+        except Exception:  # Catch all non-system exceptions
             return []
     return []
 
@@ -2864,7 +3002,7 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
                             hold_duration = f"{days}d {hours}h"
                         else:
                             hold_duration = f"{hours}h {(duration.seconds % 3600) // 60}m"
-                    except:
+                    except Exception:  # Catch all non-system exceptions
                         hold_duration = "N/A"
 
                 # Calculate actual dollar P&L per unit (e.g., per 1 BTC or 1 share)
@@ -2929,7 +3067,7 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
             is_stale, warning = is_data_stale_for_futures(data_end_date, ticker)
             if is_stale and warning:
                 data_stale_warning = warning
-        except:
+        except Exception:  # Catch all non-system exceptions
             pass
 
         msg_full = (
@@ -3039,7 +3177,7 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
                 is_stale, warning = is_data_stale_for_futures(data_end_date, ticker)
                 if is_stale and warning:
                     data_stale_warning = warning
-            except:
+            except Exception:  # Catch all non-system exceptions
                 pass
 
             msg_subset = (
@@ -3380,7 +3518,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 state_date = pd.to_datetime(state_date_str).date()
                 backtest_date = pd.to_datetime(backtest_date_str).date()
                 days_diff = abs((backtest_date - state_date).days)
-        except:
+        except Exception:  # Catch all non-system exceptions
             days_diff = 1 if state_date_str != backtest_date_str else 0
 
         # For crypto: allow 1-day tolerance if prices match closely (UTC vs local time issue)
@@ -3493,6 +3631,12 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             try:
                 with open(bundled_backtest_path, 'r') as f:
                     bundled_results = json.load(f)
+
+                # Validate bundle schema (R2.3: ensures bundle has required fields)
+                required_keys = ['entries', 'exits']
+                missing_keys = [k for k in required_keys if k not in bundled_results]
+                if missing_keys:
+                    raise ValueError(f"Invalid bundle schema: missing required keys {missing_keys}")
 
                 # Calculate stats from exits
                 exits = bundled_results.get('exits', [])
@@ -3666,7 +3810,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 if isinstance(exit_date, str):
                     try:
                         exit_date = pd.to_datetime(exit_date)
-                    except:
+                    except Exception:  # Catch all non-system exceptions
                         continue
                 exit_date = normalize_tz(exit_date)
                 if exit_date >= chart_start and exit_date <= chart_end:
@@ -4332,7 +4476,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                                 hold_duration = f"{days}d {hours}h"
                             else:
                                 hold_duration = f"{hours}h {(duration.seconds % 3600) // 60}m"
-                        except:
+                        except Exception:  # Catch all non-system exceptions
                             hold_duration = "N/A"
 
                     # Calculate actual dollar P&L per unit
@@ -4692,9 +4836,13 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             send_discord_alert(webhook_url, shutdown_msg, strategy_name=strategy_name)
             break
         except Exception as e:
-            error_msg = f"⚠️ **[VELOCITY] Error in Trader**\n```{str(e)}```"
-            send_discord_alert(webhook_url, error_msg, strategy_name=strategy_name)
+            error_msg = f"⚠️ **[VELOCITY] Error in Trader**\n```{str(e)[:500]}```"
             print(f"Error: {e}")
+            # Wrap Discord alert in try/except to prevent nested errors
+            try:
+                send_discord_alert(webhook_url, error_msg, strategy_name=strategy_name)
+            except Exception as discord_err:
+                print(f"   ⚠️ Failed to send error to Discord: {discord_err}")
             time.sleep(60)  # Wait 1 minute on error
 
 
