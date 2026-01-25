@@ -1,0 +1,419 @@
+{
+  "metrics": {
+    "range_mae": 0.24212060428732485,
+    "range_mape": 48.86161795590895,
+    "range_r2": 0.03376893258088787,
+    "range_bias": 0.16230743560475358,
+    "high_mae": 3.0608090954665954,
+    "high_mae_pct": 0.4447792042942318,
+    "high_bias": 0.7618085634009996,
+    "high_bias_pct": 0.10829684458090955,
+    "high_r2": -0.34103976915798717,
+    "low_mae": 3.0397685614905563,
+    "low_mae_pct": 0.4417831575845505,
+    "low_bias": -0.35752541763099543,
+    "low_bias_pct": -0.05401059102384399,
+    "low_r2": 0.056470490989512845,
+    "high_containment_rate": 83.33333333333334,
+    "low_containment_rate": 66.66666666666666,
+    "full_containment_rate": 55.55555555555556,
+    "high_band_width_pct": 1.1911104818185108,
+    "low_band_width_pct": 1.494537380006579,
+    "high_calibration_error": -6.666666666666657,
+    "low_calibration_error": -23.333333333333343,
+    "upside_direction_accuracy": 83.33333333333334,
+    "downside_direction_accuracy": 72.22222222222221,
+    "useful_range_pct": 66.66666666666666,
+    "actual_high_ratio_mean": 0.5325127023890257,
+    "actual_high_ratio_std": 0.6694550551637534,
+    "gap_up_high_mae_pct": 0.31015130066180396,
+    "gap_up_low_mae_pct": 0.5025349435919405,
+    "gap_up_count": 3,
+    "gap_down_high_mae_pct": 1.4559378139768626,
+    "gap_down_low_mae_pct": 1.781466297879661,
+    "gap_down_count": 1,
+    "no_gap_high_mae_pct": 0.40140242580956415,
+    "no_gap_low_mae_pct": 0.33307326484760186,
+    "no_gap_count": 14,
+    "n_predictions": 18,
+    "avg_actual_range_pct": 0.7180405027582395,
+    "avg_predicted_range_pct": 0.8803479383629929,
+    "ticker": "SPY",
+    "test_days": 20,
+    "successful_predictions": 18,
+    "evaluation_date": "2026-01-25T11:36:37.422741"
+  },
+  "predictions": [
+    {
+      "date": "2025-12-24 00:00:00",
+      "predicted_high": 693.7257139312197,
+      "predicted_low": 688.1025565312135,
+      "predicted_range": 0.008145017758677289,
+      "current_close": 690.3800048828125,
+      "high_lower": 690.3800048828125,
+      "high_upper": 697.4957159856763,
+      "low_lower": 683.1170168030845,
+      "low_upper": 690.3800048828125,
+      "confidence_level": 0.9,
+      "model_r2": 0.2578566309164102
+    },
+    {
+      "date": "2025-12-26 00:00:00",
+      "predicted_high": 693.6991019718339,
+      "predicted_low": 688.006964394287,
+      "predicted_range": 0.00824577015786842,
+      "current_close": 690.3099975585938,
+      "high_lower": 690.3099975585938,
+      "high_upper": 697.2748539114913,
+      "low_lower": 683.2861959013916,
+      "low_upper": 690.3099975585938,
+      "confidence_level": 0.9,
+      "model_r2": 0.2578566309164102
+    },
+    {
+      "date": "2025-12-29 00:00:00",
+      "predicted_high": 691.1669855071638,
+      "predicted_low": 685.2756768128288,
+      "predicted_range": 0.008564816316692467,
+      "current_close": 687.8499755859375,
+      "high_lower": 687.8499755859375,
+      "high_upper": 694.7900116411063,
+      "low_lower": 678.9651051512212,
+      "low_upper": 687.8499755859375,
+      "confidence_level": 0.9,
+      "model_r2": 0.2578566309164102
+    },
+    {
+      "date": "2025-12-30 00:00:00",
+      "predicted_high": 690.5639234838012,
+      "predicted_low": 684.5147761341179,
+      "predicted_range": 0.008805035245042423,
+      "current_close": 687.010009765625,
+      "high_lower": 687.010009765625,
+      "high_upper": 693.9415710177336,
+      "low_lower": 678.0949319693988,
+      "low_upper": 687.010009765625,
+      "confidence_level": 0.9,
+      "model_r2": 0.2578566309164102
+    },
+    {
+      "date": "2025-12-31 00:00:00",
+      "predicted_high": 685.4169046505418,
+      "predicted_low": 678.8383067880512,
+      "predicted_range": 0.009647169796103973,
+      "current_close": 681.9199829101562,
+      "high_lower": 681.9199829101562,
+      "high_upper": 693.55474804292,
+      "low_lower": 669.3981446646292,
+      "low_upper": 681.9199829101562,
+      "confidence_level": 0.9,
+      "model_r2": 0.2578566309164102
+    },
+    {
+      "date": "2026-01-02 00:00:00",
+      "predicted_high": 686.3959708047213,
+      "predicted_low": 680.04319671903,
+      "predicted_range": 0.009298965476541946,
+      "current_close": 683.1699829101562,
+      "high_lower": 683.1699829101562,
+      "high_upper": 696.0586817724546,
+      "low_lower": 672.4847775590824,
+      "low_upper": 683.1699829101562,
+      "confidence_level": 0.9,
+      "model_r2": 0.2578566309164102
+    },
+    {
+      "date": "2026-01-05 00:00:00",
+      "predicted_high": 690.5918572587043,
+      "predicted_low": 685.0978946462914,
+      "predicted_range": 0.007988662313813427,
+      "current_close": 687.719970703125,
+      "high_lower": 687.719970703125,
+      "high_upper": 694.6586950789945,
+      "low_lower": 679.9144876518401,
+      "low_upper": 687.719970703125,
+      "confidence_level": 0.9,
+      "model_r2": 0.2578566309164102
+    },
+    {
+      "date": "2026-01-06 00:00:00",
+      "predicted_high": 694.7239326405881,
+      "predicted_low": 689.2932001143898,
+      "predicted_range": 0.00785003475717818,
+      "current_close": 691.8099975585938,
+      "high_lower": 691.8099975585938,
+      "high_upper": 698.7899881041965,
+      "low_lower": 683.8837483105355,
+      "low_upper": 691.8099975585938,
+      "confidence_level": 0.9,
+      "model_r2": 0.2578566309164102
+    },
+    {
+      "date": "2026-01-07 00:00:00",
+      "predicted_high": 692.714649806506,
+      "predicted_low": 686.7773803137046,
+      "predicted_range": 0.008609979038919666,
+      "current_close": 689.5800170898438,
+      "high_lower": 689.5800170898438,
+      "high_upper": 697.1990264172972,
+      "low_lower": 677.128119848003,
+      "low_upper": 689.5800170898438,
+      "confidence_level": 0.9,
+      "model_r2": 0.2578566309164102
+    },
+    {
+      "date": "2026-01-08 00:00:00",
+      "predicted_high": 692.8962210383793,
+      "predicted_low": 686.8053229613054,
+      "predicted_range": 0.008833661572432148,
+      "current_close": 689.510009765625,
+      "high_lower": 689.510009765625,
+      "high_upper": 697.1282455984252,
+      "low_lower": 677.1721997107215,
+      "low_upper": 689.510009765625,
+      "confidence_level": 0.9,
+      "model_r2": 0.2578566309164102
+    },
+    {
+      "date": "2026-01-09 00:00:00",
+      "predicted_high": 696.9438612182412,
+      "predicted_low": 691.4084436149049,
+      "predicted_range": 0.007975301547284099,
+      "current_close": 694.0700073242188,
+      "high_lower": 694.0700073242188,
+      "high_upper": 700.7398374155131,
+      "low_lower": 681.7577519654159,
+      "low_upper": 694.0700073242188,
+      "confidence_level": 0.9,
+      "model_r2": 0.26601453390452623
+    },
+    {
+      "date": "2026-01-12 00:00:00",
+      "predicted_high": 698.1761883369694,
+      "predicted_low": 692.6002845420868,
+      "predicted_range": 0.008021036898399378,
+      "current_close": 695.1599731445312,
+      "high_lower": 695.1599731445312,
+      "high_upper": 701.84027752048,
+      "low_lower": 687.7891679688277,
+      "low_upper": 695.1599731445312,
+      "confidence_level": 0.9,
+      "model_r2": 0.26601453390452623
+    },
+    {
+      "date": "2026-01-13 00:00:00",
+      "predicted_high": 696.7961791943841,
+      "predicted_low": 691.0880180848148,
+      "predicted_range": 0.008227742549938936,
+      "current_close": 693.77001953125,
+      "high_lower": 693.77001953125,
+      "high_upper": 700.4369668188106,
+      "low_lower": 684.1682585650275,
+      "low_upper": 693.77001953125,
+      "confidence_level": 0.9,
+      "model_r2": 0.26601453390452623
+    },
+    {
+      "date": "2026-01-14 00:00:00",
+      "predicted_high": 693.4799245786418,
+      "predicted_low": 687.3396375067141,
+      "predicted_range": 0.0088943264415894,
+      "current_close": 690.3599853515625,
+      "high_lower": 690.3599853515625,
+      "high_upper": 698.1789149641844,
+      "low_lower": 678.2160367704811,
+      "low_upper": 690.3599853515625,
+      "confidence_level": 0.9,
+      "model_r2": 0.26601453390452623
+    },
+    {
+      "date": "2026-01-15 00:00:00",
+      "predicted_high": 695.3328935115725,
+      "predicted_low": 689.4617106345632,
+      "predicted_range": 0.00848142690372655,
+      "current_close": 692.239990234375,
+      "high_lower": 692.239990234375,
+      "high_upper": 699.9117879404206,
+      "low_lower": 680.5562659592935,
+      "low_upper": 692.239990234375,
+      "confidence_level": 0.9,
+      "model_r2": 0.26601453390452623
+    },
+    {
+      "date": "2026-01-16 00:00:00",
+      "predicted_high": 694.8401586244034,
+      "predicted_low": 688.8916966417121,
+      "predicted_range": 0.008600269227157299,
+      "current_close": 691.6599731445312,
+      "high_lower": 691.6599731445312,
+      "high_upper": 699.3253427709483,
+      "low_lower": 679.9860384797701,
+      "low_upper": 691.6599731445312,
+      "confidence_level": 0.9,
+      "model_r2": 0.26601453390452623
+    },
+    {
+      "date": "2026-01-20 00:00:00",
+      "predicted_high": 681.6090039122013,
+      "predicted_low": 673.1536653191095,
+      "predicted_range": 0.012478730747413243,
+      "current_close": 677.5800170898438,
+      "high_lower": 677.5800170898438,
+      "high_upper": 689.3514582852793,
+      "low_lower": 664.9848039641558,
+      "low_upper": 677.5800170898438,
+      "confidence_level": 0.9,
+      "model_r2": 0.26601453390452623
+    },
+    {
+      "date": "2026-01-21 00:00:00",
+      "predicted_high": 688.1691129682199,
+      "predicted_low": 681.4558375789858,
+      "predicted_range": 0.009794682156559884,
+      "current_close": 685.4000244140625,
+      "high_lower": 685.4000244140625,
+      "high_upper": 696.3166014358893,
+      "low_lower": 673.3718038999945,
+      "low_upper": 685.4000244140625,
+      "confidence_level": 0.9,
+      "model_r2": 0.26601453390452623
+    }
+  ],
+  "actuals": [
+    {
+      "date": "2025-12-26 00:00:00",
+      "actual_high": 691.6599731445312,
+      "actual_low": 689.27001953125,
+      "actual_range": 0.0034617943688663596,
+      "actual_open": 690.6400146484375
+    },
+    {
+      "date": "2025-12-29 00:00:00",
+      "actual_high": 689.2000122070312,
+      "actual_low": 686.0700073242188,
+      "actual_range": 0.004534201871452433,
+      "actual_open": 687.5399780273438
+    },
+    {
+      "date": "2025-12-30 00:00:00",
+      "actual_high": 688.5599975585938,
+      "actual_low": 686.5800170898438,
+      "actual_range": 0.0028785062717540627,
+      "actual_open": 687.4500122070312
+    },
+    {
+      "date": "2025-12-31 00:00:00",
+      "actual_high": 687.3599853515625,
+      "actual_low": 681.7100219726562,
+      "actual_range": 0.008223989896207986,
+      "actual_open": 687.1400146484375
+    },
+    {
+      "date": "2026-01-02 00:00:00",
+      "actual_high": 686.8699951171875,
+      "actual_low": 679.8200073242188,
+      "actual_range": 0.010338438482008223,
+      "actual_open": 685.7100219726562
+    },
+    {
+      "date": "2026-01-05 00:00:00",
+      "actual_high": 689.4299926757812,
+      "actual_low": 686.3800048828125,
+      "actual_range": 0.004464463997637107,
+      "actual_open": 686.5399780273438
+    },
+    {
+      "date": "2026-01-06 00:00:00",
+      "actual_high": 692.3200073242188,
+      "actual_low": 687.780029296875,
+      "actual_range": 0.00660149220721637,
+      "actual_open": 687.9299926757812
+    },
+    {
+      "date": "2026-01-07 00:00:00",
+      "actual_high": 693.9600219726562,
+      "actual_low": 689.3200073242188,
+      "actual_range": 0.006707065039262472,
+      "actual_open": 692.1900024414062
+    },
+    {
+      "date": "2026-01-08 00:00:00",
+      "actual_high": 690.6199951171875,
+      "actual_low": 687.489990234375,
+      "actual_range": 0.004539001718787769,
+      "actual_open": 688.8200073242188
+    },
+    {
+      "date": "2026-01-09 00:00:00",
+      "actual_high": 695.3099975585938,
+      "actual_low": 689.1799926757812,
+      "actual_range": 0.008890378378837724,
+      "actual_open": 690.6300048828125
+    },
+    {
+      "date": "2026-01-12 00:00:00",
+      "actual_high": 696.0900268554688,
+      "actual_low": 690.6300048828125,
+      "actual_range": 0.007866673267882223,
+      "actual_open": 690.6799926757812
+    },
+    {
+      "date": "2026-01-13 00:00:00",
+      "actual_high": 696.0900268554688,
+      "actual_low": 691.3499755859375,
+      "actual_range": 0.0068186481567541896,
+      "actual_open": 695.489990234375
+    },
+    {
+      "date": "2026-01-14 00:00:00",
+      "actual_high": 691.719970703125,
+      "actual_low": 686.0399780273438,
+      "actual_range": 0.008187140573786934,
+      "actual_open": 691.0
+    },
+    {
+      "date": "2026-01-15 00:00:00",
+      "actual_high": 695.4500122070312,
+      "actual_low": 691.25,
+      "actual_range": 0.006083800185626944,
+      "actual_open": 694.5700073242188
+    },
+    {
+      "date": "2026-01-16 00:00:00",
+      "actual_high": 694.25,
+      "actual_low": 690.0999755859375,
+      "actual_range": 0.005995065977996167,
+      "actual_open": 693.6599731445312
+    },
+    {
+      "date": "2026-01-20 00:00:00",
+      "actual_high": 684.77001953125,
+      "actual_low": 676.5700073242188,
+      "actual_range": 0.011855554066185282,
+      "actual_open": 681.489990234375
+    },
+    {
+      "date": "2026-01-21 00:00:00",
+      "actual_high": 688.739990234375,
+      "actual_low": 678.1300048828125,
+      "actual_range": 0.015658645597506852,
+      "actual_open": 679.6500244140625
+    },
+    {
+      "date": "2026-01-22 00:00:00",
+      "actual_high": 691.1300048828125,
+      "actual_low": 686.9199829101562,
+      "actual_range": 0.006142430438713991,
+      "actual_open": 689.8499755859375
+    }
+  ],
+  "config": {
+    "ticker": "SPY",
+    "test_days": 60,
+    "min_train_days": 252,
+    "retrain_frequency": 5,
+    "confidence_level": 0.9,
+    "optuna_trials": 50,
+    "years_of_data": 3
+  }
+}

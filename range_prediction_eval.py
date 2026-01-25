@@ -349,13 +349,16 @@ def run_walk_forward_evaluation(
             predictor = PriceRangePredictor()
 
             try:
+                import multiprocessing
+                n_cores = multiprocessing.cpu_count()
+
                 predictor.train_range_model(
                     train_df,
                     ticker=ticker,
-                    optuna_trials=optuna_trials,
-                    train_high_low_models=True,
-                    train_quantile_models=True,
-                    confidence_levels=[confidence_level]
+                    n_trials=optuna_trials,
+                    n_workers=n_cores,  # Use all cores
+                    feature_selection=False,  # Disable for walk-forward stability
+                    optimize_highlow=True
                 )
                 last_train_idx = i
 

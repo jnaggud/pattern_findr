@@ -1,0 +1,16 @@
+{
+  "metrics": {
+    "error": "No successful predictions"
+  },
+  "predictions": [],
+  "actuals": [],
+  "config": {
+    "ticker": "SPY",
+    "test_days": 60,
+    "min_train_days": 252,
+    "retrain_frequency": 5,
+    "confidence_level": 0.9,
+    "optuna_trials": 50,
+    "years_of_data": 3
+  }
+}
