@@ -832,6 +832,21 @@ def _find_bar_num(date_str, date_to_barnum: Dict, is_intraday: bool = True) -> O
             if fmt in date_to_barnum:
                 return date_to_barnum[fmt]
 
+        # CRITICAL FIX: Trade dates use bar CLOSE time, but DataFrame index uses bar START time
+        # For intraday, try subtracting common intervals to convert close -> start time
+        # E.g., exit at 18:30 should map to bar starting at 18:15 (for 15m bars)
+        if is_intraday:
+            for minutes in [15, 30, 60, 5, 1]:  # Try common intervals
+                dt_start = dt_minute - pd.Timedelta(minutes=minutes)
+                if dt_start in date_to_barnum:
+                    return date_to_barnum[dt_start]
+                # Also try string formats for the adjusted time
+                start_iso = dt_start.strftime('%Y-%m-%dT%H:%M:%S')
+                start_space = dt_start.strftime('%Y-%m-%d %H:%M:%S')
+                for fmt in [dt_start, start_iso, start_space, start_iso[:16], start_space[:16]]:
+                    if fmt in date_to_barnum:
+                        return date_to_barnum[fmt]
+
         # Date-only fallback: ONLY for daily charts
         # For intraday, this causes trades outside chart range to map to wrong bars
         if not is_intraday:
