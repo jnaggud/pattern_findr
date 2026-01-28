@@ -276,7 +276,7 @@ def generate_chart(
         # === Panel 1: Price Chart ===
         ax1 = axes[0]
         _draw_candlesticks(ax1, df_plot, col_map)
-        _draw_entry_exit_markers(ax1, entries_for_markers, exits_for_markers, date_to_barnum, df_plot, col_map, is_intraday=is_intraday)
+        _draw_entry_exit_markers(ax1, entries_for_markers, exits_for_markers, date_to_barnum, df_plot, col_map, is_intraday=is_intraday, interval=interval)
 
         # Mark current position entry line
         if current_position and current_position.get('entry_price'):
@@ -671,7 +671,7 @@ def _draw_candlesticks(ax, df: pd.DataFrame, col_map: Dict):
 
 def _draw_entry_exit_markers(ax, entries: List[Dict], exits: List[Dict], date_to_barnum: Dict,
                               df_plot: pd.DataFrame = None, col_map: Dict = None,
-                              is_intraday: bool = True):
+                              is_intraday: bool = True, interval: str = '15m'):
     """Draw entry and exit markers on the chart.
 
     Entry = green triangle UP (▲) positioned BELOW the bar low (charting convention)
@@ -717,7 +717,7 @@ def _draw_entry_exit_markers(ax, entries: List[Dict], exits: List[Dict], date_to
 
     # Entry markers (green triangles pointing up, BELOW bar low)
     for entry in entries:
-        bar_num = _find_bar_num(entry.get('date'), date_to_barnum, is_intraday=is_intraday)
+        bar_num = _find_bar_num(entry.get('date'), date_to_barnum, is_intraday=is_intraday, interval=interval)
         if bar_num is not None:
             matched_entries += 1
             # Get the bar's low price to position marker below it
@@ -734,7 +734,7 @@ def _draw_entry_exit_markers(ax, entries: List[Dict], exits: List[Dict], date_to
 
     # Exit markers (RED triangles pointing down, ABOVE bar high)
     for exit_trade in exits:
-        bar_num = _find_bar_num(exit_trade.get('date'), date_to_barnum, is_intraday=is_intraday)
+        bar_num = _find_bar_num(exit_trade.get('date'), date_to_barnum, is_intraday=is_intraday, interval=interval)
         if bar_num is not None:
             matched_exits += 1
             # Get the bar's high price to position marker above it
@@ -773,7 +773,7 @@ def _normalize_to_utc_naive(dt) -> pd.Timestamp:
     return dt
 
 
-def _find_bar_num(date_str, date_to_barnum: Dict, is_intraday: bool = True) -> Optional[int]:
+def _find_bar_num(date_str, date_to_barnum: Dict, is_intraday: bool = True, interval: str = '15m') -> Optional[int]:
     """Find bar number for a date string.
 
     CRITICAL: Handles mixed timestamp formats by trying multiple lookup keys.
@@ -833,19 +833,23 @@ def _find_bar_num(date_str, date_to_barnum: Dict, is_intraday: bool = True) -> O
                 return date_to_barnum[fmt]
 
         # CRITICAL FIX: Trade dates use bar CLOSE time, but DataFrame index uses bar START time
-        # For intraday, try subtracting common intervals to convert close -> start time
+        # For intraday, subtract the bar interval to convert close -> start time
         # E.g., exit at 18:30 should map to bar starting at 18:15 (for 15m bars)
         if is_intraday:
-            for minutes in [15, 30, 60, 5, 1]:  # Try common intervals
-                dt_start = dt_minute - pd.Timedelta(minutes=minutes)
-                if dt_start in date_to_barnum:
-                    return date_to_barnum[dt_start]
-                # Also try string formats for the adjusted time
-                start_iso = dt_start.strftime('%Y-%m-%dT%H:%M:%S')
-                start_space = dt_start.strftime('%Y-%m-%d %H:%M:%S')
-                for fmt in [dt_start, start_iso, start_space, start_iso[:16], start_space[:16]]:
-                    if fmt in date_to_barnum:
-                        return date_to_barnum[fmt]
+            # Convert interval string to minutes
+            interval_map = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '90m': 90, '2h': 120, '4h': 240}
+            interval_minutes = interval_map.get(interval, 15)
+
+            # Only try the specific interval - don't guess
+            dt_start = dt_minute - pd.Timedelta(minutes=interval_minutes)
+            if dt_start in date_to_barnum:
+                return date_to_barnum[dt_start]
+            # Also try string formats for the adjusted time
+            start_iso = dt_start.strftime('%Y-%m-%dT%H:%M:%S')
+            start_space = dt_start.strftime('%Y-%m-%d %H:%M:%S')
+            for fmt in [start_iso, start_space, start_iso[:16], start_space[:16]]:
+                if fmt in date_to_barnum:
+                    return date_to_barnum[fmt]
 
         # Date-only fallback: ONLY for daily charts
         # For intraday, this causes trades outside chart range to map to wrong bars
