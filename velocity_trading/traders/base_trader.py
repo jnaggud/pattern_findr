@@ -779,12 +779,13 @@ class BaseTrader(ABC):
                 chart_start = _time.time()
                 chart = None
                 try:
-                    # Use cached df if available (already has indicators calculated)
-                    df = getattr(self, '_cached_df', None)
+                    # ALWAYS fetch fresh data for chart to include the signal bar
+                    # The cached_df was fetched BEFORE the signal bar existed
+                    df = self._fetch_data(for_chart=True)
                     if df is None or df.empty:
-                        # Fallback to fetch only if no cached data
-                        print(f"   ⚠️ No cached data, fetching for chart...")
-                        df = self._fetch_data(for_chart=True)
+                        # Fallback to cached data if fresh fetch fails
+                        print(f"   ⚠️ Fresh fetch failed, using cached data...")
+                        df = getattr(self, '_cached_df', None)
                         if df is not None and not df.empty:
                             if self.use_legacy:
                                 df = calculate_composite_oscillator_legacy(df)
@@ -921,12 +922,13 @@ class BaseTrader(ABC):
                 chart_start = _time.time()
                 chart = None
                 try:
-                    # Use cached df if available (already has indicators calculated)
-                    df = getattr(self, '_cached_df', None)
+                    # ALWAYS fetch fresh data for chart to include the signal bar
+                    # The cached_df was fetched BEFORE the signal bar existed
+                    df = self._fetch_data(for_chart=True)
                     if df is None or df.empty:
-                        # Fallback to fetch only if no cached data
-                        print(f"   ⚠️ No cached data, fetching for chart...")
-                        df = self._fetch_data(for_chart=True)
+                        # Fallback to cached data if fresh fetch fails
+                        print(f"   ⚠️ Fresh fetch failed, using cached data...")
+                        df = getattr(self, '_cached_df', None)
                         if df is not None and not df.empty:
                             if self.use_legacy:
                                 df = calculate_composite_oscillator_legacy(df)
