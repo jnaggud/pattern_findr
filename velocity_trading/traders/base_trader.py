@@ -150,10 +150,11 @@ class BaseTrader(ABC):
         """
         Ensure database is populated with historical trades.
 
-        - If empty: Run full rebuild from backtest (fetch data from providers)
-        - If stale: Run incremental update (only fetch new data)
+        Priority order:
+        1. Import from bundle's backtest_results.json (ground truth - exact trades from optimization)
+        2. Fall back to rebuild_from_backtest (recalculates from scratch - may differ!)
 
-        This makes the new system completely independent of old JSON files.
+        Using bundle backtest_results ensures stats match exactly what was optimized.
         """
         trade_count = self.pm.get_trade_count()
         last_trade = self.pm.get_last_trade_date()
@@ -165,18 +166,42 @@ class BaseTrader(ABC):
             print()
 
         if trade_count == 0:
-            # Empty database - need full rebuild
-            print(f"   ℹ️  Database empty, rebuilding from backtest...")
-            success, result = self.pm.rebuild_from_backtest(
-                ticker=self.ticker,
-                config=self.config,
-                days=self._get_rebuild_days()
-            )
-            if success:
-                print(f"   ✓ Rebuilt: {result['entries']} entries, {result['exits']} exits")
-                print(f"   ✓ Win rate: {result['stats']['win_rate']:.1f}%")
+            # Empty database - try importing from bundle first
+            imported = self._try_import_from_bundle()
+
+            if imported:
+                # After bundle import, run incremental update to catch up on trades
+                # since the bundle was created (bundle might be days/weeks old)
+                print(f"   ℹ️  Running catch-up update for trades since bundle creation...")
+                success, result = self.pm.process_new_bars(
+                    ticker=self.ticker,
+                    config=self.config,
+                    interval=self.interval,
+                    lookback_bars=500  # Enough to cover time since bundle creation
+                )
+                if success:
+                    new_entries = result.get('new_entries', 0)
+                    new_exits = result.get('new_exits', 0)
+                    if new_entries > 0 or new_exits > 0:
+                        print(f"   ✓ Catch-up complete: +{new_entries} entries, +{new_exits} exits")
+                    else:
+                        print(f"   ✓ No new trades since bundle creation")
+                else:
+                    print(f"   ⚠️  Catch-up failed: {result.get('error', 'Unknown error')}")
             else:
-                print(f"   ⚠️  Rebuild failed: {result.get('error', 'Unknown error')}")
+                # Fall back to rebuilding from scratch (may produce different results!)
+                print(f"   ℹ️  No bundle found, rebuilding from backtest...")
+                success, result = self.pm.rebuild_from_backtest(
+                    ticker=self.ticker,
+                    config=self.config,
+                    days=self._get_rebuild_days(),
+                    interval=self.interval  # CRITICAL: Pass interval for intraday strategies!
+                )
+                if success:
+                    print(f"   ✓ Rebuilt: {result['entries']} entries, {result['exits']} exits")
+                    print(f"   ✓ Win rate: {result['stats']['win_rate']:.1f}%")
+                else:
+                    print(f"   ⚠️  Rebuild failed: {result.get('error', 'Unknown error')}")
         else:
             # Database has data - check if we need incremental update
             # CRITICAL: Always run update if in position to catch missed exit signals
@@ -225,6 +250,71 @@ class BaseTrader(ABC):
                     print(f"   ⚠️  Update failed: {result.get('error', 'Unknown error')}")
             else:
                 print(f"   ✓ Database is up to date")
+
+    def _try_import_from_bundle(self) -> bool:
+        """
+        Try to import trades from the bundle's backtest_results.json.
+
+        This is the preferred method because it uses the exact trades from the
+        optimization backtest, ensuring stats match exactly.
+
+        Returns True if import succeeded, False otherwise.
+        """
+        import json
+
+        # Get bundle name from config
+        bundle_name = self.config.get('bundle_name')
+        if not bundle_name:
+            print(f"   ℹ️  No bundle_name in config, will rebuild from scratch")
+            return False
+
+        # Construct path to backtest_results.json
+        parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        bundle_path = os.path.join(parent_dir, "velocity_strategies", bundle_name, "backtest_results.json")
+
+        if not os.path.exists(bundle_path):
+            print(f"   ℹ️  Bundle backtest not found: {bundle_path}")
+            return False
+
+        try:
+            print(f"   📦 Importing from bundle: {bundle_name}")
+            with open(bundle_path) as f:
+                backtest_results = json.load(f)
+
+            # Get the last bar date from bundle data for tracking
+            data_path = os.path.join(parent_dir, "velocity_strategies", bundle_name, "data.parquet")
+            last_bar_date = None
+            if os.path.exists(data_path):
+                try:
+                    import pandas as pd
+                    df = pd.read_parquet(data_path)
+                    if len(df) > 0:
+                        last_bar_date = str(df.index[-1])
+                except Exception:
+                    pass
+
+            # Use import_from_locked_backtest for exact trade replication
+            success, result = self.pm.import_from_locked_backtest(
+                locked_backtest=backtest_results,
+                ticker=self.ticker,
+                clear_existing=True,
+                last_bar_date=last_bar_date
+            )
+
+            if success:
+                entries = result.get('entries_imported', 0)
+                exits = result.get('exits_imported', 0)
+                stats = result.get('stats', {})
+                print(f"   ✓ Imported from bundle: {entries} entries, {exits} exits")
+                print(f"   ✓ Win rate: {stats.get('win_rate', 0):.1f}% | Total return: {stats.get('total_return', 0):.1f}%")
+                return True
+            else:
+                print(f"   ⚠️  Bundle import failed: {result.get('error', 'Unknown error')}")
+                return False
+
+        except Exception as e:
+            print(f"   ⚠️  Error importing from bundle: {e}")
+            return False
 
     def _get_rebuild_days(self) -> int:
         """Get number of days for full rebuild. Override for longer histories."""
@@ -278,9 +368,26 @@ class BaseTrader(ABC):
 
     def _trading_cycle(self):
         """Single iteration of the trading loop."""
+        import time as _time
+        cycle_start = _time.time()
         now = datetime.now()
         print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] [{self.strategy_name}] Checking {self.ticker}...")
 
+        # Get current position
+        position = self.pm.get_current_position()
+
+        # OPTIMIZATION: When in position, only do quick SL/TP check using realtime price
+        # Full bar data fetch is only needed when:
+        # 1. Not in position (looking for entry signals)
+        # 2. A new bar might be complete (check for signal-based exits)
+        if position and not self._should_fetch_full_data():
+            self._quick_sltp_check(position)
+            sleep_time = self._calculate_sleep_time()
+            print(f"   ⏱️ Quick check completed, sleeping {sleep_time}s")
+            time.sleep(sleep_time)
+            return
+
+        # Full data fetch and analysis path
         # Fetch price data with retry logic
         df = self._fetch_data()
         retry_count = 0
@@ -295,6 +402,12 @@ class BaseTrader(ABC):
             print("   No data after retries, skipping cycle")
             time.sleep(self.check_interval_seconds)
             return
+
+        # Record successful full fetch time (for optimization when in position)
+        self._last_full_fetch_time = _time.time()
+
+        fetch_time = _time.time() - cycle_start
+        print(f"   ⏱️ Data fetch took {fetch_time:.1f}s")
 
         # Calculate indicators (use legacy mode for exact matching with old system)
         if self.use_legacy:
@@ -324,8 +437,12 @@ class BaseTrader(ABC):
                 entropy_threshold=self.entropy_threshold
             )
 
-        # Get current position
-        position = self.pm.get_current_position()
+        # PERFORMANCE: Cache the DataFrame with indicators for reuse in exit/entry processing
+        # This avoids re-fetching and re-calculating indicators for chart generation
+        self._cached_df = df.copy()
+
+        indicators_time = _time.time() - cycle_start
+        print(f"   ⏱️ Indicators calculated in {indicators_time - fetch_time:.1f}s (total: {indicators_time:.1f}s)")
 
         # Check for exit conditions FIRST (if in position)
         if position:
@@ -336,9 +453,97 @@ class BaseTrader(ABC):
             self._check_entry(df)
 
         # Sleep until next check
+        cycle_total = _time.time() - cycle_start
         sleep_time = self._calculate_sleep_time()
-        print(f"   [{self.strategy_name}] Next check in {sleep_time}s")
+        print(f"   ⏱️ Cycle completed in {cycle_total:.1f}s, sleeping {sleep_time}s")
         time.sleep(sleep_time)
+
+    def _should_fetch_full_data(self) -> bool:
+        """
+        Determine if full bar data fetch is needed.
+
+        Returns True when:
+        1. We haven't done a full fetch since the last bar closed
+        2. More than interval_minutes have passed since last full fetch
+
+        This optimizes API usage when in position - only fetch full data once per bar
+        to check for signal-based exits, not every 5-second SL/TP check.
+        """
+        try:
+            import time as _time
+            now_ts = _time.time()
+            interval_seconds = self._get_interval_minutes() * 60
+
+            # Initialize last_full_fetch if not set
+            if not hasattr(self, '_last_full_fetch_time'):
+                self._last_full_fetch_time = 0
+
+            # Do full fetch if it's been more than interval_minutes since last one
+            time_since_last_fetch = now_ts - self._last_full_fetch_time
+            if time_since_last_fetch >= interval_seconds:
+                # Update timestamp (will be done when fetch actually happens)
+                return True
+
+            # Also check if we're in the first minute of a new bar and haven't fetched this bar yet
+            now = get_current_market_time(self.ticker)
+            interval_minutes = self._get_interval_minutes()
+            minutes_into_bar = (now.minute % interval_minutes) + (now.second / 60)
+
+            # If we're in first minute of bar AND we fetched before this bar started, fetch again
+            if minutes_into_bar < 1.0:
+                # Calculate when this bar started
+                bar_start_minute = (now.minute // interval_minutes) * interval_minutes
+                bar_start = now.replace(minute=bar_start_minute, second=0, microsecond=0)
+
+                # If last fetch was before this bar started, do a full fetch
+                last_fetch_dt = datetime.fromtimestamp(self._last_full_fetch_time)
+                if last_fetch_dt < bar_start:
+                    return True
+
+            return False
+
+        except Exception:
+            # On any error, default to fetching full data
+            return True
+
+    def _quick_sltp_check(self, position):
+        """
+        Quick check for stop loss and take profit using only real-time price.
+
+        This is the lightweight path when in position - no bar data fetch needed.
+        """
+        # Get real-time price
+        current_price = fetch_realtime_price(self.ticker)
+        if current_price is None:
+            print("   ⚠️ Realtime price unavailable, skipping quick check")
+            return
+
+        entry_price = position.entry_price
+        pnl_pct = ((current_price - entry_price) / entry_price) * 100
+
+        # Calculate SL/TP price levels for display
+        sl_price = entry_price * (1 - self.stop_loss_pct / 100)
+        tp_price = entry_price * (1 + self.take_profit_pct / 100)
+
+        print(f"   📊 Position: LONG @ ${entry_price:,.2f} | Current: ${current_price:,.2f}")
+        print(f"   📊 P&L: {pnl_pct:+.2f}% | SL: ${sl_price:,.2f} | TP: ${tp_price:,.2f}")
+
+        exit_reason = None
+        exit_price = current_price
+
+        # Stop Loss
+        if pnl_pct <= -self.stop_loss_pct:
+            exit_reason = f"Stop Loss ({pnl_pct:.2f}%)"
+            print(f"   🛑 STOP LOSS TRIGGERED! P&L {pnl_pct:.2f}% <= -{self.stop_loss_pct}%")
+
+        # Take Profit
+        elif pnl_pct >= self.take_profit_pct:
+            exit_reason = f"Take Profit ({pnl_pct:.2f}%)"
+            print(f"   🎯 TAKE PROFIT TRIGGERED! P&L {pnl_pct:.2f}% >= +{self.take_profit_pct}%")
+
+        # Execute exit if triggered
+        if exit_reason:
+            self._execute_exit(exit_price, exit_reason, None)
 
     def _fetch_data(self, for_chart: bool = False) -> Optional[pd.DataFrame]:
         """
@@ -396,6 +601,14 @@ class BaseTrader(ABC):
                     interval=self.interval
                 )
                 if df is not None and not df.empty:
+                    # CRITICAL: Store fallback data to pipeline DB to prevent repeated failures
+                    # This ensures the database stays current even when Databento fails
+                    try:
+                        bars_stored = self.pipeline._store_bars(df, source='yfinance_fallback')
+                        if bars_stored > 0:
+                            print(f"   ✓ Stored {bars_stored} bars from fallback fetch to DB")
+                    except Exception as store_err:
+                        print(f"   ⚠️ Could not store fallback data: {store_err}")
                     return df
             except Exception as e:
                 print(f"   Fetch attempt {attempt+1} failed: {e}")
@@ -407,12 +620,23 @@ class BaseTrader(ABC):
         """Check if position should be exited."""
         # Get current price
         current_price = fetch_realtime_price(self.ticker)
+        price_source = "realtime"
         if current_price is None:
             current_price = df['Close'].iloc[-1]
+            price_source = "last_bar"
+            print(f"   ⚠️ Realtime price unavailable, using last bar close")
 
         # Check stop loss and take profit
         entry_price = position.entry_price
         pnl_pct = ((current_price - entry_price) / entry_price) * 100
+
+        # Calculate SL/TP price levels for display
+        sl_price = entry_price * (1 - self.stop_loss_pct / 100)
+        tp_price = entry_price * (1 + self.take_profit_pct / 100)
+
+        # Debug logging for position monitoring
+        print(f"   📊 Position: LONG @ ${entry_price:,.2f} | Current: ${current_price:,.2f} ({price_source})")
+        print(f"   📊 P&L: {pnl_pct:+.2f}% | SL: -{self.stop_loss_pct}% (${sl_price:,.2f}) | TP: +{self.take_profit_pct}% (${tp_price:,.2f})")
 
         exit_reason = None
         exit_price = current_price
@@ -421,10 +645,12 @@ class BaseTrader(ABC):
         # Stop Loss
         if pnl_pct <= -self.stop_loss_pct:
             exit_reason = f"Stop Loss ({pnl_pct:.2f}%)"
+            print(f"   🛑 STOP LOSS TRIGGERED! P&L {pnl_pct:.2f}% <= -{self.stop_loss_pct}%")
 
         # Take Profit
         elif pnl_pct >= self.take_profit_pct:
             exit_reason = f"Take Profit ({pnl_pct:.2f}%)"
+            print(f"   🎯 TAKE PROFIT TRIGGERED! P&L {pnl_pct:.2f}% >= +{self.take_profit_pct}%")
 
         # Signal-based exits (only if no SL/TP and in signal window)
         elif self.is_signal_window():
@@ -432,9 +658,17 @@ class BaseTrader(ABC):
             if completed_bar is not None:
                 # Check for opposite signal
                 if completed_bar.get('sell_signal', False):
-                    exit_reason = f"Opposite Signal ({pnl_pct:.2f}%)"
                     exit_price = completed_bar['Close']
-                    signal_bar_time = bar_time
+                    # Recalculate P&L using actual bar close price (not realtime)
+                    bar_pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                    exit_reason = f"Opposite Signal ({bar_pnl_pct:.2f}%)"
+                    # Use bar CLOSE time (not start time) so timestamp matches when signal was actionable
+                    # For intraday bars: add interval to get close time
+                    # For daily bars: keep as-is (date represents the trading day)
+                    if self.interval in ['1d', '1wk', '1mo']:
+                        signal_bar_time = bar_time
+                    else:
+                        signal_bar_time = bar_time + timedelta(minutes=self._get_interval_minutes())
 
         # Execute exit if triggered
         if exit_reason:
@@ -463,8 +697,14 @@ class BaseTrader(ABC):
         if current_price is None:
             current_price = completed_bar['Close']
 
-        # Execute entry
-        self._execute_entry(current_price, bar_time)
+        # Execute entry - use bar CLOSE time (not start time) so timestamp matches when signal was actionable
+        # For intraday bars: add interval to get close time (e.g., 16:00 + 15min = 16:15)
+        # For daily bars: keep as-is (date represents the trading day)
+        if self.interval in ['1d', '1wk', '1mo']:
+            bar_close_time = bar_time  # Daily bars keep their date
+        else:
+            bar_close_time = bar_time + timedelta(minutes=self._get_interval_minutes())
+        self._execute_entry(current_price, bar_close_time)
         self.last_signal_time = signal_time_str
 
     def _execute_entry(self, entry_price: float, signal_time: datetime):
@@ -488,6 +728,9 @@ class BaseTrader(ABC):
 
             # Only send Discord if DB was updated (prevents desync)
             if self.webhook_url:
+                import time as _time
+                alert_start = _time.time()
+
                 stats = self.pm.get_stats()
 
                 # Get enhanced stats for Discord notification
@@ -501,27 +744,66 @@ class BaseTrader(ABC):
                 except Exception as e:
                     print(f"   Warning: Enhanced stats failed: {e}")
 
-                # Generate chart for entry alert
+                # Format signal time with timezone indicator
+                # Convert to UTC for display to avoid confusion
+                import pytz
+                if hasattr(signal_time, 'tzinfo') and signal_time.tzinfo is not None:
+                    # Convert to UTC for consistent display
+                    utc_time = signal_time.astimezone(pytz.UTC)
+                    signal_time_str = utc_time.strftime('%Y-%m-%d %H:%M') + " UTC"
+                else:
+                    # Naive timestamp - just format as-is
+                    signal_time_str = str(signal_time)[:16]
+
+                # IMMEDIATE ALERT: Send text alert FIRST (no chart) for fastest notification
+                stats_time = _time.time() - alert_start
+                print(f"   ⏱️ Stats prepared in {stats_time:.1f}s, sending immediate alert...")
+
+                send_entry_alert(
+                    self.webhook_url,
+                    self.strategy_name,
+                    self.ticker,
+                    entry_price,
+                    signal_time_str,
+                    self.stop_loss_pct,
+                    self.take_profit_pct,
+                    stats,
+                    chart=None,  # No chart - send immediately
+                    enhanced_stats=enhanced_stats
+                )
+
+                immediate_time = _time.time() - alert_start
+                print(f"   ⏱️ Immediate alert sent in {immediate_time:.1f}s")
+
+                # FOLLOW-UP: Generate and send chart separately
+                chart_start = _time.time()
                 chart = None
                 try:
-                    df = self._fetch_data(for_chart=True)  # Include synthetic bar for display
+                    # Use cached df if available (already has indicators calculated)
+                    df = getattr(self, '_cached_df', None)
+                    if df is None or df.empty:
+                        # Fallback to fetch only if no cached data
+                        print(f"   ⚠️ No cached data, fetching for chart...")
+                        df = self._fetch_data(for_chart=True)
+                        if df is not None and not df.empty:
+                            if self.use_legacy:
+                                df = calculate_composite_oscillator_legacy(df)
+                                df = calculate_velocity_signals_legacy(df, self.config)
+                            else:
+                                df = calculate_composite_oscillator(df, oscillator_type=self.oscillator_type, config=self.config)
+                                df = calculate_velocity_signals(
+                                    df,
+                                    signal_type=self.signal_type,
+                                    oversold_threshold=self.oversold_threshold,
+                                    overbought_threshold=self.overbought_threshold,
+                                    vel_smoothing=self.vel_smoothing,
+                                    extreme_zone_mult=self.extreme_zone_mult,
+                                    require_accel=self.require_accel,
+                                    use_regime_filter=self.use_regime_filter,
+                                    regime_threshold=self.regime_threshold
+                                )
+
                     if df is not None and not df.empty:
-                        if self.use_legacy:
-                            df = calculate_composite_oscillator_legacy(df)
-                            df = calculate_velocity_signals_legacy(df, self.config)
-                        else:
-                            df = calculate_composite_oscillator(df, oscillator_type=self.oscillator_type, config=self.config)
-                            df = calculate_velocity_signals(
-                                df,
-                                signal_type=self.signal_type,
-                                oversold_threshold=self.oversold_threshold,
-                                overbought_threshold=self.overbought_threshold,
-                                vel_smoothing=self.vel_smoothing,
-                                extreme_zone_mult=self.extreme_zone_mult,
-                                require_accel=self.require_accel,
-                                use_regime_filter=self.use_regime_filter,
-                                regime_threshold=self.regime_threshold
-                            )
                         trade_data = self.pm.get_entries_and_exits()
                         chart = generate_chart(
                             df=df,
@@ -534,23 +816,21 @@ class BaseTrader(ABC):
                             chart_type="signal",
                             interval=self.interval,
                             oversold_threshold=self.oversold_threshold,
-                            overbought_threshold=self.overbought_threshold
+                            overbought_threshold=self.overbought_threshold,
+                            signal_time=signal_time  # Show UTC + Chicago time on chart
                         )
                 except Exception as e:
                     print(f"   Warning: Entry chart generation failed: {e}")
 
-                send_entry_alert(
-                    self.webhook_url,
-                    self.strategy_name,
-                    self.ticker,
-                    entry_price,
-                    str(signal_time)[:16],
-                    self.stop_loss_pct,
-                    self.take_profit_pct,
-                    stats,
-                    chart=chart,
-                    enhanced_stats=enhanced_stats
-                )
+                chart_time = _time.time() - chart_start
+                print(f"   ⏱️ Chart generated in {chart_time:.1f}s")
+
+                # Send chart as follow-up message
+                if chart:
+                    from ..notifications.discord import send_discord_alert
+                    send_discord_alert(self.webhook_url, f"📊 Chart for {self.strategy_name}", chart=chart)
+                    total_time = _time.time() - alert_start
+                    print(f"   ⏱️ Chart follow-up sent (total: {total_time:.1f}s)")
         else:
             print(f"   Entry rejected: {result.get('error')} - {result.get('message')}")
 
@@ -579,6 +859,9 @@ class BaseTrader(ABC):
 
             # Only send Discord if DB was updated (prevents desync)
             if self.webhook_url:
+                import time as _time
+                alert_start = _time.time()
+
                 stats = self.pm.get_stats()
                 cumulative = {
                     'total_trades': stats.get('num_trades', 0),
@@ -605,27 +888,64 @@ class BaseTrader(ABC):
                 except Exception as e:
                     print(f"   Warning: Enhanced stats failed: {e}")
 
-                # Generate chart for exit alert
+                # Format times - just use local time without confusing UTC label
+                # The times shown are when the signal was actionable (bar close time)
+                entry_time_str = str(result.get('entry_date', ''))[:16]
+                exit_time_str = str(exit_date)[:16]
+
+                # IMMEDIATE ALERT: Send text alert FIRST (no chart) for fastest notification
+                stats_time = _time.time() - alert_start
+                print(f"   ⏱️ Stats prepared in {stats_time:.1f}s, sending immediate alert...")
+
+                send_exit_alert(
+                    self.webhook_url,
+                    self.strategy_name,
+                    self.ticker,
+                    result.get('entry_price', 0),
+                    exit_price,
+                    pnl,
+                    result.get('pnl_dollars', 0),
+                    exit_reason,
+                    entry_time_str,
+                    exit_time_str,
+                    cumulative,
+                    chart=None,  # No chart - send immediately
+                    csv_buf=csv_buf,
+                    enhanced_stats=enhanced_stats
+                )
+
+                immediate_time = _time.time() - alert_start
+                print(f"   ⏱️ Immediate alert sent in {immediate_time:.1f}s")
+
+                # FOLLOW-UP: Generate and send chart separately
+                chart_start = _time.time()
                 chart = None
                 try:
-                    df = self._fetch_data(for_chart=True)  # Include synthetic bar for display
+                    # Use cached df if available (already has indicators calculated)
+                    df = getattr(self, '_cached_df', None)
+                    if df is None or df.empty:
+                        # Fallback to fetch only if no cached data
+                        print(f"   ⚠️ No cached data, fetching for chart...")
+                        df = self._fetch_data(for_chart=True)
+                        if df is not None and not df.empty:
+                            if self.use_legacy:
+                                df = calculate_composite_oscillator_legacy(df)
+                                df = calculate_velocity_signals_legacy(df, self.config)
+                            else:
+                                df = calculate_composite_oscillator(df, oscillator_type=self.oscillator_type, config=self.config)
+                                df = calculate_velocity_signals(
+                                    df,
+                                    signal_type=self.signal_type,
+                                    oversold_threshold=self.oversold_threshold,
+                                    overbought_threshold=self.overbought_threshold,
+                                    vel_smoothing=self.vel_smoothing,
+                                    extreme_zone_mult=self.extreme_zone_mult,
+                                    require_accel=self.require_accel,
+                                    use_regime_filter=self.use_regime_filter,
+                                    regime_threshold=self.regime_threshold
+                                )
+
                     if df is not None and not df.empty:
-                        if self.use_legacy:
-                            df = calculate_composite_oscillator_legacy(df)
-                            df = calculate_velocity_signals_legacy(df, self.config)
-                        else:
-                            df = calculate_composite_oscillator(df, oscillator_type=self.oscillator_type, config=self.config)
-                            df = calculate_velocity_signals(
-                                df,
-                                signal_type=self.signal_type,
-                                oversold_threshold=self.oversold_threshold,
-                                overbought_threshold=self.overbought_threshold,
-                                vel_smoothing=self.vel_smoothing,
-                                extreme_zone_mult=self.extreme_zone_mult,
-                                require_accel=self.require_accel,
-                                use_regime_filter=self.use_regime_filter,
-                                regime_threshold=self.regime_threshold
-                            )
                         trade_data = self.pm.get_entries_and_exits()
                         chart = generate_chart(
                             df=df,
@@ -638,29 +958,31 @@ class BaseTrader(ABC):
                             chart_type="signal",
                             interval=self.interval,
                             oversold_threshold=self.oversold_threshold,
-                            overbought_threshold=self.overbought_threshold
+                            overbought_threshold=self.overbought_threshold,
+                            signal_time=exit_date  # Show UTC + Chicago time on chart
                         )
                 except Exception as e:
                     print(f"   Warning: Exit chart generation failed: {e}")
 
-                send_exit_alert(
-                    self.webhook_url,
-                    self.strategy_name,
-                    self.ticker,
-                    result.get('entry_price', 0),
-                    exit_price,
-                    pnl,
-                    result.get('pnl_dollars', 0),
-                    exit_reason,
-                    result.get('entry_date', ''),
-                    exit_date,
-                    cumulative,
-                    chart=chart,
-                    csv_buf=csv_buf,
-                    enhanced_stats=enhanced_stats
-                )
+                chart_time = _time.time() - chart_start
+                print(f"   ⏱️ Chart generated in {chart_time:.1f}s")
+
+                # Send chart as follow-up message
+                if chart:
+                    from ..notifications.discord import send_discord_alert
+                    send_discord_alert(self.webhook_url, f"📊 Chart for {self.strategy_name}", chart=chart)
+                    total_time = _time.time() - alert_start
+                    print(f"   ⏱️ Chart follow-up sent (total: {total_time:.1f}s)")
         else:
             print(f"   Exit rejected: {result.get('error')} - {result.get('message')}")
+
+    def _get_interval_minutes(self) -> int:
+        """Get the bar interval in minutes."""
+        interval_map = {
+            '1m': 1, '5m': 5, '15m': 15, '30m': 30,
+            '1h': 60, '2h': 120, '4h': 240, '1d': 1440
+        }
+        return interval_map.get(self.interval, 15)
 
     def _calculate_sleep_time(self) -> int:
         """Calculate seconds until next check."""
@@ -738,6 +1060,16 @@ class BaseTrader(ABC):
                 exits = trade_data.get('exits', [])
                 print(f"   📊 Generating chart ({len(entries)} entries, {len(exits)} exits)...")
 
+                # Determine signal time for chart display
+                # If in position: show entry time
+                # If flat: show last exit time
+                chart_signal_time = None
+                if position:
+                    chart_signal_time = position.entry_signal_bar or position.entry_date
+                elif exits:
+                    # Get most recent exit time
+                    chart_signal_time = exits[-1].get('date')
+
                 # Generate chart
                 chart = generate_chart(
                     df=df,
@@ -750,7 +1082,8 @@ class BaseTrader(ABC):
                     chart_type="status",
                     interval=self.interval,
                     oversold_threshold=self.oversold_threshold,
-                    overbought_threshold=self.overbought_threshold
+                    overbought_threshold=self.overbought_threshold,
+                    signal_time=chart_signal_time  # Show UTC + Chicago time
                 )
                 print("   ✓ Chart generated")
         except Exception as e:
