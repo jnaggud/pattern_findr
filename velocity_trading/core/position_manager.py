@@ -296,7 +296,7 @@ class PositionManager:
         ticker: str,
         position_type: str,
         entry_price: float,
-        entry_date: str,
+        entry_date_raw: str,
         entry_signal_bar: str = None,
         is_missed: bool = False
     ) -> Tuple[bool, Dict]:
@@ -324,6 +324,10 @@ class PositionManager:
 
         CRITICAL: Caller should only send Discord if success=True
         """
+        # CRITICAL: Normalize timestamp to consistent ISO format (YYYY-MM-DDTHH:MM:SS)
+        # This ensures date comparisons work correctly in SQL and chart rendering
+        entry_date = normalize_timestamp(entry_date_raw)
+
         try:
             with self._db.transaction() as conn:
                 # Check for existing position
@@ -448,7 +452,7 @@ class PositionManager:
     def exit_position(
         self,
         exit_price: float,
-        exit_date: str,
+        exit_date_raw: str,
         exit_reason: str,
         exit_signal_bar: str = None,
         is_missed: bool = False
@@ -466,7 +470,7 @@ class PositionManager:
 
         Args:
             exit_price: Exit price
-            exit_date: Exit timestamp (ISO format)
+            exit_date_raw: Exit timestamp (any format - will be normalized)
             exit_reason: Reason for exit (e.g., "Opposite Signal", "Stop Loss")
             exit_signal_bar: Bar that generated the exit signal
             is_missed: True if this is a missed exit being recovered
@@ -478,6 +482,10 @@ class PositionManager:
 
         CRITICAL: Caller should only send Discord if success=True
         """
+        # CRITICAL: Normalize timestamp to consistent ISO format (YYYY-MM-DDTHH:MM:SS)
+        # This ensures date comparisons work correctly in SQL and chart rendering
+        exit_date = normalize_timestamp(exit_date_raw)
+
         try:
             with self._db.transaction() as conn:
                 # Get current position

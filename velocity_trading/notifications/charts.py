@@ -833,21 +833,36 @@ def _find_bar_num(date_str, date_to_barnum: Dict, is_intraday: bool = True, inte
                 return date_to_barnum[fmt]
 
         # CRITICAL FIX: Trade dates use bar CLOSE time, but DataFrame index uses bar START time
-        # For intraday, subtract the bar interval to convert close -> start time
-        # E.g., exit at 18:30 should map to bar starting at 18:15 (for 15m bars)
+        # For intraday, convert to the bar that contains this timestamp
+        #
+        # Two cases:
+        # 1. Signal on bar boundary (e.g., 18:30) -> bar starting at 18:15 (subtract interval)
+        # 2. Mid-bar event (e.g., stop-loss at 19:46) -> bar starting at 19:45 (floor to interval)
         if is_intraday:
             # Convert interval string to minutes
             interval_map = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '90m': 90, '2h': 120, '4h': 240}
             interval_minutes = interval_map.get(interval, 15)
 
-            # Only try the specific interval - don't guess
+            # Method 1: Assume bar close time - subtract interval
             dt_start = dt_minute - pd.Timedelta(minutes=interval_minutes)
             if dt_start in date_to_barnum:
                 return date_to_barnum[dt_start]
-            # Also try string formats for the adjusted time
             start_iso = dt_start.strftime('%Y-%m-%dT%H:%M:%S')
             start_space = dt_start.strftime('%Y-%m-%d %H:%M:%S')
             for fmt in [start_iso, start_space, start_iso[:16], start_space[:16]]:
+                if fmt in date_to_barnum:
+                    return date_to_barnum[fmt]
+
+            # Method 2: Floor to nearest bar start (handles mid-bar events like stop-loss)
+            # E.g., 19:46 with 15m bars -> floor to 19:45
+            total_minutes = dt_minute.hour * 60 + dt_minute.minute
+            floored_minutes = (total_minutes // interval_minutes) * interval_minutes
+            dt_floored = dt_minute.replace(hour=floored_minutes // 60, minute=floored_minutes % 60)
+            if dt_floored in date_to_barnum:
+                return date_to_barnum[dt_floored]
+            floored_iso = dt_floored.strftime('%Y-%m-%dT%H:%M:%S')
+            floored_space = dt_floored.strftime('%Y-%m-%d %H:%M:%S')
+            for fmt in [floored_iso, floored_space, floored_iso[:16], floored_space[:16]]:
                 if fmt in date_to_barnum:
                     return date_to_barnum[fmt]
 
