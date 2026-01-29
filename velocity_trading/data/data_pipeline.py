@@ -593,22 +593,16 @@ class DataPipeline:
 
         Filters out:
         1. Candles with zero/negative OHLC values
-        2. Candles where low > high or OHLC outside high/low range
-        3. Candles where Open=High with significant downward range (bad aggregation)
-        4. Candles with volume <= 1 (placeholder data) - SKIPPED for GC=F
-        5. Candles with > 1.5% move from previous close (abnormal for 15min bars)
+        2. Candles where low > high (impossible)
+        3. Candles where open/close outside high/low range
 
-        Note: GC=F uses relaxed validation to match Polygon backtest data which
-        includes overnight bars that may have low volume or Open=High patterns.
+        Only structural validation is performed. We trust data from yfinance/Polygon
+        and don't filter based on market behavior assumptions (% moves, volume, etc.)
         """
         if df.empty:
             return df
 
         df = df.copy()
-
-        # GC=F uses relaxed validation to match backtest data
-        # The backtest included overnight bars that get filtered by strict validation
-        relaxed_validation = self.ticker == 'GC=F'
 
         # Normalize column names for checking
         col_map = {}
@@ -624,7 +618,6 @@ class DataPipeline:
         high_col = col_map['high']
         low_col = col_map['low']
         close_col = col_map['close']
-        volume_col = col_map.get('volume')
 
         initial_len = len(df)
 
@@ -650,38 +643,10 @@ class DataPipeline:
         )
         df = df[mask_valid]
 
-        # Filter 4: Remove bars where Open=High with significant downward range
-        # SKIP for GC=F - these can be legitimate overnight bars
-        if not relaxed_validation:
-            bar_range_pct = (df[high_col] - df[low_col]) / df[low_col] * 100
-            mask_valid = ~(
-                (df[open_col] == df[high_col]) &  # Open equals High
-                (bar_range_pct > 0.5)  # With > 0.5% range (not a doji)
-            )
-            df = df[mask_valid]
-
-        # Filter 5: Remove placeholder bars with volume <= 1
-        # SKIP for GC=F - overnight bars may have low volume but valid prices
-        if not relaxed_validation and volume_col is not None and volume_col in df.columns:
-            mask_valid = df[volume_col] > 1
-            df = df[mask_valid]
-
-        # Filter 6: Remove outlier moves (> 1.5% from previous close for intraday)
-        # ES futures rarely move > 1% in a single 15-min bar
-        if len(df) > 1:
-            prev_close = df[close_col].shift(1)
-            pct_change_high = abs(df[high_col] - prev_close) / prev_close * 100
-            pct_change_low = abs(df[low_col] - prev_close) / prev_close * 100
-
-            # 1.5% threshold for intraday - captures most bad data
-            # Real flash crashes would have proper OHLC structure
-            max_move_pct = 1.5
-            mask_valid = (
-                (pct_change_high <= max_move_pct) &
-                (pct_change_low <= max_move_pct)
-            ) | prev_close.isna()
-
-            df = df[mask_valid]
+        # NOTE: Removed filters 4-6 (Open=High check, low volume check, % move check)
+        # These were opinionated filters that assumed "normal" market behavior and
+        # were incorrectly filtering out valid data during volatile conditions.
+        # If OHLC structure is valid, trust the data from yfinance/Polygon.
 
         removed = initial_len - len(df)
         if removed > 0:
