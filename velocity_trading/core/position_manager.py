@@ -296,7 +296,7 @@ class PositionManager:
         ticker: str,
         position_type: str,
         entry_price: float,
-        entry_date_raw: str,
+        entry_date: str,
         entry_signal_bar: str = None,
         is_missed: bool = False
     ) -> Tuple[bool, Dict]:
@@ -313,7 +313,7 @@ class PositionManager:
             ticker: Trading instrument symbol
             position_type: 'long' or 'short'
             entry_price: Entry price
-            entry_date: Entry timestamp (ISO format)
+            entry_date: Entry timestamp (any format - will be normalized)
             entry_signal_bar: Bar that generated the signal
             is_missed: True if this is a missed signal being recovered
 
@@ -326,7 +326,7 @@ class PositionManager:
         """
         # CRITICAL: Normalize timestamp to consistent ISO format (YYYY-MM-DDTHH:MM:SS)
         # This ensures date comparisons work correctly in SQL and chart rendering
-        entry_date = normalize_timestamp(entry_date_raw)
+        entry_date = normalize_timestamp(entry_date)
 
         try:
             with self._db.transaction() as conn:
@@ -452,7 +452,7 @@ class PositionManager:
     def exit_position(
         self,
         exit_price: float,
-        exit_date_raw: str,
+        exit_date: str,
         exit_reason: str,
         exit_signal_bar: str = None,
         is_missed: bool = False
@@ -470,7 +470,7 @@ class PositionManager:
 
         Args:
             exit_price: Exit price
-            exit_date_raw: Exit timestamp (any format - will be normalized)
+            exit_date: Exit timestamp (any format - will be normalized)
             exit_reason: Reason for exit (e.g., "Opposite Signal", "Stop Loss")
             exit_signal_bar: Bar that generated the exit signal
             is_missed: True if this is a missed exit being recovered
@@ -484,7 +484,7 @@ class PositionManager:
         """
         # CRITICAL: Normalize timestamp to consistent ISO format (YYYY-MM-DDTHH:MM:SS)
         # This ensures date comparisons work correctly in SQL and chart rendering
-        exit_date = normalize_timestamp(exit_date_raw)
+        exit_date = normalize_timestamp(exit_date)
 
         try:
             with self._db.transaction() as conn:
