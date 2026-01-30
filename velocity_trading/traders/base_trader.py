@@ -116,6 +116,15 @@ class BaseTrader(ABC):
         self.use_entropy_filter = self.config.get('use_entropy_filter', False)
         self.entropy_threshold = self.config.get('entropy_threshold', 0.7)
 
+        # Acceleration Reversal Exit parameters
+        self.use_accel_exit = self.config.get('use_accel_exit', False)
+        self.accel_exit_type = self.config.get('accel_exit_type', 'sign_reversal')
+        self.accel_exit_threshold = self.config.get('accel_exit_threshold', 0.0)
+        self.accel_exit_min_pnl = self.config.get('accel_exit_min_pnl', 0.5)
+        self.accel_exit_lookback = self.config.get('accel_exit_lookback', 1)
+        self.use_jerk_confirm = self.config.get('use_jerk_confirm', False)
+        self.jerk_confirm_threshold = self.config.get('jerk_confirm_threshold', 0.0)
+
         # Non-legacy mode now produces identical results to old system
         # Legacy mode is kept as fallback but not required by default
         self.use_legacy = self.config.get('use_legacy', False)
@@ -652,7 +661,35 @@ class BaseTrader(ABC):
             exit_reason = f"Take Profit ({pnl_pct:.2f}%)"
             print(f"   🎯 TAKE PROFIT TRIGGERED! P&L {pnl_pct:.2f}% >= +{self.take_profit_pct}%")
 
-        # Signal-based exits (only if no SL/TP and in signal window)
+        # Acceleration Reversal Exit (early warning before stop loss)
+        elif self.use_accel_exit and 'acceleration' in df.columns:
+            # Check if conditions are met
+            pnl_ok = pnl_pct >= self.accel_exit_min_pnl or pnl_pct < 0
+
+            if pnl_ok and len(df) >= self.accel_exit_lookback + 1:
+                accel_values = df['acceleration'].iloc[-self.accel_exit_lookback:].values
+                current_accel = df['acceleration'].iloc[-1]
+
+                # For LONG positions: negative acceleration is bearish
+                accel_cond = False
+                if self.accel_exit_type == 'sign_reversal':
+                    accel_cond = all(a < 0 for a in accel_values)
+                elif self.accel_exit_type == 'magnitude':
+                    accel_cond = current_accel < -self.accel_exit_threshold
+                elif self.accel_exit_type == 'both':
+                    accel_cond = all(a < 0 for a in accel_values) and abs(current_accel) > self.accel_exit_threshold
+
+                # Jerk confirmation (optional)
+                jerk_cond = True
+                if self.use_jerk_confirm and 'jerk' in df.columns and self.jerk_confirm_threshold > 0:
+                    current_jerk = df['jerk'].iloc[-1]
+                    jerk_cond = current_jerk < -self.jerk_confirm_threshold
+
+                if accel_cond and jerk_cond:
+                    exit_reason = f"Accel Reversal ({pnl_pct:.2f}%)"
+                    print(f"   ⚠️ ACCELERATION REVERSAL EXIT! Accel: {current_accel:.4f}, P&L: {pnl_pct:.2f}%")
+
+        # Signal-based exits (only if no SL/TP/Accel and in signal window)
         elif self.is_signal_window():
             completed_bar, bar_time = self.get_completed_bar(df)
             if completed_bar is not None:

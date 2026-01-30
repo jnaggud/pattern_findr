@@ -294,26 +294,67 @@ _VELOCITY_CACHED_DATA = None
 
 def set_velocity_shared_data(close_prices, osc_values, rsi_cache, macd_histogram, bb_upper, bb_lower,
                               optimize_metric='total_return', use_extra_indicators=True,
-                              all_oscillators=None):
+                              all_oscillators=None, v2_indicators=None,
+                              # Exit strategy constraints
+                              force_midline_exit=False, force_opposite_exit=True,
+                              sl_range=None, tp_range=None,
+                              # Drawdown penalty settings
+                              use_drawdown_penalty=False, max_drawdown_threshold=15.0,
+                              drawdown_penalty_weight=0.3,
+                              # V2 filter constraints (from UI checkboxes)
+                              v2_filter_settings=None):
     """
     Save velocity optimization data to a temp file for parallel workers.
     Returns the path to the temp file.
 
     Args:
         all_oscillators: Dict mapping oscillator names to their values (for searching across oscillator types)
+        v2_indicators: Dict with 'rsc', 'mfi2', 'sei' arrays for V2 filter optimization
+        force_midline_exit: If True, always use exit_on_midline_cross=True
+        force_opposite_exit: If True, always use exit_on_opposite_signal=True
+        sl_range: Tuple (min_pct, max_pct) for stop loss search range
+        tp_range: Tuple (min_pct, max_pct) for take profit search range
+        use_drawdown_penalty: If True, penalize strategies with high max drawdown
+        v2_filter_settings: Dict with filter constraints from UI checkboxes:
+            {'use_regime_filter': True/False, 'regime_threshold': float,
+             'use_fragility_filter': True/False, 'fragility_threshold': float,
+             'use_entropy_filter': True/False, 'entropy_threshold': float}
+        max_drawdown_threshold: Drawdown % above which penalty starts
+        drawdown_penalty_weight: Weight of drawdown penalty in objective (0-1)
     """
     global _VELOCITY_DATA_PATH, _VELOCITY_CACHED_DATA
 
     _VELOCITY_CACHED_DATA = None
 
-    fd, path = tempfile.mkstemp(suffix='.joblib', prefix='velocity_optuna_')
-    os.close(fd)
+    # Use project directory for temp file instead of system temp
+    # macOS aggressively cleans /var/folders which causes race conditions with parallel workers
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    temp_dir = os.path.join(project_dir, '.optuna_temp')
+    os.makedirs(temp_dir, exist_ok=True)
+
+    # Create unique filename
+    import uuid
+    filename = f'velocity_optuna_{uuid.uuid4().hex[:8]}.joblib'
+    path = os.path.join(temp_dir, filename)
 
     # Process all oscillators if provided
     processed_oscillators = {}
     if all_oscillators:
         for name, values in all_oscillators.items():
             processed_oscillators[name] = np.array(values) if hasattr(values, 'values') else values
+
+    # Process V2 indicators if provided
+    processed_v2 = {}
+    if v2_indicators:
+        for name, values in v2_indicators.items():
+            if values is not None:
+                processed_v2[name] = np.array(values) if hasattr(values, 'values') else values
+
+    # Default SL/TP ranges if not specified
+    if sl_range is None:
+        sl_range = (0.0, 10.0)
+    if tp_range is None:
+        tp_range = (0.0, 20.0)
 
     data = {
         'close_prices': np.array(close_prices) if hasattr(close_prices, 'values') else close_prices,
@@ -325,6 +366,18 @@ def set_velocity_shared_data(close_prices, osc_values, rsi_cache, macd_histogram
         'optimize_metric': optimize_metric,
         'use_extra_indicators': use_extra_indicators,
         'all_oscillators': processed_oscillators,  # All oscillator types for search
+        'v2_indicators': processed_v2,  # V2 indicators for filter optimization
+        # Exit strategy constraints
+        'force_midline_exit': force_midline_exit,
+        'force_opposite_exit': force_opposite_exit,
+        'sl_range': sl_range,
+        'tp_range': tp_range,
+        # Drawdown penalty settings
+        'use_drawdown_penalty': use_drawdown_penalty,
+        'max_drawdown_threshold': max_drawdown_threshold,
+        'drawdown_penalty_weight': drawdown_penalty_weight,
+        # V2 filter constraints from UI
+        'v2_filter_settings': v2_filter_settings or {},
     }
     joblib.dump(data, path)
 
@@ -375,6 +428,17 @@ class VelocityOptunaObjective:
         use_extra_indicators = data['use_extra_indicators']
         all_oscillators = data.get('all_oscillators', {})
 
+        # Exit strategy constraints from UI
+        force_midline_exit = data.get('force_midline_exit', False)
+        force_opposite_exit = data.get('force_opposite_exit', True)
+        sl_range = data.get('sl_range', (0.0, 10.0))
+        tp_range = data.get('tp_range', (0.0, 20.0))
+
+        # Drawdown penalty settings
+        use_drawdown_penalty = data.get('use_drawdown_penalty', False)
+        max_drawdown_threshold = data.get('max_drawdown_threshold', 15.0)
+        drawdown_penalty_weight = data.get('drawdown_penalty_weight', 0.3)
+
         # Determine available oscillator types
         if all_oscillators and len(all_oscillators) > 1:
             oscillator_types = list(all_oscillators.keys())
@@ -390,6 +454,21 @@ class VelocityOptunaObjective:
         else:
             params['oscillator_type'] = 'composite_smooth'
 
+        # SL/TP with constrained ranges from UI
+        sl_min, sl_max = sl_range
+        tp_min, tp_max = tp_range
+
+        # Exit conditions - either forced or searchable
+        if force_opposite_exit:
+            exit_opposite = True
+        else:
+            exit_opposite = trial.suggest_categorical('exit_on_opposite_signal', [True, False])
+
+        if force_midline_exit:
+            exit_midline = True
+        else:
+            exit_midline = trial.suggest_categorical('exit_on_midline_cross', [True, False])
+
         params.update({
             'signal_type': trial.suggest_categorical('signal_type', [
                 'velocity_crossover_and_zone', 'velocity_crossover_or_zone', 'zone_only',
@@ -398,13 +477,27 @@ class VelocityOptunaObjective:
             'vel_smoothing': trial.suggest_int('vel_smoothing', 1, 15),
             'oversold_threshold': trial.suggest_float('oversold_threshold', -0.6, -0.02),
             'overbought_threshold': trial.suggest_float('overbought_threshold', 0.02, 0.6),
-            'stop_loss_pct': trial.suggest_float('stop_loss_pct', 0.0, 10.0),
-            'take_profit_pct': trial.suggest_float('take_profit_pct', 0.0, 20.0),
+            'stop_loss_pct': trial.suggest_float('stop_loss_pct', sl_min, sl_max),
+            'take_profit_pct': trial.suggest_float('take_profit_pct', tp_min, tp_max),
+            'min_hold_bars': trial.suggest_int('min_hold_bars', 1, 10),
             'min_bars_between': trial.suggest_int('min_bars_between', 1, 15),
             'require_accel': trial.suggest_categorical('require_accel', [True, False]),
             'extreme_zone_mult': trial.suggest_float('extreme_zone_mult', 1.1, 2.5),
-            'exit_on_opposite_signal': trial.suggest_categorical('exit_on_opposite_signal', [True, False]),
-            'exit_on_midline_cross': trial.suggest_categorical('exit_on_midline_cross', [True, False]),
+            'exit_on_opposite_signal': exit_opposite,
+            'exit_on_midline_cross': exit_midline,
+            # Previously hardcoded parameters - now searchable for exhaustive optimization
+            'velocity_std_window': trial.suggest_int('velocity_std_window', 5, 20),
+            'momentum_multiplier': trial.suggest_float('momentum_multiplier', 1.0, 3.0),
+            'double_bottom_lookback': trial.suggest_int('double_bottom_lookback', 5, 20),
+            'divergence_lookback': trial.suggest_int('divergence_lookback', 3, 10),
+            # Acceleration Reversal Exit parameters - exit based on acceleration/jerk
+            'use_accel_exit': trial.suggest_categorical('use_accel_exit', [True, False]),
+            'accel_exit_type': trial.suggest_categorical('accel_exit_type', ['sign_reversal', 'magnitude', 'both']),
+            'accel_exit_threshold': trial.suggest_float('accel_exit_threshold', 0.0, 0.1),
+            'accel_exit_min_pnl': trial.suggest_float('accel_exit_min_pnl', 0.5, 5.0),
+            'accel_exit_lookback': trial.suggest_int('accel_exit_lookback', 1, 5),
+            'use_jerk_confirm': trial.suggest_categorical('use_jerk_confirm', [True, False]),
+            'jerk_confirm_threshold': trial.suggest_float('jerk_confirm_threshold', 0.0, 0.05),
         })
 
         if use_extra_indicators:
@@ -415,6 +508,41 @@ class VelocityOptunaObjective:
             params['use_macd_confirm'] = trial.suggest_categorical('use_macd_confirm', [True, False])
             params['use_bb_filter'] = trial.suggest_categorical('use_bb_filter', [True, False])
 
+        # V2 indicator filters (Regime, Fragility, Entropy)
+        # RESPECT UI CHECKBOX SETTINGS: if user checked a filter, force it ON for all trials
+        v2_indicators = data.get('v2_indicators', {})
+        v2_settings = data.get('v2_filter_settings', {})
+
+        if v2_indicators:
+            # Regime filter: use UI setting if specified, otherwise don't use it
+            if v2_settings.get('use_regime_filter', False) and 'rsc' in v2_indicators:
+                params['use_regime_filter'] = True
+                # Search for optimal threshold
+                params['regime_threshold'] = trial.suggest_float('regime_threshold', -0.5, 0.5)
+            else:
+                params['use_regime_filter'] = False
+                params['regime_threshold'] = 0.0
+
+            # Fragility filter: use UI setting if specified
+            if v2_settings.get('use_fragility_filter', False) and 'mfi2' in v2_indicators:
+                params['use_fragility_filter'] = True
+                params['fragility_threshold'] = trial.suggest_float('fragility_threshold', 0.2, 0.8)
+            else:
+                params['use_fragility_filter'] = False
+                params['fragility_threshold'] = 0.5
+
+            # Entropy filter: use UI setting if specified
+            if v2_settings.get('use_entropy_filter', False) and 'sei' in v2_indicators:
+                params['use_entropy_filter'] = True
+                params['entropy_threshold'] = trial.suggest_float('entropy_threshold', 0.3, 0.9)
+            else:
+                params['use_entropy_filter'] = False
+                params['entropy_threshold'] = 0.7
+        else:
+            params['use_regime_filter'] = False
+            params['use_fragility_filter'] = False
+            params['use_entropy_filter'] = False
+
         # Select the oscillator values based on the chosen type
         selected_osc_type = params['oscillator_type']
         if selected_osc_type in all_oscillators:
@@ -422,21 +550,44 @@ class VelocityOptunaObjective:
         else:
             selected_osc_values = osc_values  # Fallback to default
 
-        # Run backtest with selected oscillator
+        # Run backtest with selected oscillator and V2 indicators
         result = self._run_backtest(params, close_prices, selected_osc_values, rsi_cache,
-                                     macd_histogram, bb_upper, bb_lower, use_extra_indicators)
+                                     macd_histogram, bb_upper, bb_lower, use_extra_indicators,
+                                     v2_indicators)
 
         if result is None:
             return float('-inf')
 
+        # Get the base score from the optimization metric
+        base_score = result[optimize_metric]
+
+        # Apply max drawdown penalty if enabled
+        if use_drawdown_penalty and 'max_drawdown' in result:
+            max_dd = result['max_drawdown']
+            if max_dd > max_drawdown_threshold:
+                # Calculate penalty: linear reduction based on how much DD exceeds threshold
+                excess_dd = max_dd - max_drawdown_threshold
+                # Penalty scales from 0 to drawdown_penalty_weight as excess increases
+                # At 2x threshold excess, penalty is full weight
+                penalty_factor = min(1.0, excess_dd / max_drawdown_threshold)
+                penalty = penalty_factor * drawdown_penalty_weight
+
+                # Apply penalty to score (reduce by penalty percentage)
+                if base_score > 0:
+                    base_score = base_score * (1 - penalty)
+                else:
+                    # For negative scores, make them more negative
+                    base_score = base_score * (1 + penalty)
+
         # Store result for later retrieval
         trial.set_user_attr('result', result)
 
-        return result[optimize_metric]
+        return base_score
 
     def _run_backtest(self, params, close_prices, osc_values, rsi_cache,
-                      macd_histogram, bb_upper, bb_lower, use_extra_indicators):
-        """Fast vectorized backtest."""
+                      macd_histogram, bb_upper, bb_lower, use_extra_indicators,
+                      v2_indicators=None):
+        """Fast vectorized backtest with V2 indicator filters."""
         import pandas as pd
 
         # Apply smoothing
@@ -447,6 +598,7 @@ class VelocityOptunaObjective:
 
         velocity = np.diff(osc_smooth, prepend=osc_smooth[0])
         acceleration = np.diff(velocity, prepend=velocity[0])
+        jerk = np.diff(acceleration, prepend=acceleration[0])  # Third derivative for accel exit
 
         # Build conditions
         vel_cross_up = (velocity > 0) & (np.roll(velocity, 1) <= 0)
@@ -456,9 +608,11 @@ class VelocityOptunaObjective:
         extreme_oversold = osc_smooth < (params['oversold_threshold'] * params['extreme_zone_mult'])
         extreme_overbought = osc_smooth > (params['overbought_threshold'] * params['extreme_zone_mult'])
 
-        vel_std = pd.Series(velocity).rolling(10, min_periods=1).std().fillna(np.std(velocity)).values
-        strong_momentum_up = velocity > vel_std * 1.5
-        strong_momentum_down = velocity < -vel_std * 1.5
+        vel_std_window = params.get('velocity_std_window', 10)
+        vel_std = pd.Series(velocity).rolling(vel_std_window, min_periods=1).std().fillna(np.std(velocity)).values
+        momentum_mult = params.get('momentum_multiplier', 1.5)
+        strong_momentum_up = velocity > vel_std * momentum_mult
+        strong_momentum_down = velocity < -vel_std * momentum_mult
 
         # Signal type conditions
         sig_type = params['signal_type']
@@ -478,18 +632,20 @@ class VelocityOptunaObjective:
             buy_cond = vel_cross_up | extreme_oversold | (strong_momentum_up & in_oversold)
             sell_cond = vel_cross_down | extreme_overbought | (strong_momentum_down & in_overbought)
         elif sig_type == 'double_bottom':
-            vel_cross_up_count = pd.Series(vel_cross_up.astype(int)).rolling(10).sum().values
+            db_lookback = params.get('double_bottom_lookback', 10)
+            vel_cross_up_count = pd.Series(vel_cross_up.astype(int)).rolling(db_lookback).sum().values
             buy_cond = (vel_cross_up_count >= 2) & in_oversold
-            vel_cross_down_count = pd.Series(vel_cross_down.astype(int)).rolling(10).sum().values
+            vel_cross_down_count = pd.Series(vel_cross_down.astype(int)).rolling(db_lookback).sum().values
             sell_cond = (vel_cross_down_count >= 2) & in_overbought
         elif sig_type == 'divergence':
+            div_lookback = params.get('divergence_lookback', 5)
             price_series = pd.Series(close_prices)
             osc_series = pd.Series(osc_smooth)
-            price_lower_low = (close_prices < price_series.rolling(5).min().shift(1).values)
-            osc_higher_low = (osc_smooth > osc_series.rolling(5).min().shift(1).values)
+            price_lower_low = (close_prices < price_series.rolling(div_lookback).min().shift(1).values)
+            osc_higher_low = (osc_smooth > osc_series.rolling(div_lookback).min().shift(1).values)
             buy_cond = price_lower_low & osc_higher_low & in_oversold
-            price_higher_high = (close_prices > price_series.rolling(5).max().shift(1).values)
-            osc_lower_high = (osc_smooth < osc_series.rolling(5).max().shift(1).values)
+            price_higher_high = (close_prices > price_series.rolling(div_lookback).max().shift(1).values)
+            osc_lower_high = (osc_smooth < osc_series.rolling(div_lookback).max().shift(1).values)
             sell_cond = price_higher_high & osc_lower_high & in_overbought
         elif sig_type == 'breakout':
             osc_breaks_above = (osc_smooth > params['oversold_threshold']) & (np.roll(osc_smooth, 1) <= params['oversold_threshold'])
@@ -528,36 +684,121 @@ class VelocityOptunaObjective:
             buy_cond = buy_cond & (close_prices < bb_lower)
             sell_cond = sell_cond & (close_prices > bb_upper)
 
-        # Trading simulation
+        # V2 indicator filters (Regime, Fragility, Entropy)
+        if v2_indicators:
+            if params.get('use_regime_filter', False) and 'rsc' in v2_indicators:
+                rsc = v2_indicators['rsc']
+                regime_thresh = params.get('regime_threshold', 0.0)
+                buy_cond = buy_cond & (rsc > regime_thresh)
+
+            if params.get('use_fragility_filter', False) and 'mfi2' in v2_indicators:
+                mfi2 = v2_indicators['mfi2']
+                frag_thresh = params.get('fragility_threshold', 0.5)
+                buy_cond = buy_cond & (mfi2 < frag_thresh)
+
+            if params.get('use_entropy_filter', False) and 'sei' in v2_indicators:
+                sei = v2_indicators['sei']
+                entropy_thresh = params.get('entropy_threshold', 0.7)
+                buy_cond = buy_cond & (sei < entropy_thresh)
+
+        # Trading simulation with equity curve tracking for max drawdown
         position = 0
         entry_price = 0.0
+        entry_bar_idx = 0  # Track entry bar for min_hold_bars
         last_trade_bar = -params['min_bars_between']
         trades = []
         exit_on_opposite = params.get('exit_on_opposite_signal', True)
         exit_on_midline = params.get('exit_on_midline_cross', False)
+        min_hold_bars = params.get('min_hold_bars', 1)
+
+        # Track equity curve for max drawdown calculation
+        equity = 100.0  # Start with $100
+        equity_curve = [equity]
+        peak_equity = equity
 
         for i in range(1, len(close_prices)):
             price = close_prices[i]
             bars_since = i - last_trade_bar
+            bars_held = i - entry_bar_idx
+            can_exit = bars_held >= min_hold_bars
 
-            if position == 1:
+            if position == 1 and can_exit:
                 if params['stop_loss_pct'] > 0 and price <= entry_price * (1 - params['stop_loss_pct'] / 100):
-                    trades.append((price - entry_price) / entry_price * 100)
+                    pnl_pct = (price - entry_price) / entry_price * 100
+                    trades.append(pnl_pct)
+                    equity *= (1 + pnl_pct / 100)
+                    equity_curve.append(equity)
+                    peak_equity = max(peak_equity, equity)
                     position = 0
                     last_trade_bar = i
                     continue
                 if params['take_profit_pct'] > 0 and price >= entry_price * (1 + params['take_profit_pct'] / 100):
-                    trades.append((price - entry_price) / entry_price * 100)
+                    pnl_pct = (price - entry_price) / entry_price * 100
+                    trades.append(pnl_pct)
+                    equity *= (1 + pnl_pct / 100)
+                    equity_curve.append(equity)
+                    peak_equity = max(peak_equity, equity)
                     position = 0
                     last_trade_bar = i
                     continue
+                # Acceleration Reversal Exit - exit on momentum reversal before stop loss
+                if params.get('use_accel_exit', False):
+                    current_pnl = (price - entry_price) / entry_price * 100
+                    accel_min_pnl = params.get('accel_exit_min_pnl', 0.5)
+                    accel_type = params.get('accel_exit_type', 'sign_reversal')
+                    accel_thresh = params.get('accel_exit_threshold', 0.0)
+                    accel_lookback = params.get('accel_exit_lookback', 1)
+                    use_jerk = params.get('use_jerk_confirm', False)
+                    jerk_thresh = params.get('jerk_confirm_threshold', 0.0)
+
+                    # Check if we have enough positive P&L (or allow exit to prevent larger loss)
+                    pnl_ok = current_pnl >= accel_min_pnl or current_pnl < 0
+
+                    # Check acceleration condition for LONG position (negative accel = bearish)
+                    accel_cond = False
+                    if accel_type == 'sign_reversal':
+                        # Check consecutive bars of adverse acceleration
+                        if i >= accel_lookback:
+                            accel_cond = all(acceleration[i-j] < 0 for j in range(accel_lookback))
+                        else:
+                            accel_cond = acceleration[i] < 0
+                    elif accel_type == 'magnitude':
+                        accel_cond = acceleration[i] < -accel_thresh
+                    elif accel_type == 'both':
+                        if i >= accel_lookback:
+                            accel_cond = all(acceleration[i-j] < 0 for j in range(accel_lookback)) and abs(acceleration[i]) > accel_thresh
+                        else:
+                            accel_cond = acceleration[i] < 0 and abs(acceleration[i]) > accel_thresh
+
+                    # Jerk confirmation (optional)
+                    jerk_cond = True
+                    if use_jerk and jerk_thresh > 0:
+                        jerk_cond = jerk[i] < -jerk_thresh
+
+                    if pnl_ok and accel_cond and jerk_cond:
+                        pnl_pct = current_pnl
+                        trades.append(pnl_pct)
+                        equity *= (1 + pnl_pct / 100)
+                        equity_curve.append(equity)
+                        peak_equity = max(peak_equity, equity)
+                        position = 0
+                        last_trade_bar = i
+                        continue
                 if exit_on_midline and osc_smooth[i] > 0 and osc_smooth[i-1] <= 0:
-                    trades.append((price - entry_price) / entry_price * 100)
+                    pnl_pct = (price - entry_price) / entry_price * 100
+                    trades.append(pnl_pct)
+                    equity *= (1 + pnl_pct / 100)
+                    equity_curve.append(equity)
+                    peak_equity = max(peak_equity, equity)
                     position = 0
                     last_trade_bar = i
                     continue
                 if exit_on_opposite and sell_cond[i] and bars_since >= params['min_bars_between']:
-                    trades.append((price - entry_price) / entry_price * 100)
+                    pnl_pct = (price - entry_price) / entry_price * 100
+                    trades.append(pnl_pct)
+                    equity *= (1 + pnl_pct / 100)
+                    equity_curve.append(equity)
+                    peak_equity = max(peak_equity, equity)
                     position = 0
                     last_trade_bar = i
                     continue
@@ -565,10 +806,14 @@ class VelocityOptunaObjective:
             if buy_cond[i] and position == 0 and bars_since >= params['min_bars_between']:
                 position = 1
                 entry_price = price
+                entry_bar_idx = i  # Track entry bar for min_hold_bars
                 last_trade_bar = i
 
         if position == 1:
-            trades.append((close_prices[-1] - entry_price) / entry_price * 100)
+            pnl_pct = (close_prices[-1] - entry_price) / entry_price * 100
+            trades.append(pnl_pct)
+            equity *= (1 + pnl_pct / 100)
+            equity_curve.append(equity)
 
         if not trades:
             return None
@@ -585,6 +830,17 @@ class VelocityOptunaObjective:
         sharpe = np.mean(pnls) / np.std(pnls) if len(pnls) > 1 and np.std(pnls) > 0 else 0
         risk_adjusted = total_return * (win_rate / 100) * np.sqrt(max(1, len(trades)))
 
+        # Calculate max drawdown from equity curve
+        equity_arr = np.array(equity_curve)
+        running_max = np.maximum.accumulate(equity_arr)
+        drawdowns = (running_max - equity_arr) / running_max * 100
+        max_drawdown = np.max(drawdowns) if len(drawdowns) > 0 else 0.0
+
+        # Calculate Risk/Reward ratio (TP% / SL%)
+        sl_pct = params.get('stop_loss_pct', 0)
+        tp_pct = params.get('take_profit_pct', 0)
+        risk_reward_ratio = tp_pct / sl_pct if sl_pct > 0 else 0.0
+
         return {
             **params,
             'total_return': total_return,
@@ -592,7 +848,9 @@ class VelocityOptunaObjective:
             'profit_factor': profit_factor,
             'sharpe_ratio': sharpe,
             'risk_adjusted': risk_adjusted,
-            'num_trades': len(trades)
+            'num_trades': len(trades),
+            'max_drawdown': max_drawdown,
+            'risk_reward_ratio': risk_reward_ratio
         }
 
 

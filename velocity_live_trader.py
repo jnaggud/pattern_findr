@@ -24,12 +24,20 @@ import time
 import argparse
 import logging
 from datetime import datetime, timedelta, timezone
+
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not installed, rely on system environment variables
 import pandas as pd
 import numpy as np
 import requests
 import matplotlib.pyplot as plt
 import io
 import shutil
+import pytz  # Timezone handling for market hours
 
 # Import production utilities for safe operations
 try:
@@ -141,6 +149,42 @@ try:
     YFINANCE_AVAILABLE = True
 except ImportError:
     YFINANCE_AVAILABLE = False
+
+# Databento for futures data (preferred over yfinance for CME futures)
+try:
+    import databento as db
+    DATABENTO_AVAILABLE = True
+except ImportError:
+    DATABENTO_AVAILABLE = False
+    print("Warning: databento not installed. Using yfinance for futures. Run: pip install databento")
+
+# Databento API key from environment (with fallback)
+DATABENTO_API_KEY = os.environ.get("DATABENTO_API_KEY", "")
+
+# Futures ticker mapping: yfinance ticker -> Databento continuous contract symbol
+# Using .n.0 = nearest/front month continuous (better data coverage than .c.0)
+# .n.0 provides complete OHLCV data vs .c.0 which has sparse data
+FUTURES_TICKER_MAP = {
+    'ES=F': 'ES.n.0',   # E-mini S&P 500 continuous
+    'NQ=F': 'NQ.n.0',   # E-mini Nasdaq 100 continuous
+    'YM=F': 'YM.n.0',   # E-mini Dow continuous
+    'RTY=F': 'RTY.n.0', # E-mini Russell 2000 continuous
+    'GC=F': 'GC.n.0',   # Gold continuous
+    'SI=F': 'SI.n.0',   # Silver continuous
+    'CL=F': 'CL.n.0',   # Crude Oil continuous
+    'NG=F': 'NG.n.0',   # Natural Gas continuous
+    'ZB=F': 'ZB.n.0',   # 30-Year Treasury Bond continuous
+    'ZN=F': 'ZN.n.0',   # 10-Year Treasury Note continuous
+    'ZC=F': 'ZC.n.0',   # Corn continuous
+    'ZS=F': 'ZS.n.0',   # Soybeans continuous
+    'ZW=F': 'ZW.n.0',   # Wheat continuous
+    '6E=F': '6E.n.0',   # Euro FX continuous
+    '6J=F': '6J.n.0',   # Japanese Yen continuous
+}
+
+def is_futures_ticker(ticker: str) -> bool:
+    """Check if ticker is a futures contract (ends with =F)."""
+    return ticker.endswith('=F') or ticker in FUTURES_TICKER_MAP
 
 # Default Discord webhook (same as live_trader.py)
 DEFAULT_DISCORD_WEBHOOK = ""
@@ -262,6 +306,7 @@ MARKET_HOURS_CONFIG = {
     # CME Globex Futures (ES, GC, CL, NQ, etc.)
     # Open: Sunday 5:00 PM CT, Close: Friday 5:00 PM CT
     # Daily break: 4:00 PM - 5:00 PM CT (maintenance)
+    # Daily bar closes at 5:00 PM CT (when new session starts)
     'futures_cme': {
         'type': 'futures',
         'timezone': 'America/Chicago',
@@ -269,40 +314,231 @@ MARKET_HOURS_CONFIG = {
         'weekend_open': {'day': 6, 'hour': 17},    # Sunday 5 PM CT
         'daily_break_start': {'hour': 16, 'minute': 0},   # 4:00 PM CT
         'daily_break_end': {'hour': 17, 'minute': 0},     # 5:00 PM CT
+        'daily_bar_close': {'hour': 17, 'minute': 0},     # 5:00 PM CT - when daily bar is complete
     },
     # US Stock Market (SPY, QQQ, etc.)
     # Open: 9:30 AM ET, Close: 4:00 PM ET
+    # Daily bar closes at 4:00 PM ET
     # Closed weekends
     'stocks_us': {
         'type': 'stocks',
         'timezone': 'America/New_York',
         'market_open': {'hour': 9, 'minute': 30},
         'market_close': {'hour': 16, 'minute': 0},
+        'daily_bar_close': {'hour': 16, 'minute': 0},     # 4:00 PM ET - when daily bar is complete
         'closed_weekends': True,
     },
     # Crypto (BTC-USD, ETH-USD, etc.)
     # 24/7 trading
+    # Daily bar closes at midnight UTC
     'crypto': {
         'type': 'crypto',
         'timezone': 'UTC',
         'always_open': True,
+        'daily_bar_close': {'hour': 0, 'minute': 0},      # 00:00 UTC - when daily bar is complete
     },
+}
+
+# Interval to minutes mapping
+INTERVAL_MINUTES = {
+    '1m': 1, '2m': 2, '5m': 5, '15m': 15, '30m': 30,
+    '1h': 60, '90m': 90, '4h': 240, '1d': 1440,
 }
 
 def get_ticker_market_type(ticker: str) -> str:
     """Determine the market type for a given ticker."""
     ticker_upper = ticker.upper()
 
-    # Futures detection
-    if any(x in ticker_upper for x in ['=F', 'ES', 'GC', 'CL', 'NQ', 'YM', 'RTY', 'ZB', 'ZN', 'ZF', 'ZC', 'ZW', 'ZS']):
+    # Futures detection - use is_futures_ticker() for consistency
+    # Checks ticker.endswith('=F') or ticker in FUTURES_TICKER_MAP
+    if is_futures_ticker(ticker):
         return 'futures_cme'
 
-    # Crypto detection
-    if any(x in ticker_upper for x in ['-USD', 'BTC', 'ETH', 'SOL', 'DOGE', 'XRP', 'ADA', 'AVAX', 'MATIC']):
+    # Crypto detection - all crypto tickers have -USD suffix (BTC-USD, ETH-USD, etc.)
+    if '-USD' in ticker_upper:
         return 'crypto'
 
     # Default to US stocks
     return 'stocks_us'
+
+
+def get_bar_close_time(ticker: str, interval: str, bar_start: datetime = None) -> datetime:
+    """
+    Calculate when a bar closes for a given ticker and interval.
+
+    For daily bars: Returns the market close time for that asset
+    For intraday bars: Returns bar_start + interval duration
+
+    Args:
+        ticker: The ticker symbol
+        interval: Data interval ('1d', '15m', etc.)
+        bar_start: Start time of the bar (required for intraday)
+
+    Returns:
+        datetime of when the bar closes (in the asset's timezone, then converted to local)
+    """
+    market_type = get_ticker_market_type(ticker)
+    config = MARKET_HOURS_CONFIG.get(market_type, MARKET_HOURS_CONFIG['stocks_us'])
+
+    if interval == '1d':
+        # Daily bar - closes at market close time
+        tz = pytz.timezone(config['timezone'])
+        now = datetime.now(tz)
+
+        close_config = config.get('daily_bar_close', {'hour': 16, 'minute': 0})
+        close_time = now.replace(
+            hour=close_config['hour'],
+            minute=close_config['minute'],
+            second=0,
+            microsecond=0
+        )
+
+        # If we're past today's close, return today's close time
+        # If we're before today's close, return today's close time
+        return close_time
+
+    else:
+        # Intraday bar - closes at bar_start + interval
+        if bar_start is None:
+            raise ValueError("bar_start required for intraday intervals")
+
+        interval_minutes = INTERVAL_MINUTES.get(interval, 15)
+        return bar_start + timedelta(minutes=interval_minutes)
+
+
+def is_bar_complete(ticker: str, interval: str, bar_start: datetime = None) -> bool:
+    """
+    Check if a bar is complete (closed) and ready for signal evaluation.
+
+    Signal should be generated the moment after a bar closes.
+
+    Args:
+        ticker: The ticker symbol
+        interval: Data interval ('1d', '15m', etc.)
+        bar_start: Start time of the bar (required for intraday)
+
+    Returns:
+        True if the bar is complete (current time > bar close time)
+    """
+    market_type = get_ticker_market_type(ticker)
+    config = MARKET_HOURS_CONFIG.get(market_type, MARKET_HOURS_CONFIG['stocks_us'])
+
+    if interval == '1d':
+        # Daily bar - check if we're past market close
+        tz = pytz.timezone(config['timezone'])
+        now = datetime.now(tz)
+
+        close_config = config.get('daily_bar_close', {'hour': 16, 'minute': 0})
+        today_close = now.replace(
+            hour=close_config['hour'],
+            minute=close_config['minute'],
+            second=0,
+            microsecond=0
+        )
+
+        # Bar is complete if current time is past close time
+        return now > today_close
+
+    else:
+        # Intraday bar - check if we're past bar_start + interval
+        if bar_start is None:
+            return False
+
+        bar_close = get_bar_close_time(ticker, interval, bar_start)
+
+        # Normalize bar_close to be timezone-aware if needed
+        if bar_close.tzinfo is None:
+            bar_close = pytz.UTC.localize(bar_close)
+
+        now = datetime.now(pytz.UTC)
+        return now > bar_close
+
+
+def get_signal_check_time(ticker: str, interval: str) -> str:
+    """
+    Get a human-readable description of when signals should be checked.
+
+    Args:
+        ticker: The ticker symbol
+        interval: Data interval ('1d', '15m', etc.)
+
+    Returns:
+        Human-readable string describing when to check for signals
+    """
+    market_type = get_ticker_market_type(ticker)
+    config = MARKET_HOURS_CONFIG.get(market_type, MARKET_HOURS_CONFIG['stocks_us'])
+
+    if interval == '1d':
+        close_config = config.get('daily_bar_close', {'hour': 16, 'minute': 0})
+        tz_name = config['timezone'].split('/')[-1].replace('_', ' ')
+        return f"Daily signals checked after {close_config['hour']:02d}:{close_config['minute']:02d} {tz_name}"
+    else:
+        return f"{interval} signals checked after each bar closes"
+
+
+def seconds_until_next_bar_close(ticker: str, interval: str) -> int:
+    """
+    Calculate seconds until the next bar closes.
+
+    For smart scheduling: sleep until bar close + buffer, then check for signals.
+    This minimizes delay between signal generation and notification.
+
+    Args:
+        ticker: The ticker symbol
+        interval: Data interval ('1d', '15m', etc.)
+
+    Returns:
+        Seconds until next bar close (minimum 5 seconds to avoid tight loops)
+    """
+    market_type = get_ticker_market_type(ticker)
+    config = MARKET_HOURS_CONFIG.get(market_type, MARKET_HOURS_CONFIG['stocks_us'])
+    tz = pytz.timezone(config['timezone'])
+    now = datetime.now(tz)
+
+    if interval == '1d':
+        # Daily bar - closes at market close time
+        close_config = config.get('daily_bar_close', {'hour': 16, 'minute': 0})
+        today_close = now.replace(
+            hour=close_config['hour'],
+            minute=close_config['minute'],
+            second=0,
+            microsecond=0
+        )
+
+        if now >= today_close:
+            # Already past today's close, next close is tomorrow
+            # For crypto (24/7), next close is in ~24h
+            # For stocks/futures, need to account for weekends
+            tomorrow_close = today_close + timedelta(days=1)
+            seconds = (tomorrow_close - now).total_seconds()
+        else:
+            seconds = (today_close - now).total_seconds()
+
+    else:
+        # Intraday bar - calculate next bar boundary
+        interval_minutes = INTERVAL_MINUTES.get(interval, 15)
+
+        # Find current bar start time (round down to interval boundary)
+        minutes_since_midnight = now.hour * 60 + now.minute
+        current_bar_start_minutes = (minutes_since_midnight // interval_minutes) * interval_minutes
+
+        # Next bar close = current bar start + interval
+        next_close_minutes = current_bar_start_minutes + interval_minutes
+
+        # Handle day rollover
+        next_close_hour = next_close_minutes // 60
+        next_close_minute = next_close_minutes % 60
+
+        if next_close_hour >= 24:
+            # Rolls over to next day
+            next_close = now.replace(hour=0, minute=next_close_minute, second=0, microsecond=0) + timedelta(days=1)
+        else:
+            next_close = now.replace(hour=next_close_hour, minute=next_close_minute, second=0, microsecond=0)
+
+        seconds = (next_close - now).total_seconds()
+
+    # Minimum 5 seconds to avoid tight loops, maximum reasonable wait
+    return max(5, min(int(seconds), 86400))
 
 
 def is_futures_market_closed(bar_timestamp, ticker: str = "") -> bool:
@@ -327,8 +563,7 @@ def is_futures_market_closed(bar_timestamp, ticker: str = "") -> bool:
     import pytz
 
     # Check if this is a futures ticker
-    is_futures = any(x in ticker.upper() for x in ['=F', 'ES', 'GC', 'CL', 'NQ', 'YM', 'RTY', 'ZB', 'ZN', 'ZF'])
-    if not is_futures and ticker:
+    if not is_futures_ticker(ticker):
         return False  # Not a futures ticker, no closure check needed
 
     # Convert to pandas timestamp
@@ -444,12 +679,15 @@ def is_market_closed(bar_timestamp, ticker: str = "") -> bool:
         return False  # Default: assume open
 
 
-def filter_phantom_bars(df: pd.DataFrame, ticker: str = "") -> pd.DataFrame:
+def filter_phantom_bars(df: pd.DataFrame, ticker: str = "", interval: str = "") -> pd.DataFrame:
     """
     Filter out phantom bars (bars during market closure) from a DataFrame.
 
     Phantom bars are bars with forward-filled stale prices that yfinance
     sometimes returns during market closure. These cause false signals.
+
+    IMPORTANT: Only applies to INTRADAY data. Daily bars should NOT be filtered
+    because their timestamps (typically midnight) don't represent actual trading time.
 
     Uses instrument-specific market hours:
     - Futures: CME Globex schedule (weekend + daily maintenance break)
@@ -459,12 +697,28 @@ def filter_phantom_bars(df: pd.DataFrame, ticker: str = "") -> pd.DataFrame:
     Args:
         df: DataFrame with datetime index
         ticker: Ticker symbol to determine market hours
+        interval: Data interval (e.g., '1d', '15m'). Daily intervals skip filtering.
 
     Returns:
         DataFrame with phantom bars removed
     """
     if df.empty:
         return df
+
+    # CRITICAL: Skip filtering for daily bars - their timestamps don't represent intraday times
+    # Daily bars typically have midnight timestamps which would incorrectly be filtered
+    if interval in ['1d', '1D', 'daily', 'd', 'D']:
+        print(f"   [filter_phantom_bars] Skipping filter for daily interval: {interval}")
+        return df
+
+    # Debug: Log when filtering is NOT skipped
+    print(f"   [filter_phantom_bars] interval='{interval}' (type={type(interval).__name__}) - will filter")
+
+    # Auto-detect daily interval if not specified (check time delta between bars)
+    if not interval and len(df) >= 2:
+        time_delta = (df.index[1] - df.index[0]).total_seconds()
+        if time_delta >= 86400:  # 24 hours or more = daily data
+            return df
 
     market_type = get_ticker_market_type(ticker)
 
@@ -485,14 +739,55 @@ def filter_phantom_bars(df: pd.DataFrame, ticker: str = "") -> pd.DataFrame:
     return filtered_df
 
 
+# Global Chicago timezone - ALL timestamps should use this
+CHICAGO_TZ = pytz.timezone('America/Chicago')
+
+
+def to_chicago_time(ts):
+    """Convert any timestamp to Chicago time with timezone info.
+
+    This is the STANDARD for all timestamp storage and comparison.
+    All locked_backtest, trade_state, and display times should use this.
+    """
+    if ts is None:
+        return None
+    ts = pd.to_datetime(ts)
+    if ts.tzinfo is None:
+        # Naive timestamp - assume it's UTC and convert to Chicago
+        ts = pytz.UTC.localize(ts)
+    # Convert to Chicago time
+    return ts.astimezone(CHICAGO_TZ)
+
+
+def to_chicago_str(ts):
+    """Convert any timestamp to Chicago time string format.
+
+    Returns format: '2026-01-21 11:45:00-0600' (with timezone offset)
+    """
+    ct = to_chicago_time(ts)
+    if ct is None:
+        return None
+    return ct.strftime('%Y-%m-%d %H:%M:%S%z')
+
+
 def normalize_tz(ts):
-    """Convert timestamp to tz-naive for comparison (handles both tz-aware and tz-naive)."""
+    """Convert timestamp to tz-naive Chicago time for comparison.
+
+    For tz-aware timestamps, converts to Chicago time then removes timezone info.
+    For tz-naive timestamps, assumes UTC and converts to Chicago time.
+
+    NOTE: All comparisons should use Chicago time as the standard.
+    """
     if ts is None:
         return None
     ts = pd.to_datetime(ts)
     if ts.tzinfo is not None:
-        return ts.tz_localize(None)
-    return ts
+        # Convert to Chicago time, then remove timezone info for comparison
+        return ts.astimezone(CHICAGO_TZ).replace(tzinfo=None)
+    else:
+        # Naive timestamp - assume UTC, convert to Chicago
+        utc_ts = pytz.UTC.localize(ts)
+        return utc_ts.astimezone(CHICAGO_TZ).replace(tzinfo=None)
 
 
 def calculate_exit_stats(exits: list, exclude_missed: bool = True) -> dict:
@@ -841,8 +1136,8 @@ def is_last_bar_incomplete(df: pd.DataFrame, interval: str, ticker: str) -> bool
     if interval != "1d":
         return False
 
-    # Determine if this is a crypto ticker
-    is_crypto = '-USD' in ticker.upper() or ticker.upper() in ['BTC', 'ETH', 'BTCUSD', 'ETHUSD']
+    # Determine if this is a crypto ticker - all crypto tickers have -USD suffix
+    is_crypto = '-USD' in ticker.upper()
 
     # Get the last bar's timestamp
     last_bar_time = df.index[-1]
@@ -936,12 +1231,57 @@ def fetch_price_data(ticker: str, api_key: str = None, days: int = 200, interval
             print(f"   ⚠️ {interval} data limited to {max_days} days (requested {days})")
             days = max_days
 
-    # Check if this is a crypto ticker
-    is_crypto = '-USD' in ticker or ticker in ['BTC', 'ETH', 'BTCUSD', 'ETHUSD']
+    # Check if this is a crypto ticker - all crypto tickers have -USD suffix
+    is_crypto = '-USD' in ticker.upper()
 
     # For crypto, yfinance actually has more current data than Polygon (tested Jan 2026)
     # Polygon crypto daily bars have ~24hr delay, yfinance has same-day data
     # So we skip Polygon for crypto and use yfinance directly
+
+    # Check if this is a futures ticker - use Databento (preferred) with yfinance fallback
+    is_futures = is_futures_ticker(ticker)
+
+    if is_futures and DATABENTO_AVAILABLE and DATABENTO_API_KEY:
+        # Try Databento first for futures (much better intraday data than yfinance)
+        try:
+            df = _fetch_futures_from_databento(ticker, days=days, interval=interval)
+            if not df.empty:
+                # Filter phantom bars for futures (weekend/closure data with stale prices)
+                df = filter_phantom_bars(df, ticker, interval=interval)
+
+                # Check data freshness for intraday - Databento Historical has ~1 hour delay
+                # Fall back to yfinance if data is too stale (>90 minutes old)
+                if interval not in ['1d', '1wk', '1mo'] and len(df) > 0:
+                    latest_bar = df.index[-1]
+                    if latest_bar.tzinfo is not None:
+                        now_utc = datetime.now(timezone.utc)
+                        data_age_minutes = (now_utc - latest_bar.astimezone(timezone.utc)).total_seconds() / 60
+                    else:
+                        data_age_minutes = (datetime.now() - latest_bar).total_seconds() / 60
+
+                    # Check if ES futures market is closed (weekend: Fri 4PM CT - Sun 5PM CT)
+                    now_ct = datetime.now(CHICAGO_TZ)
+                    weekday = now_ct.weekday()  # 0=Mon, 4=Fri, 5=Sat, 6=Sun
+                    hour = now_ct.hour
+                    es_market_closed = (
+                        weekday == 5 or  # Saturday
+                        (weekday == 6 and hour < 17) or  # Sunday before 5 PM CT
+                        (weekday == 4 and hour >= 16)  # Friday after 4 PM CT
+                    )
+
+                    if data_age_minutes > 90 and not (es_market_closed and is_futures):
+                        print(f"   ⚠️ Databento data is {data_age_minutes:.0f} min old, checking yfinance for fresher data")
+                        # Don't return yet - fall through to yfinance check below
+                    else:
+                        if es_market_closed and is_futures and data_age_minutes > 90:
+                            print(f"   ℹ️ ES futures market closed for weekend - data is current as of Friday close")
+                        return df
+                else:
+                    return df
+            else:
+                print(f"   ⚠️ Databento returned empty, falling back to yfinance")
+        except Exception as e:
+            print(f"   ⚠️ Databento failed: {e}, falling back to yfinance")
 
     if not YFINANCE_AVAILABLE:
         raise RuntimeError("yfinance not installed. Run: pip install yfinance")
@@ -953,7 +1293,7 @@ def fetch_price_data(ticker: str, api_key: str = None, days: int = 200, interval
             df = fetch_and_cache(ticker, days=days, interval=interval)
             if not df.empty:
                 # Filter phantom bars for futures (weekend/closure data with stale prices)
-                df = filter_phantom_bars(df, ticker)
+                df = filter_phantom_bars(df, ticker, interval=interval)
                 return df
         except ImportError:
             print("   ⚠️ data_cache module not found, fetching directly")
@@ -979,7 +1319,7 @@ def fetch_price_data(ticker: str, api_key: str = None, days: int = 200, interval
     if len(df) > 0:
         print(f"   ✓ Loaded {len(df)} bars: {df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')}")
         # Filter phantom bars for futures (weekend/closure data with stale prices)
-        df = filter_phantom_bars(df, ticker)
+        df = filter_phantom_bars(df, ticker, interval=interval)
     else:
         print(f"   ⚠ Warning: No data returned for {ticker}")
 
@@ -1050,15 +1390,316 @@ def _fetch_crypto_from_polygon(ticker: str, api_key: str, days: int = 200, inter
     return df
 
 
+def _fetch_realtime_from_databento_live(ticker: str, lookback_minutes: int = 120) -> pd.DataFrame:
+    """
+    Fetch real-time futures data from Databento Live API.
+
+    Uses the Live API to get the most recent bars with minimal latency.
+    This supplements Historical API data which has ~15-60 min delay.
+
+    Args:
+        ticker: The yfinance-style ticker (e.g., 'ES=F', 'GC=F')
+        lookback_minutes: How many minutes of history to fetch (default: 120)
+
+    Returns:
+        DataFrame with 1-minute OHLCV data, or empty DataFrame on failure
+    """
+    if not DATABENTO_AVAILABLE:
+        return pd.DataFrame()
+
+    if not DATABENTO_API_KEY:
+        return pd.DataFrame()
+
+    # Map ticker to Databento symbol
+    db_symbol = FUTURES_TICKER_MAP.get(ticker)
+    if not db_symbol:
+        if ticker.endswith('=F'):
+            root = ticker[:-2]
+            db_symbol = f"{root}.n.0"
+        else:
+            return pd.DataFrame()
+
+    try:
+        client = db.Live(key=DATABENTO_API_KEY)
+
+        # Get intraday history starting from lookback_minutes ago
+        start_time = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
+
+        client.subscribe(
+            dataset='GLBX.MDP3',
+            schema='ohlcv-1m',
+            stype_in='continuous',
+            symbols=[db_symbol],
+            start=start_time.strftime('%Y-%m-%dT%H:%M:%S'),
+        )
+
+        # Collect OHLCV records
+        ohlcv_records = []
+
+        def callback(record):
+            if hasattr(record, 'open') and hasattr(record, 'close'):
+                ohlcv_records.append({
+                    'ts': record.ts_event,
+                    'open': record.open / 1e9,
+                    'high': record.high / 1e9,
+                    'low': record.low / 1e9,
+                    'close': record.close / 1e9,
+                    'volume': record.volume
+                })
+
+        client.add_callback(callback)
+        client.start()
+
+        # Wait for data (with timeout)
+        import time
+        max_wait = 10
+        waited = 0
+        while waited < max_wait:
+            time.sleep(0.5)
+            waited += 0.5
+            if len(ohlcv_records) >= lookback_minutes * 0.8:  # Got most expected bars
+                break
+
+        client.stop()
+
+        if not ohlcv_records:
+            return pd.DataFrame()
+
+        # Convert to DataFrame
+        df = pd.DataFrame(ohlcv_records)
+        df['timestamp'] = pd.to_datetime(df['ts'], unit='ns', utc=True)
+        df = df.set_index('timestamp').sort_index()
+        df = df[['open', 'high', 'low', 'close', 'volume']]
+        df = df[~df.index.duplicated(keep='last')]  # Remove duplicates
+
+        print(f"   ⚡ Live API: Got {len(df)} bars up to {df.index[-1]}")
+        return df
+
+    except Exception as e:
+        print(f"   ⚠️ Databento Live failed: {e}")
+        return pd.DataFrame()
+
+
+def _fetch_futures_from_databento(ticker: str, days: int = 60, interval: str = "15m") -> pd.DataFrame:
+    """
+    Fetch futures data from Databento API.
+
+    Databento provides real-time and historical CME futures data with much better
+    coverage than yfinance, especially for intraday bars.
+
+    Args:
+        ticker: The yfinance-style ticker (e.g., 'ES=F', 'GC=F', 'CL=F')
+        days: Number of days of data to fetch
+        interval: Data interval ('1m', '5m', '15m', '30m', '1h', '1d')
+
+    Returns:
+        DataFrame with OHLCV data, or empty DataFrame on failure
+    """
+    if not DATABENTO_AVAILABLE:
+        print("   ⚠️ Databento not available")
+        return pd.DataFrame()
+
+    if not DATABENTO_API_KEY:
+        print("   ⚠️ DATABENTO_API_KEY not set in environment")
+        return pd.DataFrame()
+
+    # Map yfinance ticker to Databento continuous contract symbol
+    db_symbol = FUTURES_TICKER_MAP.get(ticker)
+    if not db_symbol:
+        # Try to construct it for unknown futures
+        if ticker.endswith('=F'):
+            root = ticker[:-2]  # Remove '=F'
+            db_symbol = f"{root}.n.0"  # Nearest/front month continuous (better data coverage)
+            print(f"   ⚠️ Unknown futures ticker {ticker}, trying {db_symbol}")
+        else:
+            print(f"   ⚠️ Cannot map ticker {ticker} to Databento symbol")
+            return pd.DataFrame()
+
+    # Map interval to Databento schema
+    # Databento supports: ohlcv-1s, ohlcv-1m, ohlcv-1h, ohlcv-1d
+    schema_map = {
+        '1m': 'ohlcv-1m',
+        '5m': 'ohlcv-1m',   # Fetch 1m and resample
+        '15m': 'ohlcv-1m',  # Fetch 1m and resample
+        '30m': 'ohlcv-1m',  # Fetch 1m and resample
+        '1h': 'ohlcv-1h',
+        '1d': 'ohlcv-1d',
+    }
+    schema = schema_map.get(interval, 'ohlcv-1m')
+
+    # Calculate date range - MUST use UTC for Databento API
+    end_date = datetime.now(timezone.utc)
+    start_date = end_date - timedelta(days=days)
+
+    print(f"📊 Fetching {ticker} via Databento ({days} days, {interval}) -> {db_symbol}")
+
+    try:
+        # Create historical client
+        client = db.Historical(DATABENTO_API_KEY)
+
+        # Fetch data using continuous contract symbology (ES.n.0 = nearest/front month)
+        # This is equivalent to ES=F on yfinance - automatically rolls at expiration
+        try:
+            data = client.timeseries.get_range(
+                dataset="GLBX.MDP3",  # CME Globex
+                symbols=[db_symbol],
+                stype_in="continuous",
+                schema=schema,
+                start=start_date.strftime('%Y-%m-%dT%H:%M:%S'),
+                end=end_date.strftime('%Y-%m-%dT%H:%M:%S'),
+            )
+        except Exception as e:
+            # Handle "data_end_after_available_end" error by extracting available end time
+            error_str = str(e)
+            if 'data_end_after_available_end' in error_str or 'available up to' in error_str:
+                # Extract available end time from error message
+                import re
+                match = re.search(r"available up to '(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})", error_str)
+                if match:
+                    available_end = f"{match.group(1)}T{match.group(2)}"  # Convert to ISO format with T separator
+                    print(f"   ℹ️ Databento data available up to {available_end}, retrying...")
+                    data = client.timeseries.get_range(
+                        dataset="GLBX.MDP3",
+                        symbols=[db_symbol],
+                        stype_in="continuous",
+                        schema=schema,
+                        start=start_date.strftime('%Y-%m-%dT%H:%M:%S'),
+                        end=available_end,
+                    )
+                else:
+                    raise
+            else:
+                raise
+
+        # Convert to DataFrame
+        df = data.to_df()
+
+        if df.empty:
+            print(f"   ⚠️ Databento returned empty data for {ticker}")
+            return pd.DataFrame()
+
+        # Continuous contracts return a single series - just need to extract OHLCV
+        # Databento returns columns: open, high, low, close, volume, plus metadata
+        ohlcv_cols = ['open', 'high', 'low', 'close', 'volume']
+        df = df[[c for c in ohlcv_cols if c in df.columns]]
+
+        # Resample if needed (Databento only has 1m, 1h, 1d native)
+        if interval in ['5m', '15m', '30m']:
+            resample_rule = interval.replace('m', 'min')  # 15m -> 15min
+            df = df.resample(resample_rule).agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            }).dropna()
+
+        # Convert index to timezone-naive for compatibility
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+
+        if len(df) > 0:
+            print(f"   ✓ Databento Historical: Loaded {len(df)} bars: {df.index[0]} to {df.index[-1]}")
+
+            # Always supplement intraday data with Live API for most current bars
+            if interval not in ['1d', '1wk', '1mo']:
+                data_age_minutes = (datetime.now() - df.index[-1]).total_seconds() / 60
+
+                # Check if ES futures market is closed (weekend: Fri 4PM CT - Sun 5PM CT)
+                now_ct = datetime.now(CHICAGO_TZ)
+                weekday = now_ct.weekday()  # 0=Mon, 4=Fri, 5=Sat, 6=Sun
+                hour = now_ct.hour
+
+                # ES futures closed: Saturday all day, Sunday before 5PM CT, Friday after 4PM CT
+                es_market_closed = (
+                    weekday == 5 or  # Saturday
+                    (weekday == 6 and hour < 17) or  # Sunday before 5 PM CT
+                    (weekday == 4 and hour >= 16)  # Friday after 4 PM CT
+                )
+
+                if es_market_closed and is_futures_ticker(ticker):
+                    print(f"   ℹ️ ES futures market closed for weekend (data current as of Friday {df.index[-1].strftime('%H:%M')} UTC)")
+                    # Skip real-time fetch - market is closed, no new data available
+                else:
+                    print(f"   ℹ️ Historical data is {data_age_minutes:.0f} min old, fetching real-time supplement...")
+                    live_df = _fetch_realtime_from_databento_live(ticker, lookback_minutes=max(120, int(data_age_minutes) + 30))
+                    if not live_df.empty:
+                        # Live data is in UTC with tz, convert to naive
+                        if live_df.index.tz is not None:
+                            live_df.index = live_df.index.tz_localize(None)
+
+                        # Resample live data to match interval
+                        if interval in ['5m', '15m', '30m']:
+                            resample_rule = interval.replace('m', 'min')
+                            live_df = live_df.resample(resample_rule).agg({
+                                'open': 'first',
+                                'high': 'max',
+                                'low': 'min',
+                                'close': 'last',
+                                'volume': 'sum'
+                            }).dropna()
+
+                        # Merge: keep historical, add/update with live data
+                        last_historical = df.index[-1]
+                        newer_live = live_df[live_df.index > last_historical]
+                        if len(newer_live) > 0:
+                            df = pd.concat([df, newer_live])
+                            df = df[~df.index.duplicated(keep='last')]
+                            df = df.sort_index()
+                            print(f"   ✓ Merged {len(newer_live)} real-time bars. Data now ends: {df.index[-1]}")
+                        else:
+                            print(f"   ✓ Live API confirmed data is current")
+        else:
+            print(f"   ⚠️ Databento: No data returned")
+
+        return df
+
+    except Exception as e:
+        print(f"   ⚠️ Databento error: {e}")
+        return pd.DataFrame()
+
+
 def fetch_realtime_price(ticker: str) -> float:
     """
     Fetch real-time/current price for display purposes.
     This is separate from daily bar data - used to show actual current price.
 
+    For futures: Uses Databento (real-time CME data)
     For crypto: Uses Coinbase API (US-friendly, real-time) with Kraken/CoinGecko fallbacks
     For stocks: Uses yfinance
     """
-    is_crypto = '-USD' in ticker or ticker in ['BTC', 'ETH', 'BTCUSD', 'ETHUSD']
+    is_crypto = '-USD' in ticker.upper()
+    is_futures = is_futures_ticker(ticker)
+
+    # For futures, use Databento (accurate real-time CME data)
+    if is_futures and DATABENTO_AVAILABLE and DATABENTO_API_KEY:
+        try:
+            db_symbol = FUTURES_TICKER_MAP.get(ticker)
+            if not db_symbol and ticker.endswith('=F'):
+                root = ticker[:-2]
+                db_symbol = f"{root}.n.0"  # Nearest/front month continuous
+
+            if db_symbol:
+                client = db.Historical(DATABENTO_API_KEY)
+                # MUST use UTC for Databento API, subtract 1 min to avoid requesting unavailable data
+                end_date = datetime.now(timezone.utc) - timedelta(minutes=1)
+                start_date = end_date - timedelta(minutes=10)  # Last 10 minutes
+
+                data = client.timeseries.get_range(
+                    dataset="GLBX.MDP3",
+                    symbols=[db_symbol],
+                    stype_in="continuous",
+                    schema="ohlcv-1m",
+                    start=start_date.strftime('%Y-%m-%dT%H:%M:%S'),
+                    end=end_date.strftime('%Y-%m-%dT%H:%M:%S'),
+                )
+                df_price = data.to_df()
+                if not df_price.empty:
+                    price = float(df_price['close'].iloc[-1])
+                    if price > 0:
+                        return price
+        except Exception as e:
+            print(f"   ⚠ Databento real-time price failed: {e}, falling back to yfinance...")
 
     # For crypto, use US-friendly APIs (Coinbase, Kraken, CoinGecko)
     if is_crypto:
@@ -1237,13 +1878,15 @@ def calculate_velocity_signals(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     else:
         df['osc_smooth'] = df[osc_col]
 
-    # Calculate velocity (first derivative) and acceleration (second derivative)
+    # Calculate velocity (first derivative), acceleration (second derivative), and jerk (third derivative)
     df['velocity'] = df['osc_smooth'].diff()
     df['acceleration'] = df['velocity'].diff()
+    df['jerk'] = df['acceleration'].diff()
 
     # Fill NaN values
     df['velocity'] = df['velocity'].fillna(0)
     df['acceleration'] = df['acceleration'].fillna(0)
+    df['jerk'] = df['jerk'].fillna(0)
 
     # Detect velocity zero-crossings (slope changes)
     df['vel_cross_up'] = (df['velocity'] > 0) & (df['velocity'].shift(1) <= 0)
@@ -1486,22 +2129,27 @@ def generate_trade_log_csv(locked_backtest: dict, num_trades: int = 10, trade_st
         entry_price = trade.get('entry_price', 0)
         pnl = trade.get('pnl', 0)
 
-        # Format entry time from entry_date field
+        # Format entry time - show BOTH UTC and Chicago time (12-hour format)
         entry_date_raw = trade.get('entry_date', '')
-        if entry_date_raw:
-            if hasattr(entry_date_raw, 'strftime'):
-                entry_time = entry_date_raw.strftime('%Y-%m-%d %H:%M')
-            else:
-                # String format - extract datetime portion
-                entry_time = str(entry_date_raw)[:16].replace('T', ' ')
-        else:
-            entry_time = "N/A"
+        try:
+            entry_dt = pd.to_datetime(entry_date_raw)
+            entry_utc = entry_dt.tz_localize('UTC') if entry_dt.tzinfo is None else entry_dt.tz_convert('UTC')
+            entry_ct = to_chicago_time(entry_date_raw)
+            entry_utc_str = entry_utc.strftime('%Y-%m-%d %H:%M UTC')
+            entry_ct_str = entry_ct.strftime('%I:%M %p CT') if entry_ct else ''
+            entry_time = f"{entry_utc_str} ({entry_ct_str})" if entry_ct_str else entry_utc_str
+        except Exception:
+            entry_time = str(entry_date_raw)[:16].replace('T', ' ') if entry_date_raw else "N/A"
 
-        # Format exit time
-        if hasattr(exit_date, 'strftime'):
-            exit_time = exit_date.strftime('%Y-%m-%d %H:%M')
-        else:
-            # String format - extract datetime portion
+        # Format exit time - show BOTH UTC and Chicago time (12-hour format)
+        try:
+            exit_dt = pd.to_datetime(exit_date)
+            exit_utc = exit_dt.tz_localize('UTC') if exit_dt.tzinfo is None else exit_dt.tz_convert('UTC')
+            exit_ct = to_chicago_time(exit_date)
+            exit_utc_str = exit_utc.strftime('%Y-%m-%d %H:%M UTC')
+            exit_ct_str = exit_ct.strftime('%I:%M %p CT') if exit_ct else ''
+            exit_time = f"{exit_utc_str} ({exit_ct_str})" if exit_ct_str else exit_utc_str
+        except Exception:
             exit_time = str(exit_date)[:16].replace('T', ' ') if exit_date else "N/A"
 
         # Result indicator
@@ -1559,10 +2207,20 @@ def send_discord_alert(webhook_url: str, message: str, chart_buf: io.BytesIO = N
                 files['file2'] = ('trade_log.csv', csv, 'text/csv')
 
             if files:
-                payload = {'content': msg}
+                # For multipart uploads, use payload_json to include allowed_mentions
+                import json
+                payload = {
+                    'payload_json': json.dumps({
+                        'content': msg,
+                        'allowed_mentions': {'parse': ['everyone']}  # Enable @here mentions
+                    })
+                }
                 response = requests.post(url, data=payload, files=files)
             else:
-                payload = {"content": msg}
+                payload = {
+                    "content": msg,
+                    "allowed_mentions": {"parse": ["everyone"]}  # Enable @here mentions
+                }
                 response = requests.post(url, json=payload)
 
             if response.status_code in [200, 204]:
@@ -1597,7 +2255,8 @@ def send_discord_alert(webhook_url: str, message: str, chart_buf: io.BytesIO = N
 def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, ticker: str,
                             title_suffix: str = "", trade_history: list = None,
                             current_position: dict = None, locked_backtest: dict = None,
-                            full_period_backtest: dict = None, chart_type: str = "status") -> io.BytesIO:
+                            full_period_backtest: dict = None, chart_type: str = "status",
+                            missed_signals: dict = None) -> io.BytesIO:
     """Generate a velocity strategy chart for Discord.
 
     Args:
@@ -1611,12 +2270,13 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
         locked_backtest: Optional locked backtest dict with frozen entry/exit markers (prevents repainting)
         full_period_backtest: Optional full period backtest for showing both recent and full stats
         chart_type: "signal" for focused entry/exit charts, "status" for broader status updates
+        missed_signals: Optional dict with 'entries' and 'exits' for ghost markers (signals while offline)
     """
     try:
         # Determine interval and if intraday
         interval = config.get('interval', '1d')
         is_intraday = interval in ['1m', '5m', '15m', '30m', '1h', '90m', '4h']
-        is_crypto = any(ticker.upper().startswith(c) for c in ['BTC', 'ETH', 'DOGE', 'SOL', 'ADA'])
+        is_crypto = '-USD' in ticker.upper()
 
         # For INTRADAY data: limit to recent bars to avoid overcrowded charts
         # Also plot by INDEX (not datetime) to eliminate market closure gaps
@@ -1669,41 +2329,61 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
             max_bars = max_bars_map.get(interval, 300 if chart_type == "signal" else 500)
             df_plot = df.tail(max_bars).copy()
 
-            # For intraday, use sequential index to eliminate gaps from market closures
-            # Store original datetime for reference but plot by bar number
+            # For intraday, use sequential bar index for x-axis (eliminates gaps)
+            # Store datetime in a column for marker mapping and x-axis labels
             df_plot = df_plot.reset_index()
-            # Find the datetime column (could be 'index', 'date', 'datetime', or first column)
+
+            # Find the datetime column
             datetime_col = None
             for col in df_plot.columns:
                 if col in ['index', 'date', 'datetime', 'Date', 'Datetime']:
                     datetime_col = col
                     break
-                # Check if column contains datetime values
                 if datetime_col is None and df_plot[col].dtype == 'datetime64[ns]':
                     datetime_col = col
                     break
             if datetime_col is None and len(df_plot.columns) > 0:
-                # Assume first column is datetime after reset_index
                 first_col = df_plot.columns[0]
                 try:
                     pd.to_datetime(df_plot[first_col].iloc[0])
                     datetime_col = first_col
-                except Exception:  # Catch all non-system exceptions
+                except Exception:
                     pass
-            df_plot['_datetime_col'] = datetime_col  # Store for later reference
-            df_plot['bar_num'] = range(len(df_plot))
-            plot_by_index = True
-        else:
-            # For daily data, keep datetime plotting
-            df_plot = df.copy()
-            plot_by_index = False
 
-            # Ensure we have a proper datetime index for plotting
+            # Normalize datetime column to Chicago time (tz-naive for plotting)
+            # Track if we converted to Chicago so we don't double-convert later
+            datetime_already_chicago = False
+            if datetime_col:
+                df_plot[datetime_col] = pd.to_datetime(df_plot[datetime_col])
+                if df_plot[datetime_col].dt.tz is not None:
+                    df_plot[datetime_col] = df_plot[datetime_col].dt.tz_convert(CHICAGO_TZ).dt.tz_localize(None)
+                    datetime_already_chicago = True
+                else:
+                    # tz-naive data - check if it's from Databento (UTC) or already local
+                    # Databento strips tz with tz_localize(None) but values are still UTC
+                    # We need to convert UTC->Chicago, which normalize_tz will do
+                    datetime_already_chicago = False
+
+            df_plot['_datetime_col'] = datetime_col  # Store for reference
+            df_plot['_datetime_already_chicago'] = datetime_already_chicago  # Track conversion
+            df_plot['bar_num'] = range(len(df_plot))  # Sequential bar index
+            plot_by_index = True  # Use bar index for continuous lines (TradingView style)
+        else:
+            # For daily data, ALSO use index-based plotting (TradingView style - no weekend gaps)
+            df_plot = df.copy()
+            datetime_col = None  # Daily data doesn't have a datetime column, uses index
+
+            # Ensure we have a proper datetime index first
             if not isinstance(df_plot.index, pd.DatetimeIndex):
                 try:
                     df_plot.index = pd.to_datetime(df_plot.index)
                 except Exception:  # Catch all non-system exceptions
-                    df_plot = df_plot.reset_index(drop=True)
+                    pass
+
+            # Store datetime for label formatting, then use bar_num for plotting
+            df_plot['_datetime_for_labels'] = df_plot.index
+            df_plot['bar_num'] = range(len(df_plot))
+            plot_by_index = True  # TradingView style - evenly spaced bars, no gaps
 
         # Create figure with subplots - LARGER for Discord
         # Note: sharex=False because equity curve uses trade numbers, not dates
@@ -1721,24 +2401,70 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
         import matplotlib.dates as mdates
 
         # Determine appropriate date formatting based on data range
-        if plot_by_index:
-            data_span_days = 7  # Approximate for intraday
+        # Check for datetime column (intraday) or _datetime_for_labels (daily)
+        span_dt_col = None
+        if datetime_col and datetime_col in df_plot.columns:
+            span_dt_col = datetime_col
+        elif '_datetime_for_labels' in df_plot.columns:
+            span_dt_col = '_datetime_for_labels'
+
+        if plot_by_index and span_dt_col:
+            try:
+                if datetime_already_chicago:
+                    # Data is already Chicago time - use directly
+                    first_dt = pd.to_datetime(df_plot[span_dt_col].iloc[0])
+                    last_dt = pd.to_datetime(df_plot[span_dt_col].iloc[-1])
+                else:
+                    # Data needs normalization
+                    first_dt = normalize_tz(pd.to_datetime(df_plot[span_dt_col].iloc[0]))
+                    last_dt = normalize_tz(pd.to_datetime(df_plot[span_dt_col].iloc[-1]))
+                data_span_days = (last_dt - first_dt).days if len(df_plot) > 1 else 1
+            except Exception:
+                data_span_days = 60 if not is_intraday else 7
         else:
             try:
                 data_span_days = (normalize_tz(df_plot.index[-1]) - normalize_tz(df_plot.index[0])).days if len(df_plot) > 1 else 1
-            except Exception:  # Catch all non-system exceptions
-                data_span_days = 60  # Default fallback
+            except Exception:
+                data_span_days = 7 if is_intraday else 60
 
         def format_xaxis(ax, show_dates=False):
-            """Apply appropriate x-axis formatting based on data characteristics."""
-            if plot_by_index:
-                # For intraday plotted by index: show date labels at key points
-                if show_dates and 'index' in df_plot.columns:
-                    # Add date labels at start of each day
-                    ax.tick_params(axis='x', labelsize=8)
-                    # Just use simple bar numbers, add date in title instead
-                else:
-                    ax.tick_params(axis='x', labelsize=8)
+            """Apply appropriate x-axis formatting with datetime labels."""
+            # Determine which column has datetime info for labels
+            dt_label_col = None
+            if datetime_col and datetime_col in df_plot.columns:
+                dt_label_col = datetime_col
+            elif '_datetime_for_labels' in df_plot.columns:
+                dt_label_col = '_datetime_for_labels'
+
+            if plot_by_index and dt_label_col:
+                # For index-based plotting, create custom tick labels showing datetime
+                from matplotlib.ticker import FuncFormatter, MaxNLocator
+
+                # Create bar_num to datetime lookup
+                barnum_to_dt = dict(zip(df_plot['bar_num'], df_plot[dt_label_col]))
+
+                def format_tick(x, pos):
+                    if x in barnum_to_dt:
+                        dt = barnum_to_dt[x]
+                        try:
+                            dt_parsed = pd.to_datetime(dt)
+                            if pd.isna(dt_parsed):
+                                return ''
+                            if is_intraday:
+                                return dt_parsed.strftime('%m/%d\n%H:%M')
+                            else:
+                                # TradingView style: "Oct", "Nov", "Dec", "2026" at year boundaries
+                                return dt_parsed.strftime('%b')
+                        except Exception:
+                            return ''
+                    return ''
+
+                ax.xaxis.set_major_formatter(FuncFormatter(format_tick))
+                # More ticks for daily data
+                ax.xaxis.set_major_locator(MaxNLocator(nbins=12 if not is_intraday else 8, integer=True))
+                ax.tick_params(axis='x', labelsize=9)
+                plt.setp(ax.xaxis.get_majorticklabels(), rotation=0, ha='center')  # No rotation like TradingView
+
             elif isinstance(df_plot.index, pd.DatetimeIndex):
                 if is_intraday and data_span_days <= 3:
                     ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d\n%H:%M'))
@@ -1759,29 +2485,141 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                 plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
 
         # Determine x-axis values based on plotting mode
+        datetime_col = df_plot['_datetime_col'].iloc[0] if '_datetime_col' in df_plot.columns else None
+        # For daily data, use _datetime_for_labels for date lookup
+        dt_lookup_col = datetime_col if datetime_col and datetime_col in df_plot.columns else '_datetime_for_labels'
+
         if plot_by_index:
+            # Use bar number for continuous lines (no gaps during market closures)
             x_axis = df_plot['bar_num']
             # Create date-to-barnum mapping for markers
             date_to_barnum = {}
-            datetime_col = df_plot['_datetime_col'].iloc[0] if '_datetime_col' in df_plot.columns else None
-            if datetime_col and datetime_col in df_plot.columns:
+            # Check if datetime was already converted to Chicago in the preprocessing step
+            # This prevents double-conversion (yfinance data gets converted once, then normalize_tz
+            # would wrongly assume UTC and convert again, causing a 6-hour offset)
+            datetime_already_chicago = df_plot['_datetime_already_chicago'].iloc[0] if '_datetime_already_chicago' in df_plot.columns else False
+            if dt_lookup_col in df_plot.columns:
                 for i, row in df_plot.iterrows():
                     try:
-                        dt = normalize_tz(pd.to_datetime(row[datetime_col]))
+                        if datetime_already_chicago:
+                            # Data is already in Chicago time - use directly
+                            dt = pd.to_datetime(row[dt_lookup_col])
+                        else:
+                            # Data needs normalization (e.g., Databento naive UTC)
+                            dt = normalize_tz(pd.to_datetime(row[dt_lookup_col]))
                         date_to_barnum[dt] = row['bar_num']
-                    except Exception:  # Catch all non-system exceptions
+                        # Also add date-only key for daily data (ignore time component)
+                        date_only = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+                        if date_only not in date_to_barnum:
+                            date_to_barnum[date_only] = row['bar_num']
+                    except Exception:
                         pass
-                print(f"   [Chart] Built date mapping with {len(date_to_barnum)} entries from column '{datetime_col}'")
-            else:
-                print(f"   [Chart] WARNING: Could not find datetime column for marker mapping")
         else:
+            # Use datetime index directly
             x_axis = df_plot.index
-            date_to_barnum = {}  # Not needed for datetime plotting
+            date_to_barnum = {}
 
         # 1. Price Chart with Entry/Exit markers
         ax1 = axes[0]
-        ax1.plot(x_axis, df_plot['close'], color='white', linewidth=1.5, label='Price')
-        ax1.fill_between(x_axis, df_plot['low'], df_plot['high'], color='gray', alpha=0.2)
+
+        # Detect and shade data gaps (time gaps > threshold OR stale prices for 3+ bars)
+        # This helps users identify periods with unreliable data
+        # NOTE: Skip for daily data - 24-hour gaps between bars are normal
+        gap_regions = []
+        interval = config.get('interval', '1d')
+        is_daily = interval == '1d'
+
+        if len(df_plot) > 3 and not is_daily:
+            # Detect time gaps - use index if it's DatetimeIndex, else try datetime_col
+            # Threshold: 2 hours for intraday (accounts for CME breaks etc)
+            gap_threshold = pd.Timedelta(hours=2)
+
+            if isinstance(df_plot.index, pd.DatetimeIndex):
+                time_diff = pd.Series(df_plot.index).diff()
+                time_gap_mask = time_diff > gap_threshold
+                time_gap_mask = time_gap_mask.values  # Convert to array for indexing
+            elif datetime_col and datetime_col in df_plot.columns:
+                df_plot['_time_diff'] = pd.to_datetime(df_plot[datetime_col]).diff()
+                time_gap_mask = df_plot['_time_diff'] > gap_threshold
+            else:
+                time_gap_mask = pd.Series([False] * len(df_plot))
+
+            # Detect stale data (price unchanged for 3+ consecutive bars)
+            df_plot['_price_change'] = df_plot['close'].diff().abs()
+            stale_mask = (df_plot['_price_change'] == 0) | df_plot['_price_change'].isna()
+            # Mark bars that are part of a stale sequence (3+ unchanged)
+            stale_count = stale_mask.rolling(3, min_periods=3).sum()
+            stale_region_mask = stale_count >= 3
+
+            # Combine masks and find contiguous regions
+            gap_mask = time_gap_mask | stale_region_mask
+
+            # Shade gap regions
+            in_gap = False
+            gap_start = None
+            for i, is_gap in enumerate(gap_mask):
+                if is_gap and not in_gap:
+                    gap_start = x_axis[i]
+                    in_gap = True
+                elif not is_gap and in_gap:
+                    gap_end = x_axis[i]
+                    ax1.axvspan(gap_start, gap_end, color='red', alpha=0.15, zorder=0)
+                    gap_regions.append((gap_start, gap_end))
+                    in_gap = False
+            # Handle gap at end of data
+            if in_gap:
+                gap_end = x_axis.iloc[-1] if hasattr(x_axis, 'iloc') else x_axis[-1]
+                ax1.axvspan(gap_start, gap_end, color='red', alpha=0.15, zorder=0)
+                gap_regions.append((gap_start, gap_end))
+
+            if gap_regions:
+                print(f"   [Chart] Detected {len(gap_regions)} data gap region(s) - shaded in red")
+
+        # Draw candlesticks (TradingView style - candles nearly touching)
+        if plot_by_index:
+            candle_width = 0.8  # Wider candles that nearly touch (TradingView style)
+            wick_width = 1.0   # Thicker wicks for visibility
+        else:
+            # For datetime x-axis, use Timedelta for width
+            candle_width = pd.Timedelta(hours=12)  # Half a day width for daily candles
+            wick_width = 0.0001  # Not used for datetime
+
+        for i in range(len(df_plot)):
+            x = x_axis.iloc[i] if hasattr(x_axis, 'iloc') else x_axis[i]
+            o, h, l, c = df_plot['open'].iloc[i], df_plot['high'].iloc[i], df_plot['low'].iloc[i], df_plot['close'].iloc[i]
+
+            # Determine candle color (green for bullish, red for bearish)
+            if c >= o:
+                body_color = '#26a69a'  # TradingView green
+                wick_color = '#26a69a'
+            else:
+                body_color = '#ef5350'  # TradingView red
+                wick_color = '#ef5350'
+
+            # Draw wick (high-low line)
+            ax1.plot([x, x], [l, h], color=wick_color, linewidth=wick_width if plot_by_index else 1, solid_capstyle='round')
+
+            # Draw body (open-close rectangle)
+            body_bottom = min(o, c)
+            body_height = abs(c - o)
+            if body_height < 0.001:  # Doji - draw a line
+                if plot_by_index:
+                    ax1.plot([x - candle_width/2, x + candle_width/2], [c, c], color=wick_color, linewidth=1)
+                else:
+                    ax1.plot([x - candle_width, x + candle_width], [c, c], color=wick_color, linewidth=1)
+            else:
+                if plot_by_index:
+                    rect = plt.Rectangle((x - candle_width/2, body_bottom), candle_width, body_height,
+                                         facecolor=body_color, edgecolor=wick_color, linewidth=0.5)
+                else:
+                    # For datetime x-axis, matplotlib handles Timedelta width
+                    rect = plt.Rectangle((x - candle_width, body_bottom), candle_width * 2, body_height,
+                                         facecolor=body_color, edgecolor=wick_color, linewidth=0.5)
+                ax1.add_patch(rect)
+
+        # Add current price line
+        current_price = df_plot['close'].iloc[-1]
+        ax1.axhline(current_price, color='#2962ff', linestyle='-', linewidth=1, alpha=0.7)
 
         # Plot trade markers from LOCKED backtest (prevents repainting)
         # The locked_backtest is frozen at startup and only appended to when new signals occur.
@@ -1789,13 +2627,24 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
         markers_source = locked_backtest if locked_backtest else backtest
 
         # Get chart date range for filtering markers (normalize for tz comparison)
-        if plot_by_index and datetime_col and datetime_col in df_plot.columns:
-            chart_start = normalize_tz(pd.to_datetime(df_plot[datetime_col].iloc[0]))
-            chart_end = normalize_tz(pd.to_datetime(df_plot[datetime_col].iloc[-1]))
-            print(f"   [Chart] Date range: {chart_start} to {chart_end}")
+        # IMPORTANT: Extend chart_end by one interval to include entries at the LAST bar's close
+        interval_minutes = INTERVAL_MINUTES.get(config.get('interval', '1d'), 1440)
+        # Use dt_lookup_col for chart date range (handles both intraday and daily)
+        # CRITICAL: Respect datetime_already_chicago flag to avoid double-conversion bug
+        if plot_by_index and dt_lookup_col in df_plot.columns:
+            if datetime_already_chicago:
+                # Data is already Chicago time - use directly
+                chart_start = pd.to_datetime(df_plot[dt_lookup_col].iloc[0])
+                chart_end = pd.to_datetime(df_plot[dt_lookup_col].iloc[-1])
+            else:
+                # Data needs normalization (e.g., Databento naive UTC)
+                chart_start = normalize_tz(pd.to_datetime(df_plot[dt_lookup_col].iloc[0]))
+                chart_end = normalize_tz(pd.to_datetime(df_plot[dt_lookup_col].iloc[-1]))
+            chart_end = chart_end + timedelta(minutes=interval_minutes)
         else:
             chart_start = normalize_tz(df_plot.index.min())
             chart_end = normalize_tz(df_plot.index.max())
+            chart_end = chart_end + timedelta(minutes=interval_minutes)
 
         # Dynamic marker size based on number of trades (smaller for dense charts)
         num_entries = len(markers_source.get('entries', [])) if markers_source else 0
@@ -1810,13 +2659,13 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
 
         # Helper function to find x-position for a given date
         def get_x_position(target_date):
-            """Get x-axis position for a date. For intraday, maps to bar number."""
+            """Get x-axis position for a date. Maps to bar number for index-based plotting."""
             target_date = normalize_tz(target_date)
             if plot_by_index:
                 # Look up in date_to_barnum mapping
                 if target_date in date_to_barnum:
                     return date_to_barnum[target_date]
-                # Try to find closest date
+                # Try to find closest date (within 1 interval)
                 closest_bar = None
                 min_diff = None
                 for dt, bar in date_to_barnum.items():
@@ -1824,18 +2673,22 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                     if min_diff is None or diff < min_diff:
                         min_diff = diff
                         closest_bar = bar
-                return closest_bar
+                # Only return closest if within reasonable range (1 interval)
+                if min_diff is not None and min_diff <= interval_minutes * 60:
+                    return closest_bar
+                return None  # Entry too far from any bar
             else:
                 return target_date
 
-        # Debug: Show marker mapping info
+        # Debug: Show marker info
         entries_in_range = 0
         entries_total = len(markers_source.get('entries', [])) if markers_source else 0
-        if plot_by_index and entries_total > 0:
+        if entries_total > 0:
             sample_entries = [normalize_tz(pd.to_datetime(e['date'])) for e in markers_source['entries'][-5:]]
-            print(f"   [Chart] Chart range: {chart_start} to {chart_end}")
+            print(f"   [Chart] Date range: {chart_start} to {chart_end}")
             print(f"   [Chart] Sample entry dates (last 5): {sample_entries}")
-            print(f"   [Chart] Sample mapping keys (last 5): {list(date_to_barnum.keys())[-5:] if date_to_barnum else 'empty'}")
+            if plot_by_index:
+                print(f"   [Chart] Date-to-barnum mapping has {len(date_to_barnum)} entries")
 
         # Get tracked position entry time to filter out conflicting markers
         # (entries/exits that occur after user's tracked entry shouldn't be drawn)
@@ -1862,11 +2715,13 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
 
                 # SKIP markers outside the chart's date range (prevents clustering at edges)
                 if entry_date < chart_start or entry_date > chart_end:
+                    if entries_total <= 20:  # Only log for low-volume strategies
+                        print(f"   [Chart] Skipping entry {entry_date} - outside range [{chart_start} to {chart_end}]")
                     continue
 
                 # SKIP entries that conflict with tracked position
-                # (entries AFTER tracked entry time create confusing duplicate markers)
-                if tracked_entry_dt and entry_date > tracked_entry_dt:
+                # (entries AT OR AFTER tracked entry time - the tracked entry has its own arrow marker)
+                if tracked_entry_dt and entry_date >= tracked_entry_dt:
                     skipped_conflicting += 1
                     continue
 
@@ -1880,15 +2735,42 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                 if is_missed:
                     marker_color = 'orange'
                 else:
-                    marker_color = 'lime' if is_long else 'red'
+                    marker_color = '#00e676' if is_long else '#ff5252'  # Brighter green/red than candles
 
                 # Get x-position (bar number for intraday, date for daily)
                 x_pos = get_x_position(entry_date)
                 if x_pos is not None:
-                    ax1.scatter(x_pos, entry['price'], marker=marker_shape, color=marker_color, s=marker_size, zorder=5)
+                    # Place BUY marker BELOW the candle (standard charting convention)
+                    # Up-pointing triangle below bar = "buy here"
+                    bar_low = None
+                    if plot_by_index and x_pos in df_plot['bar_num'].values:
+                        bar_idx = df_plot[df_plot['bar_num'] == x_pos].index[0]
+                        bar_low = df_plot.loc[bar_idx, 'low']
+                    elif not plot_by_index:
+                        # For daily charts, find bar by date in index
+                        try:
+                            # Try exact match first
+                            if x_pos in df_plot.index:
+                                bar_low = df_plot.loc[x_pos, 'low']
+                            else:
+                                # Try matching by date only (ignore time)
+                                target_date = pd.to_datetime(x_pos).date()
+                                for idx in df_plot.index:
+                                    if pd.to_datetime(idx).date() == target_date:
+                                        bar_low = df_plot.loc[idx, 'low']
+                                        break
+                        except Exception:
+                            pass
 
-            if plot_by_index:
-                print(f"   [Chart] Entries: {entries_in_range}/{entries_total} in chart range")
+                    if bar_low is not None:
+                        price_range = df_plot['high'].max() - df_plot['low'].min()
+                        marker_offset = price_range * 0.02  # 2% offset below candle
+                        y_pos = bar_low - marker_offset
+                    else:
+                        y_pos = entry['price']  # Fallback to recorded price
+                    ax1.scatter(x_pos, y_pos, marker=marker_shape, color=marker_color, s=marker_size, zorder=5, edgecolors='white', linewidth=0.5)
+
+            print(f"   [Chart] Entries: {entries_in_range}/{entries_total} in chart range")
 
         exits_in_range = 0
         exits_total = len(markers_source.get('exits', [])) if markers_source else 0
@@ -1927,24 +2809,159 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                 if is_missed:
                     color = 'orange'
                 else:
-                    # LONG-only: Exits are red down triangles for visibility
-                    color = '#ff4444'  # Red for exits (contrasts with green entries)
+                    # Exits are red down triangles (brighter red than candles)
+                    color = '#ff5252'
 
                 # Get x-position (bar number for intraday, date for daily)
                 x_pos = get_x_position(exit_date)
                 if x_pos is not None:
-                    ax1.scatter(x_pos, exit_trade['price'], marker='v', color=color, s=marker_size, zorder=5)
+                    # Place SELL/EXIT marker ABOVE the candle (standard charting convention)
+                    # Down-pointing triangle above bar = "sell/exit here"
+                    bar_high = None
+                    if plot_by_index and x_pos in df_plot['bar_num'].values:
+                        bar_idx = df_plot[df_plot['bar_num'] == x_pos].index[0]
+                        bar_high = df_plot.loc[bar_idx, 'high']
+                    elif not plot_by_index:
+                        # For daily charts, find bar by date in index
+                        try:
+                            if x_pos in df_plot.index:
+                                bar_high = df_plot.loc[x_pos, 'high']
+                            else:
+                                target_date = pd.to_datetime(x_pos).date()
+                                for idx in df_plot.index:
+                                    if pd.to_datetime(idx).date() == target_date:
+                                        bar_high = df_plot.loc[idx, 'high']
+                                        break
+                        except Exception:
+                            pass
 
-            if plot_by_index:
-                print(f"   [Chart] Exits: {exits_in_range}/{exits_total} in chart range")
+                    if bar_high is not None:
+                        price_range = df_plot['high'].max() - df_plot['low'].min()
+                        marker_offset = price_range * 0.02  # 2% offset above candle
+                        y_pos = bar_high + marker_offset
+                    else:
+                        y_pos = exit_trade['price']  # Fallback to recorded price
+                    ax1.scatter(x_pos, y_pos, marker='v', color=color, s=marker_size, zorder=5, edgecolors='white', linewidth=0.5)
+
+            print(f"   [Chart] Exits: {exits_in_range}/{exits_total} in chart range")
 
         if skipped_conflicting > 0:
             print(f"   [Chart] Skipped {skipped_conflicting} markers that conflict with tracked position")
 
+        # Plot GHOST MARKERS for missed signals (signals that occurred while bot was offline)
+        # These are visually distinct: hollow markers with reduced opacity
+        # They're NOT included in stats, but traders can see the strategy did generate signals
+        missed_entries_plotted = 0
+        missed_exits_plotted = 0
+        if missed_signals:
+            ghost_marker_size = marker_size * 0.8  # Slightly smaller than tracked markers
+            ghost_alpha = 0.5  # 50% opacity for ghost effect
+
+            # Plot missed entries as hollow green triangles
+            for entry in missed_signals.get('entries', []):
+                entry_date = entry.get('date')
+                if not entry_date:
+                    continue
+                try:
+                    entry_date = normalize_tz(pd.to_datetime(entry_date))
+                except Exception:
+                    continue
+
+                # Skip if outside chart range
+                if entry_date < chart_start or entry_date > chart_end:
+                    continue
+
+                x_pos = get_x_position(entry_date)
+                if x_pos is not None:
+                    # Place ghost BUY marker BELOW candle (standard charting convention)
+                    bar_low = None
+                    if plot_by_index and x_pos in df_plot['bar_num'].values:
+                        bar_idx = df_plot[df_plot['bar_num'] == x_pos].index[0]
+                        bar_low = df_plot.loc[bar_idx, 'low']
+                    elif not plot_by_index:
+                        try:
+                            if x_pos in df_plot.index:
+                                bar_low = df_plot.loc[x_pos, 'low']
+                            else:
+                                target_date = pd.to_datetime(x_pos).date()
+                                for idx in df_plot.index:
+                                    if pd.to_datetime(idx).date() == target_date:
+                                        bar_low = df_plot.loc[idx, 'low']
+                                        break
+                        except Exception:
+                            pass
+
+                    if bar_low is not None:
+                        price_range = df_plot['high'].max() - df_plot['low'].min()
+                        y_pos = bar_low - price_range * 0.02
+                    else:
+                        y_pos = entry.get('price', df_plot['low'].min())
+
+                    # Ghost entry: hollow green triangle (facecolors='none')
+                    ax1.scatter(x_pos, y_pos, marker='^', s=ghost_marker_size, zorder=4,
+                               facecolors='none', edgecolors='#00e676', linewidth=1.5, alpha=ghost_alpha)
+                    missed_entries_plotted += 1
+
+            # Plot missed exits as hollow red triangles
+            for exit_trade in missed_signals.get('exits', []):
+                exit_date = exit_trade.get('date')
+                if not exit_date:
+                    continue
+                try:
+                    exit_date = normalize_tz(pd.to_datetime(exit_date))
+                except Exception:
+                    continue
+
+                # Skip if outside chart range
+                if exit_date < chart_start or exit_date > chart_end:
+                    continue
+
+                x_pos = get_x_position(exit_date)
+                if x_pos is not None:
+                    # Place ghost EXIT marker ABOVE candle (standard charting convention)
+                    bar_high = None
+                    if plot_by_index and x_pos in df_plot['bar_num'].values:
+                        bar_idx = df_plot[df_plot['bar_num'] == x_pos].index[0]
+                        bar_high = df_plot.loc[bar_idx, 'high']
+                    elif not plot_by_index:
+                        try:
+                            if x_pos in df_plot.index:
+                                bar_high = df_plot.loc[x_pos, 'high']
+                            else:
+                                target_date = pd.to_datetime(x_pos).date()
+                                for idx in df_plot.index:
+                                    if pd.to_datetime(idx).date() == target_date:
+                                        bar_high = df_plot.loc[idx, 'high']
+                                        break
+                        except Exception:
+                            pass
+
+                    if bar_high is not None:
+                        price_range = df_plot['high'].max() - df_plot['low'].min()
+                        y_pos = bar_high + price_range * 0.02
+                    else:
+                        y_pos = exit_trade.get('price', df_plot['high'].max())
+
+                    # Ghost exit: hollow red triangle (facecolors='none')
+                    ax1.scatter(x_pos, y_pos, marker='v', s=ghost_marker_size, zorder=4,
+                               facecolors='none', edgecolors='#ff5252', linewidth=1.5, alpha=ghost_alpha)
+                    missed_exits_plotted += 1
+
+            if missed_entries_plotted + missed_exits_plotted > 0:
+                print(f"   [Chart] Ghost markers: {missed_entries_plotted} entries, {missed_exits_plotted} exits (missed while offline)")
+                # Add legend entry for ghost markers
+                ax1.scatter([], [], marker='^', s=ghost_marker_size, facecolors='none',
+                           edgecolors='gray', linewidth=1.5, alpha=ghost_alpha, label='Missed (not tracked)')
+
         # Mark current open position - use LOCKED trade_state (current_position) if provided
         # This ensures the entry line shows YOUR ACTUAL tracked position, not the recalculated one
         # Priority: current_position (trade_state) > locked_backtest > fresh backtest
-        if current_position and current_position.get('entry_price'):
+        # IMPORTANT: If trade_state was provided but shows no position, DON'T fall through to backtest
+        # (trade_state is authoritative - fresh backtest may calculate differently)
+        trade_state_provided = current_position is not None
+        trade_state_has_position = current_position and current_position.get('entry_price')
+
+        if trade_state_has_position:
             ax1.axhline(current_position['entry_price'], color='cyan', linestyle='--', alpha=0.7,
                        label=f"Entry ${current_position['entry_price']:.2f}")
 
@@ -1955,32 +2972,89 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                 try:
                     tracked_entry_dt = normalize_tz(pd.to_datetime(tracked_entry_time))
                     tracked_x = get_x_position(tracked_entry_dt)
+                    print(f"   [Chart] Tracked position: time={tracked_entry_time}, normalized={tracked_entry_dt}, x_pos={tracked_x}")
                     if tracked_x is not None:
-                        # Large cyan star marker with white edge - stands out from regular triangles
-                        ax1.scatter(tracked_x, current_position['entry_price'],
-                                   marker='*', s=300, color='cyan', edgecolors='white',
-                                   linewidth=1.5, zorder=15, label='YOUR ENTRY')
+                        # Place arrow BELOW the candle pointing UP (standard charting convention for LONG entry)
+                        # Arrow originates below bar and points up to bar = "buy here"
+                        bar_low = None
+                        if plot_by_index and tracked_x in df_plot['bar_num'].values:
+                            bar_idx = df_plot[df_plot['bar_num'] == tracked_x].index[0]
+                            bar_low = df_plot.loc[bar_idx, 'low']
+                        elif not plot_by_index:
+                            try:
+                                if tracked_x in df_plot.index:
+                                    bar_low = df_plot.loc[tracked_x, 'low']
+                                else:
+                                    target_date = pd.to_datetime(tracked_x).date()
+                                    for idx in df_plot.index:
+                                        if pd.to_datetime(idx).date() == target_date:
+                                            bar_low = df_plot.loc[idx, 'low']
+                                            break
+                            except Exception:
+                                pass
+
+                        price_range = df_plot['high'].max() - df_plot['low'].min()
+                        if bar_low is not None:
+                            arrow_head = bar_low - price_range * 0.01  # Arrow HEAD just below bar
+                            arrow_tail = bar_low - price_range * 0.06  # Arrow TAIL further below
+                        else:
+                            arrow_head = current_position['entry_price']
+                            arrow_tail = arrow_head - price_range * 0.05
+                        # Green upward arrow for YOUR ENTRY (arrow draws from xytext to xy)
+                        ax1.annotate('', xy=(tracked_x, arrow_head), xytext=(tracked_x, arrow_tail),
+                                    arrowprops=dict(arrowstyle='->', color='#00e676', lw=2.5),
+                                    zorder=15)
+                        ax1.scatter(tracked_x, arrow_tail, marker='', s=0, label='YOUR ENTRY')  # For legend
+                    else:
+                        print(f"   [Chart] Warning: Could not find x position for tracked entry {tracked_entry_dt}")
                 except Exception as e:
                     print(f"   [Chart] Warning: Could not plot tracked entry marker: {e}")
 
-        elif locked_backtest and locked_backtest.get('current_position'):
+        elif not trade_state_provided and locked_backtest and locked_backtest.get('current_position'):
+            # Only use locked_backtest position if no trade_state was passed
             pos = locked_backtest['current_position']
             ax1.axhline(pos['entry_price'], color='cyan', linestyle='--', alpha=0.7, label=f"Entry ${pos['entry_price']:.2f}")
-        elif backtest and backtest.get('current_position'):
+        elif not trade_state_provided and backtest and backtest.get('current_position'):
+            # Only use fresh backtest position if no trade_state was passed
             pos = backtest['current_position']
             ax1.axhline(pos['entry_price'], color='cyan', linestyle='--', alpha=0.7, label=f"Entry ${pos['entry_price']:.2f}")
 
-        # Build title with date range for intraday (since x-axis shows bar numbers)
-        if plot_by_index and datetime_col and datetime_col in df_plot.columns:
-            start_dt = pd.to_datetime(df_plot[datetime_col].iloc[0])
-            end_dt = pd.to_datetime(df_plot[datetime_col].iloc[-1])
-            date_range = f" ({start_dt.strftime('%m/%d')} - {end_dt.strftime('%m/%d %H:%M')})"
-            chart_title = f"{ticker} - JD Strategy{title_suffix}{date_range} ({len(df_plot)} bars)"
-        else:
-            chart_title = f"{ticker} - JD Strategy{title_suffix}"
+        # Build title with date range info
+        chart_title = f"{ticker} - JD Strategy{title_suffix}"
+        try:
+            # Determine which column has datetime info for title
+            title_dt_col = None
+            if datetime_col and datetime_col in df_plot.columns:
+                title_dt_col = datetime_col
+            elif '_datetime_for_labels' in df_plot.columns:
+                title_dt_col = '_datetime_for_labels'
+
+            if plot_by_index and title_dt_col and len(df_plot) > 0:
+                start_dt = pd.to_datetime(df_plot[title_dt_col].iloc[0])
+                end_dt = pd.to_datetime(df_plot[title_dt_col].iloc[-1])
+                if not pd.isna(start_dt) and not pd.isna(end_dt):
+                    if is_intraday:
+                        date_range = f" ({start_dt.strftime('%m/%d')} - {end_dt.strftime('%m/%d %H:%M')})"
+                    else:
+                        date_range = f" ({start_dt.strftime('%Y-%m-%d')} - {end_dt.strftime('%Y-%m-%d')})"
+                    chart_title = f"{ticker} - JD Strategy{title_suffix}{date_range}"
+            elif isinstance(df_plot.index, pd.DatetimeIndex) and len(df_plot) > 0:
+                start_dt = df_plot.index[0]
+                end_dt = df_plot.index[-1]
+                if not pd.isna(start_dt) and not pd.isna(end_dt):
+                    if is_intraday:
+                        date_range = f" ({start_dt.strftime('%m/%d')} - {end_dt.strftime('%m/%d %H:%M')})"
+                    else:
+                        date_range = f" ({start_dt.strftime('%Y-%m-%d')} - {end_dt.strftime('%Y-%m-%d')})"
+                    chart_title = f"{ticker} - JD Strategy{title_suffix}{date_range}"
+        except Exception:
+            pass  # Keep default title if date formatting fails
         ax1.set_title(chart_title, color='white', fontsize=14, fontweight='bold')
         ax1.set_ylabel("Price ($)", color='white')
-        ax1.legend(loc='upper left', facecolor='#1a1a2e', labelcolor='white')
+        # Only show legend if there are labeled items (avoids empty legend box)
+        handles, labels = ax1.get_legend_handles_labels()
+        if handles and labels:
+            ax1.legend(loc='upper left', facecolor='#1a1a2e', labelcolor='white')
         format_xaxis(ax1)
 
         # 2. JD Oscillator with thresholds
@@ -2014,31 +3088,161 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
         format_xaxis(ax3)
 
         # 4. Equity Curve - Use backtest (period-specific) for equity to match displayed timeframe
-        # Markers come from locked_backtest (filtered to chart range), but equity shows period stats
+        # For "signal" charts, filter exits to match df_plot date range so equity curve matches price chart
         ax4 = axes[3]
         equity_source = backtest if backtest and backtest.get('exits') else locked_backtest
+        STARTING_CAPITAL = 100000  # $100k starting capital
+
+        # Initialize exits_for_equity (used for both equity curve and stats)
+        exits_for_equity = []
+
+        # For signal charts, filter exits to match the visible df_plot date range
+        # This ensures the equity curve shows the same period as the price chart
         if equity_source and equity_source.get('exits'):
-            # Build simple equity curve from trades
-            equity = [100]
-            for exit in equity_source['exits']:
+            exits_for_equity = equity_source['exits']
+
+            # Filter exits to df_plot date range for signal charts
+            if chart_type == "signal" and len(df_plot) > 0:
+                # CRITICAL: Get datetime from the correct column, not from index
+                # After reset_index(), df_plot.index is RangeIndex (0,1,2...), not DatetimeIndex!
+                # The datetime is stored in datetime_col (intraday) or _datetime_for_labels (daily)
+                # Also respect datetime_already_chicago to avoid double-conversion bug
+                dt_col_for_filter = None
+                if '_datetime_col' in df_plot.columns:
+                    dt_col_for_filter = df_plot['_datetime_col'].iloc[0]  # Get the column name
+                if dt_col_for_filter and dt_col_for_filter in df_plot.columns:
+                    if datetime_already_chicago:
+                        chart_start = pd.to_datetime(df_plot[dt_col_for_filter].iloc[0])
+                        chart_end = pd.to_datetime(df_plot[dt_col_for_filter].iloc[-1])
+                    else:
+                        chart_start = normalize_tz(pd.to_datetime(df_plot[dt_col_for_filter].iloc[0]))
+                        chart_end = normalize_tz(pd.to_datetime(df_plot[dt_col_for_filter].iloc[-1]))
+                elif '_datetime_for_labels' in df_plot.columns:
+                    chart_start = normalize_tz(pd.to_datetime(df_plot['_datetime_for_labels'].iloc[0]))
+                    chart_end = normalize_tz(pd.to_datetime(df_plot['_datetime_for_labels'].iloc[-1]))
+                elif isinstance(df_plot.index, pd.DatetimeIndex):
+                    chart_start = normalize_tz(df_plot.index.min())
+                    chart_end = normalize_tz(df_plot.index.max())
+                else:
+                    # Fallback: use full exits if we can't determine date range
+                    chart_start = None
+                    chart_end = None
+
+                if chart_start is not None and chart_end is not None:
+                    exits_for_equity = [
+                        e for e in equity_source['exits']
+                        if chart_start <= normalize_tz(pd.to_datetime(e['date'])) <= chart_end
+                    ]
+                    # If no exits in range, show flat line (0 trades in visible range)
+                    # Don't fall back to full exits - that causes misleading stats!
+                else:
+                    exits_for_equity = equity_source['exits']
+
+            # Build equity curve from trades (starting with $100k, compounding full position)
+            equity = [STARTING_CAPITAL]
+            trade_dates = []
+
+            # Get first entry date as starting point (normalize_tz handles tz-aware/tz-naive mix)
+            entries_for_equity = equity_source.get('entries', [])
+            if chart_type == "signal" and len(df_plot) > 0 and entries_for_equity:
+                # Filter entries to chart range too - use same date extraction logic
+                # Respect datetime_already_chicago to avoid double-conversion bug
+                dt_col_for_filter = None
+                if '_datetime_col' in df_plot.columns:
+                    dt_col_for_filter = df_plot['_datetime_col'].iloc[0]
+                if dt_col_for_filter and dt_col_for_filter in df_plot.columns:
+                    if datetime_already_chicago:
+                        chart_start = pd.to_datetime(df_plot[dt_col_for_filter].iloc[0])
+                        chart_end = pd.to_datetime(df_plot[dt_col_for_filter].iloc[-1])
+                    else:
+                        chart_start = normalize_tz(pd.to_datetime(df_plot[dt_col_for_filter].iloc[0]))
+                        chart_end = normalize_tz(pd.to_datetime(df_plot[dt_col_for_filter].iloc[-1]))
+                elif '_datetime_for_labels' in df_plot.columns:
+                    chart_start = normalize_tz(pd.to_datetime(df_plot['_datetime_for_labels'].iloc[0]))
+                    chart_end = normalize_tz(pd.to_datetime(df_plot['_datetime_for_labels'].iloc[-1]))
+                elif isinstance(df_plot.index, pd.DatetimeIndex):
+                    chart_start = normalize_tz(df_plot.index.min())
+                    chart_end = normalize_tz(df_plot.index.max())
+                else:
+                    chart_start = None
+                    chart_end = None
+
+                if chart_start is not None and chart_end is not None:
+                    entries_for_equity = [
+                        e for e in entries_for_equity
+                        if chart_start <= normalize_tz(pd.to_datetime(e['date'])) <= chart_end
+                    ]
+
+            if entries_for_equity and len(entries_for_equity) > 0:
+                first_date = normalize_tz(entries_for_equity[0]['date'])
+                trade_dates.append(first_date)
+            elif len(exits_for_equity) > 0:
+                # Fallback to first exit date
+                first_date = normalize_tz(exits_for_equity[0]['date'])
+                trade_dates.append(first_date)
+
+            for exit in exits_for_equity:
                 equity.append(equity[-1] * (1 + exit['pnl']/100))
+                trade_dates.append(normalize_tz(exit['date']))
 
             # Add unrealized if open position (use .get() to handle missing key)
             if equity_source.get('current_position'):
                 unrealized = equity_source['current_position'].get('unrealized_pnl', 0)
                 if unrealized:
                     equity.append(equity[-1] * (1 + unrealized/100))
+                    # Use current time for unrealized position (already tz-naive)
+                    trade_dates.append(pd.Timestamp.now())
 
-            ax4.plot(range(len(equity)), equity, color='#00ff88', linewidth=2)
-            ax4.fill_between(range(len(equity)), 100, equity, alpha=0.3,
-                           color='green' if equity[-1] > 100 else 'red')
-            ax4.axhline(100, color='gray', linestyle='--', alpha=0.5)
-        ax4.set_ylabel("Equity", color='white')
-        ax4.set_xlabel("Trade #", color='white')
+            # Plot with dates on x-axis
+            if len(trade_dates) == len(equity):
+                ax4.plot(trade_dates, equity, color='#00ff88', linewidth=2)
+                ax4.fill_between(trade_dates, STARTING_CAPITAL, equity, alpha=0.3,
+                               color='green' if equity[-1] > STARTING_CAPITAL else 'red')
+            else:
+                # Fallback to trade numbers if date mismatch
+                ax4.plot(range(len(equity)), equity, color='#00ff88', linewidth=2)
+                ax4.fill_between(range(len(equity)), STARTING_CAPITAL, equity, alpha=0.3,
+                               color='green' if equity[-1] > STARTING_CAPITAL else 'red')
+
+            ax4.axhline(STARTING_CAPITAL, color='gray', linestyle='--', alpha=0.5)
+            # Format y-axis as currency
+            ax4.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x/1000:.0f}k'))
+
+            # Format x-axis dates - auto-select based on date range
+            if len(trade_dates) >= 2:
+                date_range = (trade_dates[-1] - trade_dates[0]).days
+                if date_range > 365:
+                    ax4.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+                    ax4.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+                elif date_range > 60:
+                    ax4.xaxis.set_major_locator(mdates.MonthLocator())
+                    ax4.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+                elif date_range > 7:
+                    ax4.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
+                    ax4.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
+                else:
+                    ax4.xaxis.set_major_locator(mdates.DayLocator())
+                    ax4.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
+                plt.setp(ax4.xaxis.get_majorticklabels(), rotation=45, ha='right')
+        ax4.set_ylabel("Equity ($)", color='white')
+        ax4.set_xlabel("Date", color='white')
 
         # Stats annotation - Use backtest (period-specific) to match displayed timeframe
-        # Markers come from locked_backtest (filtered), but stats should reflect visible period
+        # For signal charts, calculate stats from filtered exits to match visible period
         stats_source = backtest if backtest and backtest.get('num_trades') else locked_backtest
+
+        # For signal charts, ALWAYS recalculate stats from filtered exits to match equity curve
+        # This ensures stats shown match the visible chart period, not full backtest
+        if chart_type == "signal":
+            # Use centralized stats calculation on filtered exits
+            filtered_stats = calculate_exit_stats(exits_for_equity, exclude_missed=True)
+            stats_source = {
+                'num_trades': filtered_stats['num_trades'],
+                'win_rate': filtered_stats['win_rate'],
+                'total_return': filtered_stats['total_return'],
+                'profit_factor': filtered_stats['profit_factor'],
+            }
+
         if full_period_backtest and stats_source:
             # Show both: Full period on top, Recent below
             full_stats = (f"Full Period: {full_period_backtest['num_trades']} trades | "
@@ -2087,6 +3291,9 @@ def run_historical_backtest(df: pd.DataFrame, config: dict) -> dict:
     """
     Run a backtest on historical data to determine current state.
     Returns dict with trades, stats, and current position.
+
+    IMPORTANT: All trade dates use BAR CLOSE time (when the signal fires and trade executes),
+    not bar START time. This matches how live trading works.
     """
     # Calculate signals
     df = calculate_velocity_signals(df, config)
@@ -2097,6 +3304,22 @@ def run_historical_backtest(df: pd.DataFrame, config: dict) -> dict:
     min_bars_between = config.get('min_bars_between', 1)
     exit_on_opposite = config.get('exit_on_opposite_signal', True)
     exit_on_midline = config.get('exit_on_midline_cross', False)
+
+    # Acceleration Reversal Exit parameters
+    use_accel_exit = config.get('use_accel_exit', False)
+    accel_exit_type = config.get('accel_exit_type', 'sign_reversal')
+    accel_exit_threshold = config.get('accel_exit_threshold', 0.0)
+    accel_exit_min_pnl = config.get('accel_exit_min_pnl', 0.5)
+    accel_exit_lookback = config.get('accel_exit_lookback', 1)
+    use_jerk_confirm = config.get('use_jerk_confirm', False)
+    jerk_confirm_threshold = config.get('jerk_confirm_threshold', 0.0)
+
+    # Get interval for calculating bar close time
+    # df.index contains bar START times, but trades happen at bar CLOSE
+    interval_str = config.get('interval', '1d')
+    interval_minutes = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '90m': 90, '4h': 240, '1d': 0}.get(interval_str, 0)
+    # For daily bars, we don't add offset (close time is market close, not midnight + 1 day)
+    bar_offset = pd.Timedelta(minutes=interval_minutes) if interval_minutes > 0 else pd.Timedelta(0)
 
     # Run simulation
     position = 0
@@ -2109,7 +3332,8 @@ def run_historical_backtest(df: pd.DataFrame, config: dict) -> dict:
     for i in range(1, len(df)):
         row = df.iloc[i]
         price = row['close']
-        date = df.index[i]
+        bar_start_time = df.index[i]
+        bar_close_time = bar_start_time + bar_offset  # When signal fires and trade executes
         osc = row['osc_smooth']
         bars_since = i - last_trade_bar
 
@@ -2122,6 +3346,28 @@ def run_historical_backtest(df: pd.DataFrame, config: dict) -> dict:
                 exit_reason = "Stop Loss"
             elif take_profit_pct > 0 and pnl_pct >= take_profit_pct:
                 exit_reason = "Take Profit"
+            # Acceleration Reversal Exit (early warning before stop loss)
+            elif use_accel_exit and 'acceleration' in df.columns and i >= accel_exit_lookback:
+                # Check if conditions are met
+                pnl_ok = pnl_pct >= accel_exit_min_pnl or pnl_pct < 0
+                if pnl_ok:
+                    accel_values = df['acceleration'].iloc[i-accel_exit_lookback+1:i+1].values
+                    current_accel = df['acceleration'].iloc[i]
+                    # For LONG positions: negative acceleration is bearish
+                    accel_cond = False
+                    if accel_exit_type == 'sign_reversal':
+                        accel_cond = all(a < 0 for a in accel_values)
+                    elif accel_exit_type == 'magnitude':
+                        accel_cond = current_accel < -accel_exit_threshold
+                    elif accel_exit_type == 'both':
+                        accel_cond = all(a < 0 for a in accel_values) and abs(current_accel) > accel_exit_threshold
+                    # Jerk confirmation (optional)
+                    jerk_cond = True
+                    if use_jerk_confirm and 'jerk' in df.columns and jerk_confirm_threshold > 0:
+                        current_jerk = df['jerk'].iloc[i]
+                        jerk_cond = current_jerk < -jerk_confirm_threshold
+                    if accel_cond and jerk_cond:
+                        exit_reason = "Accel Reversal"
             elif exit_on_midline and osc > 0:
                 exit_reason = "Midline Cross"
             elif exit_on_opposite and row['sell_signal'] and bars_since >= min_bars_between:
@@ -2130,7 +3376,7 @@ def run_historical_backtest(df: pd.DataFrame, config: dict) -> dict:
             if exit_reason:
                 trades.append({
                     'type': 'exit',
-                    'date': date,
+                    'date': bar_close_time,  # Use bar CLOSE time
                     'price': price,
                     'pnl': pnl_pct,
                     'reason': exit_reason,
@@ -2146,12 +3392,12 @@ def run_historical_backtest(df: pd.DataFrame, config: dict) -> dict:
         if position == 0 and row['buy_signal'] and bars_since >= min_bars_between:
             position = 1
             entry_price = price
-            entry_date = date
+            entry_date = bar_close_time  # Use bar CLOSE time
             entry_osc = osc
             last_trade_bar = i
             trades.append({
                 'type': 'entry',
-                'date': date,
+                'date': bar_close_time,  # Use bar CLOSE time
                 'price': price,
                 'osc': osc,
             })
@@ -2331,18 +3577,23 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
     new_entries_added = 0
     skipped_overlap = 0
     skipped_timestamp_dupe = 0
+    skipped_market_closed = 0  # Track entries skipped due to market closure (phantom signals)
     skipped_tracked_conflict = set()  # Track entries skipped due to tracked position conflict
     # Build set of existing entry timestamps for deduplication
     existing_entry_timestamps = {str(e.get('date', ''))[:19] for e in locked["entries"]}
 
-    # Build map of entry timestamp -> exit timestamp from fresh backtest
+    # Build map of entry timestamp -> exit info from fresh backtest
     # Used to detect entries whose exits would overlap with tracked position
+    # Also used to detect stale data (0% P&L trades)
     entry_to_exit_map = {}
+    entry_to_exit_pnl = {}  # For stale data detection
     for exit_t in backtest.get('exits', []):
         entry_ts = str(exit_t.get('entry_date', ''))[:19]
         exit_ts = str(exit_t.get('date', ''))[:19]
+        exit_pnl = exit_t.get('pnl', 0)
         if entry_ts:
             entry_to_exit_map[entry_ts] = exit_ts
+            entry_to_exit_pnl[entry_ts] = exit_pnl
 
     for entry in backtest.get('entries', []):
         entry_date = entry['date']
@@ -2352,6 +3603,19 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
         # Skip if exact timestamp already exists (prevent duplicates)
         if entry_timestamp_str in existing_entry_timestamps:
             skipped_timestamp_dupe += 1
+            continue
+
+        # Skip entries during market closure (phantom signals from data gaps)
+        # This prevents adding false signals with frozen prices during CME weekend closure etc.
+        if is_market_closed(entry['date'], ticker):
+            skipped_market_closed += 1
+            continue
+
+        # Skip entries with 0% P&L exits (stale/frozen price data)
+        # This catches phantom trades near market open where prices haven't updated
+        exit_pnl = entry_to_exit_pnl.get(entry_timestamp_str)
+        if exit_pnl is not None and exit_pnl == 0:
+            skipped_market_closed += 1  # Count with market closed (same category - phantom signals)
             continue
 
         # Only add entries AFTER the latest exit in locked backtest
@@ -2419,6 +3683,8 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
         print(f"   ⏭️  Skipped {skipped_overlap} entries (already in position)")
     if skipped_timestamp_dupe > 0:
         print(f"   ⏭️  Skipped {skipped_timestamp_dupe} duplicate entries (same timestamp)")
+    if skipped_market_closed > 0:
+        print(f"   ⏭️  Skipped {skipped_market_closed} phantom entries (market was closed)")
 
     # Add NEW exits from fresh backtest (only exits AFTER latest exit date)
     new_exits_added = 0
@@ -2426,6 +3692,7 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
     skipped_duplicate = 0
     skipped_end_of_period = 0
     skipped_no_entry = 0
+    skipped_exit_market_closed = 0  # Track exits skipped due to market closure
 
     # Build set of entry timestamps in locked backtest for validation
     # Note: We ONLY use exact timestamps, not date-only matching (stricter validation)
@@ -2442,6 +3709,16 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
         # VALIDATION 0: Reject "end_of_period" artificial exits (not real signals)
         if exit_trade.get('reason') == 'end_of_period':
             skipped_end_of_period += 1
+            continue
+
+        # VALIDATION 0a: Skip exits during market closure (phantom signals from data gaps)
+        if is_market_closed(exit_trade['date'], ticker):
+            skipped_exit_market_closed += 1
+            continue
+
+        # VALIDATION 0a2: Skip exits with 0% P&L (stale/frozen price data)
+        if exit_trade.get('pnl', 0) == 0:
+            skipped_exit_market_closed += 1  # Count with market closed (phantom signals)
             continue
 
         # VALIDATION 0b: Reject exits whose entries were skipped (tracked position conflict)
@@ -2499,29 +3776,43 @@ def save_locked_backtest(backtest: dict, strategy_name: str = None, ticker: str 
         print(f"   ⏭️  Skipped {skipped_end_of_period} end_of_period exits (artificial backtest close)")
     if skipped_no_entry > 0:
         print(f"   ⚠️ Skipped {skipped_no_entry} orphan exits (no matching entry in locked backtest)")
+    if skipped_exit_market_closed > 0:
+        print(f"   ⏭️  Skipped {skipped_exit_market_closed} phantom exits (market was closed)")
 
     # Handle tracked position - add or update
     if trade_state and trade_state.get('position') and trade_state.get('entry_price'):
-        # Use full timestamp for comparison (not just date) to support intraday strategies
-        tracked_entry_timestamp = str(trade_state.get('entry_time', ''))[:19]
+        # IMPORTANT: Use entry_time (bar close time) for the entry date
+        # This matches how entries are created during live trading (bar close = when we enter)
+        entry_time = trade_state.get('entry_time', '')
+        tracked_entry_timestamp = str(entry_time)[:19]
 
-        # Remove any existing entries that match tracked position TIMESTAMP (not just date)
-        # This prevents removing other intraday entries from the same day
-        locked["entries"] = [e for e in locked["entries"] if str(e.get('date', ''))[:19] != tracked_entry_timestamp]
+        # Check if entry already exists (avoid duplicates)
+        existing_entry = any(str(e.get('date', ''))[:19] == tracked_entry_timestamp for e in locked["entries"])
 
-        # Add the tracked position as entry
-        locked["entries"].append({
-            "date": str(trade_state.get('entry_time', '')),
-            "price": trade_state['entry_price'],
-            "position": trade_state['position']
-        })
-        print(f"   ✅ Synced tracked {trade_state['position'].upper()} entry in locked backtest")
+        # CRITICAL: Also check if we're already in a position (entries > exits)
+        # This prevents adding a second entry when there's already an open position
+        num_entries = len(locked.get("entries", []))
+        num_exits = len(locked.get("exits", []))
+        already_in_position = num_entries > num_exits
+
+        if not existing_entry and not already_in_position:
+            # Add the tracked position as entry (use bar close time)
+            locked["entries"].append({
+                "date": str(entry_time),
+                "price": trade_state['entry_price'],
+                "position": trade_state['position']
+            })
+            print(f"   ✅ Synced tracked {trade_state['position'].upper()} entry in locked backtest")
+        elif already_in_position and not existing_entry:
+            print(f"   ⚠️  Skipping sync entry: Already in position (entries: {num_entries}, exits: {num_exits})")
+        else:
+            print(f"   ✓ Tracked {trade_state['position'].upper()} entry already in locked backtest")
 
         # Update current_position
         locked["current_position"] = {
             "position": trade_state['position'],
             "entry_price": trade_state['entry_price'],
-            "entry_date": str(trade_state.get('entry_time', ''))
+            "entry_date": str(entry_time)
         }
 
     # RECALCULATE STATS from all exits (not from fresh backtest)
@@ -2576,6 +3867,7 @@ def validate_locked_backtest(locked_backtest: dict) -> list:
     - Exits where entry_date == exit_date (invalid - can't trade same bar)
     - More exits than entries (data corruption)
     - Orphan exits (exit without matching entry timestamp)
+    - Overlapping positions (two entries without an exit between them)
 
     Returns:
         List of issue descriptions (empty if no issues)
@@ -2592,11 +3884,19 @@ def validate_locked_backtest(locked_backtest: dict) -> list:
         if entry_date and exit_date and str(entry_date)[:19] == str(exit_date)[:19]:
             issues.append(f"Invalid exit: entry_date == exit_date at {exit_date}")
 
-    # Check 2: Entry count should be >= exit count
+    # Check 2: Entry/exit count balance
+    # With open position: entries = exits + 1
+    # Without open position: entries = exits
     entry_count = len(locked_backtest.get('entries', []))
     exit_count = len(locked_backtest.get('exits', []))
+    has_position = locked_backtest.get('current_position') is not None
+
     if exit_count > entry_count:
         issues.append(f"More exits ({exit_count}) than entries ({entry_count})")
+    elif has_position and entry_count > exit_count + 1:
+        issues.append(f"Too many entries: {entry_count} entries, {exit_count} exits (with open position, should be {exit_count + 1})")
+    elif not has_position and entry_count > exit_count:
+        issues.append(f"Orphan entries: {entry_count} entries, {exit_count} exits (no position, should be equal)")
 
     # Check 3: Orphan exits (exit without matching entry timestamp)
     entry_timestamps = {str(e.get('date', ''))[:19] for e in locked_backtest.get('entries', [])}
@@ -2612,12 +3912,206 @@ def validate_locked_backtest(locked_backtest: dict) -> list:
             if not price_match:
                 issues.append(f"Orphan exit at {exit_t.get('date')} - no matching entry for {entry_ts}")
 
+    # Check 4: Overlapping positions (CRITICAL for LONG-only strategy)
+    # Create timeline of all events and check for consecutive entries
+    events = []
+    for e in locked_backtest.get('entries', []):
+        events.append({'time': str(e.get('date', ''))[:19], 'type': 'entry'})
+    for e in locked_backtest.get('exits', []):
+        events.append({'time': str(e.get('date', ''))[:19], 'type': 'exit'})
+    # Sort by time, with exits BEFORE entries when timestamps equal (reversal signals)
+    # Reversal = exit old position and immediately enter new position at same bar
+    events.sort(key=lambda x: (x['time'], 0 if x['type'] == 'exit' else 1))
+
+    in_position = False
+    for event in events:
+        if event['type'] == 'entry':
+            if in_position:
+                issues.append(f"Overlapping entry at {event['time']} - already in position")
+            in_position = True
+        else:  # exit
+            if not in_position:
+                issues.append(f"Exit at {event['time']} without prior entry")
+            in_position = False
+
     return issues
+
+
+def cleanup_locked_backtest(strategy_name: str = None, ticker: str = None) -> int:
+    """Clean up invalid entries from locked backtest.
+
+    Removes:
+    - Overlapping positions (entries while already in position)
+    - Exits where entry_date >= exit_date (impossible - can't exit before or at entry)
+    - Orphan entries (entries without a corresponding exit, except current position)
+    - Exits for removed entries
+
+    Returns:
+        Number of items removed
+    """
+    locked = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
+    if not locked:
+        return 0
+
+    removed_count = 0
+
+    # Step 0: Remove OVERLAPPING POSITIONS (CRITICAL)
+    # Build a timeline of all events and keep only valid alternating entry/exit sequence
+    entries = locked.get('entries', [])
+    exits = locked.get('exits', [])
+
+    # Create timeline events
+    events = []
+    for e in entries:
+        events.append({
+            'time': str(e.get('date', ''))[:19],
+            'type': 'entry',
+            'data': e
+        })
+    for e in exits:
+        events.append({
+            'time': str(e.get('date', ''))[:19],
+            'type': 'exit',
+            'data': e
+        })
+    # Sort by time, with exits BEFORE entries when timestamps equal (reversal signals)
+    events.sort(key=lambda x: (x['time'], 0 if x['type'] == 'exit' else 1))
+
+    # Process events and keep only valid sequence
+    valid_entries = []
+    valid_exits = []
+    current_entry = None
+    removed_entry_timestamps = set()
+
+    for event in events:
+        if event['type'] == 'entry':
+            if current_entry is None:
+                # No current position - valid entry
+                current_entry = event['data']
+                valid_entries.append(event['data'])
+            else:
+                # Already in position - OVERLAPPING ENTRY, skip it
+                print(f"   🗑️ Removing overlapping entry: {event['time']} (already in position from {str(current_entry.get('date', ''))[:19]})")
+                removed_entry_timestamps.add(event['time'])
+                removed_count += 1
+        else:  # exit
+            exit_entry_date = str(event['data'].get('entry_date', ''))[:19]
+            if current_entry is None:
+                # No position to exit - orphan exit
+                print(f"   🗑️ Removing orphan exit: {event['time']} (no position to exit)")
+                removed_count += 1
+            elif exit_entry_date in removed_entry_timestamps:
+                # Exit for a removed overlapping entry
+                print(f"   🗑️ Removing exit for removed entry: {event['time']} (entry {exit_entry_date} was removed)")
+                removed_count += 1
+            elif exit_entry_date == str(current_entry.get('date', ''))[:19]:
+                # Matches our tracked entry - valid exit
+                valid_exits.append(event['data'])
+                current_entry = None
+            else:
+                # Exit for a different entry (shouldn't happen after overlap removal)
+                print(f"   🗑️ Removing mismatched exit: {event['time']} (expected entry {str(current_entry.get('date', ''))[:19]}, got {exit_entry_date})")
+                removed_count += 1
+
+    locked['entries'] = valid_entries
+    locked['exits'] = valid_exits
+
+    # Update current_position
+    if current_entry:
+        locked['current_position'] = {
+            'position': 'long',
+            'entry_price': current_entry.get('price', 0),
+            'entry_date': current_entry.get('date', '')
+        }
+    else:
+        locked['current_position'] = None
+
+    # Step 1: Clean invalid exits (entry_date >= exit_date)
+    original_exits = locked.get('exits', [])
+    cleaned_exits = []
+
+    for exit_t in original_exits:
+        entry_date = str(exit_t.get('entry_date', ''))[:19]
+        exit_date = str(exit_t.get('date', ''))[:19]
+
+        # Remove exits where entry_date >= exit_date
+        if entry_date and exit_date and entry_date >= exit_date:
+            print(f"   🗑️ Removing invalid exit: entry_date ({entry_date}) >= exit_date ({exit_date})")
+            removed_count += 1
+            continue
+
+        cleaned_exits.append(exit_t)
+
+    locked['exits'] = cleaned_exits
+
+    # Step 2: Clean orphan entries (entries without corresponding exit)
+    # Build set of entry timestamps that have been exited
+    exited_entry_timestamps = set()
+    for exit_t in cleaned_exits:
+        entry_ts = str(exit_t.get('entry_date', ''))[:19]
+        if entry_ts:
+            exited_entry_timestamps.add(entry_ts)
+
+    # Get current position entry timestamp (this one should NOT be cleaned)
+    current_pos = locked.get('current_position')
+    current_entry_ts = None
+    if current_pos:
+        current_entry_ts = str(current_pos.get('entry_date', ''))[:19]
+
+    # Filter entries - keep only those that have exits OR are the current position
+    original_entries = locked.get('entries', [])
+    cleaned_entries = []
+
+    for entry in original_entries:
+        entry_ts = str(entry.get('date', ''))[:19]
+
+        # Keep if this entry has a corresponding exit
+        if entry_ts in exited_entry_timestamps:
+            cleaned_entries.append(entry)
+            continue
+
+        # Keep if this is the current position
+        if current_entry_ts and entry_ts == current_entry_ts:
+            cleaned_entries.append(entry)
+            continue
+
+        # This is an orphan entry - remove it
+        print(f"   🗑️ Removing orphan entry: {entry_ts} (no corresponding exit)")
+        removed_count += 1
+
+    locked['entries'] = cleaned_entries
+
+    # Step 3: Recalculate stats and save if anything was removed
+    if removed_count > 0:
+        # Recalculate stats after cleanup
+        tracked_exits = [e for e in cleaned_exits if not e.get('missed')]
+        if tracked_exits:
+            winners = [e for e in tracked_exits if e['pnl'] > 0]
+            losers = [e for e in tracked_exits if e['pnl'] <= 0]
+            locked["num_trades"] = len(tracked_exits)
+            locked["win_rate"] = (len(winners) / len(tracked_exits)) * 100 if tracked_exits else 0
+            # Recalculate compounded return
+            sorted_exits = sorted(tracked_exits, key=lambda x: str(x.get('date', '')))
+            equity = 1.0
+            for exit_trade in sorted_exits:
+                equity *= (1 + exit_trade['pnl'] / 100)
+            locked["total_return"] = (equity - 1) * 100
+            # Recalculate profit factor
+            win_pnl = sum(e['pnl'] for e in winners) if winners else 0
+            loss_pnl = abs(sum(e['pnl'] for e in losers)) if losers else 0.001
+            locked["profit_factor"] = win_pnl / loss_pnl if loss_pnl > 0 else (999.99 if win_pnl > 0 else 0)
+
+        # Write directly to file (don't use save_locked_backtest which merges with existing)
+        path = get_locked_backtest_path(strategy_name=strategy_name, ticker=ticker)
+        safe_json_write(path, locked, indent=2)
+        print(f"   ✅ Cleaned locked backtest: removed {removed_count} invalid items")
+
+    return removed_count
 
 
 def append_to_locked_backtest(entry: dict = None, exit_trade: dict = None,
                                strategy_name: str = None, ticker: str = None,
-                               missed: bool = False):
+                               missed: bool = False) -> bool:
     """Append a new entry or exit to the locked backtest.
 
     Called when a NEW signal is detected (at end of day). This adds
@@ -2629,25 +4123,51 @@ def append_to_locked_backtest(entry: dict = None, exit_trade: dict = None,
         strategy_name: Strategy name for file path
         ticker: Ticker symbol for file path
         missed: If True, marks the signal as missed (bot was down)
+
+    Returns:
+        True if successfully appended, False if rejected (duplicate, invalid, etc.)
+        CRITICAL: Callers should check this return value before updating trade_state
+        or sending Discord notifications to prevent desync.
     """
     locked = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
 
     if locked is None:
         print("   ⚠️ No locked backtest to append to")
-        return
+        return False
 
     if entry:
-        entry_date_str = str(entry.get('date', ''))[:19]  # Normalize to "YYYY-MM-DD HH:MM:SS"
-        # Check for duplicate entries (same date)
-        existing_dates = {str(e.get('date', ''))[:19] for e in locked.get("entries", [])}
+        # Normalize the new entry date to Chicago time for comparison
+        try:
+            entry_date_chicago = normalize_tz(pd.to_datetime(entry.get('date', '')))
+            entry_date_str = entry_date_chicago.strftime('%Y-%m-%d %H:%M:%S') if entry_date_chicago else str(entry.get('date', ''))[:19]
+        except Exception:
+            entry_date_str = str(entry.get('date', ''))[:19]
+
+        # Check for duplicate entries (same date) - normalize all to Chicago time
+        existing_dates = set()
+        for e in locked.get("entries", []):
+            try:
+                e_date = normalize_tz(pd.to_datetime(e.get('date', '')))
+                existing_dates.add(e_date.strftime('%Y-%m-%d %H:%M:%S') if e_date else str(e.get('date', ''))[:19])
+            except Exception:
+                existing_dates.add(str(e.get('date', ''))[:19])
+
         if entry_date_str in existing_dates:
             print(f"   ⏭️  Skipping duplicate entry: {entry_date_str} (already exists)")
-            return  # Don't add duplicate
+            return False  # Don't add duplicate
 
-        # Ensure date has UTC timezone for consistency
-        date_str = str(entry.get('date', ''))
-        if date_str and '+' not in date_str and 'Z' not in date_str:
-            date_str = date_str[:19] + '+00:00'
+        # CRITICAL: Check if we're already in a position (last entry has no corresponding exit)
+        # This prevents adding consecutive entries without an exit between them
+        num_entries = len(locked.get("entries", []))
+        num_exits = len(locked.get("exits", []))
+        if num_entries > num_exits:
+            last_entry = locked["entries"][-1] if locked.get("entries") else None
+            print(f"   ⚠️  Rejecting duplicate entry: Already in position from {last_entry.get('date', 'unknown') if last_entry else 'unknown'}")
+            print(f"      (entries: {num_entries}, exits: {num_exits} - must exit before new entry)")
+            return False  # Don't add entry while already in position
+
+        # Convert to Chicago time for consistency
+        date_str = to_chicago_str(entry.get('date', ''))
 
         entry_record = {
             "date": date_str,
@@ -2662,19 +4182,100 @@ def append_to_locked_backtest(entry: dict = None, exit_trade: dict = None,
 
     if exit_trade:
         exit_date_str = str(exit_trade.get('date', ''))[:19]  # Normalize to "YYYY-MM-DD HH:MM:SS"
-        # Check for duplicate exits (same date)
-        existing_dates = {str(e.get('date', ''))[:19] for e in locked.get("exits", [])}
-        if exit_date_str in existing_dates:
-            print(f"   ⏭️  Skipping duplicate exit: {exit_date_str} (already exists)")
-            return  # Don't add duplicate
+        entry_date_check = str(exit_trade.get('entry_date', ''))[:19]
 
-        # Ensure dates have UTC timezone for consistency
-        date_str = str(exit_trade.get('date', ''))
-        if date_str and '+' not in date_str and 'Z' not in date_str:
-            date_str = date_str[:19] + '+00:00'
-        entry_date_str_tz = str(exit_trade.get('entry_date', ''))
-        if entry_date_str_tz and '+' not in entry_date_str_tz and 'Z' not in entry_date_str_tz:
-            entry_date_str_tz = entry_date_str_tz[:19] + '+00:00'
+        # Validation: entry_date must be before exit_date
+        # CRITICAL: Use proper datetime comparison with timezone normalization
+        # String comparison fails when entry is UTC and exit is local time
+        if entry_date_check and exit_date_str:
+            try:
+                # Parse and normalize both to UTC for proper comparison
+                entry_dt = normalize_tz(pd.to_datetime(exit_trade.get('entry_date', '')))
+                exit_dt = normalize_tz(pd.to_datetime(exit_trade.get('date', '')))
+                if entry_dt >= exit_dt:
+                    print(f"   ⚠️  Rejecting invalid exit: entry_date ({entry_dt}) >= exit_date ({exit_dt})")
+                    return False  # Don't add invalid exit
+            except Exception as e:
+                # Fallback to string comparison if datetime parsing fails
+                if entry_date_check >= exit_date_str:
+                    print(f"   ⚠️  Rejecting invalid exit: entry_date ({entry_date_check}) >= exit_date ({exit_date_str}) [string compare, parse error: {e}]")
+                    return False  # Don't add invalid exit
+
+        # Check for duplicate exits (same date) - NORMALIZE to UTC for proper comparison
+        # Raw string comparison fails when one has +00:00 and another has -0600
+        existing_dates = set()
+        for e in locked.get("exits", []):
+            try:
+                norm_dt = normalize_tz(pd.to_datetime(e.get('date', '')))
+                existing_dates.add(norm_dt.strftime('%Y-%m-%d %H:%M:%S'))
+            except Exception:
+                existing_dates.add(str(e.get('date', ''))[:19])
+
+        # Normalize the new exit date for comparison
+        try:
+            new_exit_norm = normalize_tz(pd.to_datetime(exit_trade.get('date', '')))
+            new_exit_str = new_exit_norm.strftime('%Y-%m-%d %H:%M:%S')
+        except Exception:
+            new_exit_str = exit_date_str
+
+        if new_exit_str in existing_dates:
+            print(f"   ⏭️  Skipping duplicate exit: {exit_date_str} (already exists as {new_exit_str})")
+            return False  # Don't add duplicate
+
+        # CRITICAL: Verify that the entry being closed actually EXISTS in locked_backtest
+        # This prevents orphan exits from being created (exits without corresponding entries)
+        # NOTE: Must normalize to Chicago time for comparison since entries are stored in Chicago time
+        if entry_date_check:
+            # Normalize the entry_date we're looking for to Chicago time (tz-naive for comparison)
+            raw_entry_date = exit_trade.get('entry_date', '')
+            try:
+                entry_date_chicago = normalize_tz(pd.to_datetime(raw_entry_date))
+                entry_date_chicago_str = entry_date_chicago.strftime('%Y-%m-%d %H:%M:%S') if entry_date_chicago else entry_date_check
+            except Exception as e:
+                print(f"   [DEBUG] Could not parse entry_date '{raw_entry_date}': {e}")
+                entry_date_chicago_str = entry_date_check
+
+            # Normalize all existing entries to Chicago time for comparison
+            existing_entries_normalized = {}  # Map normalized date -> original date for debugging
+            for e in locked.get("entries", []):
+                try:
+                    e_date = normalize_tz(pd.to_datetime(e.get('date', '')))
+                    norm_str = e_date.strftime('%Y-%m-%d %H:%M:%S') if e_date else str(e.get('date', ''))[:19]
+                    existing_entries_normalized[norm_str] = e.get('date', '')
+                except Exception:
+                    existing_entries_normalized[str(e.get('date', ''))[:19]] = e.get('date', '')
+
+            if entry_date_chicago_str not in existing_entries_normalized:
+                # Check if there's a match within 15-minute window (handles bar START vs bar CLOSE)
+                found_nearby = None
+                try:
+                    entry_dt = pd.to_datetime(entry_date_chicago_str)
+                    for norm_str in existing_entries_normalized:
+                        existing_dt = pd.to_datetime(norm_str)
+                        time_diff = abs((entry_dt - existing_dt).total_seconds())
+                        if time_diff <= 900:  # 15 minutes = 900 seconds
+                            found_nearby = (norm_str, existing_entries_normalized[norm_str], time_diff)
+                            break
+                except Exception:
+                    pass
+
+                if found_nearby:
+                    print(f"   ⚠️  [WARN] Entry date mismatch by {found_nearby[2]:.0f}s: looking for {entry_date_chicago_str}, found {found_nearby[0]} (original: {found_nearby[1]})")
+                    print(f"      Proceeding with exit (within 15-min tolerance for bar timing)")
+                    # Allow the exit - this handles bar START vs bar CLOSE mismatch
+                else:
+                    # Show debug info for last 5 entries
+                    last_5 = list(existing_entries_normalized.items())[-5:]
+                    print(f"   ⚠️  Rejecting orphan exit: entry_date ({entry_date_chicago_str}) not found in locked_backtest entries")
+                    print(f"      Raw entry_date from trade_state: '{raw_entry_date}'")
+                    print(f"      Looking for normalized: '{entry_date_chicago_str}'")
+                    print(f"      Available entries: {len(existing_entries_normalized)}")
+                    print(f"      Last 5 entries (normalized -> original): {last_5}")
+                    return False  # Don't add exit without corresponding entry
+
+        # Convert to Chicago time for consistency
+        date_str = to_chicago_str(exit_trade.get('date', ''))
+        entry_date_str_tz = to_chicago_str(exit_trade.get('entry_date', ''))
 
         exit_record = {
             "date": date_str,
@@ -2727,6 +4328,7 @@ def append_to_locked_backtest(entry: dict = None, exit_trade: dict = None,
 
     path = get_locked_backtest_path(strategy_name=strategy_name, ticker=ticker)
     safe_json_write(path, locked, indent=2)
+    return True  # Successfully appended
 
 
 def count_potential_missed_signals(locked_backtest: dict, fresh_backtest: dict) -> int:
@@ -2741,8 +4343,26 @@ def count_potential_missed_signals(locked_backtest: dict, fresh_backtest: dict) 
 
     Returns: Approximate count of signals that may have been missed
     """
+    missed = get_missed_signals(locked_backtest, fresh_backtest)
+    return len(missed.get('entries', [])) + len(missed.get('exits', []))
+
+
+def get_missed_signals(locked_backtest: dict, fresh_backtest: dict) -> dict:
+    """Get signals that may have occurred while bot was down (READ-ONLY).
+
+    Returns the actual missed signals for visualization purposes (ghost markers).
+    Does NOT modify any data files (anti-repainting policy).
+
+    Args:
+        locked_backtest: The locked backtest dict (source of truth)
+        fresh_backtest: Dict with 'entries' and 'exits' from fresh backtest
+
+    Returns: Dict with 'entries' and 'exits' lists of missed signals
+    """
+    missed = {'entries': [], 'exits': []}
+
     if not locked_backtest or not fresh_backtest:
-        return 0
+        return missed
 
     # Find the last signal date in locked backtest
     last_locked_date = None
@@ -2756,7 +4376,7 @@ def count_potential_missed_signals(locked_backtest: dict, fresh_backtest: dict) 
             last_locked_date = exit_date
 
     if last_locked_date is None:
-        return 0
+        return missed
 
     # Get existing timestamps from locked backtest
     existing_timestamps = set()
@@ -2767,29 +4387,28 @@ def count_potential_missed_signals(locked_backtest: dict, fresh_backtest: dict) 
         if exit_t.get('date'):
             existing_timestamps.add(str(exit_t['date'])[:19])
 
-    # Count signals in fresh backtest that are AFTER last_locked_date and NOT in existing
-    count = 0
+    # Get signals in fresh backtest that are AFTER last_locked_date and NOT in existing
     for entry in fresh_backtest.get('entries', []):
         entry_date = normalize_tz(pd.to_datetime(entry['date'])) if entry.get('date') else None
         if entry_date and entry_date > last_locked_date:
             timestamp_str = str(entry['date'])[:19]
             if timestamp_str not in existing_timestamps:
-                count += 1
+                missed['entries'].append(entry)
 
     for exit_t in fresh_backtest.get('exits', []):
         exit_date = normalize_tz(pd.to_datetime(exit_t['date'])) if exit_t.get('date') else None
         if exit_date and exit_date > last_locked_date:
             timestamp_str = str(exit_t['date'])[:19]
             if timestamp_str not in existing_timestamps:
-                count += 1
+                missed['exits'].append(exit_t)
 
-    return count
+    return missed
 
 
-def detect_and_add_missed_signals(fresh_backtest: dict, strategy_name: str = None, ticker: str = None, trade_state: dict = None) -> int:
-    """DEPRECATED - This function is no longer called due to anti-repainting policy.
+def detect_and_add_missed_signals(fresh_backtest: dict, strategy_name: str = None, ticker: str = None, trade_state: dict = None, mark_as_missed: bool = False) -> int:
+    """Detect signals that occurred while bot was down and add them to locked_backtest.
 
-    Detect signals that occurred while bot was down and add them as missed.
+    Detect signals that occurred while bot was down and add them as real signals.
 
     Compares fresh backtest entries/exits with locked_backtest to find signals
     that occurred after the last tracked signal. Adds them with missed=True.
@@ -2837,16 +4456,24 @@ def detect_and_add_missed_signals(fresh_backtest: dict, strategy_name: str = Non
         return 0
 
     # Get set of existing entry/exit timestamps to avoid duplicates
-    # Use full timestamps ([:19]) for intraday support
+    # CRITICAL: Normalize to UTC for comparison - raw strings fail when timezones differ
     existing_entry_timestamps = set()
     for entry in locked_entries:
         if entry.get('date'):
-            existing_entry_timestamps.add(str(entry['date'])[:19])
+            try:
+                norm_dt = normalize_tz(pd.to_datetime(entry['date']))
+                existing_entry_timestamps.add(norm_dt.strftime('%Y-%m-%d %H:%M:%S'))
+            except Exception:
+                existing_entry_timestamps.add(str(entry['date'])[:19])
 
     existing_exit_timestamps = set()
     for exit_t in locked_exits:
         if exit_t.get('date'):
-            existing_exit_timestamps.add(str(exit_t['date'])[:19])
+            try:
+                norm_dt = normalize_tz(pd.to_datetime(exit_t['date']))
+                existing_exit_timestamps.add(norm_dt.strftime('%Y-%m-%d %H:%M:%S'))
+            except Exception:
+                existing_exit_timestamps.add(str(exit_t['date'])[:19])
 
     missed_count = 0
     skipped_count = 0
@@ -2860,11 +4487,12 @@ def detect_and_add_missed_signals(fresh_backtest: dict, strategy_name: str = Non
                 skipped_count += 1
                 continue
 
-            timestamp_str = str(entry['date'])[:19]
+            # Normalize to UTC for comparison (matches existing_entry_timestamps normalization)
+            timestamp_str = entry_date.strftime('%Y-%m-%d %H:%M:%S')  # entry_date already normalized above
             if timestamp_str not in existing_entry_timestamps:
                 append_to_locked_backtest(
                     entry={'date': entry['date'], 'price': entry['price'], 'position': entry.get('position', 'long')},
-                    strategy_name=strategy_name, ticker=ticker, missed=True
+                    strategy_name=strategy_name, ticker=ticker, missed=mark_as_missed
                 )
                 existing_entry_timestamps.add(timestamp_str)
                 missed_count += 1
@@ -2882,18 +4510,21 @@ def detect_and_add_missed_signals(fresh_backtest: dict, strategy_name: str = Non
                     skipped_count += 1
                     continue
 
-            timestamp_str = str(exit_t['date'])[:19]
+            # Normalize to UTC for comparison (matches existing_exit_timestamps normalization)
+            timestamp_str = exit_date.strftime('%Y-%m-%d %H:%M:%S')  # exit_date already normalized above
             if timestamp_str not in existing_exit_timestamps:
+                # Use original reason from backtest, not "Missed"
+                reason = exit_t.get('reason', 'Opposite Signal')
                 append_to_locked_backtest(
                     exit_trade={
                         'date': exit_t['date'],
                         'price': exit_t['price'],
                         'pnl': exit_t.get('pnl', 0),
-                        'reason': exit_t.get('reason', 'Missed'),
+                        'reason': reason,
                         'entry_price': exit_t.get('entry_price', 0),
                         'entry_date': exit_t.get('entry_date', '')
                     },
-                    strategy_name=strategy_name, ticker=ticker, missed=True
+                    strategy_name=strategy_name, ticker=ticker, missed=mark_as_missed
                 )
                 existing_exit_timestamps.add(timestamp_str)
                 missed_count += 1
@@ -2918,16 +4549,19 @@ def load_trade_state(strategy_name: str = None, ticker: str = None, state_path: 
     if state_path is None:
         state_path = get_state_file_path(strategy_name=strategy_name, ticker=ticker)
 
-    if os.path.exists(state_path):
-        with open(state_path, 'r') as f:
-            return json.load(f)
-    return {
+    default_state = {
         "position": None,  # None or "long" (LONG-only strategy)
         "entry_price": None,
         "entry_time": None,
         "entry_signal_bar": None,  # Bar datetime that generated entry signal (for locked charts)
         "last_signal_time": None,
     }
+    if os.path.exists(state_path):
+        with open(state_path, 'r') as f:
+            loaded = json.load(f)
+            # Merge with defaults to ensure all keys exist
+            return {**default_state, **loaded}
+    return default_state
 
 
 def save_trade_state(state: dict, strategy_name: str = None, ticker: str = None, state_path: str = None):
@@ -3167,7 +4801,7 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
             f"• Trades: {backtest['num_trades']} | Win Rate: {backtest['win_rate']:.0f}%\n"
             f"• Return: {backtest['total_return']:.1f}% | PF: {backtest['profit_factor']:.1f}\n"
             f"---\n"
-            f"_Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}_{data_stale_warning}"
+            f"_Updated: {datetime.now(CHICAGO_TZ).strftime('%Y-%m-%d %H:%M CT')}_{data_stale_warning}"
         )
 
         send_discord_alert(webhook_url, msg_full, chart_buf_full, strategy_name=strategy_name)
@@ -3184,8 +4818,8 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
             '1m': 390, '5m': 78, '15m': 26, '30m': 13, '1h': 7, '90m': 5, '4h': 2, '1d': 1
         }
         # Futures trade ~23 hours, Crypto trades 24/7
-        is_futures = ticker.endswith('=F') or ticker.startswith('^')
-        is_crypto = any(ticker.upper().startswith(c) for c in ['BTC', 'ETH', 'DOGE', 'SOL', 'ADA'])
+        is_futures = is_futures_ticker(ticker)
+        is_crypto = '-USD' in ticker.upper()
         bars_per_day = bars_per_day_map.get(interval, 1)
         if is_crypto and interval not in ['1d']:
             bars_per_day = int(bars_per_day * 3.7)  # Crypto trades 24/7
@@ -3193,16 +4827,20 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
             bars_per_day = int(bars_per_day * 3.5)  # Futures trade longer hours
 
         if len(df) > min_bars_for_subset:
-            if len(df) > subset_bars:
-                actual_days = max(1, subset_bars // bars_per_day) if bars_per_day > 1 else subset_bars
-            else:
+            if len(df) <= subset_bars:
                 subset_bars = len(df) // 2
-                actual_days = max(1, subset_bars // bars_per_day) if bars_per_day > 1 else subset_bars
-            day_word = "Day" if actual_days == 1 else "Days"
-            period_label = f"Last {actual_days} {day_word}"
 
             # Use SUBSET of bundled df (NOT run_backtest_for_period which causes repainting)
             df_subset = df.iloc[-subset_bars:].copy()
+
+            # Calculate actual days from REAL data range (not bar count estimate)
+            # This handles weekends, holidays, and data gaps correctly
+            if len(df_subset) > 1:
+                actual_days = max(1, (df_subset.index.max() - df_subset.index.min()).days)
+            else:
+                actual_days = 1
+            day_word = "Day" if actual_days == 1 else "Days"
+            period_label = f"Last {actual_days} {day_word}"
 
             # Filter locked_backtest to get stats and exits for just the subset period
             # EXCLUDE missed/sync trades from stats (consistent with trade_history filtering)
@@ -3266,7 +4904,7 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
                 f"• Trades: {backtest_subset['num_trades']} | Win Rate: {backtest_subset['win_rate']:.0f}%\n"
                 f"• Return: {backtest_subset['total_return']:.1f}% | PF: {backtest_subset['profit_factor']:.1f}\n"
                 f"---\n"
-                f"_Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}_{data_stale_warning}"
+                f"_Updated: {datetime.now(CHICAGO_TZ).strftime('%Y-%m-%d %H:%M CT')}_{data_stale_warning}"
             )
 
             send_discord_alert(webhook_url, msg_subset, chart_buf_subset, strategy_name=strategy_name)
@@ -3360,14 +4998,18 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             # Ensure index is DatetimeIndex
             if not isinstance(df.index, pd.DatetimeIndex):
                 df.index = pd.to_datetime(df.index)
-            print(f"   ✓ Loaded {len(df)} bars: {df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')}")
-            print(f"   ✓ Using EXACT same data as Streamlit!")
+            if len(df) > 0:
+                print(f"   ✓ Loaded {len(df)} bars: {df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')}")
+                print(f"   ✓ Using EXACT same data as Streamlit!")
+            else:
+                print(f"   ⚠️ Warning: Bundled data is empty")
         else:
             # Fetch fresh data via yfinance (fallback)
             print(f"   Fetching fresh data via yfinance...")
             df = fetch_price_data(ticker, api_key, days=backtest_days, interval=interval)
 
         df = calculate_composite_oscillator(df, config)
+        df = calculate_velocity_signals(df, config)  # Required for chart JD_Signal panel
         backtest = run_historical_backtest(df, config)
 
         print(f"\n{'='*60}")
@@ -3405,16 +5047,24 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
     print(f"📁 State file: {get_state_file_path(strategy_name=strategy_name, ticker=ticker)}")
     print(f"📁 History file: {get_history_file_path(strategy_name=strategy_name, ticker=ticker)}")
 
+    # NOTE: DO NOT clear last_signal_time when no position!
+    # last_signal_time tracks which signals have been PROCESSED (added to locked_backtest),
+    # NOT which position is open. Clearing it causes re-processing of old signals.
+
     # FETCH FRESH DATA FOR SYNC - bundled data may be stale!
     print(f"\n🔄 Fetching FRESH data for state sync check...")
     fresh_backtest = None
     fresh_df = pd.DataFrame()  # Initialize empty to prevent NameError
+    fresh_df_for_charts = pd.DataFrame()  # Full data including incomplete bar (for charts)
     excluded_incomplete_bar = False  # Track if we excluded a bar
     try:
         import time
         time.sleep(1)  # Small delay to avoid rate limiting
         fresh_df = fetch_price_data(ticker, api_key, days=200, interval=interval)
         if not fresh_df.empty:
+            # Keep a copy WITH incomplete bar for charts (shows current data)
+            fresh_df_for_charts = fresh_df.copy()
+
             # CRITICAL: Exclude incomplete current bar to prevent false signals on startup
             # For daily intervals, if the market hasn't closed, today's bar is still forming
             # and shouldn't be used for position sync (matches behavior of normal signal detection)
@@ -3475,6 +5125,10 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
     backtest_position = sync_backtest.get('current_position') if sync_backtest else None
     state_position = trade_state.get('position')
 
+    # Flag to track if user chose to keep their position despite mismatch
+    # This prevents the main loop auto-sync from overriding the user's explicit choice
+    user_chose_keep_position = False
+
     # Case 1: No state but backtest shows position - missed entry
     if state_position is None and backtest_position:
         pos = backtest_position
@@ -3486,6 +5140,16 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             'last_signal_time': pos['entry_date'],
         }
         save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
+
+        # Also sync entry to locked_backtest so charts/stats are consistent
+        # Use missed=False - this IS a valid signal from fresh data, we just weren't tracking it
+        # Red marker = valid signal, Orange marker = questionable signal
+        append_to_locked_backtest(
+            entry={'date': pos['entry_date'], 'price': pos['entry_price'], 'position': 'long'},
+            strategy_name=strategy_name, ticker=ticker, missed=False
+        )
+        locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
+
         print(f"✅ Initialized position from backtest: LONG @ ${pos['entry_price']:.2f}")
 
     # Case 2: State shows position but backtest shows none - POSSIBLE missed exit
@@ -3570,6 +5234,8 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
         else:
             print(f"   ✅ Keeping tracked position: {state_position.upper()} @ ${old_entry:.2f}")
             print(f"   ℹ️  The trader will continue monitoring this position for exit signals")
+            # CRITICAL: Set flag to prevent main loop auto-sync from overriding user's choice
+            user_chose_keep_position = True
 
     # Case 3: Both show position but entries differ - missed exit AND new entry
     elif state_position is not None and backtest_position is not None:
@@ -3760,19 +5426,21 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             locked_backtest = save_locked_backtest(fresh_backtest, strategy_name=strategy_name, ticker=ticker, trade_state=trade_state)
             print(f"📁 Locked backtest file: {locked_backtest_path}")
 
-    # ANTI-REPAINTING: Do NOT add missed signals to locked_backtest
-    # The locked_backtest should ONLY contain signals that were detected in real-time
-    # while the bot was running. Adding "missed" signals after the fact causes:
-    # 1. Charts to change on every restart (repainting)
-    # 2. Stats to change retroactively
-    # 3. Loss of trader credibility
-    #
-    # Instead, we just WARN about potential missed signals without modifying data
+    # RETROACTIVE SYNC: Add missed signals to locked_backtest as real signals
+    # This ensures complete signal history even if bot was offline
+    # Signals are added with mark_as_missed=False so they appear as regular markers
+    missed_signals = None  # No longer using ghost markers
     if locked_backtest and fresh_backtest:
-        potential_missed = count_potential_missed_signals(locked_backtest, fresh_backtest)
+        # DISABLED: Missed signals sync was causing consistent data corruption
+        # The duplicate detection has timezone/timestamp format issues that cause
+        # the same exit to be added multiple times with slightly different timestamps
+        # TODO: Fix the root cause - timestamp normalization in get_missed_signals
+        #       and detect_and_add_missed_signals needs to be more robust
+        potential_missed_signals = get_missed_signals(locked_backtest, fresh_backtest)
+        potential_missed = len(potential_missed_signals.get('entries', [])) + len(potential_missed_signals.get('exits', []))
+
         if potential_missed > 0:
-            print(f"⚠️  Approximately {potential_missed} signal(s) may have occurred while bot was offline")
-            print(f"   These are NOT added to your tracked stats (anti-repainting policy)")
+            print(f"ℹ️  Detected {potential_missed} potential signal(s) while offline (sync DISABLED to prevent corruption)")
 
     # Validate locked backtest data integrity
     if locked_backtest:
@@ -3783,6 +5451,13 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 print(f"   • {issue}")
             if len(integrity_issues) > 5:
                 print(f"   ... and {len(integrity_issues) - 5} more issues")
+
+            # DISABLED: Auto-cleanup was too aggressive and destroyed valid backtests
+            # The cleanup_locked_backtest function has a bug where mismatched entry_date
+            # fields cause ALL subsequent entries to be removed as "overlapping"
+            # TODO: Fix cleanup_locked_backtest to be more tolerant of format mismatches
+            print(f"\n⚠️  Auto-cleanup DISABLED (was destroying valid data)")
+            print(f"   Please manually verify and fix data integrity issues")
         else:
             print(f"✅ Locked backtest data integrity validated")
 
@@ -3839,8 +5514,8 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
         bars_per_day_map = {
             '1m': 390, '5m': 78, '15m': 26, '30m': 13, '1h': 7, '90m': 5, '4h': 2, '1d': 1
         }
-        is_futures = ticker.endswith('=F') or ticker.startswith('^')
-        is_crypto = any(ticker.upper().startswith(c) for c in ['BTC', 'ETH', 'DOGE', 'SOL', 'ADA'])
+        is_futures = is_futures_ticker(ticker)
+        is_crypto = '-USD' in ticker.upper()
         bars_per_day = bars_per_day_map.get(interval, 1)
         if is_crypto and interval not in ['1d']:
             # Crypto trades 24/7: multiply by ~3.7 (24 hours / 6.5 stock hours)
@@ -3857,11 +5532,6 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
         else:
             recent_bars = 126
 
-        # Calculate actual days label
-        actual_days = max(1, recent_bars // bars_per_day) if bars_per_day > 1 else recent_bars
-        day_word = "Day" if actual_days == 1 else "Days"
-        recent_label = f"{actual_days} {day_word}"
-
         if locked_backtest and locked_backtest.get('exits'):
             # Get the chart date range using same logic as chart generation
             chart_df = fresh_df if fresh_backtest and not fresh_df.empty else df
@@ -3871,6 +5541,15 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 df_recent_for_stats = chart_df
             chart_start = normalize_tz(df_recent_for_stats.index.min())
             chart_end = normalize_tz(df_recent_for_stats.index.max())
+
+            # Calculate actual days from REAL data range (not bar count estimate)
+            # This handles weekends, holidays, and data gaps correctly
+            if len(df_recent_for_stats) > 1:
+                actual_days = max(1, (df_recent_for_stats.index.max() - df_recent_for_stats.index.min()).days)
+            else:
+                actual_days = 1
+            day_word = "Day" if actual_days == 1 else "Days"
+            recent_label = f"{actual_days} {day_word}"
 
             # Filter exits to chart window (matches chart exactly)
             # IMPORTANT: Exclude 'missed' trades to match chart legend stats
@@ -3937,18 +5616,22 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             startup_trade_history = load_trade_history(strategy_name=strategy_name, ticker=ticker)
 
             # Determine which data to use for charts
-            # If fresh data is available and more recent, use it for charts
-            # Otherwise fall back to bundled data (charts may not show recent positions)
+            # Use fresh_df_for_charts (includes incomplete bar) to show current data
+            # Otherwise fall back to bundled data
             chart_df = df  # Default to bundled
             chart_data_source = "bundled"  # Track source for accurate logging
             try:
-                if fresh_backtest and fresh_df is not None and len(fresh_df) > 0:
+                # Use fresh data INCLUDING incomplete bar for charts (shows current price)
+                if fresh_df_for_charts is not None and len(fresh_df_for_charts) > 0:
+                    # Calculate oscillators AND velocity signals for the chart data
+                    fresh_chart_df = calculate_composite_oscillator(fresh_df_for_charts.copy(), config)
+                    fresh_chart_df = calculate_velocity_signals(fresh_chart_df, config)
                     bundled_end = normalize_tz(df.index[-1]) if len(df) > 0 else None
-                    fresh_end = normalize_tz(fresh_df.index[-1])
-                    if bundled_end and fresh_end > bundled_end:
-                        chart_df = fresh_df
+                    fresh_end = normalize_tz(fresh_chart_df.index[-1])
+                    if bundled_end is None or fresh_end >= bundled_end:
+                        chart_df = fresh_chart_df
                         chart_data_source = "fresh"
-                        print(f"📊 Using FRESH data for charts (bundled ends {bundled_end.strftime('%Y-%m-%d')}, fresh ends {fresh_end.strftime('%Y-%m-%d')})")
+                        print(f"📊 Using FRESH data for charts (bundled ends {bundled_end.strftime('%Y-%m-%d') if bundled_end else 'N/A'}, fresh ends {fresh_end.strftime('%Y-%m-%d')})")
                     else:
                         print(f"📊 Using bundled data for charts (up to {bundled_end.strftime('%Y-%m-%d') if bundled_end else 'unknown'})")
                 else:
@@ -3962,7 +5645,8 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                                                         trade_history=startup_trade_history,
                                                         current_position=trade_state,
                                                         locked_backtest=locked_backtest,
-                                                        full_period_backtest=backtest)
+                                                        full_period_backtest=backtest,
+                                                        missed_signals=missed_signals)
             print("✅ Generated full period chart")
 
             # RECENT chart - subset of chart data
@@ -3973,8 +5657,8 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             bars_per_day_map = {
                 '1m': 390, '5m': 78, '15m': 26, '30m': 13, '1h': 7, '90m': 5, '4h': 2, '1d': 1
             }
-            is_futures = ticker.endswith('=F') or ticker.startswith('^')
-            is_crypto = any(ticker.upper().startswith(c) for c in ['BTC', 'ETH', 'DOGE', 'SOL', 'ADA'])
+            is_futures = is_futures_ticker(ticker)
+            is_crypto = '-USD' in ticker.upper()
             bars_per_day = bars_per_day_map.get(interval, 1)
             if is_crypto and interval not in ['1d']:
                 bars_per_day = int(bars_per_day * 3.7)  # Crypto trades 24/7
@@ -3990,16 +5674,23 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             else:
                 recent_bars = 126
 
-            # Calculate actual days label
-            actual_days = max(1, recent_bars // bars_per_day) if bars_per_day > 1 else recent_bars
-            day_word = "Day" if actual_days == 1 else "Days"
-            recent_label = f"{actual_days} {day_word}"
-
             if len(chart_df) > recent_bars:
                 df_recent = chart_df.iloc[-recent_bars:].copy()
             else:
                 df_recent = chart_df.copy()
+
+            # Calculate actual days from REAL data range (not bar count estimate)
+            # This handles weekends, holidays, and data gaps correctly
+            if len(df_recent) > 1:
+                actual_days = max(1, (df_recent.index.max() - df_recent.index.min()).days)
+            else:
+                actual_days = 1
+
+            if len(chart_df) <= recent_bars:
                 recent_label = "Full Period"
+            else:
+                day_word = "Day" if actual_days == 1 else "Days"
+                recent_label = f"{actual_days} {day_word}"
 
             # Calculate subset stats from locked_backtest for the recent period
             # Use BOTH start and end boundaries to match message stats exactly
@@ -4037,7 +5728,8 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                                                    trade_history=startup_trade_history,
                                                    current_position=trade_state,
                                                    locked_backtest=locked_backtest,
-                                                   full_period_backtest=locked_backtest)
+                                                   full_period_backtest=locked_backtest,
+                                                   missed_signals=missed_signals)
             print(f"✅ Generated recent {recent_label} chart ({chart_data_source} data, {recent_backtest['num_trades']} trades)")
 
             # Use recent chart for main display (full period chart can be added later)
@@ -4082,13 +5774,15 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
     send_discord_alert(webhook_url, startup_msg, startup_chart, strategy_name=strategy_name, csv_buf=trade_log_csv)
 
     # Determine check interval based on data interval
-    # Check frequently enough to catch scheduled update windows
+    # Minimize delay for actionable signals - check frequently after bar closes
     if interval == "1d":
-        check_interval_seconds = 900  # Check every 15 min for daily signals (to catch scheduled updates)
+        check_interval_seconds = 120  # Check every 2 min for daily signals
     elif interval == "1h":
-        check_interval_seconds = 300  # Check every 5 min for hourly signals
+        check_interval_seconds = 60   # Check every 1 min for hourly signals
+    elif interval in ["15m", "30m"]:
+        check_interval_seconds = 30   # Check every 30 sec for 15m/30m signals
     else:
-        check_interval_seconds = 60  # Check every minute
+        check_interval_seconds = 30   # Default: check every 30 sec for fast signals
 
     # Track scheduled alerts to avoid duplicates
     # Persist to file to survive restarts and prevent duplicate alerts on same day
@@ -4098,7 +5792,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
     def load_daily_alerts() -> set:
         """Load persisted daily alerts, filtering to today's alerts only."""
         alerts_path = get_daily_alerts_path()
-        today_str = datetime.now().strftime('%Y-%m-%d')
+        today_str = datetime.now(CHICAGO_TZ).strftime('%Y-%m-%d')  # Chicago date
         try:
             if os.path.exists(alerts_path):
                 data = safe_json_read(alerts_path, default=[])
@@ -4111,7 +5805,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
     def save_daily_alerts(alerts: set):
         """Persist daily alerts to file."""
         alerts_path = get_daily_alerts_path()
-        today_str = datetime.now().strftime('%Y-%m-%d')
+        today_str = datetime.now(CHICAGO_TZ).strftime('%Y-%m-%d')  # Chicago date
         # Only save today's alerts
         today_alerts = [a for a in alerts if a.startswith(today_str)]
         safe_json_write(alerts_path, today_alerts)
@@ -4122,8 +5816,11 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
     # Track the last completed bar we evaluated for signals (prevents re-evaluation)
     last_signal_bar_evaluated = None
 
+    # Track the last bar we posted a status update for (prevents duplicate bar updates)
+    last_bar_update_time = None
+
     # Determine if this is a crypto or stock ticker for signal timing
-    is_crypto = ticker.upper() in ['BTC-USD', 'ETH-USD', 'SOL-USD', 'DOGE-USD'] or '-USD' in ticker.upper()
+    is_crypto = '-USD' in ticker.upper()
 
     # Determine if this is an intraday strategy (15m, 1h, etc.) for more frequent status updates
     # Note: Signal alerts (entry/exit) are posted immediately regardless - this is for STATUS updates
@@ -4142,7 +5839,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
     # STARTUP CATCH-UP: If crypto and we just missed a scheduled update window, send immediately
     # This handles cases where trader started at 6:51 AM but 6:00 AM window was missed
     if is_crypto and backtest:
-        startup_now = datetime.now()
+        startup_now = datetime.now(CHICAGO_TZ)  # Use Chicago time
         startup_hour = startup_now.hour
         startup_minute = startup_now.minute
 
@@ -4174,9 +5871,16 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
     consecutive_fetch_failures = 0
     max_failures_before_alert = 3
 
+    # AUTO-SYNC flag: Only allow auto-sync on FIRST cycle after startup
+    # This prevents backtest flip-flopping from causing spurious entries/exits during live trading
+    # CRITICAL: If user chose "Keep" at startup, skip auto-sync entirely to respect their choice
+    auto_sync_completed = user_chose_keep_position
+    if user_chose_keep_position:
+        print(f"   ℹ️  Auto-sync disabled (user chose to keep tracked position)")
+
     while True:
         try:
-            current_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            current_time_str = datetime.now(CHICAGO_TZ).strftime('%Y-%m-%d %H:%M:%S CT')
             print(f"\n[{current_time_str}] 📡 {strategy_label} | {strategy_name} | Update Cycle")
 
             # --- CONFIG HOT-RELOAD ---
@@ -4282,14 +5986,16 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             print(f"Acceleration: {latest['acceleration']:.4f}")
             print(f"Buy Signal: {latest['buy_signal']}")
             print(f"Sell Signal: {latest['sell_signal']}")
-            print(f"Position: {trade_state['position']}")
+            print(f"Position: {trade_state.get('position', 'none')}")
+
+            # CRITICAL: Flag to prevent re-entry on the same cycle after an exit
+            # Without this, exiting on "Opposite Signal" would immediately re-enter
+            # on a buy signal from a previous bar (since position is now None)
+            just_exited_this_cycle = False
 
             # --- SCHEDULED STATUS UPDATES ---
-            # Use Eastern Time for stocks (SPY market hours), UTC for crypto
-            if is_crypto:
-                now = datetime.now()  # Local time is fine for 24/7 crypto
-            else:
-                now = get_market_time()  # Eastern Time for stock market hours
+            # Use Chicago time for all scheduling (consistent timezone)
+            now = datetime.now(CHICAGO_TZ)
             day_str = now.strftime("%Y-%m-%d")
             hm = now.strftime("%H:%M")
             hour = now.hour
@@ -4315,12 +6021,201 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             except Exception as e:
                 print(f"   ⚠️ Backtest failed: {e}")
 
-            # Check for position sync issues - warn if backtest shows position but we're not tracking
-            if status_backtest and status_backtest.get('current_position'):
+            # Check for position sync issues - AUTO-SYNC ONLY AT STARTUP
+            # CRITICAL: Do NOT auto-sync during live trading - backtests can flip-flop
+            # as new bars complete, causing spurious entries/exits
+            # Only run auto-sync on the FIRST cycle after startup
+            # CRITICAL: Also skip auto-sync if the last bar is incomplete - the backtest
+            # position could be based on a forming bar that will flip when it completes
+            bar_incomplete_for_sync = is_last_bar_incomplete(df, interval, ticker)
+            if bar_incomplete_for_sync:
+                print(f"   ⏳ Auto-sync deferred - last bar still forming (will check when complete)")
+
+            if not auto_sync_completed and status_backtest and status_backtest.get('current_position') and not bar_incomplete_for_sync:
                 bt_pos = status_backtest['current_position']
                 if not trade_state.get('position'):
-                    print(f"   ⚠️  SYNC WARNING: Backtest shows {bt_pos.get('position', 'unknown').upper()} @ ${bt_pos.get('entry_price', 0):.2f}")
-                    print(f"   ⚠️  But trade_state has no position! Consider restarting to sync.")
+                    print(f"   🔄 AUTO-SYNC (startup): Backtest shows {bt_pos.get('position', 'unknown').upper()} @ ${bt_pos.get('entry_price', 0):.2f}")
+                    print(f"   🔄 trade_state has no position - syncing now...")
+
+                    # Sync trade_state to match backtest position
+                    bt_entry_date = bt_pos.get('entry_date', str(datetime.now()))
+                    bt_entry_price = bt_pos.get('entry_price', 0)
+                    trade_state = {
+                        'position': bt_pos.get('position', 'long'),
+                        'entry_price': bt_entry_price,
+                        'entry_time': bt_entry_date,
+                        'entry_signal_bar': bt_entry_date,
+                        'last_signal_time': bt_entry_date,  # Reset to entry time to allow future signals
+                    }
+                    save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
+
+                    # Also sync the entry to locked_backtest so charts/stats are consistent
+                    # Use missed=False - this IS a valid signal (bar is complete), we just weren't running
+                    # Red marker = valid signal, Orange marker = questionable signal
+                    append_to_locked_backtest(
+                        entry={'date': bt_entry_date, 'price': bt_entry_price, 'position': 'long'},
+                        strategy_name=strategy_name, ticker=ticker, missed=False
+                    )
+                    # Reload locked_backtest to include the new entry
+                    locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
+
+                    print(f"   ✅ AUTO-SYNCED: Now tracking LONG @ ${bt_entry_price:.2f} (entered {str(bt_entry_date)[:16]})")
+
+                    # Generate chart showing the entry
+                    sync_chart = None
+                    try:
+                        sync_backtest = run_historical_backtest(df, config)
+                        sync_chart = generate_velocity_chart(df, sync_backtest, config, ticker,
+                                                            locked_backtest=locked_backtest,
+                                                            current_position=trade_state,
+                                                            chart_type="signal")
+                        print(f"   ✅ Generated sync chart with entry marker")
+                    except Exception as chart_err:
+                        print(f"   ⚠️ Could not generate sync chart: {chart_err}")
+
+                    # Send Discord notification about the sync with chart
+                    sync_msg = (
+                        f"🔄 **[{strategy_label}] Auto-Sync - Position Recovered**\n"
+                        f"---\n"
+                        f"**Position:** LONG @ ${bt_pos.get('entry_price', 0):.2f}\n"
+                        f"**Entry:** {str(bt_entry_date)[:16]}\n"
+                        f"**Current Price:** ${current_price:,.2f}\n"
+                        f"---\n"
+                        f"_State was out of sync with backtest. Position recovered automatically._"
+                    )
+                    try:
+                        send_discord_alert(webhook_url, sync_msg, sync_chart, strategy_name=strategy_name)
+                    except Exception as discord_err:
+                        print(f"   ⚠️ Failed to send sync notification: {discord_err}")
+
+                    # Skip signal detection this cycle - state just synced, wait for next bar
+                    print(f"   ⏭️ Skipping signal detection this cycle - just synced state")
+                    auto_sync_completed = True  # Mark sync as done
+                    # Use smart scheduling to wait for next bar close
+                    sync_wait = seconds_until_next_bar_close(ticker, interval) + 5
+                    sync_wait = min(sync_wait, 90000 if interval == '1d' else 7200)  # Cap: 25h daily, 2h intraday
+                    time.sleep(sync_wait)
+                    continue
+
+            # Reverse sync: trade_state has position but backtest shows none (missed exit)
+            # CRITICAL: Only run at startup - during live trading, trust trade_state
+            # CRITICAL: Also skip if last bar is incomplete - backtest position could flip
+            elif not auto_sync_completed and status_backtest and not status_backtest.get('current_position') and trade_state.get('position') and not bar_incomplete_for_sync:
+                old_pos = trade_state.get('position', 'long')
+                old_entry = trade_state.get('entry_price', 0)
+                old_time = trade_state.get('entry_time', '')
+                print(f"   🔄 AUTO-SYNC: trade_state shows {old_pos.upper()} @ ${old_entry:.2f}")
+                print(f"   🔄 But backtest shows NO position - syncing (missed exit)...")
+
+                # CRITICAL: Verify the entry exists in locked_backtest before syncing exit
+                # This prevents orphan exits from being recorded when trade_state is stale
+                entry_time_check = str(old_time)[:19] if old_time else ''
+                existing_entries = {str(e.get('date', ''))[:19] for e in locked_backtest.get("entries", [])}
+                if entry_time_check and entry_time_check not in existing_entries:
+                    print(f"   ⚠️  SKIPPING auto-sync: Entry at {entry_time_check} not found in locked_backtest")
+                    print(f"      (trade_state may be stale - clearing without recording exit)")
+                    # Clear the stale trade_state without recording an orphan exit
+                    trade_state = {'position': None, 'entry_price': None, 'entry_time': None, 'last_signal_time': to_chicago_str(datetime.now())}
+                    save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
+                    auto_sync_completed = True
+                    continue
+
+                # Try to find the exit in backtest to record accurate P&L
+                exit_pnl = 0
+                exit_reason = "[SYNC] Missed Exit"
+                exit_price = current_price
+                exit_time = to_chicago_str(datetime.now())
+
+                if status_backtest.get('exits'):
+                    # Find the most recent exit that matches our entry
+                    for exit_trade in reversed(status_backtest['exits']):
+                        if old_entry > 0:
+                            exit_entry_price = exit_trade.get('entry_price', 0)
+                            if abs(exit_entry_price - old_entry) / old_entry < 0.01:  # 1% tolerance
+                                exit_pnl = exit_trade.get('pnl', 0)
+                                exit_reason = f"[SYNC] {exit_trade.get('reason', 'Unknown')}"
+                                exit_price = exit_trade.get('price', current_price)
+                                exit_time = to_chicago_str(exit_trade.get('date', datetime.now()))
+                                break
+
+                # Log the closed trade
+                log_closed_trade(
+                    ticker=ticker,
+                    position_type=old_pos,
+                    entry_price=old_entry,
+                    exit_price=exit_price,
+                    entry_time=to_chicago_str(old_time),
+                    exit_time=exit_time,
+                    exit_reason=exit_reason,
+                    pnl_pct=exit_pnl,
+                    strategy_name=strategy_name,
+                    entry_signal_bar=trade_state.get('entry_signal_bar'),
+                    exit_signal_bar=exit_time
+                )
+
+                # Also sync the exit to locked_backtest so charts/stats are consistent
+                # Use missed=False since this was a real signal, just synced late
+                append_to_locked_backtest(
+                    exit_trade={
+                        'date': exit_time,
+                        'price': exit_price,
+                        'pnl': exit_pnl,
+                        'reason': exit_reason,
+                        'entry_price': old_entry,
+                        'entry_date': to_chicago_str(old_time),
+                    },
+                    strategy_name=strategy_name, ticker=ticker, missed=False
+                )
+                # Reload locked_backtest
+                locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
+
+                # Clear position
+                trade_state = {'position': None, 'entry_price': None, 'entry_time': None, 'last_signal_time': exit_time}
+                save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
+                print(f"   ✅ AUTO-SYNCED: Position closed. P&L: {exit_pnl:+.2f}%")
+
+                # Generate chart showing the exit
+                sync_chart = None
+                try:
+                    sync_backtest = run_historical_backtest(df, config)
+                    sync_chart = generate_velocity_chart(df, sync_backtest, config, ticker,
+                                                        locked_backtest=locked_backtest,
+                                                        chart_type="signal")
+                    print(f"   ✅ Generated sync chart with exit marker")
+                except Exception as chart_err:
+                    print(f"   ⚠️ Could not generate sync chart: {chart_err}")
+
+                # Send Discord notification with chart
+                sync_msg = (
+                    f"🔄 **[{strategy_label}] Auto-Sync - Missed Exit Recorded**\n"
+                    f"---\n"
+                    f"**Previous Position:** {old_pos.upper()} @ ${old_entry:.2f}\n"
+                    f"**Exit Price:** ${exit_price:.2f}\n"
+                    f"**P&L:** {exit_pnl:+.2f}%\n"
+                    f"**Reason:** {exit_reason}\n"
+                    f"---\n"
+                    f"_Position was exited while trader was offline. Trade recorded._"
+                )
+                try:
+                    send_discord_alert(webhook_url, sync_msg, sync_chart, strategy_name=strategy_name)
+                except Exception as discord_err:
+                    print(f"   ⚠️ Failed to send sync notification: {discord_err}")
+
+                # Skip signal detection this cycle - state just synced, wait for next bar
+                print(f"   ⏭️ Skipping signal detection this cycle - just synced state")
+                auto_sync_completed = True  # Mark sync as done
+                # Use smart scheduling to wait for next bar close
+                sync_wait = seconds_until_next_bar_close(ticker, interval) + 5
+                sync_wait = min(sync_wait, 90000 if interval == '1d' else 7200)  # Cap: 25h daily, 2h intraday
+                time.sleep(sync_wait)
+                continue
+
+            # Mark auto-sync as completed after first cycle WITH COMPLETE BAR
+            # This prevents backtest flip-flopping from causing issues during live trading
+            # CRITICAL: Only mark complete if bar was complete - otherwise defer to next cycle
+            if not auto_sync_completed and not bar_incomplete_for_sync:
+                auto_sync_completed = True
+                print(f"   ✅ Auto-sync check completed (first cycle with complete bar)")
 
             # Market Open Update (8:30-8:45 AM ET for stocks)
             if "08:30" <= hm <= "08:45" and not is_crypto and not skip_stock_updates:
@@ -4428,7 +6323,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         break  # Only one update per cycle
 
             # Check for exit conditions first (if in position)
-            if trade_state['position'] == 'long':
+            if trade_state.get('position') == 'long':
                 entry_price = trade_state.get('entry_price')
                 # CRITICAL: Validate entry_price before calculations to prevent crash
                 if not entry_price or entry_price <= 0:
@@ -4438,6 +6333,9 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 pnl_pct = ((current_price - entry_price) / entry_price) * 100
 
                 exit_reason = None
+                exit_bar_close_time = None  # Will be set for signal-based exits
+                signal_bar_time = None  # Will be set when checking signal-based exits
+                can_check_signal_exits = False  # Will be set True when checking signal-based exits
 
                 # Stop loss - uses real-time price (can trigger anytime)
                 if pnl_pct <= -stop_loss_pct:
@@ -4468,24 +6366,121 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                                 can_check_signal_exits = False
                                 print(f"   ⏳ [CRYPTO] Waiting for new daily bar (UTC: {utc_now.strftime('%H:%M')})")
                         else:
-                            # Stocks (SPY): Daily bar closes at 4 PM ET
-                            market_time = get_market_time()
-                            if market_time.hour < 16:
+                            # Stocks/Futures: Use is_bar_complete() which handles different market types
+                            # Stocks (SPY): closes 4 PM ET, Futures (ES=F): closes 5 PM CT
+                            if not is_bar_complete(ticker, interval):
                                 can_check_signal_exits = False
                     else:
-                        signal_bar = latest  # Use latest for intraday
-                        can_check_signal_exits = True
+                        # For intraday intervals, check if last bar is complete
+                        # CRITICAL: Only use COMPLETED bars for signal-based exits to prevent repainting
+                        bar_is_incomplete = is_last_bar_incomplete(df, interval, ticker)
+
+                        if bar_is_incomplete and len(df) >= 2:
+                            # Last bar still forming - use completed bar for signal exits
+                            signal_bar = df.iloc[-2]
+                            signal_bar_time = df.index[-2]
+                            can_check_signal_exits = True
+                            # Note: Stop-loss and take-profit still use real-time price (above)
+                        else:
+                            # Last bar is complete - use it
+                            signal_bar = latest
+                            signal_bar_time = df.index[-1]  # Use latest bar's time
+                            can_check_signal_exits = True
 
                     if can_check_signal_exits:
+                        # Acceleration Reversal Exit (early warning before stop loss)
+                        # Check if enabled and we have acceleration data
+                        use_accel_exit = config.get('use_accel_exit', False)
+                        if use_accel_exit and 'acceleration' in df.columns:
+                            accel_exit_type = config.get('accel_exit_type', 'sign_reversal')
+                            accel_exit_threshold = config.get('accel_exit_threshold', 0.0)
+                            accel_exit_min_pnl = config.get('accel_exit_min_pnl', 0.5)
+                            accel_exit_lookback = config.get('accel_exit_lookback', 1)
+                            use_jerk_confirm = config.get('use_jerk_confirm', False)
+                            jerk_confirm_threshold = config.get('jerk_confirm_threshold', 0.0)
+
+                            # Check if conditions are met
+                            pnl_ok = pnl_pct >= accel_exit_min_pnl or pnl_pct < 0
+                            if pnl_ok:
+                                # Get index of signal_bar in df
+                                bar_idx = df.index.get_loc(signal_bar_time) if signal_bar_time in df.index else -1
+                                if bar_idx >= accel_exit_lookback:
+                                    accel_values = df['acceleration'].iloc[bar_idx-accel_exit_lookback+1:bar_idx+1].values
+                                    current_accel = df['acceleration'].iloc[bar_idx]
+                                    # For LONG positions: negative acceleration is bearish
+                                    accel_cond = False
+                                    if accel_exit_type == 'sign_reversal':
+                                        accel_cond = all(a < 0 for a in accel_values)
+                                    elif accel_exit_type == 'magnitude':
+                                        accel_cond = current_accel < -accel_exit_threshold
+                                    elif accel_exit_type == 'both':
+                                        accel_cond = all(a < 0 for a in accel_values) and abs(current_accel) > accel_exit_threshold
+                                    # Jerk confirmation (optional)
+                                    jerk_cond = True
+                                    if use_jerk_confirm and 'jerk' in df.columns and jerk_confirm_threshold > 0:
+                                        current_jerk = df['jerk'].iloc[bar_idx]
+                                        jerk_cond = current_jerk < -jerk_confirm_threshold
+                                    if accel_cond and jerk_cond:
+                                        exit_reason = f"Accel Reversal ({pnl_pct:.2f}%)"
+                                        interval_minutes = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440}.get(interval, 15)
+                                        exit_bar_close_time = pd.to_datetime(signal_bar_time) + pd.Timedelta(minutes=interval_minutes)
+
                         # Exit on opposite signal
-                        if exit_on_opposite_signal and signal_bar['sell_signal']:
+                        if not exit_reason and exit_on_opposite_signal and signal_bar['sell_signal']:
                             exit_reason = f"Opposite Signal ({pnl_pct:.2f}%)"
+                            # Calculate bar close time for signal-based exit
+                            interval_minutes = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440}.get(interval, 15)
+                            exit_bar_close_time = pd.to_datetime(signal_bar_time) + pd.Timedelta(minutes=interval_minutes)
                         # Exit on midline cross (oscillator crosses above 0 = bearish for long)
-                        elif exit_on_midline_cross and signal_bar['osc_smooth'] > 0:
+                        elif not exit_reason and exit_on_midline_cross and signal_bar['osc_smooth'] > 0:
                             exit_reason = f"Midline Cross ({pnl_pct:.2f}%)"
+                            # Calculate bar close time for signal-based exit
+                            interval_minutes = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440}.get(interval, 15)
+                            exit_bar_close_time = pd.to_datetime(signal_bar_time) + pd.Timedelta(minutes=interval_minutes)
+
+                # For SL/TP exits, use real-time; for signal exits, use bar close time
+                # Safety: check for NaT (can occur if signal_bar_time is None/invalid)
+                if exit_bar_close_time is not None and not pd.isna(exit_bar_close_time):
+                    exit_timestamp = exit_bar_close_time
+                else:
+                    exit_timestamp = current_time
 
                 if exit_reason:
-                    # Generate chart and get stats for exit
+                    # CRITICAL: Validate with append_to_locked_backtest FIRST before ANY Discord
+                    # This prevents spam if the exit is rejected (e.g., orphan exit, timestamp mismatch)
+                    entry_time_for_exit = trade_state.get('entry_time', '')
+
+                    # Pre-validation: Check if this exit would be accepted
+                    append_success = append_to_locked_backtest(
+                        exit_trade={
+                            'date': exit_timestamp,  # Bar close time for signal exits
+                            'price': current_price,
+                            'pnl': pnl_pct,
+                            'reason': exit_reason,
+                            'entry_price': entry_price,
+                            'entry_date': entry_time_for_exit
+                        },
+                        strategy_name=strategy_name, ticker=ticker
+                    )
+                    if not append_success:
+                        print(f"   ❌ EXIT SIGNAL REJECTED by locked_backtest - NOT sending Discord or updating trade_state")
+                        print(f"   ❌ This prevents desync. trade_state still shows position: {trade_state.get('position')}")
+                        continue  # Skip ALL Discord, trade_state update, and wait for next cycle
+
+                    # Validation passed - NOW send immediate alert
+                    pnl_emoji_quick = "✅" if pnl_pct > 0 else "❌"
+                    quick_exit_msg = (
+                        f"@here\n"
+                        f"📤 **[{strategy_label}] LONG EXIT** {pnl_emoji_quick}\n"
+                        f"**Reason:** {exit_reason}\n"
+                        f"**Exit Price:** ${current_price:,.2f}\n"
+                        f"💰 **P&L:** {pnl_pct:+.2f}%\n"
+                        f"_Chart and full stats loading..._"
+                    )
+                    send_discord_alert(webhook_url, quick_exit_msg, strategy_name=strategy_name)
+                    print(f"⚡ IMMEDIATE EXIT ALERT SENT! {exit_reason}")
+
+                    # Generate chart and get stats for exit (can be slow)
                     exit_chart = None
                     exit_backtest = None
                     try:
@@ -4498,7 +6493,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         if 'exits' not in locked_backtest_with_exit:
                             locked_backtest_with_exit['exits'] = []
                         locked_backtest_with_exit['exits'].append({
-                            'date': current_time,
+                            'date': exit_timestamp,  # Use bar close time for signal exits
                             'price': current_price,
                             'pnl': pnl_pct,
                             'reason': exit_reason,
@@ -4534,7 +6529,9 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     if entry_time_str:
                         try:
                             entry_dt = datetime.strptime(entry_time_str.split('.')[0], '%Y-%m-%d %H:%M:%S')
-                            duration = current_time - entry_dt
+                            # Use exit_timestamp (bar close time) for duration calculation
+                            exit_dt = exit_timestamp if isinstance(exit_timestamp, datetime) else current_time
+                            duration = exit_dt - entry_dt
                             days = duration.days
                             hours = duration.seconds // 3600
                             if days > 0:
@@ -4547,13 +6544,34 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     # Calculate actual dollar P&L per unit
                     pnl_dollars = current_price - entry_price  # LONG: profit when price goes up
 
+                    # Format timestamps for display - show BOTH UTC and Chicago time (12-hour format)
+                    try:
+                        entry_dt = pd.to_datetime(entry_time_str)
+                        entry_utc = entry_dt.tz_localize('UTC') if entry_dt.tzinfo is None else entry_dt.tz_convert('UTC')
+                        entry_ct = to_chicago_time(entry_time_str)
+                        entry_utc_str = entry_utc.strftime('%Y-%m-%d %H:%M UTC')
+                        entry_ct_str = entry_ct.strftime('%Y-%m-%d %I:%M %p CT') if entry_ct else ''
+                        entry_time_display = f"{entry_utc_str} ({entry_ct_str})" if entry_ct_str else entry_utc_str
+                    except Exception:
+                        entry_time_display = entry_time_str[:16] if entry_time_str else 'N/A'
+
+                    try:
+                        exit_dt = pd.to_datetime(exit_timestamp)
+                        exit_utc = exit_dt.tz_localize('UTC') if exit_dt.tzinfo is None else exit_dt.tz_convert('UTC')
+                        exit_ct = to_chicago_time(exit_timestamp)
+                        exit_utc_str = exit_utc.strftime('%Y-%m-%d %H:%M UTC')
+                        exit_ct_str = exit_ct.strftime('%Y-%m-%d %I:%M %p CT') if exit_ct else ''
+                        exit_time_display = f"{exit_utc_str} ({exit_ct_str})" if exit_ct_str else exit_utc_str
+                    except Exception:
+                        exit_time_display = str(exit_timestamp)[:16] if exit_timestamp else 'N/A'
+
                     exit_msg = (
                         f"@here\n"
                         f"📤 **[{strategy_label}] LONG EXIT** {pnl_emoji}\n"
                         f"**Reason:** {exit_reason}\n"
                         f"---\n"
-                        f"📅 **Entry:** {entry_time_str[:16] if entry_time_str else 'N/A'} @ ${entry_price:.2f}\n"
-                        f"📅 **Exit:** {current_time.strftime('%Y-%m-%d %H:%M')} @ ${current_price:.2f}\n"
+                        f"📅 **Entry:** {entry_time_display} @ ${entry_price:.2f}\n"
+                        f"📅 **Exit:** {exit_time_display} @ ${current_price:.2f}\n"
                         f"⏱️ **Hold Duration:** {hold_duration}\n"
                         f"---\n"
                         f"💰 **P&L:** {pnl_pct:+.2f}% (${pnl_dollars:+,.2f}/unit)\n"
@@ -4561,32 +6579,26 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     )
 
                     # Log closed trade and get cumulative stats
+                    # Format exit timestamp for logging (Chicago time)
+                    exit_ct = to_chicago_time(exit_timestamp)
+                    exit_time_for_log = to_chicago_str(exit_ct) if exit_ct else str(exit_timestamp)
                     cumulative = log_closed_trade(
                         ticker=ticker,
                         position_type="LONG",
                         entry_price=entry_price,
                         exit_price=current_price,
                         entry_time=entry_time_str,
-                        exit_time=current_time.strftime('%Y-%m-%d %H:%M:%S'),
+                        exit_time=exit_time_for_log,
                         exit_reason=exit_reason,
                         pnl_pct=pnl_pct,
                         strategy_name=strategy_name,
                         entry_signal_bar=trade_state.get('entry_signal_bar'),  # Locked entry signal bar
-                        exit_signal_bar=str(current_time)  # Exit bar
+                        exit_signal_bar=str(signal_bar_time) if can_check_signal_exits and signal_bar_time else str(current_time)  # Signal bar for signal exits
                     )
 
-                    # Append exit to locked backtest (for future charts)
-                    append_to_locked_backtest(
-                        exit_trade={
-                            'date': current_time,
-                            'price': current_price,
-                            'pnl': pnl_pct,
-                            'reason': exit_reason,
-                            'entry_price': entry_price,
-                            'entry_date': trade_state.get('entry_time', '')
-                        },
-                        strategy_name=strategy_name, ticker=ticker
-                    )
+                    # Append to locked_backtest already done at start of exit_reason block
+                    # (validation happens BEFORE any Discord is sent to prevent spam)
+
                     # Reload the locked backtest with the new exit
                     locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
 
@@ -4639,77 +6651,94 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     trade_state['entry_signal_bar'] = None  # Clear signal bar
                     save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
 
+                    # CRITICAL: Set flag to prevent immediate re-entry on buy signal from previous bar
+                    # After exiting on "Opposite Signal", we should NOT re-enter on the same cycle
+                    just_exited_this_cycle = True
+
             # NOTE: SHORT positions are not supported in this LONG-only strategy
             # The backtest engine only tracks LONG positions (position=1 or position=0)
 
-            # Check for new entry signals (only if not in position)
-            if trade_state['position'] is None:
-                # For daily interval, only evaluate COMPLETED bars to prevent repainting
-                # The current bar (df.iloc[-1]) is still forming, use df.iloc[-2] for signals
+            # Initialize variables that may be used later (even if we skip signal checking)
+            should_check_signals = False
+            completed_bar_time = None
 
-                # Use Eastern Time for stock market hour checks (SPY closes at 4 PM ET)
+            # Check for new entry signals (only if not in position AND didn't just exit)
+            # CRITICAL: just_exited_this_cycle prevents flip-flopping where exit on opposite signal
+            # is immediately followed by entry on a buy signal from a previous bar
+            if trade_state.get('position') is None and not just_exited_this_cycle:
+                # CRITICAL: Only evaluate signals on COMPLETED bars to prevent repainting
+                # Use is_bar_complete() which knows when each asset type's bar closes:
+                #   - Stocks (SPY): 4:00 PM ET
+                #   - Futures (ES=F): 5:00 PM CT
+                #   - Crypto (BTC): 00:00 UTC
+
                 market_time = get_market_time()  # Returns Eastern Time
                 should_check_signals = False
+                completed_bar = None
+                completed_bar_time = None
+                bar_is_incomplete = False
 
                 if interval == "1d":
-                    # Get the last COMPLETED bar (not the current forming bar)
+                    # DAILY BARS: Check if the bar is complete based on asset's close time
                     if len(df) >= 2:
                         completed_bar = df.iloc[-2]
                         completed_bar_time = df.index[-2]
 
-                        # Check if we've already evaluated this bar (use safe timestamp comparison)
-                        if not timestamps_equal(completed_bar_time, last_signal_bar_evaluated):
-                            if is_crypto:
-                                # Crypto (BTC): Daily bar closes at 00:00 UTC
-                                # Only evaluate after new bar starts (wait 30 min buffer for data)
-                                utc_now = datetime.now(timezone.utc)
-                                utc_hour = utc_now.hour
-                                utc_minute = utc_now.minute
-                                # Check between 00:30 UTC and 23:59 UTC (avoid checking right at midnight)
-                                if utc_hour == 0 and utc_minute < 30:
-                                    print(f"   ⏳ [CRYPTO] Waiting for new daily bar to finalize (UTC: {utc_now.strftime('%H:%M')})")
-                                else:
-                                    should_check_signals = True
-                                    print(f"   📊 [CRYPTO] Evaluating completed bar: {completed_bar_time} (UTC: {utc_now.strftime('%H:%M')})")
+                        # Check if we've already evaluated this bar
+                        if timestamps_equal(completed_bar_time, last_signal_bar_evaluated):
+                            pass  # Already evaluated this bar
+                        # Check for holidays/weekends (stocks only)
+                        elif not is_crypto:
+                            is_holiday_today, holiday_name = is_market_holiday(market_time.date(), ticker)
+                            if is_holiday_today:
+                                print(f"   🏖️ [{ticker}] Market closed for {holiday_name}")
+                            elif market_time.weekday() >= 5:
+                                print(f"   📅 [{ticker}] Weekend - Market closed")
+                            elif is_bar_complete(ticker, interval):
+                                # Bar is complete - ready to generate signal
+                                should_check_signals = True
+                                market_type = get_ticker_market_type(ticker)
+                                mh_config = MARKET_HOURS_CONFIG.get(market_type, {})
+                                tz_name = mh_config.get('timezone', 'UTC').split('/')[-1]
+                                print(f"   📊 [{ticker}] Daily bar complete ({tz_name}) - evaluating: {completed_bar_time}")
                             else:
-                                # Stocks (SPY): Check for holidays first
-                                is_holiday_today, holiday_name = is_market_holiday(market_time.date(), ticker)
-                                if is_holiday_today:
-                                    print(f"   🏖️ [STOCK] Market closed for {holiday_name} - No new data expected")
-                                    # Don't check signals on holidays
-                                elif market_time.weekday() >= 5:
-                                    print(f"   📅 [STOCK] Weekend - Market closed")
-                                    # Don't check signals on weekends
-                                else:
-                                    # Stocks (SPY): Only evaluate after market close (4 PM ET = 16:00)
-                                    # market_time is already in Eastern Time via get_market_time()
-                                    et_hour = market_time.hour
-                                    if et_hour >= 16:
-                                        should_check_signals = True
-                                        print(f"   📊 [STOCK] Market closed ({market_time.strftime('%H:%M')} ET) - Evaluating completed bar: {completed_bar_time}")
-                                    else:
-                                        print(f"   ⏳ [STOCK] Market open ({market_time.strftime('%H:%M')} ET) - Waiting for 4 PM ET close to evaluate signals")
-                else:
-                    # For non-daily intervals (15m, 1h, etc.), check if last bar is complete
-                    # CRITICAL: Only generate signals on COMPLETED bars to prevent repainting
-                    bar_is_incomplete = is_last_bar_incomplete(df, interval, ticker)
-
-                    if bar_is_incomplete:
-                        # Last bar still forming - use second-to-last bar
-                        if len(df) >= 2:
-                            completed_bar = df.iloc[-2]
-                            completed_bar_time = df.index[-2]
-                            should_check_signals = True
-                            print(f"   ⏳ [INTRADAY] Current bar forming - using completed bar: {completed_bar_time}")
+                                # Bar not complete yet - waiting for close
+                                market_type = get_ticker_market_type(ticker)
+                                mh_config = MARKET_HOURS_CONFIG.get(market_type, {})
+                                close_time = mh_config.get('daily_bar_close', {'hour': 16, 'minute': 0})
+                                tz_name = mh_config.get('timezone', 'UTC').split('/')[-1]
+                                print(f"   ⏳ [{ticker}] Waiting for bar close ({close_time['hour']:02d}:{close_time['minute']:02d} {tz_name})")
                         else:
-                            print(f"   ⚠️ [INTRADAY] Not enough bars to evaluate")
-                            should_check_signals = False
-                    else:
-                        # Last bar is complete - use it
-                        completed_bar = df.iloc[-1]
-                        completed_bar_time = df.index[-1]
-                        should_check_signals = True
-                        print(f"   📊 [INTRADAY] Bar complete - evaluating: {completed_bar_time}")
+                            # Crypto - check if bar is complete (after midnight UTC)
+                            if is_bar_complete(ticker, interval):
+                                should_check_signals = True
+                                utc_now = datetime.now(timezone.utc)
+                                print(f"   📊 [{ticker}] Daily bar complete (UTC: {utc_now.strftime('%H:%M')}) - evaluating: {completed_bar_time}")
+                            else:
+                                utc_now = datetime.now(timezone.utc)
+                                print(f"   ⏳ [{ticker}] Waiting for daily bar close (00:00 UTC, now: {utc_now.strftime('%H:%M')})")
+                else:
+                    # INTRADAY BARS: Check if the last bar in the data is complete
+                    # Use the bar's start time to calculate when it closes
+                    if len(df) >= 1:
+                        last_bar_time = df.index[-1]
+                        bar_is_incomplete = not is_bar_complete(ticker, interval, last_bar_time)
+
+                        if bar_is_incomplete:
+                            # Last bar still forming - use second-to-last bar
+                            if len(df) >= 2:
+                                completed_bar = df.iloc[-2]
+                                completed_bar_time = df.index[-2]
+                                should_check_signals = True
+                                print(f"   ⏳ [{ticker}] Current bar forming - using completed bar: {completed_bar_time}")
+                            else:
+                                print(f"   ⚠️ [{ticker}] Not enough bars to evaluate")
+                        else:
+                            # Last bar is complete - use it
+                            completed_bar = df.iloc[-1]
+                            completed_bar_time = df.index[-1]
+                            should_check_signals = True
+                            print(f"   📊 [{ticker}] Bar complete - evaluating: {completed_bar_time}")
 
                 recent_buy_signal = None
                 recent_sell_signal = None
@@ -4752,12 +6781,6 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         if bar['sell_signal'] and recent_sell_signal is None:
                             recent_sell_signal = {'bar': bar, 'time': bar_time, 'index': -i}
 
-                # Log recent signals found
-                if recent_buy_signal and recent_buy_signal['index'] < -1:
-                    print(f"⚠️  Found missed BUY signal from {recent_buy_signal['time']}")
-                if recent_sell_signal and recent_sell_signal['index'] < -1:
-                    print(f"⚠️  Found missed SELL signal from {recent_sell_signal['time']}")
-
                 # Use most recent signal (prefer current bar, then recent bars)
                 # CRITICAL: Only consider buy signals if NOT already in a position
                 # CRITICAL: Only consider sell signals if IN a position
@@ -4765,15 +6788,32 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 effective_buy = recent_buy_signal is not None and not already_in_position
                 effective_sell = recent_sell_signal is not None and already_in_position
 
-                # Log if we're ignoring signals due to position state
-                if recent_buy_signal is not None and already_in_position:
-                    print(f"   ⏭️  Ignoring BUY signal from {recent_buy_signal['time']} (already in LONG position)")
-                if recent_sell_signal is not None and not already_in_position:
-                    print(f"   ⏭️  Ignoring SELL signal from {recent_sell_signal['time']} (no position to exit)")
+                # Log recent signals found - ONLY if they're actionable given our position state
+                # Don't warn about SELL signals when we have no position (not actionable)
+                # Don't warn about BUY signals when we're already in position (not actionable)
+                if recent_buy_signal and recent_buy_signal['index'] < -1 and not already_in_position:
+                    print(f"⚠️  Found missed BUY signal from {recent_buy_signal['time']}")
+                if recent_sell_signal and recent_sell_signal['index'] < -1 and already_in_position:
+                    print(f"⚠️  Found missed SELL signal from {recent_sell_signal['time']}")
 
                 # Avoid duplicate/stale signals
                 # Skip signals that are AT OR BEFORE the last processed signal time
                 last_signal_time = trade_state.get('last_signal_time')
+
+                # FALLBACK: If no last_signal_time, use latest timestamp from locked_backtest
+                # This prevents re-processing old signals that are already in locked_backtest
+                if not last_signal_time and locked_backtest:
+                    latest_entry = locked_backtest.get('entries', [])[-1] if locked_backtest.get('entries') else None
+                    latest_exit = locked_backtest.get('exits', [])[-1] if locked_backtest.get('exits') else None
+                    fallback_times = []
+                    if latest_entry:
+                        fallback_times.append(pd.to_datetime(latest_entry['date']))
+                    if latest_exit:
+                        fallback_times.append(pd.to_datetime(latest_exit['date']))
+                    if fallback_times:
+                        last_signal_time = str(max(fallback_times))
+                        print(f"   ℹ️  Using locked_backtest fallback: last_signal_time = {last_signal_time}")
+
                 if last_signal_time:
                     last_signal_dt = normalize_tz(pd.to_datetime(last_signal_time))
                     if recent_buy_signal:
@@ -4792,20 +6832,65 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
                 if effective_buy:
                     signal_bar = recent_buy_signal['bar']
-                    signal_time = recent_buy_signal['time']
-                    is_missed = recent_buy_signal['index'] < -1
-                    signal_note = f" (Signal from {signal_time} - entering at market)" if is_missed else ""
+                    signal_time_utc = recent_buy_signal['time']  # Bar start time in UTC
+                    is_delayed = recent_buy_signal['index'] < -1
+
+                    # Calculate bar close time (when signal fires and entry happens)
+                    interval_minutes = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440}.get(interval, 15)
+                    bar_close_time = pd.to_datetime(signal_time_utc) + pd.Timedelta(minutes=interval_minutes)
+
+                    # Convert bar CLOSE time to display format
+                    # Show BOTH UTC and Chicago time for clarity (especially for daily bars where midnight UTC = 6 PM CT)
+                    try:
+                        bar_close_utc = pd.to_datetime(bar_close_time).tz_localize('UTC') if bar_close_time.tzinfo is None else pd.to_datetime(bar_close_time).tz_convert('UTC')
+                        signal_ct = to_chicago_time(bar_close_time)
+                        utc_str = bar_close_utc.strftime('%Y-%m-%d %H:%M UTC')
+                        ct_str = signal_ct.strftime('%Y-%m-%d %I:%M %p CT') if signal_ct else ''
+                        signal_time_display = f"{utc_str} ({ct_str})" if ct_str else utc_str
+                    except Exception:
+                        signal_time_display = str(bar_close_time)[:16]
+
+                    signal_note = f" (Signal from {signal_time_display} - entering at market)" if is_delayed else ""
 
                     # Append new entry to locked backtest (for future charts)
-                    # Pass missed=True if signal was from a past bar
-                    append_to_locked_backtest(
-                        entry={'date': signal_time, 'price': current_price, 'position': 'long'},
-                        strategy_name=strategy_name, ticker=ticker, missed=is_missed
+                    # IMPORTANT: Use bar CLOSE time - entry happens when bar closes, not at bar start
+                    # Live trading signals are NEVER missed - we're acting on them!
+                    # CRITICAL: Check return value - if False, DON'T send Discord or update trade_state
+                    # This prevents desync between locked_backtest and trade_state
+                    append_success = append_to_locked_backtest(
+                        entry={'date': bar_close_time, 'price': current_price, 'position': 'long'},
+                        strategy_name=strategy_name, ticker=ticker, missed=False
                     )
+                    if not append_success:
+                        print(f"   ❌ ENTRY SIGNAL REJECTED by locked_backtest - NOT sending Discord or updating trade_state")
+                        print(f"   ❌ This prevents desync. Waiting for next cycle...")
+                        continue  # Skip Discord, trade_state update, and wait for next cycle
+
                     # Reload the locked backtest with the new entry
                     locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
 
-                    # Run backtest to get stats for the signal alert
+                    # IMMEDIATE ALERT: Send quick text notification FIRST before slow chart generation
+                    # This ensures traders get the signal within seconds of bar close
+                    entry_sl_price_quick = current_price * (1 - stop_loss_pct / 100)
+                    entry_tp_price_quick = current_price * (1 + take_profit_pct / 100)
+
+                    # Use consistent position status (respect is_delayed like the full message does)
+                    quick_position_status = "🟢 **Position: LONG**" if not is_delayed else "🟡 **Position: LONG** (late entry)"
+
+                    quick_buy_msg = (
+                        f"@here\n"
+                        f"📈 **[{strategy_label}] BUY SIGNAL**{signal_note}\n"
+                        f"**Signal Time:** {signal_time_display}\n"
+                        f"**Entry Price:** ${current_price:,.2f}\n"
+                        f"{quick_position_status}\n"
+                        f"---\n"
+                        f"_SL: {stop_loss_pct:.1f}% (${entry_sl_price_quick:,.2f}) | TP: {take_profit_pct:.1f}% (${entry_tp_price_quick:,.2f})_\n"
+                        f"_Chart and stats loading..._"
+                    )
+                    send_discord_alert(webhook_url, quick_buy_msg, strategy_name=strategy_name)
+                    print(f"⚡ IMMEDIATE BUY ALERT SENT!{signal_note}")
+
+                    # Now generate chart and stats (can be slow for large backtests)
                     signal_backtest = None
                     signal_chart = None
                     try:
@@ -4829,7 +6914,9 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         )
 
                     # Build position status line
-                    position_status = "🟢 **Position: LONG**" if not is_missed else "🟡 **Position: LONG** (late entry)"
+                    # Live trading signals are never "missed" - we're acting on them in real time
+                    # is_delayed means signal came from a past bar (still valid, just entering late)
+                    position_status = "🟢 **Position: LONG**" if not is_delayed else "🟡 **Position: LONG** (late entry)"
 
                     # Calculate SL/TP prices
                     entry_sl_price = current_price * (1 - stop_loss_pct / 100)
@@ -4838,7 +6925,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     buy_msg = (
                         f"@here\n"
                         f"📈 **[{strategy_label}] BUY SIGNAL**{signal_note}\n"
-                        f"**Signal Time:** {signal_time}\n"
+                        f"**Signal Time:** {signal_time_display}\n"
                         f"**Entry Price:** ${current_price:,.2f}\n"
                         f"{position_status}\n"
                         f"{stats_section}"
@@ -4864,7 +6951,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                                 direction="LONG",
                                 ticker=ticker,
                                 price=current_price,
-                                signal_time=signal_time,
+                                signal_time=bar_close_time,  # Use bar close time (when signal fires)
                                 strategy_name=strategy_name,
                                 config=config
                             )
@@ -4875,9 +6962,9 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
                     trade_state['position'] = 'long'
                     trade_state['entry_price'] = current_price
-                    trade_state['entry_time'] = str(current_time)
-                    trade_state['entry_signal_bar'] = str(signal_time)  # Lock the signal bar for charts
-                    trade_state['last_signal_time'] = str(signal_time)
+                    trade_state['entry_time'] = to_chicago_str(bar_close_time)  # Bar close time (Chicago)
+                    trade_state['entry_signal_bar'] = to_chicago_str(signal_time_utc)  # Bar start time (Chicago)
+                    trade_state['last_signal_time'] = to_chicago_str(bar_close_time)  # Use bar close for deduplication
                     save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
 
                 elif effective_sell:
@@ -4886,14 +6973,120 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     signal_time = recent_sell_signal['time']
                     print(f"   ℹ️  Sell signal on {signal_time} ignored (LONG-only strategy, no position)")
                     # Update last_signal_time to avoid re-processing
-                    trade_state['last_signal_time'] = str(signal_time)
+                    trade_state['last_signal_time'] = to_chicago_str(signal_time)
                     save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
+
+            # --- BAR CLOSE STATUS UPDATE (Intraday Only) ---
+            # Post a status update every bar close for intraday strategies
+            # This helps monitor the trader and catch issues early
+            if is_intraday and should_check_signals and completed_bar_time is not None:
+                # Check if we already posted for this bar
+                completed_bar_str = str(completed_bar_time)
+                if last_bar_update_time != completed_bar_str:
+                    # Only post if no entry/exit happened this cycle (those have their own alerts)
+                    if not effective_buy and not (trade_state.get('position') and just_exited_this_cycle):
+                        try:
+                            # Get oscillator zone description
+                            osc_val = completed_bar.get('osc_smooth', 0) if completed_bar is not None else 0
+                            vel_val = completed_bar.get('velocity', 0) if completed_bar is not None else 0
+
+                            if osc_val < config.get('oversold_threshold', -0.3):
+                                zone_desc = "OVERSOLD 📉"
+                            elif osc_val > config.get('overbought_threshold', 0.3):
+                                zone_desc = "OVERBOUGHT 📈"
+                            else:
+                                zone_desc = "Neutral"
+
+                            # Position status
+                            position_str = trade_state.get('position', 'None')
+                            if position_str and position_str.lower() != 'none':
+                                entry_price = trade_state.get('entry_price', 0)
+                                if entry_price and current_price:
+                                    unrealized_pnl = ((current_price - entry_price) / entry_price) * 100
+                                    pos_status = f"LONG @ ${entry_price:.2f} ({unrealized_pnl:+.2f}%)"
+                                else:
+                                    pos_status = "LONG"
+                            else:
+                                pos_status = "Flat (no position)"
+
+                            # Signal status
+                            buy_sig = completed_bar.get('buy_signal', False) if completed_bar is not None else False
+                            sell_sig = completed_bar.get('sell_signal', False) if completed_bar is not None else False
+                            if buy_sig:
+                                sig_status = "✅ BUY signal present"
+                            elif sell_sig:
+                                sig_status = "🔴 SELL signal present"
+                            else:
+                                sig_status = "No signal"
+
+                            # Format bar time in Chicago timezone for display
+                            try:
+                                bar_ct = to_chicago_time(completed_bar_time)
+                                bar_time_display = bar_ct.strftime('%H:%M CT') if bar_ct else str(completed_bar_time)[-8:-3]
+                            except:
+                                bar_time_display = str(completed_bar_time)[-8:-3]
+
+                            # Build status message
+                            bar_update_msg = (
+                                f"📊 **[{strategy_label}] Bar Close Update** ({bar_time_display})\n"
+                                f"**Price:** ${current_price:,.2f}\n"
+                                f"**Oscillator:** {osc_val:+.4f} ({zone_desc})\n"
+                                f"**Velocity:** {vel_val:+.5f}\n"
+                                f"**Position:** {pos_status}\n"
+                                f"**Signal:** {sig_status}"
+                            )
+
+                            send_discord_alert(webhook_url, bar_update_msg, strategy_name=strategy_name)
+                            print(f"   📊 Bar close update sent for {completed_bar_str}")
+                        except Exception as e:
+                            print(f"   ⚠️ Failed to send bar close update: {e}")
+
+                        # Update tracker regardless of success/failure to prevent spam
+                        last_bar_update_time = completed_bar_str
 
             # Persist daily alerts to survive restarts
             save_daily_alerts(daily_alerts)
 
-            print(f"⏳ [{strategy_label} | {strategy_name}] Next check in {check_interval_seconds // 60} min")
-            time.sleep(check_interval_seconds)
+            # Smart scheduling: sleep until next bar close + buffer
+            # This minimizes delay between signal generation and notification
+            seconds_to_wait = seconds_until_next_bar_close(ticker, interval)
+            buffer_seconds = 5  # Small buffer to ensure bar data is available
+            total_wait = seconds_to_wait + buffer_seconds
+
+            # Safety cap based on interval:
+            # - Daily bars: cap at 25 hours (allows for timezone edge cases)
+            # - Intraday: cap at 2 hours (in case of calculation issues)
+            if interval == '1d':
+                max_wait = 90000  # 25 hours
+            else:
+                max_wait = 7200   # 2 hours
+            total_wait = min(total_wait, max_wait)
+
+            # Display wait time in appropriate units
+            if total_wait >= 3600:
+                hours = total_wait // 3600
+                mins = (total_wait % 3600) // 60
+                print(f"⏳ [{strategy_label} | {strategy_name}] Next bar closes in {hours}h {mins}m")
+            elif total_wait >= 60:
+                print(f"⏳ [{strategy_label} | {strategy_name}] Next bar closes in {total_wait // 60}m {total_wait % 60}s")
+            else:
+                print(f"⏳ [{strategy_label} | {strategy_name}] Next bar closes in {total_wait}s")
+
+            # CRITICAL FIX: Don't sleep for the entire duration at once!
+            # For daily strategies, this could be hours - we need to wake up
+            # periodically to check for scheduled status updates.
+            # Sleep in chunks of check_interval_seconds to allow scheduled updates.
+            time_slept = 0
+            while time_slept < total_wait:
+                sleep_chunk = min(check_interval_seconds, total_wait - time_slept)
+                time.sleep(sleep_chunk)
+                time_slept += sleep_chunk
+
+                # Break out of wait loop to run the main cycle again
+                # This allows scheduled updates to be checked
+                # Only break early for daily strategies where wait is long
+                if interval == '1d' and total_wait > 600:
+                    break  # Go back to main loop to check scheduled updates
 
         except KeyboardInterrupt:
             print("\n\nShutting down...")
