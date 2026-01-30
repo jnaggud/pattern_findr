@@ -328,6 +328,26 @@ class DataPipeline:
         if df.empty:
             return True, {'message': 'No new bars', 'new_bars': 0}
 
+        # CRITICAL: Exclude today's incomplete bar for daily intervals
+        # Today's bar is still forming and may have wrong OHLC values
+        # that will corrupt the database when stored with INSERT OR REPLACE
+        if self.interval in ['1d', '1wk', '1mo']:
+            today = pd.Timestamp.now(tz='UTC').normalize()
+            if df.index.tz is None:
+                today = today.tz_localize(None)
+            elif df.index.tz != today.tz:
+                today = today.tz_convert(df.index.tz)
+
+            # Filter out today's bar
+            df_filtered = df[df.index < today]
+            if len(df_filtered) < len(df):
+                excluded = len(df) - len(df_filtered)
+                print(f"   ⚠️ Excluded {excluded} incomplete daily bar(s) (today's data)")
+            df = df_filtered
+
+            if df.empty:
+                return True, {'message': 'No completed bars to store', 'new_bars': 0}
+
         # Store new bars
         bars_stored = self._store_bars(df, source='live')
 
@@ -921,9 +941,9 @@ class DataPipeline:
         """
         Fetch recent data from yfinance for incremental updates.
 
-        Uses period='2d' to ensure we capture bars across midnight boundary.
-        The '1d' period only fetches the current calendar day, which causes
-        the 23:45 bar to be lost when crossing midnight (never fetched again).
+        Period selection by interval:
+        - Daily (1d): Use '7d' to ensure we capture gaps over weekends/holidays
+        - Intraday: Use '2d' to capture bars across midnight boundary
 
         Includes caching to prevent excessive API calls (max once per 30s).
         """
@@ -940,11 +960,18 @@ class DataPipeline:
             return self._last_api_fetch_result.copy() if self._last_api_fetch_result is not None else None
 
         try:
-            # Use period='2d' to ensure overlap across midnight boundary
-            # Previously period='1d' caused 23:45 bars to be lost at midnight
+            # Period selection:
+            # - Daily bars: Use '7d' to ensure we capture gaps over weekends/holidays
+            #   (2d was causing missed bars when updates were skipped)
+            # - Intraday: Use '2d' to capture bars across midnight boundary
+            if self.interval in ['1d', '1wk', '1mo']:
+                fetch_period = '7d'
+            else:
+                fetch_period = '2d'
+
             df = yf.download(
                 self.ticker,
-                period='2d',
+                period=fetch_period,
                 interval=self.interval,
                 progress=False
             )

@@ -317,16 +317,15 @@ def fetch_realtime_price(ticker: str) -> Optional[float]:
     if is_futures_ticker(ticker) and is_weekend:
         return None
 
-    # For futures, try Databento first
-    if is_futures_ticker(ticker) and HAS_DATABENTO:
-        try:
-            price = _fetch_realtime_databento(ticker)
-            if price is not None:
-                return price
-        except Exception:
-            pass
+    databento_price = None
+    yfinance_price = None
 
-    # Fallback to yfinance (suppress "possibly delisted" warnings)
+    # CRITICAL FIX: Use yfinance as PRIMARY source for realtime prices
+    # Databento continuous contracts (ES.n.0, ES.c.0) may differ from yfinance ES=F
+    # by several dollars, causing incorrect SL/TP calculations.
+    # yfinance matches TradingView which is what traders expect.
+
+    # Get yfinance price first (primary source - matches TradingView)
     if HAS_YFINANCE:
         try:
             # Temporarily suppress yfinance warnings to stderr
@@ -339,10 +338,27 @@ def fetch_realtime_price(ticker: str) -> Optional[float]:
                 sys.stderr = old_stderr
 
             if not data.empty:
-                return float(data['Close'].iloc[-1])
+                yfinance_price = float(data['Close'].iloc[-1])
+            else:
+                print(f"   ⚠️ yfinance returned empty data for {ticker} realtime price")
+        except Exception as e:
+            print(f"   ⚠️ yfinance realtime price failed for {ticker}: {e}")
+
+    # If yfinance succeeded, use it
+    if yfinance_price is not None:
+        return yfinance_price
+
+    # Fallback to Databento only if yfinance failed
+    if is_futures_ticker(ticker) and HAS_DATABENTO:
+        try:
+            databento_price = _fetch_realtime_databento(ticker)
+            if databento_price is not None:
+                print(f"   ⚠️ Using Databento fallback price: ${databento_price:.2f}")
+                return databento_price
         except Exception:
             pass
 
+    print(f"   ⚠️ fetch_realtime_price returning None for {ticker}")
     return None
 
 
@@ -361,10 +377,11 @@ def _fetch_realtime_databento(ticker: str) -> Optional[float]:
         # Get last 5 minutes of data
         base_symbol = ticker.replace('=F', '')
 
-        # Use .n.0 (open interest roll) for COMEX metals, .c.0 for others
+        # Use .c.1 (second month calendar roll) for COMEX metals to match yfinance pricing
+        # The .n.0 (open interest roll) tracks a different contract that doesn't match yfinance
         COMEX_METALS = ['GC', 'SI', 'HG', 'PL', 'PA']
         if base_symbol in COMEX_METALS:
-            symbol = f"{base_symbol}.n.0"
+            symbol = f"{base_symbol}.c.1"
         else:
             symbol = f"{base_symbol}.c.0"
 
