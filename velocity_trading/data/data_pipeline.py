@@ -301,10 +301,31 @@ class DataPipeline:
             raw_df = self._fetch_recent_yfinance()
             df, source_used = filter_and_validate(raw_df, 'yfinance')
 
-        # Try Databento for other futures or as fallback
+        # Try Databento Live for other futures or as fallback
         if df is None and self.is_futures and HAS_DATABENTO and DATABENTO_API_KEY and not skip_databento:
             raw_df = self._fetch_live_databento(lookback_minutes=max(120, int(gap_minutes) + 30))
             df, source_used = filter_and_validate(raw_df, 'databento')
+
+        # If gap is large (e.g., over a weekend) and Live API didn't work,
+        # try Databento Historical API for backfill
+        if df is None and self.is_futures and HAS_DATABENTO and DATABENTO_API_KEY and gap_minutes > 720:
+            # Gap > 12 hours - use Historical API
+            gap_days = max(3, int(gap_minutes / 1440) + 1)  # At least 3 days
+            print(f"   📊 Backfilling {gap_days} days via Databento Historical...")
+            raw_df = self._fetch_historical_databento(days=gap_days)
+            if raw_df is not None and not raw_df.empty:
+                # Filter to new bars only
+                compare_ts = last_timestamp
+                if raw_df.index.tz is None and compare_ts.tzinfo is not None:
+                    compare_ts = compare_ts.replace(tzinfo=None)
+                elif raw_df.index.tz is not None and compare_ts.tzinfo is None:
+                    compare_ts = compare_ts.tz_localize(raw_df.index.tz)
+                df = raw_df[raw_df.index > compare_ts]
+                if not df.empty:
+                    source_used = 'databento-historical'
+                    print(f"   ✓ Backfilled {len(df)} bars via Databento Historical")
+                else:
+                    df = None
 
         # Final fallback to yfinance if nothing worked yet
         if df is None and HAS_YFINANCE:
@@ -366,18 +387,12 @@ class DataPipeline:
 
     def _is_data_valid(self, df: pd.DataFrame, last_known_price: float, max_gap_pct: float = 2.0) -> bool:
         """
-        Check if new data is valid by comparing to last known price AND real-time quote.
+        Check if new data is valid.
 
-        Detects:
-        - Large price gaps (> max_gap_pct) that indicate bad data
-        - Data that doesn't match current real-time quote (off by > 0.5%)
-        - Bars where Open=High with large range (bad aggregation)
-        - All bars have same OHLC (placeholder data)
+        For commodity futures (GC, SI, CL, etc.) and crypto, only reject true placeholder data.
+        These markets are volatile and yfinance quotes are often stale/broken.
 
-        Args:
-            df: New data to validate
-            last_known_price: Last close price from database
-            max_gap_pct: Maximum allowed price gap percentage
+        For other tickers, apply stricter validation.
 
         Returns:
             True if data looks valid, False if suspicious
@@ -394,21 +409,42 @@ class DataPipeline:
         if close_col not in df.columns:
             return True  # Can't validate
 
-        # Check 1: Compare latest bar to real-time quote (most reliable check)
-        # Use 1.0% threshold - relaxed to allow for normal market movement
-        # The previous 0.3% was too tight and caused valid data to be rejected
-        # during volatile periods, leading to delayed signals.
-        # 1.0% of $6000 ES = $60, reasonable tolerance for intraday movement
-        # 1.0% of $2700 GC = $27, reasonable tolerance for gold futures
+        # Tickers that skip strict validation (volatile markets, unreliable yfinance quotes)
+        SKIP_STRICT_VALIDATION = [
+            # CME Futures (all use Databento, yfinance quotes unreliable)
+            'ES=F', 'NQ=F', 'YM=F', 'RTY=F',  # Index futures
+            'GC=F', 'SI=F', 'HG=F',            # Metals
+            'CL=F', 'NG=F',                    # Energy
+            'ZB=F', 'ZN=F',                    # Treasuries
+            # Crypto (24/7, volatile)
+            'BTC-USD', 'ETH-USD', 'SOL-USD',
+        ]
+
+        # For volatile tickers: only check for TRUE placeholder data
+        if self.ticker in SKIP_STRICT_VALIDATION:
+            # Check: All bars have identical OHLC (placeholder data)
+            if all(col in df.columns for col in [open_col, high_col, low_col, close_col]):
+                all_same = (
+                    (df[open_col] == df[high_col]) &
+                    (df[high_col] == df[low_col]) &
+                    (df[low_col] == df[close_col])
+                )
+                if all_same.all() and len(df) > 1:
+                    print(f"   All bars have identical OHLC (placeholder data)")
+                    return False
+            return True  # Accept the data
+
+        # For other tickers: apply stricter validation
+        # Check 1: Compare to yfinance quote
         realtime_price = self._get_realtime_quote()
         if realtime_price is not None:
             latest_close = df[close_col].iloc[-1]
             quote_gap_pct = abs(latest_close - realtime_price) / realtime_price * 100
-            if quote_gap_pct > 1.0:  # More than 1.0% off from real-time quote
+            if quote_gap_pct > 1.0:
                 print(f"   ⚠️ Data doesn't match yfinance quote: ${latest_close:.2f} vs ${realtime_price:.2f} ({quote_gap_pct:.2f}% off)")
                 return False
 
-        # Check 2: First bar's price shouldn't be too far from last known
+        # Check 2: Price gap from last known
         if last_known_price is not None:
             first_close = df[close_col].iloc[0]
             gap_pct = abs(first_close - last_known_price) / last_known_price * 100
@@ -416,17 +452,7 @@ class DataPipeline:
                 print(f"   Price gap too large: {last_known_price:.2f} -> {first_close:.2f} ({gap_pct:.1f}%)")
                 return False
 
-        # Check 3: Look for bars where Open=High with large range (bad aggregation)
-        if all(col in df.columns for col in [open_col, high_col, low_col]):
-            bad_bars = (
-                (df[open_col] == df[high_col]) &
-                ((df[high_col] - df[low_col]) / df[low_col] * 100 > 0.5)
-            )
-            if bad_bars.sum() > len(df) * 0.3:  # More than 30% bad bars
-                print(f"   Too many bars with Open=High: {bad_bars.sum()}/{len(df)}")
-                return False
-
-        # Check 4: All bars identical (placeholder data)
+        # Check 3: All bars identical close (placeholder)
         if df[close_col].nunique() == 1 and len(df) > 3:
             print(f"   All bars have identical close price (placeholder data)")
             return False
@@ -461,6 +487,10 @@ class DataPipeline:
         Returns:
             DataFrame with OHLCV data, index is datetime
         """
+        # First, detect and fill any internal gaps (e.g., missing weekend bars)
+        if self.is_futures and HAS_DATABENTO and DATABENTO_API_KEY:
+            self._detect_and_fill_internal_gaps()
+
         with self._get_conn() as conn:
             query = f'''
                 SELECT timestamp, open, high, low, close, volume
@@ -485,6 +515,111 @@ class DataPipeline:
             df = self._add_synthetic_bar_if_needed(df)
 
         return df
+
+    def _detect_and_fill_internal_gaps(self):
+        """
+        Detect and fill internal gaps in OHLCV data.
+
+        This handles cases where:
+        - Historical data ends Friday
+        - Live API fetches Monday's data
+        - But Sunday evening bars (when CME reopens) are missing
+
+        For CME futures, markets reopen Sunday 5 PM CT (23:00 UTC).
+        """
+        # Get recent bars to check for gaps
+        with self._get_conn() as conn:
+            # Get last 500 bars to check for gaps
+            df = pd.read_sql_query(
+                '''SELECT timestamp FROM ohlcv ORDER BY timestamp DESC LIMIT 500''',
+                conn
+            )
+
+        if df.empty or len(df) < 2:
+            return
+
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df = df.sort_values('timestamp')
+        timestamps = df['timestamp'].tolist()
+
+        # Calculate expected gap between bars
+        interval_minutes = self._get_interval_minutes()
+        # Allow up to 3x interval for minor gaps (e.g., daily maintenance window)
+        # For CME futures, the daily break is 4-5 PM CT = 1 hour
+        # Weekend gap is ~60 hours (Fri 5PM to Sun 5PM CT)
+        max_normal_gap_minutes = interval_minutes * 4  # 4x interval = about 1 hour for 15m
+
+        # Check for large gaps
+        gaps_found = []
+        for i in range(1, len(timestamps)):
+            gap = (timestamps[i] - timestamps[i-1]).total_seconds() / 60
+            if gap > max_normal_gap_minutes:
+                # Check if this is a weekend gap that should have Sunday evening bars
+                prev_ts = timestamps[i-1]
+                next_ts = timestamps[i]
+
+                # Weekend check: Friday to Monday gap
+                prev_weekday = prev_ts.weekday()  # 0=Mon, 4=Fri
+                next_weekday = next_ts.weekday()
+
+                # If gap spans Fri->Mon, CME reopens Sunday 5 PM CT
+                # That's ~2040 minutes (34 hours) from Friday close to Sunday reopen
+                # Plus Sunday evening to Monday = ~2880+ total minutes
+                if prev_weekday == 4 and next_weekday == 0:  # Fri -> Mon
+                    # This is a weekend gap - should have Sunday evening bars
+                    gaps_found.append({
+                        'start': prev_ts,
+                        'end': next_ts,
+                        'gap_minutes': gap,
+                        'is_weekend': True
+                    })
+                elif gap > 720:  # 12+ hour gap that's not explained
+                    gaps_found.append({
+                        'start': prev_ts,
+                        'end': next_ts,
+                        'gap_minutes': gap,
+                        'is_weekend': False
+                    })
+
+        if not gaps_found:
+            return
+
+        # Fill the gaps using Databento Historical
+        for gap in gaps_found:
+            print(f"   📊 Detected {gap['gap_minutes']:.0f} min gap: {gap['start']} -> {gap['end']}")
+
+            # Calculate how many days to fetch
+            gap_days = max(3, int(gap['gap_minutes'] / 1440) + 1)
+
+            try:
+                raw_df = self._fetch_historical_databento(days=gap_days)
+                if raw_df is not None and not raw_df.empty:
+                    # Filter to bars within the gap
+                    start_ts = gap['start']
+                    end_ts = gap['end']
+
+                    # Handle timezone
+                    if raw_df.index.tz is None:
+                        if start_ts.tzinfo is not None:
+                            start_ts = start_ts.replace(tzinfo=None)
+                        if end_ts.tzinfo is not None:
+                            end_ts = end_ts.replace(tzinfo=None)
+                    else:
+                        if start_ts.tzinfo is None:
+                            start_ts = start_ts.tz_localize(raw_df.index.tz)
+                        if end_ts.tzinfo is None:
+                            end_ts = end_ts.tz_localize(raw_df.index.tz)
+
+                    gap_bars = raw_df[(raw_df.index > start_ts) & (raw_df.index < end_ts)]
+
+                    if not gap_bars.empty:
+                        bars_stored = self._store_bars(gap_bars, source='gap-fill')
+                        print(f"   ✓ Filled gap with {bars_stored} bars")
+                    else:
+                        print(f"   ⚠️ No bars available for gap period")
+
+            except Exception as e:
+                print(f"   ⚠️ Failed to fill gap: {e}")
 
     def _add_synthetic_bar_if_needed(self, df: pd.DataFrame, max_age_minutes: int = 30) -> pd.DataFrame:
         """

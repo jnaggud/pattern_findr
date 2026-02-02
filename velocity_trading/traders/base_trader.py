@@ -78,7 +78,10 @@ class BaseTrader(ABC):
         self.webhook_url = webhook_url
         self.config = config or {}
 
-        # Initialize position manager (SQLite-backed)
+        # Auto-backup the strategy bundle config on startup (daily)
+        self._backup_config_if_needed()
+
+        # Initialize position manager (SQLite-backed, with daily auto-backup)
         self.pm = PositionManager(strategy_name)
 
         # CRITICAL: Validate required config parameters - NO DEFAULTS
@@ -138,6 +141,36 @@ class BaseTrader(ABC):
         # Data pipeline for incremental updates (Historical + Live API)
         self.pipeline = DataPipeline(ticker, interval)
         self._pipeline_initialized = False
+
+    # Class-level tracking of daily config backups
+    _config_backups_done = {}
+
+    def _backup_config_if_needed(self):
+        """
+        Backup strategy bundle config once per day on startup.
+
+        This ensures we always have a backup of the config before any trading.
+        """
+        from datetime import date
+        today = date.today().isoformat()
+        backup_key = f"{self.strategy_name}_{today}"
+
+        # Check if we've already backed up today
+        if backup_key in BaseTrader._config_backups_done:
+            return
+
+        # Find and backup the strategy bundle config
+        bundle_path = os.path.join(PARENT_DIR, 'velocity_strategies', self.strategy_name)
+        config_path = os.path.join(bundle_path, 'velocity_config.json')
+
+        if os.path.exists(config_path):
+            try:
+                from ..core.backup import backup_config
+                backup_path = backup_config(config_path, reason=f"startup_{today}")
+                if backup_path:
+                    BaseTrader._config_backups_done[backup_key] = backup_path
+            except Exception as e:
+                print(f"   ⚠️  Config backup warning: {e}")
 
     @property
     @abstractmethod
@@ -691,21 +724,46 @@ class BaseTrader(ABC):
 
         # Signal-based exits (only if no SL/TP/Accel and in signal window)
         elif self.is_signal_window():
-            completed_bar, bar_time = self.get_completed_bar(df)
-            if completed_bar is not None:
-                # Check for opposite signal
-                if completed_bar.get('sell_signal', False):
-                    exit_price = completed_bar['Close']
-                    # Recalculate P&L using actual bar close price (not realtime)
-                    bar_pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                    exit_reason = f"Opposite Signal ({bar_pnl_pct:.2f}%)"
-                    # Use bar CLOSE time (not start time) so timestamp matches when signal was actionable
-                    # For intraday bars: add interval to get close time
-                    # For daily bars: keep as-is (date represents the trading day)
-                    if self.interval in ['1d', '1wk', '1mo']:
-                        signal_bar_time = bar_time
+            # CRITICAL FIX: Check ALL bars since position entry for missed exit signals
+            # Previously only checked the most recent completed bar, missing signals that
+            # fired during weekends, gaps, or when trader wasn't running.
+            entry_date = pd.to_datetime(position.entry_date)
+            if entry_date.tzinfo is None:
+                entry_date = entry_date.tz_localize('UTC')
+
+            # Find bars after position entry
+            df_since_entry = df[df.index >= entry_date]
+
+            # Determine which signal to look for based on position type
+            is_long = position.position_type.lower() == 'long'
+            signal_col = 'sell_signal' if is_long else 'buy_signal'
+
+            # Check for any opposite signal since entry
+            if signal_col in df_since_entry.columns:
+                opposite_signals = df_since_entry[df_since_entry[signal_col] == True]
+
+                if not opposite_signals.empty:
+                    # Use the FIRST opposite signal after entry (exit at earliest opportunity)
+                    first_signal = opposite_signals.iloc[0]
+                    first_signal_time = opposite_signals.index[0]
+
+                    exit_price = first_signal['Close']
+
+                    # Calculate P&L based on position type
+                    if is_long:
+                        bar_pnl_pct = ((exit_price - entry_price) / entry_price) * 100
                     else:
-                        signal_bar_time = bar_time + timedelta(minutes=self._get_interval_minutes())
+                        bar_pnl_pct = ((entry_price - exit_price) / entry_price) * 100
+
+                    exit_reason = f"Opposite Signal ({bar_pnl_pct:.2f}%)"
+
+                    # Use bar CLOSE time
+                    if self.interval in ['1d', '1wk', '1mo']:
+                        signal_bar_time = first_signal_time
+                    else:
+                        signal_bar_time = first_signal_time + timedelta(minutes=self._get_interval_minutes())
+
+                    print(f"   📍 Found missed {signal_col} at {first_signal_time}")
 
         # Execute exit if triggered
         if exit_reason:
@@ -729,19 +787,36 @@ class BaseTrader(ABC):
         if self.last_signal_time and signal_time_str <= self.last_signal_time:
             return
 
-        # Get current price for entry
-        current_price = fetch_realtime_price(self.ticker)
-        if current_price is None:
-            current_price = completed_bar['Close']
+        # CRITICAL FIX: Entry happens on the NEXT bar after signal bar
+        #
+        # For DAILY bars:
+        #   - Signal bar (Jan 29) closes at midnight UTC
+        #   - Signal detected 1 second after midnight = we're now on Jan 30
+        #   - Entry happens on Jan 30 at realtime price
+        #   - entry_date = Jan 30 (execution day), NOT Jan 29 (signal day)
+        #   - entry_price = realtime price (actual execution)
+        #
+        # For INTRADAY bars:
+        #   - Signal and entry happen within seconds, same bar timing applies
+        #   - entry_date = bar close time
+        #   - entry_price = realtime price
 
-        # Execute entry - use bar CLOSE time (not start time) so timestamp matches when signal was actionable
-        # For intraday bars: add interval to get close time (e.g., 16:00 + 15min = 16:15)
-        # For daily bars: keep as-is (date represents the trading day)
+        entry_price = fetch_realtime_price(self.ticker)
+        if entry_price is None:
+            entry_price = completed_bar['Close']
+
         if self.interval in ['1d', '1wk', '1mo']:
-            bar_close_time = bar_time  # Daily bars keep their date
+            # Daily bars: Entry is on the NEXT day (today), not the signal bar
+            # Signal bar closed at midnight, we're now on the next day
+            from ..data.market_hours import get_current_market_time
+            now = get_current_market_time(self.ticker)
+            # Use today's date at 00:00:00 as entry_date (the execution bar)
+            entry_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
         else:
-            bar_close_time = bar_time + timedelta(minutes=self._get_interval_minutes())
-        self._execute_entry(current_price, bar_close_time)
+            # Intraday bars: Use bar close time (signal and execution are same bar context)
+            entry_time = bar_time + timedelta(minutes=self._get_interval_minutes())
+
+        self._execute_entry(entry_price, entry_time)
         self.last_signal_time = signal_time_str
 
     def _execute_entry(self, entry_price: float, signal_time: datetime):
