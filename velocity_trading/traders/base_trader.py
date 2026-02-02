@@ -731,8 +731,9 @@ class BaseTrader(ABC):
             if entry_date.tzinfo is None:
                 entry_date = entry_date.tz_localize('UTC')
 
-            # Find bars after position entry
-            df_since_entry = df[df.index >= entry_date]
+            # Find bars AFTER position entry (use > not >= to exclude entry bar)
+            # Entry bar cannot have exit signal - that would be same-bar exit
+            df_since_entry = df[df.index > entry_date]
 
             # Determine which signal to look for based on position type
             is_long = position.position_type.lower() == 'long'
@@ -767,6 +768,13 @@ class BaseTrader(ABC):
 
         # Execute exit if triggered
         if exit_reason:
+            # CRITICAL: Re-verify position still exists before exiting
+            # Another process might have exited/cleared the position while we were processing
+            current_pos = self.pm.get_current_position()
+            if current_pos is None:
+                print(f"   ⚠️ Position no longer exists in database - skipping exit")
+                print(f"   ℹ️  This can happen if another process exited the position or ran a rebuild")
+                return
             self._execute_exit(exit_price, exit_reason, signal_bar_time)
 
     def _check_entry(self, df: pd.DataFrame):
