@@ -257,10 +257,10 @@ def generate_chart(
 
         print(f"      Chart: {len(df_plot)} bars, all-time: {all_time_stats['num_trades']} trades, visible: {visible_stats['num_trades']} trades")
 
-        # Create figure with 4 subplots
+        # Create figure with 4 subplots - SHARE x-axis for alignment
         fig, axes = plt.subplots(4, 1, figsize=(14, 11),
                                  gridspec_kw={'height_ratios': [3, 1.2, 0.8, 1.2]},
-                                 sharex=False)
+                                 sharex=True)
 
         # Dark theme (TradingView style)
         fig.patch.set_facecolor('#1a1a2e')
@@ -343,13 +343,14 @@ def generate_chart(
         ax3.set_ylabel("JD_Signal", color='white', fontsize=9)
         _format_xaxis_dates(ax3, df_plot, datetime_col, is_intraday)
 
-        # === Panel 4: Equity Curve (in $ with dates on x-axis) ===
-        # CRITICAL: Only show trades within the chart's visible period
+        # === Panel 4: Equity Curve (aligned with price chart x-axis) ===
+        # CRITICAL: Uses bar numbers to align with entry/exit markers on price chart
         ax4 = axes[3]
-        _draw_equity_curve(ax4, exits_for_equity, entries_for_equity, chart_start)
+        _draw_equity_curve(ax4, exits_for_equity, entries_for_equity, date_to_barnum,
+                          df_plot, is_intraday=is_intraday, interval=interval)
+        _format_xaxis_dates(ax4, df_plot, datetime_col, is_intraday)
 
         ax4.set_ylabel("Equity ($)", color='white', fontsize=9)
-        ax4.set_xlabel("Date", color='white', fontsize=9)
 
         # Stats annotation at bottom: ALL-TIME stats + CHART PERIOD stats (including drawdown)
         # Add gap risk note for daily charts where drawdown exceeds typical stop loss
@@ -546,14 +547,17 @@ def _calculate_visible_stats(exits: List[Dict]) -> Dict:
     if not exits:
         return {'num_trades': 0, 'win_rate': 0, 'total_return': 0, 'profit_factor': 0, 'max_drawdown': 0}
 
-    num_trades = len(exits)
-    wins = sum(1 for e in exits if e.get('pnl', 0) > 0)
+    # Sort exits by date for accurate chronological compounding
+    sorted_exits = sorted(exits, key=lambda x: pd.to_datetime(x.get('date', '1970-01-01')))
+
+    num_trades = len(sorted_exits)
+    wins = sum(1 for e in sorted_exits if e.get('pnl', 0) > 0)
     win_rate = (wins / num_trades * 100) if num_trades > 0 else 0
 
     # Use COMPOUND returns (matches database calculation)
     # Each pnl is a percentage (e.g., 1.5 means 1.5% gain)
     equity = 1.0
-    for e in exits:
+    for e in sorted_exits:
         pnl_pct = e.get('pnl', 0)
         equity *= (1 + pnl_pct / 100)
     total_return = (equity - 1) * 100
@@ -583,9 +587,12 @@ def _calculate_max_drawdown(exits: List[Dict]) -> float:
     if not exits:
         return 0.0
 
+    # Sort exits by date for accurate chronological drawdown calculation
+    sorted_exits = sorted(exits, key=lambda x: pd.to_datetime(x.get('date', '1970-01-01')))
+
     # Build equity curve
     equity = [STARTING_CAPITAL]
-    for exit_trade in exits:
+    for exit_trade in sorted_exits:
         pnl = exit_trade.get('pnl', 0)
         equity.append(equity[-1] * (1 + pnl / 100))
 
@@ -680,6 +687,12 @@ def _draw_entry_exit_markers(ax, entries: List[Dict], exits: List[Dict], date_to
     This matches the legacy velocity_live_trader.py behavior where markers are
     placed at the candle edges, not at the trade price.
 
+    IMPORTANT for DAILY charts: The entry_date stored in the database is the SIGNAL bar
+    (when the signal was generated), but the entry PRICE is the real-time execution price
+    which happens AFTER the signal bar closes (on the next bar). So we need to check if
+    the entry price falls within the signal bar's OHLC range - if not, place the marker
+    on the next bar where the price actually existed.
+
     Args:
         is_intraday: If True, don't use date-only fallback for bar matching
                      (prevents trades outside chart range from appearing on wrong bars)
@@ -695,9 +708,11 @@ def _draw_entry_exit_markers(ax, entries: List[Dict], exits: List[Dict], date_to
 
     # Build barnum to row lookup for finding highs/lows
     barnum_to_row = {}
+    max_bar_num = 0
     if df_plot is not None:
         for _, row in df_plot.iterrows():
             barnum_to_row[row['bar_num']] = row
+            max_bar_num = max(max_bar_num, row['bar_num'])
 
     # Dynamic marker size based on trade density
     # Minimum size of 50 to keep markers visible even with many trades
@@ -719,6 +734,32 @@ def _draw_entry_exit_markers(ax, entries: List[Dict], exits: List[Dict], date_to
     for entry in entries:
         bar_num = _find_bar_num(entry.get('date'), date_to_barnum, is_intraday=is_intraday, interval=interval)
         if bar_num is not None:
+            entry_price = entry.get('price')
+
+            # CRITICAL FIX for DAILY charts: Check if entry price falls within this bar's range
+            # For daily strategies, entry_date is the signal bar, but entry happens on NEXT bar
+            # If price doesn't fall within signal bar's OHLC, try the next bar
+            if not is_intraday and entry_price is not None and bar_num in barnum_to_row and col_map is not None:
+                high_col = col_map.get('high', col_map.get('close'))
+                low_col = col_map.get('low', col_map.get('close'))
+                bar_high = barnum_to_row[bar_num][high_col]
+                bar_low = barnum_to_row[bar_num][low_col]
+
+                # Check if entry price is within this bar's range (with small tolerance for float comparison)
+                tolerance = (bar_high - bar_low) * 0.01  # 1% tolerance
+                price_in_bar = (bar_low - tolerance) <= entry_price <= (bar_high + tolerance)
+
+                # If price is NOT in signal bar, check next bar (where execution actually happened)
+                if not price_in_bar:
+                    next_bar_num = bar_num + 1
+                    if next_bar_num in barnum_to_row:
+                        next_bar_high = barnum_to_row[next_bar_num][high_col]
+                        next_bar_low = barnum_to_row[next_bar_num][low_col]
+                        next_tolerance = (next_bar_high - next_bar_low) * 0.01
+                        price_in_next_bar = (next_bar_low - next_tolerance) <= entry_price <= (next_bar_high + next_tolerance)
+                        if price_in_next_bar:
+                            bar_num = next_bar_num  # Move marker to execution bar
+
             matched_entries += 1
             # Get the bar's low price to position marker below it
             if bar_num in barnum_to_row and col_map is not None:
@@ -736,6 +777,32 @@ def _draw_entry_exit_markers(ax, entries: List[Dict], exits: List[Dict], date_to
     for exit_trade in exits:
         bar_num = _find_bar_num(exit_trade.get('date'), date_to_barnum, is_intraday=is_intraday, interval=interval)
         if bar_num is not None:
+            exit_price = exit_trade.get('price')
+
+            # CRITICAL FIX for DAILY charts: Check if exit price falls within this bar's range
+            # For daily strategies, exit_date may be signal bar, but exit happens on NEXT bar
+            # If price doesn't fall within signal bar's OHLC, try the next bar
+            if not is_intraday and exit_price is not None and bar_num in barnum_to_row and col_map is not None:
+                high_col = col_map.get('high', col_map.get('close'))
+                low_col = col_map.get('low', col_map.get('close'))
+                bar_high = barnum_to_row[bar_num][high_col]
+                bar_low = barnum_to_row[bar_num][low_col]
+
+                # Check if exit price is within this bar's range
+                tolerance = (bar_high - bar_low) * 0.01
+                price_in_bar = (bar_low - tolerance) <= exit_price <= (bar_high + tolerance)
+
+                # If price is NOT in signal bar, check next bar
+                if not price_in_bar:
+                    next_bar_num = bar_num + 1
+                    if next_bar_num in barnum_to_row:
+                        next_bar_high = barnum_to_row[next_bar_num][high_col]
+                        next_bar_low = barnum_to_row[next_bar_num][low_col]
+                        next_tolerance = (next_bar_high - next_bar_low) * 0.01
+                        price_in_next_bar = (next_bar_low - next_tolerance) <= exit_price <= (next_bar_high + next_tolerance)
+                        if price_in_next_bar:
+                            bar_num = next_bar_num  # Move marker to execution bar
+
             matched_exits += 1
             # Get the bar's high price to position marker above it
             if bar_num in barnum_to_row and col_map is not None:
@@ -832,39 +899,42 @@ def _find_bar_num(date_str, date_to_barnum: Dict, is_intraday: bool = True, inte
             if fmt in date_to_barnum:
                 return date_to_barnum[fmt]
 
-        # CRITICAL FIX: Trade dates use bar CLOSE time, but DataFrame index uses bar START time
-        # For intraday, convert to the bar that contains this timestamp
+        # CRITICAL FIX: Handle mid-bar events (e.g., stop-loss at 19:46)
+        # For bar-boundary timestamps (divisible by interval), the timestamp represents
+        # a bar START time, NOT a bar close time. Only do conversion for mid-bar events.
         #
-        # Two cases:
-        # 1. Signal on bar boundary (e.g., 18:30) -> bar starting at 18:15 (subtract interval)
-        # 2. Mid-bar event (e.g., stop-loss at 19:46) -> bar starting at 19:45 (floor to interval)
+        # Example with 15m bars:
+        # - Entry at 17:15:00 -> bar starting at 17:15 (direct match)
+        # - Exit at 17:30:00 -> bar starting at 17:30 (direct match, if exists; else NOT found)
+        # - Stop-loss at 19:46:00 -> floor to bar starting at 19:45
+        #
+        # We should NOT subtract interval for bar-boundary timestamps because:
+        # - 17:30 is the START of the 17:30 bar, not the CLOSE of the 17:15 bar
+        # - If 17:30 bar doesn't exist in chart, the marker should not appear
         if is_intraday:
             # Convert interval string to minutes
             interval_map = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '90m': 90, '2h': 120, '4h': 240}
             interval_minutes = interval_map.get(interval, 15)
 
-            # Method 1: Assume bar close time - subtract interval
-            dt_start = dt_minute - pd.Timedelta(minutes=interval_minutes)
-            if dt_start in date_to_barnum:
-                return date_to_barnum[dt_start]
-            start_iso = dt_start.strftime('%Y-%m-%dT%H:%M:%S')
-            start_space = dt_start.strftime('%Y-%m-%d %H:%M:%S')
-            for fmt in [start_iso, start_space, start_iso[:16], start_space[:16]]:
-                if fmt in date_to_barnum:
-                    return date_to_barnum[fmt]
-
-            # Method 2: Floor to nearest bar start (handles mid-bar events like stop-loss)
-            # E.g., 19:46 with 15m bars -> floor to 19:45
+            # Check if timestamp is on a bar boundary
             total_minutes = dt_minute.hour * 60 + dt_minute.minute
-            floored_minutes = (total_minutes // interval_minutes) * interval_minutes
-            dt_floored = dt_minute.replace(hour=floored_minutes // 60, minute=floored_minutes % 60)
-            if dt_floored in date_to_barnum:
-                return date_to_barnum[dt_floored]
-            floored_iso = dt_floored.strftime('%Y-%m-%dT%H:%M:%S')
-            floored_space = dt_floored.strftime('%Y-%m-%d %H:%M:%S')
-            for fmt in [floored_iso, floored_space, floored_iso[:16], floored_space[:16]]:
-                if fmt in date_to_barnum:
-                    return date_to_barnum[fmt]
+            is_bar_boundary = (total_minutes % interval_minutes) == 0
+
+            # For mid-bar events ONLY: floor to nearest bar start
+            # E.g., 19:46 with 15m bars -> floor to 19:45
+            if not is_bar_boundary:
+                floored_minutes = (total_minutes // interval_minutes) * interval_minutes
+                dt_floored = dt_minute.replace(hour=floored_minutes // 60, minute=floored_minutes % 60)
+                if dt_floored in date_to_barnum:
+                    return date_to_barnum[dt_floored]
+                floored_iso = dt_floored.strftime('%Y-%m-%dT%H:%M:%S')
+                floored_space = dt_floored.strftime('%Y-%m-%d %H:%M:%S')
+                for fmt in [floored_iso, floored_space, floored_iso[:16], floored_space[:16]]:
+                    if fmt in date_to_barnum:
+                        return date_to_barnum[fmt]
+
+            # If timestamp is on bar boundary but not found, return None (bar not in chart)
+            # This prevents entry/exit on same bar when exit bar doesn't exist yet
 
         # Date-only fallback: ONLY for daily charts
         # For intraday, this causes trades outside chart range to map to wrong bars
@@ -883,71 +953,75 @@ def _find_bar_num(date_str, date_to_barnum: Dict, is_intraday: bool = True, inte
     return None
 
 
-def _draw_equity_curve(ax, exits: List[Dict], entries: List[Dict], chart_start):
-    """Draw equity curve with dates on x-axis."""
+def _draw_equity_curve(ax, exits: List[Dict], entries: List[Dict], date_to_barnum: Dict,
+                       df_plot: pd.DataFrame, is_intraday: bool = True, interval: str = '15m'):
+    """Draw equity curve aligned with price chart x-axis (bar numbers).
+
+    CRITICAL: Uses the same bar number mapping as entry/exit markers so the
+    equity curve visually aligns with trade triangles on the price chart.
+    """
     if not exits:
         ax.text(0.5, 0.5, 'No trades in period', transform=ax.transAxes,
                ha='center', va='center', color='white', fontsize=10)
         return
 
-    # Build equity curve
-    equity = [STARTING_CAPITAL]
-    trade_dates = []
+    # Sort exits by date chronologically
+    sorted_exits = sorted(exits, key=lambda x: pd.to_datetime(x.get('date', '1970-01-01')))
+    sorted_entries = sorted(entries, key=lambda x: pd.to_datetime(x.get('date', '1970-01-01'))) if entries else []
 
-    # Start date from first entry or exit
-    def normalize_date(date_str):
-        """Normalize date to UTC timezone-naive for matplotlib."""
-        dt = pd.to_datetime(date_str)
-        if dt.tzinfo is not None:
-            # Convert to UTC, then strip timezone for consistent comparison
-            dt = dt.tz_convert('UTC').tz_localize(None)
-        return dt
+    # Build equity curve with bar numbers for x-axis (aligned with price chart)
+    equity_points = []  # List of (bar_num, equity_value) tuples
+    current_equity = STARTING_CAPITAL
 
-    if entries:
-        try:
-            first_date = normalize_date(entries[0].get('date'))
-            trade_dates.append(first_date)
-        except Exception:
-            if exits:
-                trade_dates.append(normalize_date(exits[0].get('date')))
-    elif exits:
-        trade_dates.append(normalize_date(exits[0].get('date')))
+    # Start with first entry if available
+    if sorted_entries:
+        bar_num = _find_bar_num(sorted_entries[0].get('date'), date_to_barnum,
+                                is_intraday=is_intraday, interval=interval)
+        if bar_num is not None:
+            equity_points.append((bar_num, current_equity))
 
-    # Add each exit
-    for exit_trade in exits:
-        try:
-            pnl = exit_trade.get('pnl', 0)
-            equity.append(equity[-1] * (1 + pnl / 100))
-            trade_dates.append(normalize_date(exit_trade.get('date')))
-        except Exception:
-            pass
+    # Add each exit with its bar number
+    for exit_trade in sorted_exits:
+        pnl = exit_trade.get('pnl', 0)
+        current_equity = current_equity * (1 + pnl / 100)
 
-    if len(trade_dates) != len(equity):
-        # Fallback to trade numbers if date mismatch
-        ax.plot(range(len(equity)), equity, color='#00ff88', linewidth=2)
-        ax.fill_between(range(len(equity)), STARTING_CAPITAL, equity, alpha=0.3,
-                       color='green' if equity[-1] > STARTING_CAPITAL else 'red')
-    else:
-        ax.plot(trade_dates, equity, color='#00ff88', linewidth=2)
-        ax.fill_between(trade_dates, STARTING_CAPITAL, equity, alpha=0.3,
-                       color='green' if equity[-1] > STARTING_CAPITAL else 'red')
+        bar_num = _find_bar_num(exit_trade.get('date'), date_to_barnum,
+                                is_intraday=is_intraday, interval=interval)
+        if bar_num is not None:
+            equity_points.append((bar_num, current_equity))
 
-        # Format x-axis dates
-        if len(trade_dates) >= 2:
-            date_range = (trade_dates[-1] - trade_dates[0]).days
-            if date_range > 365:
-                ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
-                ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
-            elif date_range > 60:
-                ax.xaxis.set_major_locator(mdates.MonthLocator())
-                ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
-            else:
-                ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
-                ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
-            plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+    if not equity_points:
+        ax.text(0.5, 0.5, 'No trades map to visible bars', transform=ax.transAxes,
+               ha='center', va='center', color='white', fontsize=10)
+        return
+
+    # Sort by bar number and extract x/y arrays
+    equity_points.sort(key=lambda x: x[0])
+    bar_nums = [p[0] for p in equity_points]
+    equity_vals = [p[1] for p in equity_points]
+
+    # Extend to chart edges for complete fill
+    min_bar = df_plot['bar_num'].min() if 'bar_num' in df_plot.columns else 0
+    max_bar = df_plot['bar_num'].max() if 'bar_num' in df_plot.columns else bar_nums[-1]
+
+    # Prepend start of chart at starting capital
+    if bar_nums[0] > min_bar:
+        bar_nums.insert(0, min_bar)
+        equity_vals.insert(0, STARTING_CAPITAL)
+
+    # Extend to end of chart at final equity (flat line for no-trade periods)
+    if bar_nums[-1] < max_bar:
+        bar_nums.append(max_bar)
+        equity_vals.append(equity_vals[-1])
+
+    # Plot with step interpolation to show discrete equity changes
+    ax.step(bar_nums, equity_vals, where='post', color='#00ff88', linewidth=2)
+    ax.fill_between(bar_nums, STARTING_CAPITAL, equity_vals, step='post', alpha=0.3,
+                   color='green' if equity_vals[-1] > STARTING_CAPITAL else 'red')
 
     ax.axhline(STARTING_CAPITAL, color='gray', linestyle='--', alpha=0.5)
 
+    # Note: x-axis limits are handled by sharex=True with other panels
     # Format y-axis as currency
     ax.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x/1000:.0f}k'))
 

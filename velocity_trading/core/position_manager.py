@@ -183,7 +183,10 @@ class PositionManager:
     to prevent state desync.
     """
 
-    def __init__(self, strategy_name: str, db_path: str = None, auto_rebuild: bool = False):
+    # Class-level tracking of daily backups (only backup once per day per strategy)
+    _daily_backups_done = {}
+
+    def __init__(self, strategy_name: str, db_path: str = None, auto_rebuild: bool = False, auto_backup: bool = True):
         """
         Initialize position manager for a strategy.
 
@@ -191,6 +194,7 @@ class PositionManager:
             strategy_name: Name of the trading strategy
             db_path: Optional explicit database path
             auto_rebuild: If True, rebuild trades from backtest if database is empty
+            auto_backup: If True, create daily backup of database on first access
         """
         self.strategy_name = strategy_name
         self.db_path = db_path or get_db_path(strategy_name)
@@ -199,6 +203,10 @@ class PositionManager:
         init_database(self.db_path)
 
         self._db = TradingDatabase(strategy_name, self.db_path)
+
+        # Auto-backup once per day
+        if auto_backup:
+            self._ensure_daily_backup()
 
         # Auto-rebuild from backtest if database is empty
         if auto_rebuild and self.get_trade_count() == 0:
@@ -262,6 +270,54 @@ class PositionManager:
                      open_trade['entry_price'], open_trade['entry_date'],
                      open_trade['id'], self.strategy_name)
                 )
+
+    def _ensure_daily_backup(self):
+        """
+        Create a backup of the database once per day.
+
+        This ensures we always have a recent backup before any trading activity.
+        Backups are stored in /backups/database/{strategy_name}/
+        """
+        from datetime import date
+        today = date.today().isoformat()
+        backup_key = f"{self.strategy_name}_{today}"
+
+        # Check if we've already backed up today
+        if backup_key in PositionManager._daily_backups_done:
+            return
+
+        # Check if database exists and has data
+        if not os.path.exists(self.db_path):
+            return
+
+        try:
+            from .backup import backup_database
+            backup_path = backup_database(
+                self.db_path,
+                reason=f"daily_{today}",
+                strategy_name=self.strategy_name
+            )
+            if backup_path:
+                PositionManager._daily_backups_done[backup_key] = backup_path
+        except Exception as e:
+            print(f"   ⚠️  Daily backup failed: {e}")
+
+    def create_backup(self, reason: str = "manual") -> Optional[str]:
+        """
+        Manually create a backup of the database.
+
+        Args:
+            reason: Reason for backup (used in filename)
+
+        Returns:
+            Path to backup file, or None if failed
+        """
+        try:
+            from .backup import backup_database
+            return backup_database(self.db_path, reason=reason, strategy_name=self.strategy_name)
+        except Exception as e:
+            print(f"   ⚠️  Backup failed: {e}")
+            return None
 
     # =========================================================================
     # Core Position Operations
@@ -1287,14 +1343,11 @@ class PositionManager:
 
             # Process each bar ONCE, in chronological order
             for bar_time, row in df_new.iterrows():
-                # Use bar CLOSE time for consistency with live trading
-                # For intraday: bar_time + interval = close time
-                # For daily: keep bar_time as-is (date represents trading day)
-                if interval in ['1d', '1wk', '1mo']:
-                    bar_close_time = bar_time
-                else:
-                    bar_close_time = bar_time + pd.Timedelta(minutes=interval_mins)
-                bar_timestamp = normalize_timestamp(bar_close_time)
+                # CRITICAL: Use bar START time for consistency with charting
+                # Charts index bars by start time (13:15 bar = 13:15-13:30)
+                # If we use close time (13:30), charts.py would map it to the NEXT bar
+                # This also matches base_trader.py live trading behavior
+                bar_timestamp = normalize_timestamp(bar_time)
 
                 # Evaluate this bar for signals
                 if not in_position and row.get('buy_signal', False):

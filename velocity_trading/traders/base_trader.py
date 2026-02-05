@@ -45,6 +45,13 @@ from ..notifications.discord import (
 )
 from ..notifications.charts import generate_chart
 
+# Sierra Chart Bridge - native support
+try:
+    from sierra_chart_bridge import build_sierra_signal, publish_signal_to_sierra
+    SIERRA_BRIDGE_AVAILABLE = True
+except ImportError:
+    SIERRA_BRIDGE_AVAILABLE = False
+
 
 class BaseTrader(ABC):
     """
@@ -295,7 +302,11 @@ class BaseTrader(ABC):
 
     def _try_import_from_bundle(self) -> bool:
         """
-        Try to import trades from the bundle's backtest_results.json.
+        Try to import trades from the bundle's backtest file.
+
+        Checks for multiple file formats:
+        1. backtest_results.json (entries/exits format)
+        2. trade_log.json (trades format - used by newer bundles)
 
         This is the preferred method because it uses the exact trades from the
         optimization backtest, ensuring stats match exactly.
@@ -310,21 +321,39 @@ class BaseTrader(ABC):
             print(f"   ℹ️  No bundle_name in config, will rebuild from scratch")
             return False
 
-        # Construct path to backtest_results.json
         parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        bundle_path = os.path.join(parent_dir, "velocity_strategies", bundle_name, "backtest_results.json")
+        bundle_dir = os.path.join(parent_dir, "velocity_strategies", bundle_name)
 
-        if not os.path.exists(bundle_path):
-            print(f"   ℹ️  Bundle backtest not found: {bundle_path}")
+        # Try multiple file formats
+        backtest_results = None
+        source_file = None
+
+        # Format 1: backtest_results.json (entries/exits format)
+        path1 = os.path.join(bundle_dir, "backtest_results.json")
+        if os.path.exists(path1):
+            source_file = path1
+            with open(path1) as f:
+                backtest_results = json.load(f)
+
+        # Format 2: trade_log.json (trades format) - convert to entries/exits
+        if backtest_results is None:
+            path2 = os.path.join(bundle_dir, "trade_log.json")
+            if os.path.exists(path2):
+                source_file = path2
+                with open(path2) as f:
+                    trade_log = json.load(f)
+                # Convert trade_log format to entries/exits format
+                backtest_results = self._convert_trade_log_to_backtest(trade_log)
+
+        if backtest_results is None:
+            print(f"   ℹ️  No backtest file found in bundle: {bundle_name}")
             return False
 
         try:
-            print(f"   📦 Importing from bundle: {bundle_name}")
-            with open(bundle_path) as f:
-                backtest_results = json.load(f)
+            print(f"   📦 Importing from bundle: {os.path.basename(source_file)}")
 
             # Get the last bar date from bundle data for tracking
-            data_path = os.path.join(parent_dir, "velocity_strategies", bundle_name, "data.parquet")
+            data_path = os.path.join(bundle_dir, "data.parquet")
             last_bar_date = None
             if os.path.exists(data_path):
                 try:
@@ -356,7 +385,43 @@ class BaseTrader(ABC):
 
         except Exception as e:
             print(f"   ⚠️  Error importing from bundle: {e}")
+            import traceback
+            traceback.print_exc()
             return False
+
+    def _convert_trade_log_to_backtest(self, trade_log: dict) -> dict:
+        """
+        Convert trade_log.json format to backtest_results.json format.
+
+        trade_log format:
+            {"trades": [{entry_date, exit_date, entry_price, exit_price, pnl_pct, exit_reason, ...}]}
+
+        backtest_results format:
+            {"entries": [{date, price, position}], "exits": [{date, price, pnl, reason, entry_date, entry_price}]}
+        """
+        trades = trade_log.get('trades', [])
+        entries = []
+        exits = []
+
+        for trade in trades:
+            # Create entry record
+            entries.append({
+                'date': trade['entry_date'],
+                'price': trade['entry_price'],
+                'position': 'long'  # Velocity strategies are long-only
+            })
+
+            # Create exit record
+            exits.append({
+                'date': trade['exit_date'],
+                'price': trade['exit_price'],
+                'pnl': trade.get('pnl_pct', 0),
+                'reason': trade.get('exit_reason', 'signal'),
+                'entry_date': trade['entry_date'],
+                'entry_price': trade['entry_price']
+            })
+
+        return {'entries': entries, 'exits': exits}
 
     def _get_rebuild_days(self) -> int:
         """Get number of days for full rebuild. Override for longer histories."""
@@ -589,52 +654,21 @@ class BaseTrader(ABC):
 
     def _fetch_data(self, for_chart: bool = False) -> Optional[pd.DataFrame]:
         """
-        Fetch price data using incremental pipeline.
+        Fetch price data for signal generation and charts.
 
-        On first call: Backfills historical data (Historical API)
-        On every call: Updates with latest bars (Live API)
-        Returns data from SQLite (fast, always complete)
+        CRITICAL FIX: Uses fetch_price_data (yfinance) directly to ensure
+        consistency with incremental updates. The DataPipeline (Databento+yfinance)
+        was producing different oscillator values causing signals to not fire.
 
         Args:
             for_chart: If True, include synthetic current bar for display.
                        If False (default), exclude synthetic for signal generation.
         """
-        try:
-            # Initialize pipeline on first run (backfill if needed)
-            if not self._pipeline_initialized:
-                stats = self.pipeline.get_stats()
-                if stats['total_bars'] < 100:
-                    print("   Backfilling historical data...")
-                    days = 60 if self.interval in ['15m', '30m', '1h'] else 365
-                    success, result = self.pipeline.backfill(days=days)
-                    if success:
-                        print(f"   Backfill complete: {result.get('bars_stored', 0)} bars")
-                    else:
-                        print(f"   Backfill warning: {result.get('error', 'unknown')}")
-                self._pipeline_initialized = True
-
-            # Update with latest bars from Live API (runs every cycle)
-            success, result = self.pipeline.update()
-            if result.get('new_bars', 0) > 0:
-                print(f"   +{result['new_bars']} new bars (latest: {result.get('latest', 'N/A')[:16]})")
-
-            # Get data from SQLite
-            # Use 600 bars for intraday: ~6 days crypto (96/day), ~22 days futures (27/day)
-            # Enough for chart (500 bars max) plus indicator warmup
-            lookback = 600 if self.interval in ['1m', '5m', '15m', '30m', '1h', '2h', '4h'] else 500
-
-            # For signal generation: NO synthetic bars (could trigger false signals)
-            # For charts: ADD synthetic bar to show current price
-            df = self.pipeline.get_data(lookback_bars=lookback, add_synthetic_current=for_chart)
-            if df is not None and not df.empty:
-                return df
-
-        except Exception as e:
-            print(f"   Pipeline error: {e}, falling back to direct fetch")
-
-        # Fallback to direct fetch if pipeline fails
-        # For intraday, yfinance max is 60 days; for daily, get 365 days
+        # Use fetch_price_data directly (same as incremental update) for consistency
+        # The DataPipeline was causing oscillator discrepancies due to Databento data merge
         fetch_days = 60 if self.interval in ['1m', '5m', '15m', '30m', '1h', '2h', '4h'] else 365
+
+        # Retry with exponential backoff
         for attempt in range(3):
             try:
                 df = fetch_price_data(
@@ -643,18 +677,10 @@ class BaseTrader(ABC):
                     interval=self.interval
                 )
                 if df is not None and not df.empty:
-                    # CRITICAL: Store fallback data to pipeline DB to prevent repeated failures
-                    # This ensures the database stays current even when Databento fails
-                    try:
-                        bars_stored = self.pipeline._store_bars(df, source='yfinance_fallback')
-                        if bars_stored > 0:
-                            print(f"   ✓ Stored {bars_stored} bars from fallback fetch to DB")
-                    except Exception as store_err:
-                        print(f"   ⚠️ Could not store fallback data: {store_err}")
                     return df
             except Exception as e:
                 print(f"   Fetch attempt {attempt+1} failed: {e}")
-                time.sleep(10 * (attempt + 1))
+                time.sleep(5 * (attempt + 1))
 
         return None
 
@@ -728,8 +754,9 @@ class BaseTrader(ABC):
             # Previously only checked the most recent completed bar, missing signals that
             # fired during weekends, gaps, or when trader wasn't running.
             entry_date = pd.to_datetime(position.entry_date)
-            if entry_date.tzinfo is None:
-                entry_date = entry_date.tz_localize('UTC')
+            # Normalize to naive UTC for comparison with df.index (which is also naive UTC)
+            if entry_date.tzinfo is not None:
+                entry_date = entry_date.tz_convert('UTC').tz_localize(None)
 
             # Find bars AFTER position entry (use > not >= to exclude entry bar)
             # Entry bar cannot have exit signal - that would be same-bar exit
@@ -758,11 +785,9 @@ class BaseTrader(ABC):
 
                     exit_reason = f"Opposite Signal ({bar_pnl_pct:.2f}%)"
 
-                    # Use bar CLOSE time
-                    if self.interval in ['1d', '1wk', '1mo']:
-                        signal_bar_time = first_signal_time
-                    else:
-                        signal_bar_time = first_signal_time + timedelta(minutes=self._get_interval_minutes())
+                    # Use bar START time so chart plots marker on signal bar
+                    # The exit_price is the signal bar's Close, so marker appears at bar's close level
+                    signal_bar_time = first_signal_time
 
                     print(f"   📍 Found missed {signal_col} at {first_signal_time}")
 
@@ -805,13 +830,16 @@ class BaseTrader(ABC):
         #   - entry_price = realtime price (actual execution)
         #
         # For INTRADAY bars:
-        #   - Signal and entry happen within seconds, same bar timing applies
+        #   - Signal fires at bar close
+        #   - entry_price = signal bar's Close (for backtest consistency)
         #   - entry_date = bar close time
-        #   - entry_price = realtime price
+        #
+        # NOTE: We use bar Close, not realtime price, because:
+        # 1. Backtest uses Close prices for entry/exit
+        # 2. Realtime price at detection is the NEXT bar's Open (not signal bar's Close)
+        # 3. For stats consistency, live trading should match backtest methodology
 
-        entry_price = fetch_realtime_price(self.ticker)
-        if entry_price is None:
-            entry_price = completed_bar['Close']
+        entry_price = completed_bar['Close']
 
         if self.interval in ['1d', '1wk', '1mo']:
             # Daily bars: Entry is on the NEXT day (today), not the signal bar
@@ -821,8 +849,11 @@ class BaseTrader(ABC):
             # Use today's date at 00:00:00 as entry_date (the execution bar)
             entry_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
         else:
-            # Intraday bars: Use bar close time (signal and execution are same bar context)
-            entry_time = bar_time + timedelta(minutes=self._get_interval_minutes())
+            # Intraday bars: Use bar START time so chart plots marker on signal bar
+            # The entry_price is the signal bar's Close, so marker appears at bar's top
+            # Previously used bar_time + interval (close time), but chart interprets
+            # that as the NEXT bar's start, causing marker to appear in wrong location
+            entry_time = bar_time
 
         self._execute_entry(entry_price, entry_time)
         self.last_signal_time = signal_time_str
@@ -875,9 +906,26 @@ class BaseTrader(ABC):
                     # Naive timestamp - just format as-is
                     signal_time_str = str(signal_time)[:16]
 
-                # IMMEDIATE ALERT: Send text alert FIRST (no chart) for fastest notification
+                # SIERRA CHART: Publish signal FIRST for fastest execution
+                if SIERRA_BRIDGE_AVAILABLE:
+                    try:
+                        sierra_signal = build_sierra_signal(
+                            signal_type="ENTRY",
+                            direction="LONG",
+                            ticker=self.ticker,
+                            price=entry_price,
+                            signal_time=signal_time,
+                            strategy_name=self.strategy_name,
+                            config=self.config
+                        )
+                        publish_signal_to_sierra(sierra_signal)
+                        print(f"   📡 Sierra Chart: ENTRY signal published")
+                    except Exception as e:
+                        print(f"   ⚠️ Sierra Chart publish failed: {e}")
+
+                # DISCORD ALERT: Send text alert (no chart) for notification
                 stats_time = _time.time() - alert_start
-                print(f"   ⏱️ Stats prepared in {stats_time:.1f}s, sending immediate alert...")
+                print(f"   ⏱️ Stats prepared in {stats_time:.1f}s, sending Discord alert...")
 
                 send_entry_alert(
                     self.webhook_url,
@@ -1014,9 +1062,33 @@ class BaseTrader(ABC):
                 entry_time_str = str(result.get('entry_date', ''))[:16]
                 exit_time_str = str(exit_date)[:16]
 
-                # IMMEDIATE ALERT: Send text alert FIRST (no chart) for fastest notification
+                # SIERRA CHART: Publish signal FIRST for fastest execution
+                if SIERRA_BRIDGE_AVAILABLE:
+                    try:
+                        exit_data = {
+                            "entry_price": result.get('entry_price', 0),
+                            "pnl_pts": round(exit_price - result.get('entry_price', exit_price), 2),
+                            "pnl_pct": pnl,
+                            "exit_reason": exit_reason
+                        }
+                        sierra_signal = build_sierra_signal(
+                            signal_type="EXIT",
+                            direction="LONG",  # Current system is long-only
+                            ticker=self.ticker,
+                            price=exit_price,
+                            signal_time=exit_date,
+                            strategy_name=self.strategy_name,
+                            config=self.config,
+                            exit_data=exit_data
+                        )
+                        publish_signal_to_sierra(sierra_signal)
+                        print(f"   📡 Sierra Chart: EXIT signal published")
+                    except Exception as e:
+                        print(f"   ⚠️ Sierra Chart publish failed: {e}")
+
+                # DISCORD ALERT: Send text alert (no chart) for notification
                 stats_time = _time.time() - alert_start
-                print(f"   ⏱️ Stats prepared in {stats_time:.1f}s, sending immediate alert...")
+                print(f"   ⏱️ Stats prepared in {stats_time:.1f}s, sending Discord alert...")
 
                 send_exit_alert(
                     self.webhook_url,
