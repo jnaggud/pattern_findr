@@ -85,7 +85,7 @@ class IntradayTrader(BaseTrader):
         self.interval_minutes = INTERVAL_MINUTES.get(interval, 15)
 
         # Intraday-specific settings
-        self.bar_completion_buffer_seconds = self.config.get('bar_completion_buffer', 5)
+        self.bar_completion_buffer_seconds = self.config.get('bar_completion_buffer', 3)
         self.last_processed_bar = None
         self._bar_processed_this_cycle = False  # Track if we processed a bar in current cycle
 
@@ -262,7 +262,7 @@ class IntradayTrader(BaseTrader):
         Calculate sleep time based on position status and market hours.
 
         When NOT in position: Sleep until bar closes (precision timing for signals)
-        When IN position + market OPEN: Check every 5 seconds (for stop loss/take profit monitoring)
+        When IN position + market OPEN: Check every 3 seconds (for stop loss/take profit monitoring)
         When IN position + market CLOSED: Sleep until market opens (no point checking)
         """
         try:
@@ -284,7 +284,7 @@ class IntradayTrader(BaseTrader):
                         return sleep_seconds
 
                 # Market is open - check every 5 seconds when in position for timely SL/TP
-                sleep_seconds = self.config.get('position_check_interval', 5)
+                sleep_seconds = self.config.get('position_check_interval', 3)
                 print(f"   📍 In position - checking SL/TP every {sleep_seconds}s")
                 return sleep_seconds
 
@@ -609,7 +609,7 @@ if __name__ == '__main__':
         'exit_on_opposite_signal': cfg.get('exit_on_opposite_signal', True),
         'exit_on_midline_cross': cfg.get('exit_on_midline_cross', False),
         'check_interval_seconds': 30,
-        'bar_completion_buffer': 5
+        'bar_completion_buffer': 3
     }
 
     # Determine webhook

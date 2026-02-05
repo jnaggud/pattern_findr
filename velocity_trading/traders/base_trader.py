@@ -103,6 +103,14 @@ class BaseTrader(ABC):
                 "not hardcoded defaults."
             )
 
+        # Validate interval matches config (prevents running wrong timeframe)
+        config_interval = self.config.get('interval')
+        if config_interval and config_interval != interval:
+            raise ValueError(
+                f"Interval mismatch: runtime '{interval}' vs config '{config_interval}'. "
+                f"Strategy {strategy_name} is configured for '{config_interval}' intervals."
+            )
+
         # Trading parameters from config - NO DEFAULTS
         self.stop_loss_pct = self.config['stop_loss_pct']
         self.take_profit_pct = self.config['take_profit_pct']
@@ -144,6 +152,10 @@ class BaseTrader(ABC):
         self.last_signal_time = None
         self.consecutive_errors = 0
         self.max_consecutive_errors = 5
+
+        # Data staleness tracking for graceful degradation
+        self._last_successful_fetch_time = 0
+        self._stale_data_alert_sent = False
 
         # Data pipeline for incremental updates (Historical + Live API)
         self.pipeline = DataPipeline(ticker, interval)
@@ -506,12 +518,36 @@ class BaseTrader(ABC):
             df = self._fetch_data()
 
         if df is None or df.empty:
-            print("   No data after retries, skipping cycle")
+            # Graceful degradation: if in position, continue SL/TP monitoring
+            # even when data fetch fails - don't abandon position monitoring
+            position = self.pm.get_current_position()
+            if position:
+                import time as _t
+                stale_seconds = _t.time() - self._last_successful_fetch_time if self._last_successful_fetch_time else 0
+                print(f"   ⚠️ Data unavailable ({stale_seconds:.0f}s stale) - continuing SL/TP monitoring")
+                self._quick_sltp_check(position)
+
+                # Alert via Discord if data stale > 5 minutes
+                if stale_seconds > 300 and not self._stale_data_alert_sent:
+                    self._send_error_alert(
+                        f"Data fetch failing for {stale_seconds:.0f}s. "
+                        f"SL/TP monitoring continues via realtime price."
+                    )
+                    self._stale_data_alert_sent = True
+            else:
+                print("   No data after retries, skipping cycle (no position)")
+
             time.sleep(self.check_interval_seconds)
             return
 
         # Record successful full fetch time (for optimization when in position)
         self._last_full_fetch_time = _time.time()
+        self._last_successful_fetch_time = _time.time()
+
+        # Reset stale data alert if we recovered
+        if self._stale_data_alert_sent:
+            self._stale_data_alert_sent = False
+            print("   ✅ Data fetch recovered")
 
         fetch_time = _time.time() - cycle_start
         print(f"   ⏱️ Data fetch took {fetch_time:.1f}s")
@@ -558,6 +594,9 @@ class BaseTrader(ABC):
         # Check for entry conditions (if not in position)
         if not self.pm.get_current_position():  # Re-check after potential exit
             self._check_entry(df)
+
+        # Write health status periodically
+        self._write_health_status()
 
         # Sleep until next check
         cycle_total = _time.time() - cycle_start
@@ -1019,7 +1058,8 @@ class BaseTrader(ABC):
         success, result = self.pm.exit_position(
             exit_price=exit_price,
             exit_date=exit_date,
-            exit_reason=exit_reason
+            exit_reason=exit_reason,
+            interval=self.interval
         )
 
         if success:
@@ -1301,6 +1341,31 @@ class BaseTrader(ABC):
         """Send error notification to Discord."""
         if self.webhook_url:
             send_error_alert(self.webhook_url, self.strategy_name, message)
+
+    def _write_health_status(self):
+        """Write health status file for external monitoring."""
+        import json
+        health_file = f"/tmp/patternfindr_{self.strategy_name}_health.json"
+        try:
+            position = self.pm.get_current_position()
+            status = {
+                'last_update': datetime.now().isoformat(),
+                'strategy': self.strategy_name,
+                'ticker': self.ticker,
+                'interval': self.interval,
+                'pid': os.getpid(),
+                'in_position': position is not None,
+                'consecutive_errors': self.consecutive_errors,
+                'last_successful_fetch': self._last_successful_fetch_time,
+                'stale_data_alert': self._stale_data_alert_sent,
+            }
+            if position:
+                status['entry_price'] = position.entry_price
+                status['entry_date'] = position.entry_date
+            with open(health_file, 'w') as f:
+                json.dump(status, f, indent=2)
+        except OSError:
+            pass  # Non-critical
 
     def stop(self):
         """Stop the trading loop."""

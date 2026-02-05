@@ -2,12 +2,14 @@
 Price data fetching for velocity trading.
 
 Provides unified interface for fetching price data from multiple sources:
+- DataPipeline (preferred for intraday - incremental SQLite-backed pipeline)
 - yfinance (stocks, ETFs, crypto)
-- Polygon (premium crypto data)
-- Databento (futures)
+- Databento (futures via DataPipeline)
 
-This module re-uses existing infrastructure from the Pattern_FindR codebase
-where possible, providing a clean interface for the new trading system.
+Data source priority:
+1. DataPipeline (intraday futures/crypto) - incremental, gap-filling, validated
+2. data_cache (legacy, kept for backward compatibility with velocity_live_trader.py)
+3. yfinance direct (fallback)
 """
 
 import os
@@ -27,6 +29,13 @@ try:
     HAS_DATA_CACHE = True
 except ImportError:
     HAS_DATA_CACHE = False
+
+# Import DataPipeline (preferred for intraday data)
+try:
+    from .data_pipeline import DataPipeline
+    HAS_DATA_PIPELINE = True
+except ImportError:
+    HAS_DATA_PIPELINE = False
 
 try:
     import yfinance as yf
@@ -75,18 +84,39 @@ def fetch_price_data(
     """
     Fetch OHLCV price data for a ticker.
 
+    Data source priority:
+    1. DataPipeline (preferred for intraday futures/crypto - incremental, validated)
+    2. data_cache legacy (fallback for compatibility)
+    3. yfinance direct (final fallback)
+
     Args:
         ticker: Trading symbol (e.g., 'SPY', 'ES=F', 'BTC-USD')
         days: Number of days of history to fetch
         interval: Bar interval ('1d', '15m', '1h', etc.)
-        use_cache: Whether to use the data_cache module
+        use_cache: Whether to use cached data sources
 
     Returns:
         DataFrame with columns: Open, High, Low, Close, Volume
         Index is datetime
         Returns None if fetch fails
     """
-    # Try cached fetch first (if available)
+    # Intraday intervals that benefit from DataPipeline's incremental updates
+    intraday_intervals = {'1m', '2m', '5m', '15m', '30m', '1h', '2h', '4h'}
+
+    # 1. Try DataPipeline first for intraday futures/crypto
+    if (HAS_DATA_PIPELINE and use_cache and interval in intraday_intervals
+            and (is_futures_ticker(ticker) or is_crypto_ticker(ticker))):
+        try:
+            pipeline = DataPipeline(ticker, interval)
+            pipeline.update()
+            lookback_bars = _days_to_bars(days, interval)
+            df = pipeline.get_data(lookback_bars=lookback_bars, add_synthetic_current=True)
+            if df is not None and not df.empty and len(df) >= 10:
+                return df  # Already in correct format (Open, High, Low, Close, Volume)
+        except Exception as e:
+            print(f"   DataPipeline failed for {ticker}/{interval}: {e}")
+
+    # 2. Try legacy data_cache (fallback for compatibility)
     if use_cache and HAS_DATA_CACHE:
         try:
             df = fetch_and_cache(ticker, days=days, interval=interval)
@@ -95,7 +125,7 @@ def fetch_price_data(
         except Exception as e:
             print(f"   Cache fetch failed for {ticker}: {e}")
 
-    # Determine fetch method based on ticker type
+    # 3. Determine fetch method based on ticker type (direct API fallback)
     if is_futures_ticker(ticker):
         df = _fetch_futures(ticker, days, interval)
     elif is_crypto_ticker(ticker):
@@ -107,6 +137,22 @@ def fetch_price_data(
         return _normalize_dataframe(df)
 
     return None
+
+
+def _days_to_bars(days: int, interval: str) -> int:
+    """Convert days to approximate number of bars for a given interval."""
+    bars_per_day = {
+        '1m': 390,   # ~6.5 market hours * 60
+        '2m': 195,
+        '5m': 78,
+        '15m': 26,   # ~6.5 hours * 4 bars/hour (stocks), more for futures
+        '30m': 13,
+        '1h': 7,     # ~6.5 hours (stocks), ~23 for futures
+        '2h': 4,
+        '4h': 2,
+    }
+    multiplier = bars_per_day.get(interval, 26)
+    return max(50, days * multiplier)  # Minimum 50 bars for oscillator calculation
 
 
 def _fetch_stock(ticker: str, days: int, interval: str) -> Optional[pd.DataFrame]:
@@ -313,19 +359,13 @@ def fetch_realtime_price(ticker: str) -> Optional[float]:
     weekday = now_check.weekday()  # 0=Monday, 5=Saturday, 6=Sunday
     is_weekend = (weekday == 5) or (weekday == 6 and now_check.hour < 17)
 
-    # For futures on weekend, skip realtime fetch (market closed)
+    # For futures on weekend (before Sunday 5pm), skip realtime fetch (market closed)
     if is_futures_ticker(ticker) and is_weekend:
         return None
 
-    databento_price = None
     yfinance_price = None
 
-    # CRITICAL FIX: Use yfinance as PRIMARY source for realtime prices
-    # Databento continuous contracts (ES.n.0, ES.c.0) may differ from yfinance ES=F
-    # by several dollars, causing incorrect SL/TP calculations.
-    # yfinance matches TradingView which is what traders expect.
-
-    # Get yfinance price first (primary source - matches TradingView)
+    # Try yfinance first (primary source - matches TradingView)
     if HAS_YFINANCE:
         try:
             # Temporarily suppress yfinance warnings to stderr
@@ -339,31 +379,49 @@ def fetch_realtime_price(ticker: str) -> Optional[float]:
 
             if not data.empty:
                 yfinance_price = float(data['Close'].iloc[-1])
-            else:
-                print(f"   ⚠️ yfinance returned empty data for {ticker} realtime price")
-        except Exception as e:
-            print(f"   ⚠️ yfinance realtime price failed for {ticker}: {e}")
+                return yfinance_price
+        except Exception:
+            pass
 
-    # If yfinance succeeded, use it
-    if yfinance_price is not None:
-        return yfinance_price
-
-    # Fallback to Databento only if yfinance failed
+    # Fallback for FUTURES: Use Databento Live API when yfinance fails
     if is_futures_ticker(ticker) and HAS_DATABENTO:
         try:
             databento_price = _fetch_realtime_databento(ticker)
             if databento_price is not None:
-                print(f"   ⚠️ Using Databento fallback price: ${databento_price:.2f}")
+                print(f"   📊 Using Databento Live: ${databento_price:,.2f}")
                 return databento_price
         except Exception:
             pass
 
-    print(f"   ⚠️ fetch_realtime_price returning None for {ticker}")
+    # Fallback for ES=F: Use SPY as proxy (ES ≈ SPY * 10)
+    # This helps when yfinance has SPY data but not ES=F realtime
+    if ticker == 'ES=F' and HAS_YFINANCE:
+        try:
+            old_stderr = sys.stderr
+            sys.stderr = io.StringIO()
+            try:
+                spy_ticker = yf.Ticker('SPY')
+                spy_data = spy_ticker.history(period='1d', interval='1m')
+            finally:
+                sys.stderr = old_stderr
+
+            if not spy_data.empty:
+                spy_price = float(spy_data['Close'].iloc[-1])
+                # ES trades at approximately 10x SPY (e.g., SPY 600 -> ES 6000)
+                es_estimate = spy_price * 10
+                print(f"   📊 Using SPY proxy for ES=F: SPY ${spy_price:.2f} -> ES est. ${es_estimate:.2f}")
+                return es_estimate
+        except Exception:
+            pass
+
+    # Only print warning if not weekend (reduce noise)
+    if not is_weekend:
+        print(f"   ⚠️ fetch_realtime_price returning None for {ticker}")
     return None
 
 
 def _fetch_realtime_databento(ticker: str) -> Optional[float]:
-    """Fetch real-time price from Databento."""
+    """Fetch real-time price from Databento Live API (fallback when yfinance fails)."""
     if not HAS_DATABENTO:
         return None
 
@@ -372,34 +430,45 @@ def _fetch_realtime_databento(ticker: str) -> Optional[float]:
         return None
 
     try:
-        client = db.Historical(api_key)
+        import time
 
-        # Get last 5 minutes of data
+        # Map ticker to Databento symbol
         base_symbol = ticker.replace('=F', '')
 
         # Use .c.1 (second month calendar roll) for COMEX metals to match yfinance pricing
-        # The .n.0 (open interest roll) tracks a different contract that doesn't match yfinance
         COMEX_METALS = ['GC', 'SI', 'HG', 'PL', 'PA']
         if base_symbol in COMEX_METALS:
             symbol = f"{base_symbol}.c.1"
         else:
             symbol = f"{base_symbol}.c.0"
 
-        end = datetime.now()
-        start = end - timedelta(minutes=5)
+        # Use Live API for real-time data (Historical API has ~1 day delay)
+        client = db.Live(api_key)
 
-        data = client.timeseries.get_range(
+        client.subscribe(
             dataset='GLBX.MDP3',
-            symbols=[symbol],
-            stype_in='continuous',  # Required for continuous contracts
             schema='ohlcv-1m',
-            start=start.strftime('%Y-%m-%dT%H:%M:%S'),
-            end=end.strftime('%Y-%m-%dT%H:%M:%S')
+            symbols=[symbol],
+            stype_in='continuous'
         )
 
-        df = data.to_df()
-        if not df.empty:
-            return float(df['close'].iloc[-1])
+        # Wait for OHLCV data (with timeout)
+        start_time = time.time()
+        timeout = 3  # 3 second timeout
+        latest_price = None
+
+        for record in client:
+            # Look for OHLCV records (have close attribute)
+            if hasattr(record, 'close') and record.close is not None:
+                latest_price = float(record.close) / 1e9  # Databento uses fixed-point
+                break
+
+            # Timeout check
+            if time.time() - start_time > timeout:
+                break
+
+        client.stop()
+        return latest_price
 
     except Exception:
         pass

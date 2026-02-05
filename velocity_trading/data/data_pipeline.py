@@ -16,11 +16,14 @@ import os
 import sys
 import sqlite3
 import time
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Tuple
 import pandas as pd
 import threading
 from contextlib import contextmanager
+
+logger = logging.getLogger(__name__)
 
 # Add parent directory to path
 PARENT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -62,6 +65,46 @@ FUTURES_TICKER_MAP = {
     'ZN=F': 'ZN.n.0',   # 10-Year Treasury
     '6E=F': '6E.n.0',   # Euro FX
 }
+
+
+def _retry_with_backoff(func, max_retries=3, base_delay=1.0, max_delay=30.0, description="API call"):
+    """
+    Retry a function with exponential backoff.
+
+    Args:
+        func: Callable to retry (should return result or raise)
+        max_retries: Maximum number of retry attempts
+        base_delay: Initial delay in seconds
+        max_delay: Maximum delay between retries
+        description: Description for logging
+
+    Returns:
+        Result of func(), or None if all retries fail
+    """
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            error_str = str(e).lower()
+            is_rate_limit = any(kw in error_str for kw in ['rate limit', 'too many', '429', 'throttl'])
+            is_connection = any(kw in error_str for kw in ['connection', 'timeout', 'refused', 'reset'])
+
+            if attempt == max_retries - 1:
+                logger.warning(f"{description} failed after {max_retries} attempts: {e}")
+                return None
+
+            delay = min(base_delay * (2 ** attempt), max_delay)
+            if is_rate_limit:
+                delay = min(delay * 2, max_delay)  # Extra delay for rate limits
+                logger.info(f"{description} rate limited, waiting {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
+            elif is_connection:
+                logger.info(f"{description} connection error, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
+            else:
+                logger.info(f"{description} failed: {e}, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
+
+            time.sleep(delay)
+
+    return None
 
 
 class DataPipeline:
@@ -291,19 +334,30 @@ class DataPipeline:
 
         # For Polygon-primary futures (GC=F), try Databento first for complete overnight coverage
         if prefer_polygon and self.is_futures and HAS_DATABENTO and DATABENTO_API_KEY and not skip_databento:
-            raw_df = self._fetch_live_databento(lookback_minutes=max(120, int(gap_minutes) + 30))
+            lookback = max(120, int(gap_minutes) + 30)
+            raw_df = _retry_with_backoff(
+                lambda: self._fetch_live_databento(lookback_minutes=lookback),
+                max_retries=2, description=f"Databento Live ({self.ticker})"
+            )
             df, source_used = filter_and_validate(raw_df, 'polygon/databento')
             if df is not None:
                 print(f"   📊 Using Polygon/Databento for {self.ticker} (complete overnight coverage)")
 
         # For equity index futures, try yfinance first
         if df is None and prefer_yfinance and HAS_YFINANCE:
-            raw_df = self._fetch_recent_yfinance()
+            raw_df = _retry_with_backoff(
+                self._fetch_recent_yfinance,
+                max_retries=2, description=f"yfinance ({self.ticker})"
+            )
             df, source_used = filter_and_validate(raw_df, 'yfinance')
 
         # Try Databento Live for other futures or as fallback
         if df is None and self.is_futures and HAS_DATABENTO and DATABENTO_API_KEY and not skip_databento:
-            raw_df = self._fetch_live_databento(lookback_minutes=max(120, int(gap_minutes) + 30))
+            lookback = max(120, int(gap_minutes) + 30)
+            raw_df = _retry_with_backoff(
+                lambda: self._fetch_live_databento(lookback_minutes=lookback),
+                max_retries=2, description=f"Databento Live fallback ({self.ticker})"
+            )
             df, source_used = filter_and_validate(raw_df, 'databento')
 
         # If gap is large (e.g., over a weekend) and Live API didn't work,
@@ -312,7 +366,10 @@ class DataPipeline:
             # Gap > 12 hours - use Historical API
             gap_days = max(3, int(gap_minutes / 1440) + 1)  # At least 3 days
             print(f"   📊 Backfilling {gap_days} days via Databento Historical...")
-            raw_df = self._fetch_historical_databento(days=gap_days)
+            raw_df = _retry_with_backoff(
+                lambda: self._fetch_historical_databento(days=gap_days),
+                max_retries=3, description=f"Databento Historical ({self.ticker})"
+            )
             if raw_df is not None and not raw_df.empty:
                 # Filter to new bars only
                 compare_ts = last_timestamp
@@ -329,7 +386,10 @@ class DataPipeline:
 
         # Final fallback to yfinance if nothing worked yet
         if df is None and HAS_YFINANCE:
-            raw_df = self._fetch_recent_yfinance()
+            raw_df = _retry_with_backoff(
+                self._fetch_recent_yfinance,
+                max_retries=2, description=f"yfinance fallback ({self.ticker})"
+            )
             if raw_df is not None and not raw_df.empty:
                 # Filter to new bars
                 compare_ts = last_timestamp
@@ -504,8 +564,14 @@ class DataPipeline:
             return df
 
         # Convert timestamp and set as index
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        # Use format='mixed' with utc=True to handle both timezone-aware and naive timestamps
+        df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed', utc=True)
+        # Convert to naive UTC for consistent comparison
+        df['timestamp'] = df['timestamp'].dt.tz_localize(None)
         df = df.set_index('timestamp').sort_index()
+
+        # Remove duplicate timestamps (keep last = most recent data source)
+        df = df[~df.index.duplicated(keep='last')]
 
         # Rename columns to match expected format
         df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
@@ -538,7 +604,9 @@ class DataPipeline:
         if df.empty or len(df) < 2:
             return
 
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed', utc=True)
+        # Convert to naive UTC for consistent comparison
+        df['timestamp'] = df['timestamp'].dt.tz_localize(None)
         df = df.sort_values('timestamp')
         timestamps = df['timestamp'].tolist()
 
@@ -828,7 +896,13 @@ class DataPipeline:
         # Prepare data for insertion
         records = []
         for idx, row in df.iterrows():
-            timestamp = idx.isoformat() if hasattr(idx, 'isoformat') else str(idx)
+            # CRITICAL: Normalize timestamp to naive UTC for consistent storage
+            # This ensures all sources (Databento, yfinance, etc.) use the same format
+            if hasattr(idx, 'tzinfo') and idx.tzinfo is not None:
+                # Convert to UTC then strip timezone
+                idx = idx.tz_convert('UTC').tz_localize(None)
+            # Use consistent format: YYYY-MM-DDTHH:MM:SS (no timezone suffix)
+            timestamp = idx.strftime('%Y-%m-%dT%H:%M:%S') if hasattr(idx, 'strftime') else str(idx)[:19]
             records.append((
                 timestamp,
                 float(row.get('open', row.get('Open', 0))),
