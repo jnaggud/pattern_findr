@@ -797,9 +797,17 @@ class BaseTrader(ABC):
             if entry_date.tzinfo is not None:
                 entry_date = entry_date.tz_convert('UTC').tz_localize(None)
 
+            # Ensure df.index is also tz-naive for comparison
+            df_index = df.index
+            if df_index.tz is not None:
+                df_index = df_index.tz_localize(None)
+
+            # Convert entry_date to same dtype as index to avoid comparison errors
+            entry_date = pd.Timestamp(entry_date)
+
             # Find bars AFTER position entry (use > not >= to exclude entry bar)
             # Entry bar cannot have exit signal - that would be same-bar exit
-            df_since_entry = df[df.index > entry_date]
+            df_since_entry = df[df_index > entry_date]
 
             # Determine which signal to look for based on position type
             is_long = position.position_type.lower() == 'long'
