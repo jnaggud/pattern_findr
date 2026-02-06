@@ -29,7 +29,9 @@ try:
     KALMAN_AVAILABLE = True
 except ImportError:
     KALMAN_AVAILABLE = False
-    print("Warning: pykalman not installed. KFIF will use fallback implementation.")
+    # Only warn once (not in every worker process)
+    import warnings
+    warnings.warn("pykalman not installed. KFIF will use fallback implementation.", ImportWarning, stacklevel=1)
 
 
 # ============================================================================
@@ -225,7 +227,7 @@ def calculate_arwo(df: pd.DataFrame, adx_period: int = 14, smooth: int = 3) -> p
 
     # Smooth
     if smooth > 1:
-        arwo = arwo.rolling(window=smooth, center=True).mean().fillna(arwo)
+        arwo = arwo.rolling(window=smooth, center=False).mean().fillna(arwo)
 
     return arwo.clip(-1, 1)
 
@@ -289,7 +291,7 @@ def calculate_dco(df: pd.DataFrame, lookback: int = 14, smooth: int = 3) -> pd.S
 
     # Smooth
     if smooth > 1:
-        dco = dco.rolling(window=smooth, center=True).mean().fillna(dco)
+        dco = dco.rolling(window=smooth, center=False).mean().fillna(dco)
 
     return dco.clip(-1, 1)
 
@@ -352,7 +354,7 @@ def calculate_vcmo(df: pd.DataFrame, mom_period: int = 10, vol_period: int = 20,
 
     # Smooth
     if smooth > 1:
-        vcmo = vcmo.rolling(window=smooth, center=True).mean().fillna(vcmo)
+        vcmo = vcmo.rolling(window=smooth, center=False).mean().fillna(vcmo)
 
     return vcmo.clip(-1, 1)
 
@@ -408,7 +410,7 @@ def calculate_ics(df: pd.DataFrame, smooth: int = 3) -> pd.Series:
 
     # Smooth
     if smooth > 1:
-        ics = ics.rolling(window=smooth, center=True).mean().fillna(ics)
+        ics = ics.rolling(window=smooth, center=False).mean().fillna(ics)
 
     return ics.clip(-1, 1)
 
@@ -507,7 +509,7 @@ def calculate_prf(df: pd.DataFrame, lookback: int = 100, smooth: int = 3) -> pd.
 
     # Smooth
     if smooth > 1:
-        prf_oscillator = prf_oscillator.rolling(window=smooth, center=True, min_periods=1).mean()
+        prf_oscillator = prf_oscillator.rolling(window=smooth, center=False, min_periods=1).mean()
 
     return prf_oscillator.clip(-1, 1)
 
@@ -572,7 +574,7 @@ def calculate_ewaf(df: pd.DataFrame, entropy_window: int = 20, n_bins: int = 10,
 
     # Smooth
     if smooth > 1:
-        ewaf = ewaf.rolling(window=smooth, center=True).mean().fillna(ewaf)
+        ewaf = ewaf.rolling(window=smooth, center=False).mean().fillna(ewaf)
 
     return ewaf.clip(-1, 1)
 
