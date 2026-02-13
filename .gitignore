@@ -270,3 +270,22 @@ model_training.log
 
 # Lock files that can be large
 requirements.lock.txt
+.optuna_temp/
+
+# JSON lock files
+*.json.lock
+
+# Backup directories
+backups/
+
+# CatBoost temporary files
+catboost_info/
+
+# Database directory (contains .db files and backups)
+velocity_trading/db/
+
+# JSON archive (migration artifacts)
+velocity_trading/json_archive/
+
+# Claude Code project context
+.claude/

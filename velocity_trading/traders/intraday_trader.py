@@ -203,9 +203,71 @@ class IntradayTrader(BaseTrader):
 
             return None, None
 
+    def _get_unprocessed_bars(self, df: pd.DataFrame):
+        """
+        Get ALL completed but unprocessed bars since last_processed_bar.
+
+        Unlike get_completed_bar() which returns only the most recent bar,
+        this scans backwards to find ALL bars that haven't been processed yet.
+        This prevents missed entries when a cycle is slow or bars are skipped.
+
+        Returns:
+            List of (bar_data, bar_time) tuples in chronological order
+        """
+        if df is None or df.empty:
+            return []
+
+        import pytz
+        now = get_current_market_time(self.ticker)
+        market_tz = pytz.timezone(self.market_config.get('timezone', 'America/New_York'))
+
+        # Parse last_processed_bar to a comparable timestamp
+        last_processed_dt = None
+        if self.last_processed_bar:
+            try:
+                last_processed_dt = pd.to_datetime(self.last_processed_bar)
+                if last_processed_dt.tzinfo is None:
+                    last_processed_dt = pytz.UTC.localize(last_processed_dt)
+                last_processed_dt = last_processed_dt.astimezone(market_tz)
+            except Exception:
+                last_processed_dt = None
+
+        unprocessed = []
+        for i in range(len(df) - 1, -1, -1):
+            bar = df.iloc[i]
+            bar_time = bar.name
+
+            # Normalize timezone
+            if bar_time.tzinfo is None:
+                bar_time = pytz.UTC.localize(bar_time)
+            bar_time = bar_time.astimezone(market_tz)
+
+            # Check if bar is complete
+            bar_end = bar_time + timedelta(minutes=self.interval_minutes)
+            bar_complete = bar_end + timedelta(seconds=self.bar_completion_buffer_seconds)
+            if now < bar_complete:
+                continue  # Bar not yet complete
+
+            # Check if already processed
+            if last_processed_dt is not None and bar_time <= last_processed_dt:
+                break  # All earlier bars are processed
+
+            unprocessed.append((bar, bar_time))
+
+            # Safety limit: don't scan back more than 20 bars (~5 hours for 15m)
+            if len(unprocessed) >= 20:
+                break
+
+        # Return in chronological order (oldest first)
+        unprocessed.reverse()
+        return unprocessed
+
     def _check_entry(self, df: pd.DataFrame):
         """
         Override to track processed bars and prevent duplicate signals.
+
+        CRITICAL: Scans ALL unprocessed bars (not just the latest one) to
+        prevent missed entries when a cycle is slow or timing drifts.
         """
         # Reset cycle flag at start of each check
         self._bar_processed_this_cycle = False
@@ -214,48 +276,110 @@ class IntradayTrader(BaseTrader):
             print("   Market closed, skipping signal check")
             return
 
-        completed_bar, bar_time = self.get_completed_bar(df)
-        if completed_bar is None or bar_time is None:
+        # Get ALL unprocessed bars, not just the latest one
+        unprocessed_bars = self._get_unprocessed_bars(df)
+        if not unprocessed_bars:
             print("   No completed bar available yet")
             return
 
-        # Normalize timestamp to ISO format for consistent DB storage
-        bar_timestamp = normalize_timestamp(bar_time)
-        bar_key = bar_timestamp[:16]  # YYYY-MM-DDTHH:MM for display
+        if len(unprocessed_bars) > 1:
+            print(f"   ⚠️ {len(unprocessed_bars)} unprocessed bars found, scanning all")
 
-        # Check if we already processed this bar (memory check for same session)
-        if self.last_processed_bar == bar_timestamp:
-            print(f"   Bar {bar_key} already processed, skipping")
-            return
+        for completed_bar, bar_time in unprocessed_bars:
+            # Normalize timestamp to ISO format for consistent DB storage
+            bar_timestamp = normalize_timestamp(bar_time)
+            bar_key = bar_timestamp[:16]  # YYYY-MM-DDTHH:MM for display
 
-        # Mark that we're processing a bar this cycle
-        self._bar_processed_this_cycle = True
+            # Mark that we're processing a bar this cycle
+            self._bar_processed_this_cycle = True
 
-        # Get signal info for logging
-        buy_signal = completed_bar.get('buy_signal', False)
-        sell_signal = completed_bar.get('sell_signal', False)
-        osc_value = completed_bar.get('JD_Osc', completed_bar.get('osc_smooth', 0))
-        velocity = completed_bar.get('velocity', 0)
-        rsc = completed_bar.get('RSC', 'N/A')
+            # Get signal info for logging
+            buy_signal = completed_bar.get('buy_signal', False)
+            sell_signal = completed_bar.get('sell_signal', False)
+            osc_value = completed_bar.get('JD_Osc', completed_bar.get('osc_smooth', 0))
+            velocity = completed_bar.get('velocity', 0)
+            rsc = completed_bar.get('RSC', 'N/A')
 
-        print(f"   Bar {bar_key}: Osc={osc_value:.4f} Vel={velocity:.4f} RSC={rsc} | Buy={buy_signal} Sell={sell_signal}")
+            # v9 regime-aware: check regime-specific buy signal
+            regime_tag = ""
+            regime_name = None
+            if self.regime_aware and self._regimes is not None and len(self._regimes) > 0:
+                from .base_trader import REGIME_NAMES
+                bar_idx = df.index.get_loc(bar_time) if bar_time in df.index else len(df) - 2
+                if 0 <= bar_idx < len(self._regimes):
+                    regime_id = int(self._regimes[bar_idx])
+                    regime_name = REGIME_NAMES.get(regime_id, 'unknown')
+                    regime_tag = f" Regime={regime_name.upper()}"
 
-        # Check for buy signal
-        if not buy_signal:
-            # Mark as processed even if no signal - PERSIST TO DATABASE
-            # This prevents incremental updates from reprocessing this bar
+                    # Override buy_signal with regime-specific signal
+                    if regime_name in self._regime_signal_dfs:
+                        regime_df = self._regime_signal_dfs[regime_name]
+                        if bar_time in regime_df.index:
+                            buy_signal = regime_df.loc[bar_time].get('buy_signal', False)
+                            sell_signal = regime_df.loc[bar_time].get('sell_signal', False)
+                        else:
+                            buy_signal = False
+                            sell_signal = False
+                    else:
+                        # Regime is dont_trade (e.g., chop)
+                        buy_signal = False
+                        sell_signal = False
+
+            print(f"   Bar {bar_key}: Osc={osc_value:.4f} Vel={velocity:.4f} RSC={rsc}{regime_tag} | Buy={buy_signal} Sell={sell_signal}")
+
+            # Check for buy signal
+            if not buy_signal:
+                # Mark as processed even if no signal - PERSIST TO DATABASE
+                # This prevents incremental updates from reprocessing this bar
+                self.last_processed_bar = bar_timestamp
+                self.pm._db.set_last_processed_bar(bar_timestamp)
+                continue
+
+            print(f"   *** BUY SIGNAL DETECTED at {bar_key} ***")
+
+            # Novel Strategy Filters (v7+): Check GBM + XGBoost confidence
+            if self.novel_filters is not None and self.novel_filters.trained:
+                # v9: Set per-regime thresholds from config before checking
+                if self.regime_aware and regime_tag and regime_name:
+                    r_params = self.config.get('regime_params', {}).get(regime_name, {})
+                    if 'gbm_conf_threshold' in r_params:
+                        self.novel_filters._gbm_conf_threshold = r_params['gbm_conf_threshold']
+                    if 'xgb_conf_threshold' in r_params:
+                        self.novel_filters._smote_conf_threshold = r_params['xgb_conf_threshold']
+                should_enter, reason = self.novel_filters.should_enter(df)
+                if not should_enter:
+                    print(f"   [NovelFilters] REJECTED: {reason}")
+                    self.last_processed_bar = bar_timestamp
+                    self.pm._db.set_last_processed_bar(bar_timestamp)
+                    continue
+                else:
+                    print(f"   [NovelFilters] APPROVED: {reason}")
+
+            # Execute entry directly (don't call super()._check_entry which
+            # re-calls get_completed_bar and might get a different bar)
+            entry_price = completed_bar['Close']
+            entry_time = bar_time  # Use bar START time for intraday
+
+            # Dedup check against last_signal_time
+            signal_time_str = str(bar_time)[:19]
+            if self.last_signal_time and signal_time_str <= self.last_signal_time:
+                self.last_processed_bar = bar_timestamp
+                self.pm._db.set_last_processed_bar(bar_timestamp)
+                continue
+
+            # Determine entry regime for v9
+            entry_regime = regime_name if (self.regime_aware and regime_name) else None
+
+            self._execute_entry(entry_price, entry_time, entry_regime=entry_regime)
+            self.last_signal_time = signal_time_str
+
+            # Mark bar as processed - PERSIST TO DATABASE
             self.last_processed_bar = bar_timestamp
             self.pm._db.set_last_processed_bar(bar_timestamp)
-            return
 
-        print(f"   *** BUY SIGNAL DETECTED at {bar_key} ***")
-
-        # Call parent implementation for actual entry
-        super()._check_entry(df)
-
-        # Mark bar as processed - PERSIST TO DATABASE
-        self.last_processed_bar = bar_timestamp
-        self.pm._db.set_last_processed_bar(bar_timestamp)
+            # If we entered a position, stop scanning for more entries
+            if self.pm.get_current_position():
+                break
 
     def _calculate_sleep_time(self) -> int:
         """
@@ -266,6 +390,19 @@ class IntradayTrader(BaseTrader):
         When IN position + market CLOSED: Sleep until market opens (no point checking)
         """
         try:
+            # RECHECK OVERRIDE: If base_trader scheduled a rapid recheck
+            # (bar not yet in data near boundary), honor it instead of
+            # sleeping the full bar interval.
+            import time as _t
+            if hasattr(self, '_bar_recheck_time') and self._bar_recheck_time > 0:
+                now_ts = _t.time()
+                if self._bar_recheck_time > now_ts:
+                    wait = max(1, int(self._bar_recheck_time - now_ts))
+                else:
+                    wait = 1  # already overdue
+                print(f"   📡 Recheck pending — sleeping {wait}s (not full bar)")
+                return wait
+
             # CRITICAL: When in a position, check frequently for SL/TP
             position = self.pm.get_current_position()
             if position:
@@ -348,14 +485,20 @@ def run_intraday_trader(
         webhook_url = os.environ.get('DISCORD_WEBHOOK_URL')
 
     # Validate config has required parameters
-    required_params = ['signal_type', 'oversold_threshold', 'overbought_threshold',
-                       'stop_loss_pct', 'take_profit_pct']
-    missing = [p for p in required_params if p not in config]
-    if missing:
-        raise ValueError(
-            f"Missing required config parameters: {missing}. "
-            f"Config must come from strategy bundle (velocity_strategies/{strategy_name}/)."
-        )
+    # For regime-aware configs, required params live inside regime_params, not at top level
+    if config.get('regime_aware', False):
+        regime_params = config.get('regime_params', {})
+        if not regime_params:
+            raise ValueError("regime_aware=True but no regime_params in config")
+    else:
+        required_params = ['signal_type', 'oversold_threshold', 'overbought_threshold',
+                           'stop_loss_pct', 'take_profit_pct']
+        missing = [p for p in required_params if p not in config]
+        if missing:
+            raise ValueError(
+                f"Missing required config parameters: {missing}. "
+                f"Config must come from strategy bundle (velocity_strategies/{strategy_name}/)."
+            )
 
     trader = IntradayTrader(
         strategy_name=strategy_name,
@@ -436,27 +579,28 @@ def load_bundle_config(strategy_name: str) -> Optional[Dict]:
     print(f"   Loaded config from: {bundle['path']}")
 
     # CRITICAL: Validate required parameters exist in bundle
-    required_params = ['signal_type', 'oversold_threshold', 'overbought_threshold',
-                       'stop_loss_pct', 'take_profit_pct']
-    missing = [p for p in required_params if p not in config]
-    if missing:
-        print(f"   WARNING: Bundle missing required params: {missing}")
-        print(f"   Re-run optimization in Streamlit to fix the bundle.")
-        return None
+    # For regime-aware configs, required params live inside regime_params
+    is_regime_aware = config.get('regime_aware', False)
+    if is_regime_aware:
+        if not config.get('regime_params'):
+            print(f"   WARNING: regime_aware=True but no regime_params in bundle")
+            return None
+    else:
+        required_params = ['signal_type', 'oversold_threshold', 'overbought_threshold',
+                           'stop_loss_pct', 'take_profit_pct']
+        missing = [p for p in required_params if p not in config]
+        if missing:
+            print(f"   WARNING: Bundle missing required params: {missing}")
+            print(f"   Re-run optimization in Streamlit to fix the bundle.")
+            return None
 
     # Map bundle config keys to our expected format - NO DEFAULTS for trading params
-    return {
+    result = {
         'ticker': config.get('ticker'),
         'interval': config.get('interval', '15m'),  # Non-critical default ok
         # Bundle identification - CRITICAL for importing trades from bundle
         'bundle_name': config.get('bundle_name'),
         'strategy_name': config.get('strategy_name'),
-        # CRITICAL trading parameters - pass through from bundle, NO DEFAULTS
-        'signal_type': config['signal_type'],
-        'stop_loss_pct': config['stop_loss_pct'],
-        'take_profit_pct': config['take_profit_pct'],
-        'oversold_threshold': config['oversold_threshold'],
-        'overbought_threshold': config['overbought_threshold'],
         # Oscillator type (for novel oscillators: arwo, prf, ics, etc.)
         'oscillator_type': config.get('oscillator_type', 'composite'),
         # Signal generation parameters
@@ -470,11 +614,53 @@ def load_bundle_config(strategy_name: str) -> Optional[Dict]:
         'fragility_threshold': config.get('fragility_threshold', 0.5),
         'use_entropy_filter': config.get('use_entropy_filter', False),
         'entropy_threshold': config.get('entropy_threshold', 0.7),
+        # Acceleration exit parameters
+        'use_accel_exit': config.get('use_accel_exit', False),
+        'accel_exit_type': config.get('accel_exit_type', 'sign_reversal'),
+        'accel_exit_threshold': config.get('accel_exit_threshold', 0.0),
+        'accel_exit_min_pnl': config.get('accel_exit_min_pnl', 0.5),
+        'accel_exit_lookback': config.get('accel_exit_lookback', 1),
+        'use_jerk_confirm': config.get('use_jerk_confirm', False),
+        'jerk_confirm_threshold': config.get('jerk_confirm_threshold', 0.0),
+        # Signal parameters
+        'min_hold_bars': config.get('min_hold_bars', 1),
+        'min_bars_between': config.get('min_bars_between', 1),
+        'vel_threshold': config.get('vel_threshold', 0.0),
+        'accel_threshold': config.get('accel_threshold', 0.0),
+        'velocity_std_window': config.get('velocity_std_window', 10),
+        'momentum_multiplier': config.get('momentum_multiplier', 1.5),
+        'double_bottom_lookback': config.get('double_bottom_lookback', 10),
+        'divergence_lookback': config.get('divergence_lookback', 5),
         # Non-critical parameters can have safe defaults
         'exit_on_opposite_signal': config.get('exit_on_opposite_signal', True),
         'exit_on_midline_cross': config.get('exit_on_midline_cross', False),
         'webhook': config.get('discord_webhook'),
+        # Novel strategy filters (v7+) — only present if bundle uses novel strategies
+        'novel_strategies': config.get('novel_strategies'),
+        # v10/v11 daily retrainer params
+        'daily_retrain': config.get('daily_retrain', False),
+        'retrain_trials': config.get('retrain_trials', 5000),
+        'retrain_train_days': config.get('retrain_train_days', 30),
+        'retrain_workers': config.get('retrain_workers'),
+        'retrain_pinned_params': config.get('retrain_pinned_params', {}),
+        'retrain_optimize_exits': config.get('retrain_optimize_exits', False),
+        'retrain_scoring': config.get('retrain_scoring', 'original'),
     }
+
+    # v9 regime-aware passthrough
+    if is_regime_aware:
+        result['regime_aware'] = True
+        result['regime_detector'] = config.get('regime_detector', {})
+        result['regime_params'] = config.get('regime_params', {})
+    else:
+        # CRITICAL trading parameters - pass through from bundle, NO DEFAULTS
+        result['signal_type'] = config['signal_type']
+        result['stop_loss_pct'] = config['stop_loss_pct']
+        result['take_profit_pct'] = config['take_profit_pct']
+        result['oversold_threshold'] = config['oversold_threshold']
+        result['overbought_threshold'] = config['overbought_threshold']
+
+    return result
 
 
 # ============================================================
@@ -518,8 +704,17 @@ def select_strategy_interactive():
 
     for i, name in enumerate(strategies, 1):
         cfg = intraday_bundles[name]['config']
+        # For regime-aware configs, signal_type lives inside regime_params
+        if cfg.get('regime_aware') and cfg.get('regime_params'):
+            active = [rc.get('signal_type', '?') for rn, rc in cfg['regime_params'].items()
+                      if not rc.get('dont_trade', False)]
+            sig_types = list(dict.fromkeys(active))  # dedupe preserving order
+            sig_display = ', '.join(sig_types) if sig_types else '?'
+            sig_display = f"v{cfg.get('version', '9')} regime-aware ({sig_display})"
+        else:
+            sig_display = cfg.get('signal_type', '?')
         print(f"  [{i}] {name}")
-        print(f"      {cfg.get('ticker', '?')} | {cfg.get('interval', '?')} | {cfg.get('signal_type', '?')}")
+        print(f"      {cfg.get('ticker', '?')} | {cfg.get('interval', '?')} | {sig_display}")
         print()
 
     while True:
@@ -581,36 +776,16 @@ if __name__ == '__main__':
         sys.exit(1)
 
     # Build config dict - pass through bundle values WITHOUT adding defaults
-    # Critical trading params come directly from bundle (already validated)
-    config = {
-        # Bundle identification - CRITICAL for importing trades from bundle
-        'bundle_name': cfg.get('bundle_name'),
-        'strategy_name': cfg.get('strategy_name'),
-        # Trading parameters
-        'stop_loss_pct': cfg['stop_loss_pct'],
-        'take_profit_pct': cfg['take_profit_pct'],
-        'signal_type': cfg['signal_type'],
-        'oversold_threshold': cfg['oversold_threshold'],
-        'overbought_threshold': cfg['overbought_threshold'],
-        # Oscillator type (for novel oscillators: arwo, prf, ics, etc.)
-        'oscillator_type': cfg.get('oscillator_type', 'composite'),
-        # Signal generation parameters
-        'vel_smoothing': cfg.get('vel_smoothing', 1),
-        'extreme_zone_mult': cfg.get('extreme_zone_mult', 1.5),
-        'require_accel': cfg.get('require_accel', False),
-        # V2 Filters (Regime, Fragility, Entropy)
-        'use_regime_filter': cfg.get('use_regime_filter', False),
-        'regime_threshold': cfg.get('regime_threshold', -0.15),
-        'use_fragility_filter': cfg.get('use_fragility_filter', False),
-        'fragility_threshold': cfg.get('fragility_threshold', 0.5),
-        'use_entropy_filter': cfg.get('use_entropy_filter', False),
-        'entropy_threshold': cfg.get('entropy_threshold', 0.7),
-        # Non-critical params can have safe defaults
-        'exit_on_opposite_signal': cfg.get('exit_on_opposite_signal', True),
-        'exit_on_midline_cross': cfg.get('exit_on_midline_cross', False),
-        'check_interval_seconds': 30,
-        'bar_completion_buffer': 3
-    }
+    # Critical trading params come directly from bundle (already validated by load_bundle_config)
+    config = dict(cfg)  # Start with all keys from load_bundle_config
+    # Add runtime-only settings
+    config['check_interval_seconds'] = 30
+    config['bar_completion_buffer'] = 3
+    # Wavelet denoising (v8+) — pass through from bundle
+    config.setdefault('use_wavelet_denoise', False)
+    config.setdefault('wavelet_family', 'db4')
+    config.setdefault('wavelet_level', 2)
+    config.setdefault('wavelet_threshold_mode', 'hard')
 
     # Determine webhook
     if args.test:
@@ -619,7 +794,7 @@ if __name__ == '__main__':
     elif args.webhook:
         webhook = args.webhook
     else:
-        webhook = cfg.get('webhook') or os.environ.get('DISCORD_WEBHOOK_URL')
+        webhook = cfg.get('discord_webhook') or cfg.get('webhook') or os.environ.get('DISCORD_WEBHOOK_URL')
 
     # Allow overrides
     ticker = args.ticker or cfg['ticker']

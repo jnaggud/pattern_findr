@@ -1,145 +1,145 @@
 {
   "runs": [
     {
-      "timestamp": "2026-01-06T16:06:35.997491",
-      "trials": 5000,
-      "duration_seconds": 64.3,
-      "n_workers": 31,
-      "trials_per_minute": 4666.0
-    },
-    {
-      "timestamp": "2026-01-06T16:17:15.881535",
-      "trials": 500,
-      "duration_seconds": 11.6,
-      "n_workers": 31,
-      "trials_per_minute": 2595.0
-    },
-    {
-      "timestamp": "2026-01-06T16:18:09.495843",
-      "trials": 5000,
-      "duration_seconds": 34.9,
-      "n_workers": 31,
-      "trials_per_minute": 8592.0
-    },
-    {
-      "timestamp": "2026-01-06T16:19:55.078967",
-      "trials": 10000,
-      "duration_seconds": 73.4,
-      "n_workers": 31,
-      "trials_per_minute": 8176.0
-    },
-    {
-      "timestamp": "2026-01-06T16:28:58.885513",
-      "trials": 25000,
-      "duration_seconds": 222.8,
-      "n_workers": 31,
-      "trials_per_minute": 6733.0
-    },
-    {
-      "timestamp": "2026-01-06T17:34:50.197565",
-      "trials": 5000,
-      "duration_seconds": 41.6,
-      "n_workers": 31,
-      "trials_per_minute": 7211.0
-    },
-    {
-      "timestamp": "2026-01-06T17:44:52.928797",
-      "trials": 50000,
-      "duration_seconds": 587.7,
-      "n_workers": 31,
-      "trials_per_minute": 5105.0
-    },
-    {
-      "timestamp": "2026-01-06T18:04:54.549306",
-      "trials": 50000,
-      "duration_seconds": 613.0,
-      "n_workers": 31,
-      "trials_per_minute": 4894.0
-    },
-    {
-      "timestamp": "2026-01-06T18:16:07.243618",
-      "trials": 50000,
-      "duration_seconds": 612.4,
-      "n_workers": 31,
-      "trials_per_minute": 4899.0
-    },
-    {
-      "timestamp": "2026-01-06T20:03:21.049519",
-      "trials": 10000,
-      "duration_seconds": 251.3,
-      "n_workers": 31,
-      "trials_per_minute": 2388.0
-    },
-    {
-      "timestamp": "2026-01-06T20:20:18.902438",
-      "trials": 10000,
-      "duration_seconds": 238.2,
-      "n_workers": 31,
-      "trials_per_minute": 2519.0
-    },
-    {
-      "timestamp": "2026-01-07T07:20:56.371032",
-      "trials": 1000,
-      "duration_seconds": 51.3,
-      "n_workers": 31,
-      "trials_per_minute": 1169.0
-    },
-    {
-      "timestamp": "2026-01-07T07:25:43.908478",
-      "trials": 1000,
-      "duration_seconds": 51.2,
-      "n_workers": 31,
-      "trials_per_minute": 1172.0
-    },
-    {
-      "timestamp": "2026-01-07T08:07:49.310444",
-      "trials": 5000,
-      "duration_seconds": 258.0,
-      "n_workers": 31,
-      "trials_per_minute": 1163.0
-    },
-    {
-      "timestamp": "2026-01-07T08:27:55.209489",
-      "trials": 46392,
-      "duration_seconds": 271.0,
+      "timestamp": "2026-01-25T07:28:55.573098",
+      "trials": 51547,
+      "duration_seconds": 379.7,
       "n_workers": 32,
-      "trials_per_minute": 10270.0
+      "trials_per_minute": 8145.0
     },
     {
-      "timestamp": "2026-01-07T15:17:05.053214",
-      "trials": 10000,
-      "duration_seconds": 450.7,
-      "n_workers": 31,
-      "trials_per_minute": 1331.0
-    },
-    {
-      "timestamp": "2026-01-08T08:26:58.033147",
-      "trials": 50000,
-      "duration_seconds": 2829.7,
-      "n_workers": 31,
-      "trials_per_minute": 1060.0
-    },
-    {
-      "timestamp": "2026-01-08T14:20:11.784814",
-      "trials": 92079,
-      "duration_seconds": 1126.7,
+      "timestamp": "2026-01-25T08:35:58.852857",
+      "trials": 57540,
+      "duration_seconds": 484.5,
       "n_workers": 32,
-      "trials_per_minute": 4903.0
+      "trials_per_minute": 7126.0
     },
     {
-      "timestamp": "2026-01-09T08:49:44.201528",
-      "trials": 25000,
-      "duration_seconds": 1772.9,
-      "n_workers": 31,
-      "trials_per_minute": 846.0
+      "timestamp": "2026-01-26T06:54:20.426158",
+      "trials": 47791,
+      "duration_seconds": 369.5,
+      "n_workers": 32,
+      "trials_per_minute": 7760.0
     },
     {
-      "timestamp": "2026-01-09T09:00:28.033227",
-      "trials": 5000,
-      "duration_seconds": 303.4,
+      "timestamp": "2026-01-26T09:11:07.035638",
+      "trials": 47920,
+      "duration_seconds": 357.3,
+      "n_workers": 32,
+      "trials_per_minute": 8047.0
+    },
+    {
+      "timestamp": "2026-02-04T15:29:43.201674",
+      "trials": 112881,
+      "duration_seconds": 2477.1,
+      "n_workers": 32,
+      "trials_per_minute": 2734.0
+    },
+    {
+      "timestamp": "2026-02-06T06:52:32.163869",
+      "trials": 50360,
+      "duration_seconds": 1625.9,
       "n_workers": 31,
-      "trials_per_minute": 989.0
+      "trials_per_minute": 1858.0
+    },
+    {
+      "timestamp": "2026-02-06T07:10:04.146205",
+      "trials": 50360,
+      "duration_seconds": 852.1,
+      "n_workers": 31,
+      "trials_per_minute": 3546.0
+    },
+    {
+      "timestamp": "2026-02-06T07:45:30.288729",
+      "trials": 20848,
+      "duration_seconds": 162.9,
+      "n_workers": 31,
+      "trials_per_minute": 7680.0
+    },
+    {
+      "timestamp": "2026-02-06T13:30:48.902961",
+      "trials": 22609,
+      "duration_seconds": 177.4,
+      "n_workers": 31,
+      "trials_per_minute": 7645.0
+    },
+    {
+      "timestamp": "2026-02-06T13:35:01.110919",
+      "trials": 28303,
+      "duration_seconds": 180.0,
+      "n_workers": 31,
+      "trials_per_minute": 9432.0
+    },
+    {
+      "timestamp": "2026-02-06T13:48:46.298047",
+      "trials": 42135,
+      "duration_seconds": 395.6,
+      "n_workers": 31,
+      "trials_per_minute": 6390.0
+    },
+    {
+      "timestamp": "2026-02-07T05:52:17.484764",
+      "trials": 7249,
+      "duration_seconds": 21.5,
+      "n_workers": 32,
+      "trials_per_minute": 20258.0
+    },
+    {
+      "timestamp": "2026-02-07T06:17:40.347271",
+      "trials": 68495,
+      "duration_seconds": 1334.8,
+      "n_workers": 32,
+      "trials_per_minute": 3079.0
+    },
+    {
+      "timestamp": "2026-02-07T06:32:37.576928",
+      "trials": 15323,
+      "duration_seconds": 73.0,
+      "n_workers": 32,
+      "trials_per_minute": 12599.0
+    },
+    {
+      "timestamp": "2026-02-07T06:56:23.674979",
+      "trials": 26205,
+      "duration_seconds": 168.7,
+      "n_workers": 32,
+      "trials_per_minute": 9322.0
+    },
+    {
+      "timestamp": "2026-02-07T07:00:45.352334",
+      "trials": 27284,
+      "duration_seconds": 169.3,
+      "n_workers": 32,
+      "trials_per_minute": 9670.0
+    },
+    {
+      "timestamp": "2026-02-07T07:13:43.105491",
+      "trials": 9296,
+      "duration_seconds": 66.0,
+      "n_workers": 16,
+      "trials_per_minute": 8452.0
+    },
+    {
+      "timestamp": "2026-02-12T07:09:42.511158",
+      "trials": 8180,
+      "duration_seconds": 36.9,
+      "n_workers": 32,
+      "trials_per_minute": 13285.0
+    },
+    {
+      "timestamp": "2026-02-12T07:15:08.397988",
+      "trials": 22301,
+      "duration_seconds": 217.0,
+      "n_workers": 32,
+      "trials_per_minute": 6167.0
+    },
+    {
+      "timestamp": "2026-02-12T07:30:30.851436",
+      "trials": 22301,
+      "duration_seconds": 221.7,
+      "n_workers": 32,
+      "trials_per_minute": 6035.0
     }
   ],
-  "avg_trials_per_minute": 3233.0
+  "avg_trials_per_minute": 8558.0
 }

@@ -31,6 +31,7 @@ USAGE PATTERN:
 import sqlite3
 import os
 import json
+import traceback
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Tuple, List
@@ -40,6 +41,14 @@ from .database import TradingDatabase, get_db_path, init_database
 import pandas as pd
 
 # Base directory for JSON files (parent of velocity_trading/)
+
+
+def _row_get(row, key, default=None):
+    """Safely get a value from a sqlite3.Row (which lacks .get())."""
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
 
 
 # =============================================================================
@@ -114,6 +123,59 @@ def get_bar_key(ts: str, precision: str = 'minute') -> str:
         return dt.strftime('%Y-%m-%dT%H')
     else:  # minute
         return dt.strftime('%Y-%m-%dT%H:%M')
+
+
+# Interval to minutes mapping for bar key calculation
+_INTERVAL_MINUTES = {
+    '1m': 1, '2m': 2, '5m': 5, '10m': 10, '15m': 15,
+    '30m': 30, '1h': 60, '2h': 120, '4h': 240,
+}
+
+
+def get_bar_key_for_interval(ts: str, interval: str) -> str:
+    """
+    Get bar-aligned timestamp key for same-bar detection.
+
+    Aligns timestamp to the START of its containing bar based on interval.
+    Two timestamps in the same bar will produce the same key.
+
+    Args:
+        ts: Timestamp string (any format)
+        interval: Bar interval ('1m', '5m', '15m', '30m', '1h', '1d', etc.)
+
+    Returns:
+        Bar-aligned key string for comparison
+
+    Examples:
+        get_bar_key_for_interval("2024-01-02T10:07:00", "15m") -> "2024-01-02T10:00"
+        get_bar_key_for_interval("2024-01-02T10:14:59", "15m") -> "2024-01-02T10:00"
+        get_bar_key_for_interval("2024-01-02T10:15:00", "15m") -> "2024-01-02T10:15"
+    """
+    dt = pd.to_datetime(ts)
+    if dt.tzinfo is not None:
+        dt = dt.tz_convert('UTC').tz_localize(None)
+
+    if interval == '1d':
+        return dt.strftime('%Y-%m-%d')
+
+    interval_mins = _INTERVAL_MINUTES.get(interval)
+    if interval_mins is None:
+        # Fallback: try to parse interval string (e.g., '45m')
+        try:
+            interval_mins = int(interval.replace('m', '').replace('min', ''))
+        except ValueError:
+            # Unknown interval - fall back to minute precision
+            return dt.strftime('%Y-%m-%dT%H:%M')
+
+    if interval_mins >= 60:
+        # Hour-based intervals: align to hour boundaries
+        interval_hours = interval_mins // 60
+        aligned_hour = (dt.hour // interval_hours) * interval_hours
+        return dt.replace(hour=aligned_hour, minute=0, second=0).strftime('%Y-%m-%dT%H:%M')
+    else:
+        # Minute-based intervals: align to minute boundaries
+        aligned_minute = (dt.minute // interval_mins) * interval_mins
+        return dt.replace(minute=aligned_minute, second=0).strftime('%Y-%m-%dT%H:%M')
 BASE_DIR = Path(__file__).parent.parent.parent
 
 
@@ -127,6 +189,7 @@ class Position:
     entry_date: str
     entry_signal_bar: Optional[str] = None
     last_signal_time: Optional[str] = None
+    entry_regime: Optional[str] = None
     trade_id: Optional[int] = None
 
     def to_dict(self) -> dict:
@@ -228,7 +291,7 @@ class PositionManager:
         """
         # Check for open trades without position records
         open_trade = self._db.execute_one(
-            """SELECT id, entry_date, entry_price, position_type, ticker
+            """SELECT id, entry_date, entry_price, position_type, ticker, entry_regime
                FROM trades
                WHERE strategy_name = ? AND exit_date IS NULL
                ORDER BY id DESC LIMIT 1""",
@@ -242,10 +305,11 @@ class PositionManager:
             print(f"   ⚠️  Syncing position from trade #{open_trade['id']}")
             self._db.execute(
                 """INSERT OR REPLACE INTO positions
-                   (strategy_name, ticker, position_type, entry_price, entry_date, trade_id)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                   (strategy_name, ticker, position_type, entry_price, entry_date, entry_regime, trade_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (self.strategy_name, open_trade['ticker'], open_trade['position_type'],
-                 open_trade['entry_price'], open_trade['entry_date'], open_trade['id'])
+                 open_trade['entry_price'], open_trade['entry_date'],
+                 _row_get(open_trade, 'entry_regime'), open_trade['id'])
             )
         elif current_position and not open_trade:
             # Position exists but no open trade - clear the orphan position
@@ -264,11 +328,11 @@ class PositionManager:
                 self._db.execute(
                     """UPDATE positions SET
                            ticker = ?, position_type = ?, entry_price = ?,
-                           entry_date = ?, trade_id = ?, updated_at = datetime('now')
+                           entry_date = ?, entry_regime = ?, trade_id = ?, updated_at = datetime('now')
                        WHERE strategy_name = ?""",
                     (open_trade['ticker'], open_trade['position_type'],
                      open_trade['entry_price'], open_trade['entry_date'],
-                     open_trade['id'], self.strategy_name)
+                     _row_get(open_trade, 'entry_regime'), open_trade['id'], self.strategy_name)
                 )
 
     def _ensure_daily_backup(self):
@@ -341,9 +405,10 @@ class PositionManager:
                 position_type=row['position_type'],
                 entry_price=row['entry_price'],
                 entry_date=row['entry_date'],
-                entry_signal_bar=row.get('entry_signal_bar'),
-                last_signal_time=row.get('last_signal_time'),
-                trade_id=row.get('trade_id')
+                entry_signal_bar=_row_get(row, 'entry_signal_bar'),
+                last_signal_time=_row_get(row, 'last_signal_time'),
+                entry_regime=_row_get(row, 'entry_regime'),
+                trade_id=_row_get(row, 'trade_id')
             )
         return None
 
@@ -354,7 +419,8 @@ class PositionManager:
         entry_price: float,
         entry_date: str,
         entry_signal_bar: str = None,
-        is_missed: bool = False
+        is_missed: bool = False,
+        entry_regime: str = None
     ) -> Tuple[bool, Dict]:
         """
         Atomically enter a new position.
@@ -467,10 +533,10 @@ class PositionManager:
                 cursor = conn.execute(
                     """INSERT INTO trades
                        (strategy_name, ticker, entry_date, entry_price,
-                        entry_signal_bar, position_type, is_missed)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        entry_signal_bar, position_type, is_missed, entry_regime)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (self.strategy_name, ticker, entry_date, entry_price,
-                     entry_signal_bar, position_type, is_missed)
+                     entry_signal_bar, position_type, is_missed, entry_regime)
                 )
                 trade_id = cursor.lastrowid
 
@@ -478,10 +544,10 @@ class PositionManager:
                 conn.execute(
                     """INSERT INTO positions
                        (strategy_name, ticker, position_type, entry_price,
-                        entry_date, entry_signal_bar, last_signal_time, trade_id)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        entry_date, entry_signal_bar, last_signal_time, entry_regime, trade_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (self.strategy_name, ticker, position_type, entry_price,
-                     entry_date, entry_signal_bar, entry_date, trade_id)
+                     entry_date, entry_signal_bar, entry_date, entry_regime, trade_id)
                 )
 
                 return True, {
@@ -491,7 +557,8 @@ class PositionManager:
                     'entry_price': entry_price,
                     'entry_date': entry_date,
                     'entry_signal_bar': entry_signal_bar,
-                    'is_missed': is_missed
+                    'is_missed': is_missed,
+                    'entry_regime': entry_regime
                 }
 
         except sqlite3.IntegrityError as e:
@@ -511,7 +578,8 @@ class PositionManager:
         exit_date: str,
         exit_reason: str,
         exit_signal_bar: str = None,
-        is_missed: bool = False
+        is_missed: bool = False,
+        interval: str = None
     ) -> Tuple[bool, Dict]:
         """
         Atomically exit current position.
@@ -561,6 +629,7 @@ class PositionManager:
                 entry_date = pos_row['entry_date']
                 position_type = pos_row['position_type']
                 ticker = pos_row['ticker']
+                entry_regime = _row_get(pos_row, 'entry_regime')
 
                 # Validate exit date is after entry date using proper datetime comparison
                 cmp_result = compare_timestamps(exit_date, entry_date)
@@ -571,8 +640,13 @@ class PositionManager:
                     }
 
                 # Same-bar protection: prevent exit on same bar as entry
-                exit_bar_key = get_bar_key(exit_date, 'minute')
-                entry_bar_key = get_bar_key(entry_date, 'minute')
+                # Use interval-aware bar keys if interval is provided
+                if interval:
+                    exit_bar_key = get_bar_key_for_interval(exit_date, interval)
+                    entry_bar_key = get_bar_key_for_interval(entry_date, interval)
+                else:
+                    exit_bar_key = get_bar_key(exit_date, 'minute')
+                    entry_bar_key = get_bar_key(entry_date, 'minute')
                 if exit_bar_key == entry_bar_key:
                     return False, {
                         'error': 'SameBarExit',
@@ -641,10 +715,13 @@ class PositionManager:
                     'exit_reason': exit_reason,
                     'pnl_pct': pnl_pct,
                     'pnl_dollars': pnl_dollars,
-                    'is_missed': is_missed
+                    'is_missed': is_missed,
+                    'entry_regime': entry_regime
                 }
 
         except Exception as e:
+            tb = traceback.format_exc()
+            print(f"   [exit_position] TRACEBACK:\n{tb}")
             return False, {
                 'error': 'Exception',
                 'message': str(e)
@@ -1020,7 +1097,8 @@ class PositionManager:
                 print(f"   📌 Using LEGACY calculation (matches old system)")
 
             # Fetch price data from providers - CRITICAL: include interval!
-            df = fetch_price_data(ticker, days=days, interval=interval)
+            # Use yfinance_only to match live trading data source
+            df = fetch_price_data(ticker, days=days, interval=interval, yfinance_only=True)
             if df is None or df.empty:
                 return False, {'error': f'Failed to fetch data for {ticker}'}
 
@@ -1046,11 +1124,34 @@ class PositionManager:
                 # Use new calculations - CRITICAL: pass config for oscillator_type (arwo, etc.)
                 oscillator_type = config.get('oscillator_type', 'composite')
                 df = calculate_composite_oscillator(df, oscillator_type=oscillator_type, config=config)
+
+                # Novel Strategy Filters: Apply OU boost + train models (v7+)
+                novel_filters = None
+                novel_config = config.get('novel_strategies')
+                if novel_config:
+                    try:
+                        from .novel_filters import NovelStrategyFilters
+                        novel_filters = NovelStrategyFilters(novel_config)
+                        novel_filters.train(df)
+                        df = novel_filters.apply_ou_boost(df)
+                    except Exception as e:
+                        print(f"   [NovelFilters] Warning: {e}")
+                        novel_filters = None
+
                 df = calculate_velocity_signals(
                     df,
                     signal_type=config['signal_type'],
                     oversold_threshold=config['oversold_threshold'],
-                    overbought_threshold=config['overbought_threshold']
+                    overbought_threshold=config['overbought_threshold'],
+                    vel_smoothing=config.get('vel_smoothing', 1),
+                    extreme_zone_mult=config.get('extreme_zone_mult', 1.5),
+                    require_accel=config.get('require_accel', False),
+                    use_regime_filter=config.get('use_regime_filter', False),
+                    regime_threshold=config.get('regime_threshold', -0.15),
+                    use_fragility_filter=config.get('use_fragility_filter', False),
+                    fragility_threshold=config.get('fragility_threshold', 0.5),
+                    use_entropy_filter=config.get('use_entropy_filter', False),
+                    entropy_threshold=config.get('entropy_threshold', 0.7),
                 )
 
             # Extract trades from backtest
@@ -1064,12 +1165,42 @@ class PositionManager:
             stop_loss_pct = config['stop_loss_pct']
             take_profit_pct = config['take_profit_pct']
 
-            for i, row in df.iterrows():
+            # Pre-compute novel filter bar indices for fast lookup
+            _novel_rejected = set()
+            if novel_filters is not None and novel_filters.trained:
+                bar_positions = list(range(len(df)))
+                n_rejected = 0
+                for bar_pos in bar_positions:
+                    if df.iloc[bar_pos].get('buy_signal', False):
+                        should_enter, reason = novel_filters.should_enter(df, bar_idx=bar_pos)
+                        if not should_enter:
+                            _novel_rejected.add(bar_pos)
+                            n_rejected += 1
+                if n_rejected > 0:
+                    total_signals = sum(1 for _, r in df.iterrows() if r.get('buy_signal', False))
+                    print(f"   [NovelFilters] Filtered {n_rejected}/{total_signals} signals in backtest")
+
+                # Train ML exit model on filtered entries
+                novel_filters.train_exit_model(df, stop_loss_pct=stop_loss_pct)
+
+            # Track whether ML exit model is available
+            _has_ml_exit = (novel_filters is not None
+                            and novel_filters.exit_model.trained)
+
+            entry_bar_idx = None
+            high_watermark = None
+
+            for idx_pos, (i, row) in enumerate(df.iterrows()):
                 if not in_position and row.get('buy_signal', False):
+                    # Novel Strategy Filters: skip rejected signals (v7+)
+                    if idx_pos in _novel_rejected:
+                        continue
                     # Enter position
                     in_position = True
                     entry_price = row['Close']
                     entry_date = str(i)
+                    entry_bar_idx = idx_pos
+                    high_watermark = entry_price
                     entries.append({
                         'date': entry_date,
                         'price': entry_price,
@@ -1080,14 +1211,29 @@ class PositionManager:
                     current_price = row['Close']
                     pnl_pct = ((current_price - entry_price) / entry_price) * 100
 
+                    if current_price > high_watermark:
+                        high_watermark = current_price
+
                     exit_reason = None
 
-                    # Check exit conditions
+                    # Check exit conditions: SL > TP > ML Exit > Signal
                     if pnl_pct <= -stop_loss_pct:
                         exit_reason = f'Stop Loss ({pnl_pct:.2f}%)'
                     elif pnl_pct >= take_profit_pct:
                         exit_reason = f'Take Profit ({pnl_pct:.2f}%)'
-                    elif row.get('sell_signal', False):
+                    elif _has_ml_exit:
+                        # ML Exit Model: check if model says exit
+                        try:
+                            should_exit, prob, reason = novel_filters.exit_model.should_exit(
+                                df, entry_price, entry_bar_idx, idx_pos,
+                                high_watermark=high_watermark
+                            )
+                            if should_exit:
+                                exit_reason = f'ML Exit ({pnl_pct:.2f}%, p={prob:.2f})'
+                        except Exception:
+                            pass
+                    # Fallback to signal-based exit when no ML model
+                    if exit_reason is None and row.get('sell_signal', False):
                         exit_reason = f'Opposite Signal ({pnl_pct:.2f}%)'
 
                     if exit_reason:
@@ -1102,6 +1248,8 @@ class PositionManager:
                         in_position = False
                         entry_price = None
                         entry_date = None
+                        entry_bar_idx = None
+                        high_watermark = None
 
             print(f"   ✓ Backtest complete: {len(entries)} entries, {len(exits)} exits")
 
@@ -1200,7 +1348,8 @@ class PositionManager:
         ticker: str,
         config: dict,
         interval: str = '1d',
-        lookback_bars: int = 50
+        lookback_bars: int = 50,
+        force_from_last_trade: bool = False
     ) -> Tuple[bool, Dict]:
         """
         Process any unprocessed COMPLETED bars since last check.
@@ -1219,6 +1368,9 @@ class PositionManager:
             config: Strategy config with signal parameters
             interval: Bar interval ('1d', '15m', etc.)
             lookback_bars: Bars for indicator warmup
+            force_from_last_trade: If True, re-evaluate from last trade date
+                instead of last_processed_bar. Used on startup to catch missed
+                entries when bars were "processed" but no trades were made.
 
         Returns:
             (success, result) tuple with new trade counts
@@ -1232,9 +1384,35 @@ class PositionManager:
             # Get last processed bar from strategy_state table
             last_processed = self._db.get_last_processed_bar()
 
+            # CRITICAL: Sync last_processed with last trade date
+            # The main trading loop may have processed bars beyond last_processed_bar
+            # (which was only updated by process_new_bars, not the live loop).
+            # Use whichever is later to avoid re-processing bars that already have trades.
+            last_trade_date = self.get_last_trade_date()
+
+            if force_from_last_trade and last_trade_date is not None:
+                # Startup mode: re-evaluate from last trade date to catch missed entries
+                # This handles the case where bars were "processed" but entries were missed
+                # (e.g., trader was running with a bug, or process died and restarted
+                # with last_processed_bar advanced past untraded bars)
+                print(f"   ℹ️  Startup re-evaluation from last trade: {last_trade_date[:16]}")
+                last_processed = last_trade_date
+            elif last_processed is not None and last_trade_date is not None:
+                lp_dt = pd.to_datetime(last_processed)
+                lt_dt = pd.to_datetime(last_trade_date)
+                # Normalize both to naive UTC for safe comparison
+                if lp_dt.tzinfo is not None:
+                    lp_dt = lp_dt.tz_convert('UTC').tz_localize(None)
+                if lt_dt.tzinfo is not None:
+                    lt_dt = lt_dt.tz_convert('UTC').tz_localize(None)
+                if lt_dt > lp_dt:
+                    print(f"   ℹ️  Syncing last_processed_bar: {last_processed[:16]} → {last_trade_date[:16]} (last trade is newer)")
+                    last_processed = last_trade_date
+                    self._db.set_last_processed_bar(normalize_timestamp(last_trade_date))
+
             # Fallback: if no last_processed, use last trade date from database
             if last_processed is None:
-                last_processed = self.get_last_trade_date()
+                last_processed = last_trade_date
 
             if last_processed is None:
                 # Fresh database - nothing processed yet
@@ -1252,8 +1430,12 @@ class PositionManager:
                 last_dt = last_dt.tz_convert('UTC')
 
             # Fetch enough data for indicators + new bars
+            # CRITICAL: Use yfinance_only=True to match live trading data source
+            # Without this, catch-up uses Databento which produces different oscillator
+            # values, leading to signal mismatches and phantom entries/exits
             days_since = (pd.Timestamp.now(tz='UTC') - last_dt).days + lookback_bars
-            df = fetch_price_data(ticker, days=max(days_since, 60), interval=interval)
+            df = fetch_price_data(ticker, days=max(days_since, 60), interval=interval,
+                                  yfinance_only=True)
             if df is None or df.empty:
                 return False, {'error': f'Failed to fetch data for {ticker}'}
 
@@ -1272,6 +1454,20 @@ class PositionManager:
             # Support novel oscillators (ARWO, PRF, etc.) and V2 filters
             oscillator_type = config.get('oscillator_type', 'composite')
             df = calculate_composite_oscillator(df, oscillator_type=oscillator_type, config=config)
+
+            # Novel Strategy Filters: Apply OU boost + train models (v7+)
+            novel_filters_inc = None
+            novel_config_inc = config.get('novel_strategies')
+            if novel_config_inc:
+                try:
+                    from .novel_filters import NovelStrategyFilters
+                    novel_filters_inc = NovelStrategyFilters(novel_config_inc)
+                    novel_filters_inc.train(df)
+                    df = novel_filters_inc.apply_ou_boost(df)
+                except Exception as e:
+                    print(f"   [NovelFilters] Warning: {e}")
+                    novel_filters_inc = None
+
             df = calculate_velocity_signals(
                 df,
                 signal_type=config['signal_type'],
@@ -1287,6 +1483,15 @@ class PositionManager:
                 use_entropy_filter=config.get('use_entropy_filter', False),
                 entropy_threshold=config.get('entropy_threshold', 0.7)
             )
+
+            # Train ML exit model (v7+)
+            if novel_filters_inc is not None and novel_filters_inc.trained:
+                try:
+                    novel_filters_inc.train_exit_model(
+                        df, stop_loss_pct=config['stop_loss_pct']
+                    )
+                except Exception as e:
+                    print(f"   [ExitModel] Warning: {e}")
 
             # Filter to bars AFTER last_processed
             compare_dt = last_dt
@@ -1338,52 +1543,138 @@ class PositionManager:
             stop_loss_pct = config['stop_loss_pct']
             take_profit_pct = config['take_profit_pct']
 
+            # ML exit model availability
+            _has_ml_exit_inc = (novel_filters_inc is not None
+                                and novel_filters_inc.exit_model.trained)
+
+            # Track entry bar position and high watermark for ML exit
+            entry_bar_pos_inc = None
+            high_watermark_inc = None
+            if in_position and entry_price:
+                high_watermark_inc = entry_price
+                # Try to find entry bar in df
+                if current_pos:
+                    try:
+                        entry_dt = pd.to_datetime(current_pos.entry_date)
+                        if entry_dt.tzinfo is not None:
+                            entry_dt = entry_dt.tz_convert('UTC').tz_localize(None)
+                        idx_match = df.index
+                        if idx_match.tz is not None:
+                            idx_match = idx_match.tz_convert('UTC').tz_localize(None)
+                        for ii, iv in enumerate(idx_match):
+                            if pd.Timestamp(iv) >= pd.Timestamp(entry_dt):
+                                entry_bar_pos_inc = ii
+                                break
+                    except Exception:
+                        entry_bar_pos_inc = 0
+
             new_entries = 0
             new_exits = 0
+
+            # When re-evaluating from last trade (force_from_last_trade), load
+            # existing trades to build "occupied" ranges so we can skip bars
+            # that already have trades and only insert genuinely missed ones.
+            _replay_ranges = []  # list of (entry_dt, exit_dt) as naive UTC
+            if force_from_last_trade:
+                rows = self._db.execute(
+                    "SELECT entry_date, exit_date FROM trades WHERE strategy_name = ?",
+                    (self.strategy_name,)
+                )
+                for r in rows:
+                    e_dt = pd.to_datetime(r['entry_date'])
+                    if e_dt.tzinfo is not None:
+                        e_dt = e_dt.tz_convert('UTC').tz_localize(None)
+                    x_dt = pd.to_datetime(r['exit_date']) if r['exit_date'] else pd.Timestamp.now()
+                    if x_dt.tzinfo is not None:
+                        x_dt = x_dt.tz_convert('UTC').tz_localize(None)
+                    _replay_ranges.append((e_dt, x_dt))
+
+                def _bar_in_existing_trade(bar_ts):
+                    """Check if bar_ts falls within an existing trade's duration."""
+                    bt = pd.to_datetime(bar_ts)
+                    if bt.tzinfo is not None:
+                        bt = bt.tz_convert('UTC').tz_localize(None)
+                    for e, x in _replay_ranges:
+                        if e <= bt <= x:
+                            return True
+                    return False
 
             # Process each bar ONCE, in chronological order
             for bar_time, row in df_new.iterrows():
                 # CRITICAL: Use bar START time for consistency with charting
-                # Charts index bars by start time (13:15 bar = 13:15-13:30)
-                # If we use close time (13:30), charts.py would map it to the NEXT bar
-                # This also matches base_trader.py live trading behavior
                 bar_timestamp = normalize_timestamp(bar_time)
+
+                # In re-evaluation mode: skip bars that fall within existing trades
+                if force_from_last_trade and _replay_ranges:
+                    if _bar_in_existing_trade(bar_time):
+                        self._db.set_last_processed_bar(bar_timestamp)
+                        continue
 
                 # Evaluate this bar for signals
                 if not in_position and row.get('buy_signal', False):
+                    # Novel Strategy Filters: check confidence (v7+)
+                    if novel_filters_inc is not None and novel_filters_inc.trained:
+                        bar_pos = df.index.get_loc(bar_time)
+                        should_enter, reason = novel_filters_inc.should_enter(df, bar_idx=bar_pos)
+                        if not should_enter:
+                            self._db.set_last_processed_bar(bar_timestamp)
+                            continue
                     success, result = self.enter_position(
                         ticker=ticker,
                         position_type='long',
                         entry_price=row['Close'],
-                        entry_date=bar_timestamp
+                        entry_date=bar_timestamp,
+                        is_missed=force_from_last_trade
                     )
                     if success:
                         in_position = True
                         entry_price = row['Close']
+                        entry_bar_pos_inc = df.index.get_loc(bar_time)
+                        high_watermark_inc = entry_price
                         new_entries += 1
-                        print(f"      📈 Entry @ ${row['Close']:,.2f} on {bar_timestamp[:10]}")
+                        tag = " [missed]" if force_from_last_trade else ""
+                        print(f"      📈 Entry @ ${row['Close']:,.2f} on {bar_timestamp[:10]}{tag}")
 
                 elif in_position:
                     current_price = row['Close']
                     pnl_pct = ((current_price - entry_price) / entry_price) * 100
 
+                    if high_watermark_inc is not None and current_price > high_watermark_inc:
+                        high_watermark_inc = current_price
+
                     exit_reason = None
+                    # SL > TP > ML Exit > Signal
                     if pnl_pct <= -stop_loss_pct:
                         exit_reason = f'Stop Loss ({pnl_pct:.2f}%)'
                     elif pnl_pct >= take_profit_pct:
                         exit_reason = f'Take Profit ({pnl_pct:.2f}%)'
-                    elif row.get('sell_signal', False):
+                    elif _has_ml_exit_inc and entry_bar_pos_inc is not None:
+                        try:
+                            bar_pos_now = df.index.get_loc(bar_time)
+                            should_exit, prob, reason = novel_filters_inc.exit_model.should_exit(
+                                df, entry_price, entry_bar_pos_inc, bar_pos_now,
+                                high_watermark=high_watermark_inc
+                            )
+                            if should_exit:
+                                exit_reason = f'ML Exit ({pnl_pct:.2f}%, p={prob:.2f})'
+                        except Exception:
+                            pass
+                    # Fallback to signal-based exit
+                    if exit_reason is None and row.get('sell_signal', False):
                         exit_reason = f'Opposite Signal ({pnl_pct:.2f}%)'
 
                     if exit_reason:
                         success, result = self.exit_position(
                             exit_price=current_price,
                             exit_date=bar_timestamp,
-                            exit_reason=exit_reason
+                            exit_reason=exit_reason,
+                            interval=interval
                         )
                         if success:
                             in_position = False
                             entry_price = None
+                            entry_bar_pos_inc = None
+                            high_watermark_inc = None
                             new_exits += 1
                             print(f"      📉 Exit @ ${current_price:,.2f} on {bar_timestamp[:10]} ({exit_reason})")
 
@@ -1720,7 +2011,9 @@ class PositionManager:
                     utc_str = dt.strftime('%Y-%m-%d %H:%M UTC')
 
                     local_dt = dt.tz_convert(local_tz_obj)
-                    local_str = local_dt.strftime(f'%I:%M %p {tz_abbrev}')
+                    # Include date in local time to avoid confusion when UTC/local dates differ
+                    # (e.g., 04:15 UTC Mon = 10:15 PM Sun CT for overnight futures sessions)
+                    local_str = local_dt.strftime(f'%m/%d %I:%M %p {tz_abbrev}')
 
                     return f"{utc_str} ({local_str})"
                 except:
@@ -1826,8 +2119,30 @@ class PositionManager:
         position = self.get_current_position()
 
         # Calculate SL/TP prices
-        sl_pct = config.get('stop_loss_pct', 2.0)
-        tp_pct = config.get('take_profit_pct', 5.0)
+        # For v9 regime-aware configs, resolve from regime_params
+        if config.get('regime_aware', False):
+            regime_params = config.get('regime_params', {})
+            # Use current position's entry regime if available, else show range across regimes
+            active_regimes = {rn: rc for rn, rc in regime_params.items() if not rc.get('dont_trade', False)}
+            if position and position.entry_regime and position.entry_regime in regime_params:
+                rcfg = regime_params[position.entry_regime]
+                sl_pct = rcfg.get('stop_loss_pct', 5.0)
+                tp_pct = rcfg.get('take_profit_pct', 10.0)
+                signal_type = f"{rcfg.get('signal_type', '?')} ({position.entry_regime})"
+            elif active_regimes:
+                # Not in position — show first active regime's values
+                first_name, first_cfg = next(iter(active_regimes.items()))
+                sl_pct = first_cfg.get('stop_loss_pct', 5.0)
+                tp_pct = first_cfg.get('take_profit_pct', 10.0)
+                signal_type = f"regime-aware ({', '.join(active_regimes.keys())})"
+            else:
+                sl_pct = config.get('stop_loss_pct', 2.0)
+                tp_pct = config.get('take_profit_pct', 5.0)
+                signal_type = 'regime-aware'
+        else:
+            sl_pct = config.get('stop_loss_pct', 2.0)
+            tp_pct = config.get('take_profit_pct', 5.0)
+            signal_type = config.get('signal_type', 'unknown')
 
         if current_price:
             sl_price = current_price * (1 - sl_pct / 100)
@@ -1850,7 +2165,7 @@ class PositionManager:
         return {
             'strategy_name': self.strategy_name,
             'ticker': ticker,
-            'signal_type': config.get('signal_type', 'unknown'),
+            'signal_type': signal_type,
             'current_price': current_price,
             'sl_pct': sl_pct,
             'tp_pct': tp_pct,

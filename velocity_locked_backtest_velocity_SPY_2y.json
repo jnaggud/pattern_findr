@@ -1,5 +1,5 @@
 {
-  "locked_at": "2026-01-13T08:20:39.399363",
+  "locked_at": "2026-01-23T05:37:29.464151",
   "entries": [
     {
       "date": "2025-06-26 00:00:00",
@@ -84,6 +84,21 @@
     {
       "date": "2026-01-08 00:00:00",
       "price": 689.510009765625,
+      "position": "long"
+    },
+    {
+      "date": "2026-01-21 18:00:00-0600",
+      "price": 688.97998046875,
+      "position": "long"
+    },
+    {
+      "date": "2026-01-30 18:00:00-0600",
+      "price": 695.555,
+      "position": "long"
+    },
+    {
+      "date": "2026-02-06 18:00:00-0600",
+      "price": 694.62,
       "position": "long"
     }
   ],
@@ -215,15 +230,44 @@
       "reason": "Opposite Signal (0.93%)",
       "entry_price": 683.1699829101562,
       "entry_date": "2026-01-02 00:00:00"
+    },
+    {
+      "date": "2026-01-14 00:00:00",
+      "price": 690.39,
+      "pnl": 0.1276254473338405,
+      "reason": "Opposite Signal (0.13%)",
+      "entry_price": 689.510009765625,
+      "entry_date": "2026-01-08 00:00:00"
+    },
+    {
+      "date": "2026-01-29 18:00:00-0600",
+      "price": 691.475,
+      "pnl": 0.3621323698770648,
+      "reason": "Opposite Signal (0.36%)",
+      "entry_price": 688.97998046875,
+      "entry_date": "2026-01-21 18:00:00-0600"
+    },
+    {
+      "date": "2026-02-02 18:00:00-0600",
+      "price": 689.585,
+      "pnl": -0.8583073948142008,
+      "reason": "Opposite Signal (-0.86%)",
+      "entry_price": 695.555,
+      "entry_date": "2026-01-30 18:00:00-0600"
+    },
+    {
+      "date": "2026-02-11 18:00:00-0600",
+      "price": 681.375,
+      "pnl": -1.9067979614753396,
+      "reason": "Opposite Signal (-1.91%)",
+      "entry_price": 694.62,
+      "entry_date": "2026-02-06 18:00:00-0600"
     }
   ],
-  "current_position": {
-    "position": "long",
-    "entry_price": 689.510009765625,
-    "entry_date": "2026-01-08 00:00:00"
-  },
-  "num_trades": 16,
-  "win_rate": 100.0,
-  "total_return": 29.238878462943063,
-  "profit_factor": Infinity
+  "current_position": null,
+  "num_trades": 20,
+  "win_rate": 90.0,
+  "total_return": 26.302578837858203,
+  "profit_factor": 9.580122032627907,
+  "num_missed": 0
 }

@@ -138,7 +138,7 @@ def create_composite_oscillator(data: pd.DataFrame) -> pd.DataFrame:
             composite += df[name].fillna(0)
 
     df['composite_oscillator'] = composite / len(components)
-    df['composite_smooth'] = df['composite_oscillator'].rolling(window=3, center=True).mean()
+    df['composite_smooth'] = df['composite_oscillator'].rolling(window=3, center=False).mean()
     df['composite_smooth'] = df['composite_smooth'].bfill().ffill()
 
     return df
@@ -170,6 +170,15 @@ def run_velocity_backtest(df: pd.DataFrame, params: dict, starting_capital: floa
     use_bb_filter = params.get('use_bb_filter', False)
     require_accel = params.get('require_accel', False)
 
+    # New exhaustive search parameters (previously hardcoded)
+    velocity_std_window = params.get('velocity_std_window', 10)
+    momentum_multiplier = params.get('momentum_multiplier', 1.5)
+    double_bottom_lookback = params.get('double_bottom_lookback', 10)
+    divergence_lookback = params.get('divergence_lookback', 5)
+
+    # Min hold bars - minimum bars to hold before any exit allowed
+    min_hold_bars = params.get('min_hold_bars', 1)
+
     test_df = df.copy()
 
     # Get oscillator column
@@ -198,9 +207,9 @@ def run_velocity_backtest(df: pd.DataFrame, params: dict, starting_capital: floa
     extreme_oversold = osc_smooth < (oversold_threshold * extreme_zone_mult)
     extreme_overbought = osc_smooth > (overbought_threshold * extreme_zone_mult)
 
-    vel_std = velocity.rolling(10, min_periods=1).std().fillna(velocity.std())
-    strong_momentum_up = velocity > vel_std * 1.5
-    strong_momentum_down = velocity < -vel_std * 1.5
+    vel_std = velocity.rolling(velocity_std_window, min_periods=1).std().fillna(velocity.std())
+    strong_momentum_up = velocity > vel_std * momentum_multiplier
+    strong_momentum_down = velocity < -vel_std * momentum_multiplier
 
     # Calculate RSI if needed
     rsi_buy_filter = pd.Series(True, index=test_df.index)
@@ -245,6 +254,32 @@ def run_velocity_backtest(df: pd.DataFrame, params: dict, starting_capital: floa
     if require_accel:
         accel_filter = test_df['acceleration'] > 0  # Positive acceleration for buys
 
+    # Novel V2 Indicator Filters (Regime, Fragility, Entropy)
+    use_regime_filter = params.get('use_regime_filter', False)
+    use_fragility_filter = params.get('use_fragility_filter', False)
+    use_entropy_filter = params.get('use_entropy_filter', False)
+    regime_threshold = params.get('regime_threshold', 0.0)  # RSC > threshold for buys
+    fragility_threshold = params.get('fragility_threshold', 0.5)  # MFI2 < threshold
+    entropy_threshold = params.get('entropy_threshold', 0.7)  # SEI < threshold
+
+    regime_filter = pd.Series(True, index=test_df.index)
+    fragility_filter = pd.Series(True, index=test_df.index)
+    entropy_filter = pd.Series(True, index=test_df.index)
+
+    # Check for V2 columns (lowercase names from novel_indicators_v2.py)
+    rsc_col = 'rsc_regime' if 'rsc_regime' in test_df.columns else 'RSC' if 'RSC' in test_df.columns else None
+    mfi2_col = 'mfi2' if 'mfi2' in test_df.columns else 'MFI2' if 'MFI2' in test_df.columns else None
+    sei_col = 'sei' if 'sei' in test_df.columns else 'SEI' if 'SEI' in test_df.columns else None
+
+    if use_regime_filter and rsc_col:
+        regime_filter = test_df[rsc_col] > regime_threshold  # Bullish regime for buys
+
+    if use_fragility_filter and mfi2_col:
+        fragility_filter = test_df[mfi2_col] < fragility_threshold  # Low fragility
+
+    if use_entropy_filter and sei_col:
+        entropy_filter = test_df[sei_col] < entropy_threshold  # Low uncertainty
+
     if signal_type == 'velocity_crossover_and_zone':
         buy_condition = test_df['vel_cross_up'] & in_oversold
         sell_condition = test_df['vel_cross_down'] & in_overbought
@@ -260,12 +295,34 @@ def run_velocity_backtest(df: pd.DataFrame, params: dict, starting_capital: floa
     elif signal_type == 'any_reversal':
         buy_condition = test_df['vel_cross_up'] | extreme_oversold | (strong_momentum_up & in_oversold)
         sell_condition = test_df['vel_cross_down'] | extreme_overbought | (strong_momentum_down & in_overbought)
+    elif signal_type == 'double_bottom':
+        # Count velocity cross ups in recent window - multiple crosses = double bottom
+        vel_cross_up_count = test_df['vel_cross_up'].astype(int).rolling(double_bottom_lookback).sum()
+        buy_condition = (vel_cross_up_count >= 2) & in_oversold
+        vel_cross_down_count = test_df['vel_cross_down'].astype(int).rolling(double_bottom_lookback).sum()
+        sell_condition = (vel_cross_down_count >= 2) & in_overbought
+    elif signal_type == 'divergence':
+        # Price making lower lows but oscillator making higher lows (bullish divergence)
+        price_lower_low = test_df['close'] < test_df['close'].rolling(divergence_lookback).min().shift(1)
+        osc_higher_low = osc_smooth > osc_smooth.rolling(divergence_lookback).min().shift(1)
+        buy_condition = price_lower_low & osc_higher_low & in_oversold
+        # Price making higher highs but oscillator making lower highs (bearish divergence)
+        price_higher_high = test_df['close'] > test_df['close'].rolling(divergence_lookback).max().shift(1)
+        osc_lower_high = osc_smooth < osc_smooth.rolling(divergence_lookback).max().shift(1)
+        sell_condition = price_higher_high & osc_lower_high & in_overbought
+    elif signal_type == 'breakout':
+        # Oscillator breaks above/below threshold levels
+        osc_breaks_above = (osc_smooth > oversold_threshold) & (osc_smooth.shift(1) <= oversold_threshold)
+        osc_breaks_below = (osc_smooth < overbought_threshold) & (osc_smooth.shift(1) >= overbought_threshold)
+        buy_condition = osc_breaks_above
+        sell_condition = osc_breaks_below
     else:
         buy_condition = test_df['vel_cross_up'] & in_oversold
         sell_condition = test_df['vel_cross_down'] & in_overbought
 
-    # Apply all filters to buy/sell conditions
+    # Apply all filters to buy/sell conditions (including novel V2 indicator filters)
     buy_condition = buy_condition & rsi_buy_filter & macd_buy_filter & bb_buy_filter & accel_filter
+    buy_condition = buy_condition & regime_filter & fragility_filter & entropy_filter
     sell_condition = sell_condition & rsi_sell_filter
 
     test_df['buy_signal'] = buy_condition
@@ -275,6 +332,7 @@ def run_velocity_backtest(df: pd.DataFrame, params: dict, starting_capital: floa
     position = 0
     entry_price = None
     entry_date = None
+    entry_bar_idx = None  # Track entry bar for min_hold_bars check
     last_trade_bar = -min_bars_between
     trades = []
 
@@ -285,8 +343,12 @@ def run_velocity_backtest(df: pd.DataFrame, params: dict, starting_capital: floa
         price = test_df['close'].iloc[i]
         date = test_df.index[i]
 
-        # Check stop loss / take profit
-        if position == 1 and entry_price is not None:
+        # Check if we've held long enough (min_hold_bars)
+        bars_held = i - entry_bar_idx if entry_bar_idx is not None else 0
+        can_exit = bars_held >= min_hold_bars
+
+        # Check stop loss / take profit (only if min_hold_bars satisfied)
+        if position == 1 and entry_price is not None and can_exit:
             pnl_pct = (price - entry_price) / entry_price * 100
 
             if stop_loss_pct > 0 and pnl_pct <= -stop_loss_pct:
@@ -300,6 +362,7 @@ def run_velocity_backtest(df: pd.DataFrame, params: dict, starting_capital: floa
                 })
                 position = 0
                 entry_price = None
+                entry_bar_idx = None
                 last_trade_bar = i
                 continue
 
@@ -314,11 +377,12 @@ def run_velocity_backtest(df: pd.DataFrame, params: dict, starting_capital: floa
                 })
                 position = 0
                 entry_price = None
+                entry_bar_idx = None
                 last_trade_bar = i
                 continue
 
-        # Check exit on opposite signal
-        if position == 1 and exit_on_opposite_signal and test_df['sell_signal'].iloc[i]:
+        # Check exit on opposite signal (only if min_hold_bars satisfied)
+        if position == 1 and can_exit and exit_on_opposite_signal and test_df['sell_signal'].iloc[i]:
             pnl_pct = (price - entry_price) / entry_price * 100
             trades.append({
                 'entry_date': entry_date,
@@ -330,11 +394,12 @@ def run_velocity_backtest(df: pd.DataFrame, params: dict, starting_capital: floa
             })
             position = 0
             entry_price = None
+            entry_bar_idx = None
             last_trade_bar = i
             continue
 
-        # Check exit on midline cross (oscillator crosses above 0 for longs)
-        if position == 1 and exit_on_midline_cross:
+        # Check exit on midline cross (only if min_hold_bars satisfied)
+        if position == 1 and can_exit and exit_on_midline_cross:
             osc_val = test_df['osc_smooth'].iloc[i]
             osc_prev = test_df['osc_smooth'].iloc[i-1] if i > 0 else osc_val
             if osc_prev <= 0 and osc_val > 0:  # Crossed above midline
@@ -349,6 +414,7 @@ def run_velocity_backtest(df: pd.DataFrame, params: dict, starting_capital: floa
                 })
                 position = 0
                 entry_price = None
+                entry_bar_idx = None
                 last_trade_bar = i
                 continue
 
@@ -357,6 +423,7 @@ def run_velocity_backtest(df: pd.DataFrame, params: dict, starting_capital: floa
             position = 1
             entry_price = price
             entry_date = date
+            entry_bar_idx = i  # Track entry bar for min_hold_bars
             last_trade_bar = i
 
     # Close any open position

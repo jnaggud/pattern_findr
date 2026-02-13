@@ -295,30 +295,32 @@ _VELOCITY_CACHED_DATA = None
 def set_velocity_shared_data(close_prices, osc_values, rsi_cache, macd_histogram, bb_upper, bb_lower,
                               optimize_metric='total_return', use_extra_indicators=True,
                               all_oscillators=None, v2_indicators=None,
+                              # MTF oscillators (computed on sub-interval, resampled to primary)
+                              all_oscillators_mtf=None, v2_indicators_mtf=None,
                               # Exit strategy constraints
-                              force_midline_exit=False, force_opposite_exit=True,
+                              force_midline_exit=False, force_opposite_exit=False,
                               sl_range=None, tp_range=None,
                               # Drawdown penalty settings
                               use_drawdown_penalty=False, max_drawdown_threshold=15.0,
                               drawdown_penalty_weight=0.3,
                               # V2 filter constraints (from UI checkboxes)
-                              v2_filter_settings=None):
+                              v2_filter_settings=None,
+                              # Additional OHLCV data for signal improvements
+                              high_prices=None, low_prices=None, volume=None):
     """
     Save velocity optimization data to a temp file for parallel workers.
     Returns the path to the temp file.
 
     Args:
-        all_oscillators: Dict mapping oscillator names to their values (for searching across oscillator types)
-        v2_indicators: Dict with 'rsc', 'mfi2', 'sei' arrays for V2 filter optimization
+        all_oscillators: Dict mapping oscillator names to their values (standard single-timeframe)
+        v2_indicators: Dict with 'rsc', 'mfi2', 'sei' arrays (standard single-timeframe)
+        all_oscillators_mtf: Dict mapping oscillator names to MTF values (sub-interval resampled)
+        v2_indicators_mtf: Dict with 'rsc', 'mfi2', 'sei' arrays (MTF sub-interval resampled)
         force_midline_exit: If True, always use exit_on_midline_cross=True
         force_opposite_exit: If True, always use exit_on_opposite_signal=True
         sl_range: Tuple (min_pct, max_pct) for stop loss search range
         tp_range: Tuple (min_pct, max_pct) for take profit search range
         use_drawdown_penalty: If True, penalize strategies with high max drawdown
-        v2_filter_settings: Dict with filter constraints from UI checkboxes:
-            {'use_regime_filter': True/False, 'regime_threshold': float,
-             'use_fragility_filter': True/False, 'fragility_threshold': float,
-             'use_entropy_filter': True/False, 'entropy_threshold': float}
         max_drawdown_threshold: Drawdown % above which penalty starts
         drawdown_penalty_weight: Weight of drawdown penalty in objective (0-1)
     """
@@ -343,12 +345,25 @@ def set_velocity_shared_data(close_prices, osc_values, rsi_cache, macd_histogram
         for name, values in all_oscillators.items():
             processed_oscillators[name] = np.array(values) if hasattr(values, 'values') else values
 
+    # Process MTF oscillators if provided
+    processed_oscillators_mtf = {}
+    if all_oscillators_mtf:
+        for name, values in all_oscillators_mtf.items():
+            processed_oscillators_mtf[name] = np.array(values) if hasattr(values, 'values') else values
+
     # Process V2 indicators if provided
     processed_v2 = {}
     if v2_indicators:
         for name, values in v2_indicators.items():
             if values is not None:
                 processed_v2[name] = np.array(values) if hasattr(values, 'values') else values
+
+    # Process MTF V2 indicators if provided
+    processed_v2_mtf = {}
+    if v2_indicators_mtf:
+        for name, values in v2_indicators_mtf.items():
+            if values is not None:
+                processed_v2_mtf[name] = np.array(values) if hasattr(values, 'values') else values
 
     # Default SL/TP ranges if not specified
     if sl_range is None:
@@ -365,8 +380,10 @@ def set_velocity_shared_data(close_prices, osc_values, rsi_cache, macd_histogram
         'bb_lower': np.array(bb_lower) if hasattr(bb_lower, 'values') else bb_lower,
         'optimize_metric': optimize_metric,
         'use_extra_indicators': use_extra_indicators,
-        'all_oscillators': processed_oscillators,  # All oscillator types for search
-        'v2_indicators': processed_v2,  # V2 indicators for filter optimization
+        'all_oscillators': processed_oscillators,  # Standard oscillator types for search
+        'all_oscillators_mtf': processed_oscillators_mtf,  # MTF oscillator types for search
+        'v2_indicators': processed_v2,  # Standard V2 indicators for filter optimization
+        'v2_indicators_mtf': processed_v2_mtf,  # MTF V2 indicators for filter optimization
         # Exit strategy constraints
         'force_midline_exit': force_midline_exit,
         'force_opposite_exit': force_opposite_exit,
@@ -378,6 +395,10 @@ def set_velocity_shared_data(close_prices, osc_values, rsi_cache, macd_histogram
         'drawdown_penalty_weight': drawdown_penalty_weight,
         # V2 filter constraints from UI
         'v2_filter_settings': v2_filter_settings or {},
+        # Additional OHLCV data for signal improvements
+        'high_prices': np.array(high_prices) if high_prices is not None else None,
+        'low_prices': np.array(low_prices) if low_prices is not None else None,
+        'volume': np.array(volume) if volume is not None else None,
     }
     joblib.dump(data, path)
 
@@ -427,10 +448,11 @@ class VelocityOptunaObjective:
         optimize_metric = data['optimize_metric']
         use_extra_indicators = data['use_extra_indicators']
         all_oscillators = data.get('all_oscillators', {})
+        all_oscillators_mtf = data.get('all_oscillators_mtf', {})
 
         # Exit strategy constraints from UI
         force_midline_exit = data.get('force_midline_exit', False)
-        force_opposite_exit = data.get('force_opposite_exit', True)
+        force_opposite_exit = data.get('force_opposite_exit', False)
         sl_range = data.get('sl_range', (0.0, 10.0))
         tp_range = data.get('tp_range', (0.0, 20.0))
 
@@ -439,16 +461,28 @@ class VelocityOptunaObjective:
         max_drawdown_threshold = data.get('max_drawdown_threshold', 15.0)
         drawdown_penalty_weight = data.get('drawdown_penalty_weight', 0.3)
 
-        # Determine available oscillator types
-        if all_oscillators and len(all_oscillators) > 1:
-            oscillator_types = list(all_oscillators.keys())
+        # MTF search: if MTF oscillators available, let Optuna choose
+        mtf_available = bool(all_oscillators_mtf)
+        if mtf_available:
+            use_mtf = trial.suggest_categorical('use_mtf', [True, False])
         else:
-            oscillator_types = ['composite_smooth']
+            use_mtf = False
+
+        # Build a FIXED oscillator type list (union of standard + MTF keys)
+        # Optuna requires the same categorical choices across all trials
+        all_osc_keys = set(all_oscillators.keys())
+        if all_oscillators_mtf:
+            all_osc_keys |= set(all_oscillators_mtf.keys())
+        oscillator_types = sorted(all_osc_keys) if len(all_osc_keys) > 1 else ['composite_smooth']
+
+        # Select oscillator source based on MTF choice
+        active_oscillators = all_oscillators_mtf if use_mtf else all_oscillators
 
         # Suggest parameters - including oscillator type if multiple available
         params = {}
+        params['use_mtf'] = use_mtf
 
-        # Add oscillator_type as a searchable parameter if we have multiple oscillators
+        # Add oscillator_type as a searchable parameter (fixed choice set)
         if len(oscillator_types) > 1:
             params['oscillator_type'] = trial.suggest_categorical('oscillator_type', oscillator_types)
         else:
@@ -498,6 +532,38 @@ class VelocityOptunaObjective:
             'accel_exit_lookback': trial.suggest_int('accel_exit_lookback', 1, 5),
             'use_jerk_confirm': trial.suggest_categorical('use_jerk_confirm', [True, False]),
             'jerk_confirm_threshold': trial.suggest_float('jerk_confirm_threshold', 0.0, 0.05),
+            # Trailing stop - replaces fixed stop loss with dynamic trailing stop
+            'use_trailing_stop': trial.suggest_categorical('use_trailing_stop', [True, False]),
+            'trailing_stop_pct': trial.suggest_float('trailing_stop_pct', 0.5, 10.0),
+            # === SIGNAL IMPROVEMENTS (1-8) ===
+            # #1: Adaptive smoothing - reduce oscillator noise
+            'smoothing_type': trial.suggest_categorical('smoothing_type', ['sma', 'ema', 'adaptive']),
+            'adaptive_fast_alpha': trial.suggest_float('adaptive_fast_alpha', 0.1, 0.5),
+            'adaptive_slow_alpha': trial.suggest_float('adaptive_slow_alpha', 0.01, 0.15),
+            # #2: Multi-oscillator consensus voting
+            'use_consensus': trial.suggest_categorical('use_consensus', [True, False]),
+            'consensus_count': trial.suggest_int('consensus_count', 2, 4),
+            # #3: ATR-based trailing stop
+            'trailing_stop_type': trial.suggest_categorical('trailing_stop_type', ['fixed_pct', 'atr']),
+            'trailing_atr_mult': trial.suggest_float('trailing_atr_mult', 1.0, 4.0),
+            'trailing_atr_period': trial.suggest_int('trailing_atr_period', 10, 20),
+            # #4: Volume confirmation
+            'use_volume_confirm': trial.suggest_categorical('use_volume_confirm', [True, False]),
+            'volume_ratio_threshold': trial.suggest_float('volume_ratio_threshold', 0.5, 2.5),
+            # #5: Price range position filter
+            'use_range_filter': trial.suggest_categorical('use_range_filter', [True, False]),
+            'range_lookback': trial.suggest_int('range_lookback', 10, 30),
+            'range_max_position': trial.suggest_float('range_max_position', 0.3, 0.7),
+            # #6: Regime-adaptive (trend filter)
+            'use_trend_filter': trial.suggest_categorical('use_trend_filter', [True, False]),
+            'trend_sma_period': trial.suggest_int('trend_sma_period', 30, 100),
+            'trend_strict_mult': trial.suggest_float('trend_strict_mult', 1.0, 2.0),
+            # #7: Higher-timeframe momentum alignment
+            'use_htf_filter': trial.suggest_categorical('use_htf_filter', [True, False]),
+            'htf_slow_window': trial.suggest_int('htf_slow_window', 10, 50),
+            'htf_threshold': trial.suggest_float('htf_threshold', -0.5, 0.0),
+            # #8: Midline exit delay
+            'midline_exit_bars': trial.suggest_int('midline_exit_bars', 1, 5),
         })
 
         if use_extra_indicators:
@@ -509,32 +575,32 @@ class VelocityOptunaObjective:
             params['use_bb_filter'] = trial.suggest_categorical('use_bb_filter', [True, False])
 
         # V2 indicator filters (Regime, Fragility, Entropy)
-        # RESPECT UI CHECKBOX SETTINGS: if user checked a filter, force it ON for all trials
-        v2_indicators = data.get('v2_indicators', {})
-        v2_settings = data.get('v2_filter_settings', {})
+        # Select V2 indicators based on MTF choice
+        v2_indicators_std = data.get('v2_indicators', {})
+        v2_indicators_mtf = data.get('v2_indicators_mtf', {})
+        v2_indicators = v2_indicators_mtf if (use_mtf and v2_indicators_mtf) else v2_indicators_std
 
         if v2_indicators:
-            # Regime filter: use UI setting if specified, otherwise don't use it
-            if v2_settings.get('use_regime_filter', False) and 'rsc' in v2_indicators:
-                params['use_regime_filter'] = True
-                # Search for optimal threshold
-                params['regime_threshold'] = trial.suggest_float('regime_threshold', -0.5, 0.5)
+            # Regime filter: searchable if indicator available
+            if 'rsc' in v2_indicators:
+                params['use_regime_filter'] = trial.suggest_categorical('use_regime_filter', [True, False])
+                params['regime_threshold'] = trial.suggest_float('regime_threshold', -0.5, 0.5) if params['use_regime_filter'] else 0.0
             else:
                 params['use_regime_filter'] = False
                 params['regime_threshold'] = 0.0
 
-            # Fragility filter: use UI setting if specified
-            if v2_settings.get('use_fragility_filter', False) and 'mfi2' in v2_indicators:
-                params['use_fragility_filter'] = True
-                params['fragility_threshold'] = trial.suggest_float('fragility_threshold', 0.2, 0.8)
+            # Fragility filter: searchable if indicator available
+            if 'mfi2' in v2_indicators:
+                params['use_fragility_filter'] = trial.suggest_categorical('use_fragility_filter', [True, False])
+                params['fragility_threshold'] = trial.suggest_float('fragility_threshold', 0.2, 0.8) if params['use_fragility_filter'] else 0.5
             else:
                 params['use_fragility_filter'] = False
                 params['fragility_threshold'] = 0.5
 
-            # Entropy filter: use UI setting if specified
-            if v2_settings.get('use_entropy_filter', False) and 'sei' in v2_indicators:
-                params['use_entropy_filter'] = True
-                params['entropy_threshold'] = trial.suggest_float('entropy_threshold', 0.3, 0.9)
+            # Entropy filter: searchable if indicator available
+            if 'sei' in v2_indicators:
+                params['use_entropy_filter'] = trial.suggest_categorical('use_entropy_filter', [True, False])
+                params['entropy_threshold'] = trial.suggest_float('entropy_threshold', 0.3, 0.9) if params['use_entropy_filter'] else 0.7
             else:
                 params['use_entropy_filter'] = False
                 params['entropy_threshold'] = 0.7
@@ -543,23 +609,50 @@ class VelocityOptunaObjective:
             params['use_fragility_filter'] = False
             params['use_entropy_filter'] = False
 
-        # Select the oscillator values based on the chosen type
+        # Select the oscillator values based on the chosen type and MTF setting
         selected_osc_type = params['oscillator_type']
-        if selected_osc_type in all_oscillators:
-            selected_osc_values = all_oscillators[selected_osc_type]
+        if selected_osc_type in active_oscillators:
+            selected_osc_values = active_oscillators[selected_osc_type]
         else:
             selected_osc_values = osc_values  # Fallback to default
+
+        # Inject fixed wavelet params from data (not searched by Optuna)
+        if data.get('use_wavelet_denoise', False):
+            params['use_wavelet_denoise'] = True
+            params['wavelet_family'] = data.get('wavelet_family', 'db4')
+            params['wavelet_level'] = data.get('wavelet_level', 2)
+            params['wavelet_threshold_mode'] = data.get('wavelet_threshold_mode', 'hard')
 
         # Run backtest with selected oscillator and V2 indicators
         result = self._run_backtest(params, close_prices, selected_osc_values, rsi_cache,
                                      macd_histogram, bb_upper, bb_lower, use_extra_indicators,
-                                     v2_indicators)
+                                     v2_indicators,
+                                     high_prices=data.get('high_prices'),
+                                     low_prices=data.get('low_prices'),
+                                     volume=data.get('volume'),
+                                     all_oscillators=active_oscillators)
 
         if result is None:
             return float('-inf')
 
+        # Minimum trade count filter: reject strategies with too few trades
+        min_trades = data.get('min_trades', 0)
+        n_trades = result.get('n_trades', result.get('num_trades', 0))
+        if min_trades > 0 and n_trades < min_trades:
+            return float('-inf')
+
         # Get the base score from the optimization metric
         base_score = result[optimize_metric]
+
+        # Apply trade count bonus: reward statistical significance
+        # sqrt(n_trades) scaling gives diminishing returns for more trades
+        # This prevents the optimizer from favoring rare lucky trades
+        trade_count_bonus_weight = data.get('trade_count_bonus_weight', 0.0)
+        if trade_count_bonus_weight > 0 and n_trades > 0 and base_score > 0:
+            import math
+            # Normalize: sqrt(n_trades) / sqrt(100) so 100 trades = 1.0x bonus
+            trade_bonus = math.sqrt(n_trades) / math.sqrt(100)
+            base_score = base_score * (1.0 + trade_count_bonus_weight * (trade_bonus - 1.0))
 
         # Apply max drawdown penalty if enabled
         if use_drawdown_penalty and 'max_drawdown' in result:
@@ -586,15 +679,49 @@ class VelocityOptunaObjective:
 
     def _run_backtest(self, params, close_prices, osc_values, rsi_cache,
                       macd_histogram, bb_upper, bb_lower, use_extra_indicators,
-                      v2_indicators=None):
-        """Fast vectorized backtest with V2 indicator filters."""
+                      v2_indicators=None, high_prices=None, low_prices=None,
+                      volume=None, all_oscillators=None):
+        """Fast vectorized backtest with V2 indicator filters and signal improvements."""
         import pandas as pd
 
-        # Apply smoothing
-        if params['vel_smoothing'] > 1:
-            osc_smooth = pd.Series(osc_values).rolling(window=params['vel_smoothing']).mean().bfill().values
-        else:
+        # === IMPROVEMENT #1: Adaptive smoothing ===
+        smoothing_type = params.get('smoothing_type', 'sma')
+        vel_smoothing = params['vel_smoothing']
+
+        if vel_smoothing <= 1:
             osc_smooth = osc_values
+        elif smoothing_type == 'ema':
+            alpha = 2.0 / (vel_smoothing + 1)
+            osc_smooth = pd.Series(osc_values).ewm(alpha=alpha, adjust=False).mean().values
+        elif smoothing_type == 'adaptive':
+            # Adaptive EMA: alpha varies with local oscillator volatility
+            fast_alpha = params.get('adaptive_fast_alpha', 0.3)
+            slow_alpha = params.get('adaptive_slow_alpha', 0.05)
+            osc_changes = np.abs(np.diff(osc_values, prepend=osc_values[0]))
+            vol = pd.Series(osc_changes).rolling(vel_smoothing, min_periods=1).mean().values
+            vol_norm = vol / (np.max(vol) + 1e-10)  # 0-1 normalized
+            alphas = slow_alpha + (fast_alpha - slow_alpha) * vol_norm
+            osc_smooth = np.zeros_like(osc_values, dtype=float)
+            osc_smooth[0] = osc_values[0]
+            for idx in range(1, len(osc_values)):
+                osc_smooth[idx] = alphas[idx] * osc_values[idx] + (1 - alphas[idx]) * osc_smooth[idx - 1]
+        else:  # 'sma' (default)
+            osc_smooth = pd.Series(osc_values).rolling(window=vel_smoothing).mean().bfill().values
+
+        # Apply wavelet denoising if enabled
+        if params.get('use_wavelet_denoise', False):
+            try:
+                import pywt
+                family = params.get('wavelet_family', 'db4')
+                level = params.get('wavelet_level', 2)
+                mode = params.get('wavelet_threshold_mode', 'hard')
+                coeffs = pywt.wavedec(osc_smooth, family, level=level)
+                sigma = np.median(np.abs(coeffs[-1])) / 0.6745
+                threshold = sigma * np.sqrt(2 * np.log(len(osc_smooth)))
+                denoised = [coeffs[0]] + [pywt.threshold(c, threshold, mode=mode) for c in coeffs[1:]]
+                osc_smooth = pywt.waverec(denoised, family)[:len(osc_smooth)]
+            except Exception:
+                pass
 
         velocity = np.diff(osc_smooth, prepend=osc_smooth[0])
         acceleration = np.diff(velocity, prepend=velocity[0])
@@ -684,6 +811,72 @@ class VelocityOptunaObjective:
             buy_cond = buy_cond & (close_prices < bb_lower)
             sell_cond = sell_cond & (close_prices > bb_upper)
 
+        # === IMPROVEMENT #2: Multi-oscillator consensus voting ===
+        if params.get('use_consensus', False) and all_oscillators and len(all_oscillators) >= 3:
+            consensus_count = params.get('consensus_count', 2)
+            # Count how many oscillators agree on buy/sell at each bar
+            buy_votes = np.zeros(len(close_prices), dtype=int)
+            sell_votes = np.zeros(len(close_prices), dtype=int)
+            for osc_name, osc_vals in all_oscillators.items():
+                if len(osc_vals) != len(close_prices):
+                    continue
+                # Compute velocity for this oscillator
+                o_smooth = osc_vals
+                if vel_smoothing > 1 and smoothing_type == 'sma':
+                    o_smooth = pd.Series(osc_vals).rolling(window=vel_smoothing).mean().bfill().values
+                o_vel = np.diff(o_smooth, prepend=o_smooth[0])
+                o_cross_up = (o_vel > 0) & (np.roll(o_vel, 1) <= 0)
+                o_cross_down = (o_vel < 0) & (np.roll(o_vel, 1) >= 0)
+                o_oversold = o_smooth < params.get('oversold_threshold', -0.2)
+                o_overbought = o_smooth > params.get('overbought_threshold', 0.2)
+                buy_votes += (o_cross_up | o_oversold).astype(int)
+                sell_votes += (o_cross_down | o_overbought).astype(int)
+            buy_cond = buy_cond & (buy_votes >= consensus_count)
+            sell_cond = sell_cond & (sell_votes >= consensus_count)
+
+        # === IMPROVEMENT #4: Volume confirmation ===
+        if params.get('use_volume_confirm', False) and volume is not None and len(volume) == len(close_prices):
+            vol_threshold = params.get('volume_ratio_threshold', 1.0)
+            vol_sma = pd.Series(volume.astype(float)).rolling(20, min_periods=1).mean().values
+            vol_ratio = volume / (vol_sma + 1e-10)
+            buy_cond = buy_cond & (vol_ratio > vol_threshold)
+            sell_cond = sell_cond & (vol_ratio > vol_threshold)
+
+        # === IMPROVEMENT #5: Price range position filter ===
+        if params.get('use_range_filter', False):
+            range_lb = params.get('range_lookback', 20)
+            range_max = params.get('range_max_position', 0.5)
+            price_series = pd.Series(close_prices)
+            rolling_min = price_series.rolling(range_lb, min_periods=1).min().values
+            rolling_max = price_series.rolling(range_lb, min_periods=1).max().values
+            price_range = rolling_max - rolling_min
+            position_in_range = np.where(price_range > 0, (close_prices - rolling_min) / price_range, 0.5)
+            buy_cond = buy_cond & (position_in_range < range_max)
+            sell_cond = sell_cond & (position_in_range > (1.0 - range_max))
+
+        # === IMPROVEMENT #6: Regime-adaptive trend filter ===
+        if params.get('use_trend_filter', False):
+            trend_period = params.get('trend_sma_period', 50)
+            trend_mult = params.get('trend_strict_mult', 1.5)
+            trend_sma = pd.Series(close_prices).rolling(trend_period, min_periods=1).mean().values
+            in_uptrend = close_prices > trend_sma
+            # In strong uptrend, require deeper oversold for buys (tighten threshold)
+            tightened_oversold = osc_smooth < (params.get('oversold_threshold', -0.2) * trend_mult)
+            # Override buy_cond in uptrend: must be deeper oversold
+            buy_cond = np.where(in_uptrend, buy_cond & tightened_oversold, buy_cond)
+
+        # === IMPROVEMENT #7: Higher-timeframe momentum alignment ===
+        if params.get('use_htf_filter', False):
+            htf_window = params.get('htf_slow_window', 20)
+            htf_thresh = params.get('htf_threshold', -0.2)
+            # Compute slow velocity as proxy for higher timeframe momentum
+            slow_osc = pd.Series(osc_smooth).rolling(htf_window, min_periods=1).mean().values
+            slow_velocity = np.diff(slow_osc, prepend=slow_osc[0])
+            # Don't buy when slow velocity is strongly negative
+            buy_cond = buy_cond & (slow_velocity > htf_thresh)
+            # Don't sell when slow velocity is strongly positive
+            sell_cond = sell_cond & (slow_velocity < -htf_thresh)
+
         # V2 indicator filters (Regime, Fragility, Entropy)
         if v2_indicators:
             if params.get('use_regime_filter', False) and 'rsc' in v2_indicators:
@@ -701,15 +894,46 @@ class VelocityOptunaObjective:
                 entropy_thresh = params.get('entropy_threshold', 0.7)
                 buy_cond = buy_cond & (sei < entropy_thresh)
 
+        # === IMPROVEMENT #3: Pre-compute ATR for dynamic trailing stop ===
+        trailing_stop_type = params.get('trailing_stop_type', 'fixed_pct')
+        atr_values = None
+        atr_mult = params.get('trailing_atr_mult', 2.0)
+        if trailing_stop_type == 'atr' and high_prices is not None and low_prices is not None:
+            atr_period = params.get('trailing_atr_period', 14)
+            tr = np.maximum(
+                high_prices - low_prices,
+                np.maximum(
+                    np.abs(high_prices - np.roll(close_prices, 1)),
+                    np.abs(low_prices - np.roll(close_prices, 1))
+                )
+            )
+            tr[0] = high_prices[0] - low_prices[0]
+            atr_values = pd.Series(tr).rolling(atr_period, min_periods=1).mean().values
+
+        # === IMPROVEMENT #8: Pre-compute consecutive bars above midline ===
+        midline_exit_bars_required = params.get('midline_exit_bars', 1)
+        if midline_exit_bars_required > 1:
+            above_midline = (osc_smooth > 0).astype(int)
+            # Count consecutive bars above midline
+            consecutive_above = np.zeros(len(osc_smooth), dtype=int)
+            for idx in range(1, len(osc_smooth)):
+                if above_midline[idx]:
+                    consecutive_above[idx] = consecutive_above[idx - 1] + 1
+                else:
+                    consecutive_above[idx] = 0
+
         # Trading simulation with equity curve tracking for max drawdown
         position = 0
         entry_price = 0.0
         entry_bar_idx = 0  # Track entry bar for min_hold_bars
+        highest_price = 0.0  # Track highest price for trailing stop
         last_trade_bar = -params['min_bars_between']
         trades = []
         exit_on_opposite = params.get('exit_on_opposite_signal', True)
         exit_on_midline = params.get('exit_on_midline_cross', False)
         min_hold_bars = params.get('min_hold_bars', 1)
+        use_trailing_stop = params.get('use_trailing_stop', False)
+        trailing_stop_pct = params.get('trailing_stop_pct', 2.0)
 
         # Track equity curve for max drawdown calculation
         equity = 100.0  # Start with $100
@@ -722,8 +946,28 @@ class VelocityOptunaObjective:
             bars_held = i - entry_bar_idx
             can_exit = bars_held >= min_hold_bars
 
+            # Update highest price for trailing stop
+            if position == 1:
+                highest_price = max(highest_price, price)
+
             if position == 1 and can_exit:
-                if params['stop_loss_pct'] > 0 and price <= entry_price * (1 - params['stop_loss_pct'] / 100):
+                # Stop loss: trailing or fixed
+                if use_trailing_stop and trailing_stop_pct > 0:
+                    # === IMPROVEMENT #3: ATR-based trailing stop ===
+                    if trailing_stop_type == 'atr' and atr_values is not None:
+                        trail_stop_price = highest_price - atr_values[i] * atr_mult
+                    else:
+                        trail_stop_price = highest_price * (1 - trailing_stop_pct / 100)
+                    if price <= trail_stop_price:
+                        pnl_pct = (price - entry_price) / entry_price * 100
+                        trades.append(pnl_pct)
+                        equity *= (1 + pnl_pct / 100)
+                        equity_curve.append(equity)
+                        peak_equity = max(peak_equity, equity)
+                        position = 0
+                        last_trade_bar = i
+                        continue
+                elif params['stop_loss_pct'] > 0 and price <= entry_price * (1 - params['stop_loss_pct'] / 100):
                     pnl_pct = (price - entry_price) / entry_price * 100
                     trades.append(pnl_pct)
                     equity *= (1 + pnl_pct / 100)
@@ -784,7 +1028,14 @@ class VelocityOptunaObjective:
                         position = 0
                         last_trade_bar = i
                         continue
-                if exit_on_midline and osc_smooth[i] > 0 and osc_smooth[i-1] <= 0:
+                # === IMPROVEMENT #8: Midline exit delay ===
+                midline_met = False
+                if exit_on_midline:
+                    if midline_exit_bars_required > 1:
+                        midline_met = consecutive_above[i] >= midline_exit_bars_required
+                    else:
+                        midline_met = osc_smooth[i] > 0 and osc_smooth[i-1] <= 0
+                if midline_met:
                     pnl_pct = (price - entry_price) / entry_price * 100
                     trades.append(pnl_pct)
                     equity *= (1 + pnl_pct / 100)
@@ -806,6 +1057,7 @@ class VelocityOptunaObjective:
             if buy_cond[i] and position == 0 and bars_since >= params['min_bars_between']:
                 position = 1
                 entry_price = price
+                highest_price = price  # Reset trailing stop tracker
                 entry_bar_idx = i  # Track entry bar for min_hold_bars
                 last_trade_bar = i
 

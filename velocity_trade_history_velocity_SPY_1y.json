@@ -11,5 +11,20 @@
     "exit_reason": "Midline Cross (0.46%)",
     "pnl_pct": 0.45704843606495577,
     "pnl_dollars": 45.70484360649558
+  },
+  {
+    "id": 2,
+    "ticker": "SPY",
+    "strategy_name": "velocity_SPY_1y",
+    "type": "LONG",
+    "entry_price": 692.87,
+    "exit_price": 695.6199,
+    "entry_time": "2026-01-23 18:00:00-0600",
+    "exit_time": "2026-01-26 18:00:00-0600",
+    "entry_signal_bar": "2026-01-22 18:00:00-0600",
+    "exit_signal_bar": "2026-01-26 00:00:00",
+    "exit_reason": "Midline Cross (0.40%)",
+    "pnl_pct": 0.3968854186211014,
+    "pnl_dollars": 2.749900000000025
   }
 ]

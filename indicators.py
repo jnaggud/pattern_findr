@@ -570,8 +570,23 @@ def get_all_indicators(data, optuna_params=None):
         # Reset index temporarily for oscillator indicator processing
         temp_data = data.reset_index()
 
-        # Integrate all oscillator indicators
-        temp_data = integrate_oscillator_indicators(temp_data)
+        # Integrate all oscillator indicators (pass interval for V2 indicator scaling)
+        # Try to detect interval from data frequency
+        detected_interval = '1d'  # default
+        if len(data) >= 2:
+            try:
+                time_diff = (data.index[1] - data.index[0]).total_seconds()
+                if time_diff <= 300:  # 5 min or less
+                    detected_interval = '5m'
+                elif time_diff <= 900:  # 15 min
+                    detected_interval = '15m'
+                elif time_diff <= 3600:  # 1 hour
+                    detected_interval = '1h'
+                elif time_diff <= 14400:  # 4 hours
+                    detected_interval = '4h'
+            except:
+                pass
+        temp_data = integrate_oscillator_indicators(temp_data, interval=detected_interval)
 
         # Get new columns added by oscillator indicators
         original_cols = set(data.columns)

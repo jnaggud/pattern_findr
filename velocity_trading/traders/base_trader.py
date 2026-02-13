@@ -15,6 +15,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Tuple
 from abc import ABC, abstractmethod
+import numpy as np
 import pandas as pd
 
 # Add parent to path for imports
@@ -41,7 +42,8 @@ from ..indicators.velocity import (
 )
 from ..notifications.discord import (
     send_entry_alert, send_exit_alert, send_status_update,
-    send_error_alert, send_startup_notification, create_trade_log_csv_buffer
+    send_error_alert, send_startup_notification, create_trade_log_csv_buffer,
+    send_regime_change_alert, send_regime_status_update,
 )
 from ..notifications.charts import generate_chart
 
@@ -51,6 +53,31 @@ try:
     SIERRA_BRIDGE_AVAILABLE = True
 except ImportError:
     SIERRA_BRIDGE_AVAILABLE = False
+
+# Novel Strategy Filters (v7+)
+try:
+    from ..core.novel_filters import NovelStrategyFilters
+    NOVEL_FILTERS_AVAILABLE = True
+except ImportError:
+    NOVEL_FILTERS_AVAILABLE = False
+
+# v9 Regime Detection
+try:
+    from ..core.regime_detector_v9 import (
+        classify_regimes, classify_regimes_extended,
+        get_regime_distribution,
+        REGIME_NAMES, REGIME_UPTREND, REGIME_DOWNTREND, REGIME_CHOP,
+    )
+    V9_REGIME_AVAILABLE = True
+except ImportError:
+    V9_REGIME_AVAILABLE = False
+
+# v10 Daily Retrainer
+try:
+    from ..core.daily_retrainer import DailyRetrainer
+    DAILY_RETRAINER_AVAILABLE = True
+except ImportError:
+    DAILY_RETRAINER_AVAILABLE = False
 
 
 class BaseTrader(ABC):
@@ -91,17 +118,33 @@ class BaseTrader(ABC):
         # Initialize position manager (SQLite-backed, with daily auto-backup)
         self.pm = PositionManager(strategy_name)
 
+        # v9 regime-aware mode
+        self.regime_aware = self.config.get('regime_aware', False) and V9_REGIME_AVAILABLE
+
         # CRITICAL: Validate required config parameters - NO DEFAULTS
-        # All parameters must come from strategy bundle to ensure consistency
-        required_params = ['signal_type', 'oversold_threshold', 'overbought_threshold',
-                           'stop_loss_pct', 'take_profit_pct']
-        missing = [p for p in required_params if p not in self.config]
-        if missing:
-            raise ValueError(
-                f"Missing required config parameters: {missing}. "
-                f"Config must come from strategy bundle (velocity_strategies/{strategy_name}/), "
-                "not hardcoded defaults."
-            )
+        # For regime-aware configs, required params live inside regime_params, not at top level
+        if self.regime_aware:
+            regime_params = self.config.get('regime_params', {})
+            if not regime_params:
+                raise ValueError("regime_aware=True but no regime_params in config")
+            required_regime_keys = ['signal_type', 'oversold_threshold', 'overbought_threshold',
+                                    'stop_loss_pct', 'take_profit_pct']
+            for rname, rcfg in regime_params.items():
+                if rcfg.get('dont_trade', False):
+                    continue
+                missing = [p for p in required_regime_keys if p not in rcfg]
+                if missing:
+                    raise ValueError(f"Regime '{rname}' missing required params: {missing}")
+        else:
+            required_params = ['signal_type', 'oversold_threshold', 'overbought_threshold',
+                               'stop_loss_pct', 'take_profit_pct']
+            missing = [p for p in required_params if p not in self.config]
+            if missing:
+                raise ValueError(
+                    f"Missing required config parameters: {missing}. "
+                    f"Config must come from strategy bundle (velocity_strategies/{strategy_name}/), "
+                    "not hardcoded defaults."
+                )
 
         # Validate interval matches config (prevents running wrong timeframe)
         config_interval = self.config.get('interval')
@@ -112,11 +155,24 @@ class BaseTrader(ABC):
             )
 
         # Trading parameters from config - NO DEFAULTS
-        self.stop_loss_pct = self.config['stop_loss_pct']
-        self.take_profit_pct = self.config['take_profit_pct']
-        self.signal_type = self.config['signal_type']
-        self.oversold_threshold = self.config['oversold_threshold']
-        self.overbought_threshold = self.config['overbought_threshold']
+        # For regime-aware configs, use first active regime as defaults for display/fallback
+        if self.regime_aware:
+            _first_regime = next(
+                (rcfg for rcfg in self.config.get('regime_params', {}).values()
+                 if not rcfg.get('dont_trade', False)),
+                {}
+            )
+            self.stop_loss_pct = self.config.get('stop_loss_pct', _first_regime.get('stop_loss_pct', 5.0))
+            self.take_profit_pct = self.config.get('take_profit_pct', _first_regime.get('take_profit_pct', 10.0))
+            self.signal_type = self.config.get('signal_type', _first_regime.get('signal_type', 'velocity_crossover_or_zone'))
+            self.oversold_threshold = self.config.get('oversold_threshold', _first_regime.get('oversold_threshold', -0.1))
+            self.overbought_threshold = self.config.get('overbought_threshold', _first_regime.get('overbought_threshold', 0.1))
+        else:
+            self.stop_loss_pct = self.config['stop_loss_pct']
+            self.take_profit_pct = self.config['take_profit_pct']
+            self.signal_type = self.config['signal_type']
+            self.oversold_threshold = self.config['oversold_threshold']
+            self.overbought_threshold = self.config['overbought_threshold']
 
         # Oscillator type (for novel oscillators: arwo, prf, ics, etc.)
         self.oscillator_type = self.config.get('oscillator_type', 'composite')
@@ -147,6 +203,15 @@ class BaseTrader(ABC):
         # Legacy mode is kept as fallback but not required by default
         self.use_legacy = self.config.get('use_legacy', False)
 
+        # Novel Strategy Filters (v7+) — only initialized if config has novel_strategies
+        self.novel_filters = None
+        novel_config = self.config.get('novel_strategies')
+        if novel_config and NOVEL_FILTERS_AVAILABLE:
+            self.novel_filters = NovelStrategyFilters(novel_config)
+            print(f"   [NovelFilters] Initialized for strategies: {novel_config.get('strategy_ids', [])}")
+        elif novel_config and not NOVEL_FILTERS_AVAILABLE:
+            print(f"   [NovelFilters] WARNING: novel_strategies in config but module not available")
+
         # State
         self.running = False
         self.last_signal_time = None
@@ -156,10 +221,38 @@ class BaseTrader(ABC):
         # Data staleness tracking for graceful degradation
         self._last_successful_fetch_time = 0
         self._stale_data_alert_sent = False
+        self._last_exit_check_time = 0  # Safety net: track when _check_exit last ran
 
         # Data pipeline for incremental updates (Historical + Live API)
         self.pipeline = DataPipeline(ticker, interval)
         self._pipeline_initialized = False
+
+        # v9 regime state (populated each cycle)
+        self._regimes = None
+        self._is_high_vol = None
+        self._regime_signal_dfs = {}  # regime_name -> DataFrame with signals
+
+        # v9 regime notification state
+        self._last_regime = None
+        self._last_regime_status_time = 0
+        self._adx_values = None
+        self._plus_di_values = None
+        self._minus_di_values = None
+
+        # v10 daily retrainer — auto-retrain numerical params after market close
+        self._daily_retrainer = None
+        if self.config.get('daily_retrain', False) and DAILY_RETRAINER_AVAILABLE:
+            self._daily_retrainer = DailyRetrainer(
+                config=self.config,
+                ticker=ticker,
+                interval=interval,
+                n_trials=self.config.get('retrain_trials', 5000),
+                n_workers=self.config.get('retrain_workers', None),
+                train_days=self.config.get('retrain_train_days', 30),
+                pinned_params=self.config.get('retrain_pinned_params', {}),
+            )
+            print(f"   [v10] Daily retrainer enabled: {self.config.get('retrain_trials', 5000)} trials, "
+                  f"{self.config.get('retrain_train_days', 30)}d window")
 
     # Class-level tracking of daily config backups
     _config_backups_done = {}
@@ -206,6 +299,68 @@ class BaseTrader(ABC):
     def get_completed_bar(self, df: pd.DataFrame) -> Tuple[Optional[pd.Series], Optional[datetime]]:
         """Get the most recently completed bar. Override in subclass."""
         pass
+
+    # =========================================================================
+    # v9 Regime Detection Helpers
+    # =========================================================================
+
+    def _compute_regimes(self, df: pd.DataFrame):
+        """Compute regime classification for each bar. Returns (regimes, is_high_vol).
+
+        Also stores ADX/DI arrays for regime notifications.
+        """
+        if not self.regime_aware:
+            return None, None
+        rd = self.config.get('regime_detector', {})
+        ext = classify_regimes_extended(
+            df['High'].values.astype(float),
+            df['Low'].values.astype(float),
+            df['Close'].values.astype(float),
+            adx_period=rd.get('adx_period', 14),
+            adx_threshold=rd.get('adx_threshold', 25.0),
+            atr_period=rd.get('atr_period', 14),
+            atr_high_vol_percentile=rd.get('atr_high_vol_percentile', 90.0),
+            atr_high_vol_lookback=rd.get('atr_high_vol_lookback', 100),
+            regime_min_bars=rd.get('regime_min_bars', 4),
+        )
+        self._adx_values = ext['adx']
+        self._plus_di_values = ext['plus_di']
+        self._minus_di_values = ext['minus_di']
+        return ext['regimes'], ext['is_high_vol']
+
+    def _generate_regime_signals(self, df: pd.DataFrame) -> dict:
+        """Generate per-regime signal DataFrames. Returns {regime_name: df_with_signals}."""
+        regime_signal_dfs = {}
+        if not self.regime_aware:
+            return regime_signal_dfs
+        for rname, rcfg in self.config.get('regime_params', {}).items():
+            if rcfg.get('dont_trade', False):
+                continue
+            merged = {**self.config, **rcfg}
+            regime_signal_dfs[rname] = calculate_velocity_signals(
+                df.copy(),
+                signal_type=merged['signal_type'],
+                oversold_threshold=merged['oversold_threshold'],
+                overbought_threshold=merged['overbought_threshold'],
+                vel_smoothing=merged.get('vel_smoothing', 1),
+                extreme_zone_mult=merged.get('extreme_zone_mult', 1.5),
+                require_accel=merged.get('require_accel', False),
+                use_regime_filter=merged.get('use_regime_filter', False),
+                regime_threshold=merged.get('regime_threshold', -0.15),
+                use_fragility_filter=merged.get('use_fragility_filter', False),
+                fragility_threshold=merged.get('fragility_threshold', 0.5),
+                use_entropy_filter=merged.get('use_entropy_filter', False),
+                entropy_threshold=merged.get('entropy_threshold', 0.7),
+            )
+        return regime_signal_dfs
+
+    def _get_exit_param(self, key: str, default, position: 'Position' = None):
+        """Get exit parameter from entry regime config (v9) or top-level config (v8)."""
+        regime_name = position.entry_regime if position else None
+        if self.regime_aware and regime_name:
+            rcfg = self.config.get('regime_params', {}).get(regime_name, {})
+            return rcfg.get(key, self.config.get(key, default))
+        return self.config.get(key, default)
 
     def _ensure_database(self):
         """
@@ -295,10 +450,23 @@ class BaseTrader(ABC):
 
             if should_update:
                 print(f"   ℹ️  Running incremental update ({update_reason})...")
-                success, result = self.pm.update_from_latest(
+
+                # For intraday strategies: re-evaluate from last trade date on startup
+                # This catches missed entries when bars were "processed" but the trader
+                # wasn't entering (e.g., process died, had a bug, or was restarted).
+                # The process_new_bars logic will skip bars that already have trades
+                # in the DB, so this is safe to run even when no trades were missed.
+                force_reeval = (
+                    self.interval in ['1m', '5m', '15m', '30m', '1h', '2h', '4h']
+                    and not current_position  # Only when flat (in-position handled above)
+                    and hours_old >= 1.0      # At least 1 hour since last trade
+                )
+
+                success, result = self.pm.process_new_bars(
                     ticker=self.ticker,
                     config=self.config,
-                    interval=self.interval
+                    interval=self.interval,
+                    force_from_last_trade=force_reeval
                 )
                 if success:
                     new_entries = result.get('new_entries', 0)
@@ -499,23 +667,40 @@ class BaseTrader(ABC):
         # Full bar data fetch is only needed when:
         # 1. Not in position (looking for entry signals)
         # 2. A new bar might be complete (check for signal-based exits)
+        # 3. SAFETY NET: _check_exit hasn't run in > 2x bar interval
         if position and not self._should_fetch_full_data():
-            self._quick_sltp_check(position)
-            sleep_time = self._calculate_sleep_time()
-            print(f"   ⏱️ Quick check completed, sleeping {sleep_time}s")
-            time.sleep(sleep_time)
-            return
+            # Safety net: force full cycle if _check_exit is stale
+            interval_seconds = self._get_interval_minutes() * 60
+            exit_check_age = _time.time() - self._last_exit_check_time
+            if exit_check_age > interval_seconds * 2:
+                print(f"   ⚠️ Exit check stale ({exit_check_age:.0f}s > {interval_seconds * 2}s), forcing full cycle")
+            else:
+                self._quick_sltp_check(position)
+                sleep_time = self._calculate_sleep_time()
+                print(f"   ⏱️ Quick check completed, sleeping {sleep_time}s")
+                time.sleep(sleep_time)
+                return
 
         # Full data fetch and analysis path
+        # Enable multi-source supplement near bar boundary (for both entries and exits)
+        # This catches the case where yfinance hasn't finalized the latest bar
+        # but Databento or Polygon already have it
+        use_supplement = False
+        now_market = get_current_market_time(self.ticker)
+        interval_minutes = self._get_interval_minutes()
+        minutes_into_bar = (now_market.minute % interval_minutes) + (now_market.second / 60)
+        if minutes_into_bar < 3.0:
+            use_supplement = True
+
         # Fetch price data with retry logic
-        df = self._fetch_data()
+        df = self._fetch_data(supplement_latest=use_supplement)
         retry_count = 0
         max_retries = 30  # Max 30 seconds of retrying
         while (df is None or df.empty) and retry_count < max_retries:
             retry_count += 1
             print(f"   No data available, retrying in 1s ({retry_count}/{max_retries})...")
             time.sleep(1)
-            df = self._fetch_data()
+            df = self._fetch_data(supplement_latest=use_supplement)
 
         if df is None or df.empty:
             # Graceful degradation: if in position, continue SL/TP monitoring
@@ -563,6 +748,15 @@ class BaseTrader(ABC):
                 oscillator_type=self.oscillator_type,
                 config=self.config
             )
+            # Novel Strategy #4: OU threshold amplification (v7+)
+            # Boosts oscillator values near OU-derived entry/exit levels
+            if self.novel_filters is not None:
+                # Train models on first cycle (or retrain daily)
+                if not self.novel_filters.trained or self.novel_filters.needs_retrain():
+                    print("   [NovelFilters] Training models on historical data...")
+                    self.novel_filters.train(df)
+                # Apply OU boost to oscillator BEFORE signal generation
+                df = self.novel_filters.apply_ou_boost(df)
             # Generate signals with V2 filters (regime, fragility, entropy)
             df = calculate_velocity_signals(
                 df,
@@ -580,6 +774,46 @@ class BaseTrader(ABC):
                 entropy_threshold=self.entropy_threshold
             )
 
+            # Train ML entry + exit models (v7+) — needs signals computed first
+            if self.novel_filters is not None and self.novel_filters.trained:
+                needs_train = (
+                    not self.novel_filters._entry_models_trained
+                    or not self.novel_filters.exit_model.trained
+                    or self.novel_filters.exit_model.needs_retrain()
+                )
+                if needs_train:
+                    self.novel_filters.train_exit_model(
+                        df, stop_loss_pct=self.stop_loss_pct
+                    )
+
+        # v9: Compute regimes and per-regime signals
+        if self.regime_aware:
+            self._regimes, self._is_high_vol = self._compute_regimes(df)
+            self._regime_signal_dfs = self._generate_regime_signals(df)
+            if self._regimes is not None and len(self._regimes) > 0:
+                current_regime_name = REGIME_NAMES.get(int(self._regimes[-1]), 'unknown')
+                print(f"   Regime: {current_regime_name.upper()}")
+        else:
+            self._regimes = None
+            self._is_high_vol = None
+            self._regime_signal_dfs = {}
+
+        # v9: Regime change detection and periodic status notifications
+        if self.regime_aware and self.webhook_url and self._regimes is not None and len(self._regimes) > 0:
+            current_regime_name = REGIME_NAMES.get(int(self._regimes[-1]), 'unknown')
+
+            # Regime change alert
+            if self._last_regime is not None and current_regime_name != self._last_regime:
+                self._send_regime_change_alert(self._last_regime, current_regime_name)
+            self._last_regime = current_regime_name
+
+            # Periodic regime status update (default every 4 hours)
+            import time as _regime_time
+            status_interval = self.config.get('regime_status_interval_hours', 4) * 3600
+            if _regime_time.time() - self._last_regime_status_time >= status_interval:
+                self._send_regime_status_update()
+                self._last_regime_status_time = _regime_time.time()
+
         # PERFORMANCE: Cache the DataFrame with indicators for reuse in exit/entry processing
         # This avoids re-fetching and re-calculating indicators for chart generation
         self._cached_df = df.copy()
@@ -595,8 +829,40 @@ class BaseTrader(ABC):
         if not self.pm.get_current_position():  # Re-check after potential exit
             self._check_entry(df)
 
+        # YFINANCE DATA LAG FIX: If near a bar boundary and the just-closed bar
+        # may not yet be in yfinance data, schedule a 1s recheck so we don't wait
+        # a full interval (15min) to detect exits OR entries.
+        # Applies when: (a) in position and no exit fired, or (b) flat and no entry fired.
+        now_market = get_current_market_time(self.ticker)
+        interval_minutes = self._get_interval_minutes()
+        minutes_into_bar = (now_market.minute % interval_minutes) + (now_market.second / 60)
+        if minutes_into_bar < 3.0:
+            completed_bar_check, _ = self.get_completed_bar(df)
+            if completed_bar_check is None:
+                # Bar not yet in data — schedule rapid recheck
+                import time as _t2
+                self._bar_recheck_time = _t2.time() + 1
+                print(f"   📡 Near bar boundary but bar not in data — recheck in 1s")
+
+        # CRITICAL: Update last_processed_bar so process_new_bars doesn't re-process
+        # bars on next restart. Without this, startup catch-up re-processes bars that
+        # the live loop already handled, creating duplicate trades.
+        try:
+            completed_bar, bar_time = self.get_completed_bar(df)
+            if bar_time is not None:
+                from ..core.position_manager import normalize_timestamp
+                bar_ts = normalize_timestamp(bar_time)
+                self.pm._db.set_last_processed_bar(bar_ts)
+        except Exception:
+            pass  # Non-critical - best effort
+
         # Write health status periodically
         self._write_health_status()
+
+        # v10: Daily retraining — run after market close when not in position
+        if self._daily_retrainer is not None and self._daily_retrainer.needs_retrain():
+            if not is_market_open(self.ticker) and not self.pm.get_current_position():
+                self._run_daily_retrain(df)
 
         # Sleep until next check
         cycle_total = _time.time() - cycle_start
@@ -611,6 +877,7 @@ class BaseTrader(ABC):
         Returns True when:
         1. We haven't done a full fetch since the last bar closed
         2. More than interval_minutes have passed since last full fetch
+        3. A pending recheck is due (yfinance data lag after bar close)
 
         This optimizes API usage when in position - only fetch full data once per bar
         to check for signal-based exits, not every 5-second SL/TP check.
@@ -624,10 +891,18 @@ class BaseTrader(ABC):
             if not hasattr(self, '_last_full_fetch_time'):
                 self._last_full_fetch_time = 0
 
+            # Initialize recheck state
+            if not hasattr(self, '_bar_recheck_time'):
+                self._bar_recheck_time = 0  # Unix timestamp when recheck is due
+
+            # Check if a pending recheck is due (yfinance data lag workaround)
+            if self._bar_recheck_time > 0 and now_ts >= self._bar_recheck_time:
+                self._bar_recheck_time = 0  # Clear — will be re-set if still needed
+                return True
+
             # Do full fetch if it's been more than interval_minutes since last one
             time_since_last_fetch = now_ts - self._last_full_fetch_time
             if time_since_last_fetch >= interval_seconds:
-                # Update timestamp (will be done when fetch actually happens)
                 return True
 
             # Also check if we're in the first minute of a new bar and haven't fetched this bar yet
@@ -641,8 +916,12 @@ class BaseTrader(ABC):
                 bar_start_minute = (now.minute // interval_minutes) * interval_minutes
                 bar_start = now.replace(minute=bar_start_minute, second=0, microsecond=0)
 
-                # If last fetch was before this bar started, do a full fetch
-                last_fetch_dt = datetime.fromtimestamp(self._last_full_fetch_time)
+                # CRITICAL FIX: Use tz-aware comparison.
+                # bar_start is tz-aware (from get_current_market_time), but
+                # datetime.fromtimestamp() returns naive local time → TypeError.
+                # Use the market timezone for both.
+                market_tz = now.tzinfo
+                last_fetch_dt = datetime.fromtimestamp(self._last_full_fetch_time, tz=market_tz)
                 if last_fetch_dt < bar_start:
                     return True
 
@@ -667,55 +946,107 @@ class BaseTrader(ABC):
         entry_price = position.entry_price
         pnl_pct = ((current_price - entry_price) / entry_price) * 100
 
-        # Calculate SL/TP price levels for display
-        sl_price = entry_price * (1 - self.stop_loss_pct / 100)
-        tp_price = entry_price * (1 + self.take_profit_pct / 100)
+        # Resolve SL/TP from entry regime (v9) or top-level (v8)
+        sl_pct = self._get_exit_param('stop_loss_pct', self.stop_loss_pct, position)
+        tp_pct = self._get_exit_param('take_profit_pct', self.take_profit_pct, position)
 
-        print(f"   📊 Position: LONG @ ${entry_price:,.2f} | Current: ${current_price:,.2f}")
+        # Calculate SL/TP price levels for display
+        sl_price = entry_price * (1 - sl_pct / 100)
+        tp_price = entry_price * (1 + tp_pct / 100)
+
+        regime_tag = f" [{position.entry_regime}]" if position.entry_regime else ""
+        print(f"   📊 Position: LONG @ ${entry_price:,.2f} | Current: ${current_price:,.2f}{regime_tag}")
         print(f"   📊 P&L: {pnl_pct:+.2f}% | SL: ${sl_price:,.2f} | TP: ${tp_price:,.2f}")
 
         exit_reason = None
         exit_price = current_price
 
         # Stop Loss
-        if pnl_pct <= -self.stop_loss_pct:
+        if pnl_pct <= -sl_pct:
             exit_reason = f"Stop Loss ({pnl_pct:.2f}%)"
-            print(f"   🛑 STOP LOSS TRIGGERED! P&L {pnl_pct:.2f}% <= -{self.stop_loss_pct}%")
+            print(f"   🛑 STOP LOSS TRIGGERED! P&L {pnl_pct:.2f}% <= -{sl_pct}%")
 
         # Take Profit
-        elif pnl_pct >= self.take_profit_pct:
+        elif pnl_pct >= tp_pct:
             exit_reason = f"Take Profit ({pnl_pct:.2f}%)"
-            print(f"   🎯 TAKE PROFIT TRIGGERED! P&L {pnl_pct:.2f}% >= +{self.take_profit_pct}%")
+            print(f"   🎯 TAKE PROFIT TRIGGERED! P&L {pnl_pct:.2f}% >= +{tp_pct}%")
 
         # Execute exit if triggered
         if exit_reason:
             self._execute_exit(exit_price, exit_reason, None)
 
-    def _fetch_data(self, for_chart: bool = False) -> Optional[pd.DataFrame]:
+    def _fetch_data(self, for_chart: bool = False, supplement_latest: bool = False) -> Optional[pd.DataFrame]:
         """
         Fetch price data for signal generation and charts.
 
-        CRITICAL FIX: Uses fetch_price_data (yfinance) directly to ensure
-        consistency with incremental updates. The DataPipeline (Databento+yfinance)
-        was producing different oscillator values causing signals to not fire.
+        CRITICAL FIX: Uses yfinance ONLY (yfinance_only=True) to ensure
+        consistent oscillator values. The DataPipeline and _fetch_futures mix
+        Databento+yfinance data which produces different oscillator values,
+        causing signals to not match between live trading and fresh calculations.
 
         Args:
             for_chart: If True, include synthetic current bar for display.
                        If False (default), exclude synthetic for signal generation.
+            supplement_latest: If True, check Databento/Polygon for latest bar
+                              when yfinance might be lagging (near bar boundary).
         """
-        # Use fetch_price_data directly (same as incremental update) for consistency
-        # The DataPipeline was causing oscillator discrepancies due to Databento data merge
         fetch_days = 60 if self.interval in ['1m', '5m', '15m', '30m', '1h', '2h', '4h'] else 365
 
         # Retry with exponential backoff
         for attempt in range(3):
             try:
+                # CRITICAL: yfinance_only=True bypasses ALL Databento paths
+                # This ensures oscillator consistency - Databento mixing was causing signal mismatches
                 df = fetch_price_data(
                     self.ticker,
                     days=fetch_days,
-                    interval=self.interval
+                    interval=self.interval,
+                    yfinance_only=True  # Force yfinance ONLY, no Databento at all
                 )
                 if df is not None and not df.empty:
+                    # DATA REDUNDANCY: When near bar boundary, check if other sources
+                    # have a newer bar that yfinance hasn't finalized yet.
+                    # Only the latest bar is supplemented — historical data stays yfinance-only
+                    # to preserve oscillator consistency.
+                    if supplement_latest:
+                        try:
+                            from ..data.fetcher import fetch_latest_bar_multisource
+                            import pytz
+
+                            alt_df = fetch_latest_bar_multisource(
+                                self.ticker, self.interval
+                            )
+                            if alt_df is not None and not alt_df.empty:
+                                # Compare latest bar times
+                                yf_last = df.index[-1]
+                                alt_last = alt_df.index[-1]
+
+                                # Normalize both to naive UTC for comparison
+                                if hasattr(yf_last, 'tzinfo') and yf_last.tzinfo is not None:
+                                    yf_last_cmp = yf_last.tz_convert(pytz.UTC).tz_localize(None)
+                                else:
+                                    yf_last_cmp = yf_last
+                                if hasattr(alt_last, 'tzinfo') and alt_last.tzinfo is not None:
+                                    alt_last_cmp = alt_last.tz_convert(pytz.UTC).tz_localize(None)
+                                else:
+                                    alt_last_cmp = alt_last
+
+                                if alt_last_cmp > yf_last_cmp:
+                                    # Alt source has a newer bar — append it
+                                    new_bar = alt_df.iloc[[-1]].copy()
+                                    # Match timezone of yfinance index
+                                    if df.index.tz is not None and new_bar.index.tz is None:
+                                        new_bar.index = new_bar.index.tz_localize('UTC').tz_convert(df.index.tz)
+                                    elif df.index.tz is None and new_bar.index.tz is not None:
+                                        new_bar.index = new_bar.index.tz_convert('UTC').tz_localize(None)
+                                    # Only keep columns that exist in both
+                                    common_cols = [c for c in df.columns if c in new_bar.columns]
+                                    new_bar = new_bar[common_cols]
+                                    df = pd.concat([df, new_bar])
+                                    print(f"   📡 Supplemented yfinance with newer bar from alt source: {alt_last_cmp}")
+                        except Exception as e:
+                            print(f"   📡 Multi-source supplement failed (non-critical): {e}")
+
                     return df
             except Exception as e:
                 print(f"   Fetch attempt {attempt+1} failed: {e}")
@@ -725,6 +1056,8 @@ class BaseTrader(ABC):
 
     def _check_exit(self, df: pd.DataFrame, position: Position):
         """Check if position should be exited."""
+        import time as _exit_time
+        self._last_exit_check_time = _exit_time.time()
         # Get current price
         current_price = fetch_realtime_price(self.ticker)
         price_source = "realtime"
@@ -737,58 +1070,102 @@ class BaseTrader(ABC):
         entry_price = position.entry_price
         pnl_pct = ((current_price - entry_price) / entry_price) * 100
 
+        # Resolve SL/TP from entry regime (v9) or top-level (v8)
+        sl_pct = self._get_exit_param('stop_loss_pct', self.stop_loss_pct, position)
+        tp_pct = self._get_exit_param('take_profit_pct', self.take_profit_pct, position)
+
         # Calculate SL/TP price levels for display
-        sl_price = entry_price * (1 - self.stop_loss_pct / 100)
-        tp_price = entry_price * (1 + self.take_profit_pct / 100)
+        sl_price = entry_price * (1 - sl_pct / 100)
+        tp_price = entry_price * (1 + tp_pct / 100)
 
         # Debug logging for position monitoring
-        print(f"   📊 Position: LONG @ ${entry_price:,.2f} | Current: ${current_price:,.2f} ({price_source})")
-        print(f"   📊 P&L: {pnl_pct:+.2f}% | SL: -{self.stop_loss_pct}% (${sl_price:,.2f}) | TP: +{self.take_profit_pct}% (${tp_price:,.2f})")
+        regime_tag = f" [{position.entry_regime}]" if position.entry_regime else ""
+        print(f"   📊 Position: LONG @ ${entry_price:,.2f} | Current: ${current_price:,.2f} ({price_source}){regime_tag}")
+        print(f"   📊 P&L: {pnl_pct:+.2f}% | SL: -{sl_pct}% (${sl_price:,.2f}) | TP: +{tp_pct}% (${tp_price:,.2f})")
 
         exit_reason = None
         exit_price = current_price
         signal_bar_time = None  # Only set for signal-based exits
 
         # Stop Loss
-        if pnl_pct <= -self.stop_loss_pct:
+        if pnl_pct <= -sl_pct:
             exit_reason = f"Stop Loss ({pnl_pct:.2f}%)"
-            print(f"   🛑 STOP LOSS TRIGGERED! P&L {pnl_pct:.2f}% <= -{self.stop_loss_pct}%")
+            print(f"   🛑 STOP LOSS TRIGGERED! P&L {pnl_pct:.2f}% <= -{sl_pct}%")
 
         # Take Profit
-        elif pnl_pct >= self.take_profit_pct:
+        elif pnl_pct >= tp_pct:
             exit_reason = f"Take Profit ({pnl_pct:.2f}%)"
-            print(f"   🎯 TAKE PROFIT TRIGGERED! P&L {pnl_pct:.2f}% >= +{self.take_profit_pct}%")
+            print(f"   🎯 TAKE PROFIT TRIGGERED! P&L {pnl_pct:.2f}% >= +{tp_pct}%")
 
         # Acceleration Reversal Exit (early warning before stop loss)
-        elif self.use_accel_exit and 'acceleration' in df.columns:
-            # Check if conditions are met
-            pnl_ok = pnl_pct >= self.accel_exit_min_pnl or pnl_pct < 0
+        # Resolve accel params from entry regime (v9) or top-level (v8)
+        elif self._get_exit_param('use_accel_exit', self.use_accel_exit, position) and 'acceleration' in df.columns:
+            _accel_exit_type = self._get_exit_param('accel_exit_type', self.accel_exit_type, position)
+            _accel_exit_threshold = self._get_exit_param('accel_exit_threshold', self.accel_exit_threshold, position)
+            _accel_exit_min_pnl = self._get_exit_param('accel_exit_min_pnl', self.accel_exit_min_pnl, position)
+            _accel_exit_lookback = self._get_exit_param('accel_exit_lookback', self.accel_exit_lookback, position)
+            _use_jerk_confirm = self._get_exit_param('use_jerk_confirm', self.use_jerk_confirm, position)
+            _jerk_confirm_threshold = self._get_exit_param('jerk_confirm_threshold', self.jerk_confirm_threshold, position)
 
-            if pnl_ok and len(df) >= self.accel_exit_lookback + 1:
-                accel_values = df['acceleration'].iloc[-self.accel_exit_lookback:].values
+            # Check if conditions are met
+            pnl_ok = pnl_pct >= _accel_exit_min_pnl or pnl_pct < 0
+
+            if pnl_ok and len(df) >= _accel_exit_lookback + 1:
+                accel_values = df['acceleration'].iloc[-_accel_exit_lookback:].values
                 current_accel = df['acceleration'].iloc[-1]
 
                 # For LONG positions: negative acceleration is bearish
                 accel_cond = False
-                if self.accel_exit_type == 'sign_reversal':
+                if _accel_exit_type == 'sign_reversal':
                     accel_cond = all(a < 0 for a in accel_values)
-                elif self.accel_exit_type == 'magnitude':
-                    accel_cond = current_accel < -self.accel_exit_threshold
-                elif self.accel_exit_type == 'both':
-                    accel_cond = all(a < 0 for a in accel_values) and abs(current_accel) > self.accel_exit_threshold
+                elif _accel_exit_type == 'magnitude':
+                    accel_cond = current_accel < -_accel_exit_threshold
+                elif _accel_exit_type == 'both':
+                    accel_cond = all(a < 0 for a in accel_values) and abs(current_accel) > _accel_exit_threshold
 
                 # Jerk confirmation (optional)
                 jerk_cond = True
-                if self.use_jerk_confirm and 'jerk' in df.columns and self.jerk_confirm_threshold > 0:
+                if _use_jerk_confirm and 'jerk' in df.columns and _jerk_confirm_threshold > 0:
                     current_jerk = df['jerk'].iloc[-1]
-                    jerk_cond = current_jerk < -self.jerk_confirm_threshold
+                    jerk_cond = current_jerk < -_jerk_confirm_threshold
 
                 if accel_cond and jerk_cond:
                     exit_reason = f"Accel Reversal ({pnl_pct:.2f}%)"
                     print(f"   ⚠️ ACCELERATION REVERSAL EXIT! Accel: {current_accel:.4f}, P&L: {pnl_pct:.2f}%")
 
-        # Signal-based exits (only if no SL/TP/Accel and in signal window)
-        elif self.is_signal_window():
+        # ML Exit Model (v7+): trained GBM predicts optimal exit timing
+        # Checked after SL/TP/Accel but before signal-based exits
+        if exit_reason is None and self.novel_filters is not None \
+                and self.novel_filters.exit_model.trained \
+                and self.is_signal_window():
+            try:
+                bar_idx = len(df) - 1
+
+                entry_date_ml = pd.to_datetime(position.entry_date)
+                if entry_date_ml.tzinfo is not None:
+                    entry_date_ml = entry_date_ml.tz_convert('UTC').tz_localize(None)
+
+                df_index_ml = df.index
+                if df_index_ml.tz is not None:
+                    df_index_ml = df_index_ml.tz_convert('UTC').tz_localize(None)
+
+                entry_bar_idx = 0
+                for i, idx_val in enumerate(df_index_ml):
+                    if pd.Timestamp(idx_val) >= pd.Timestamp(entry_date_ml):
+                        entry_bar_idx = i
+                        break
+
+                should_exit, prob, reason = self.novel_filters.exit_model.should_exit(
+                    df, entry_price, entry_bar_idx, bar_idx
+                )
+                if should_exit:
+                    exit_reason = f"ML Exit ({pnl_pct:.2f}%, p={prob:.2f})"
+                    print(f"   🤖 ML EXIT TRIGGERED! P&L: {pnl_pct:.2f}%, prob: {prob:.2f}")
+            except Exception as e:
+                print(f"   [ExitModel] Check failed: {e}")
+
+        # Signal-based exits (only if no SL/TP/Accel/ML and in signal window)
+        if exit_reason is None and self.is_signal_window():
             # CRITICAL FIX: Check ALL bars since position entry for missed exit signals
             # Previously only checked the most recent completed bar, missing signals that
             # fired during weekends, gaps, or when trader wasn't running.
@@ -797,17 +1174,29 @@ class BaseTrader(ABC):
             if entry_date.tzinfo is not None:
                 entry_date = entry_date.tz_convert('UTC').tz_localize(None)
 
-            # Ensure df.index is also tz-naive for comparison
+            # Ensure df.index is also tz-naive UTC for comparison
+            # CRITICAL: Must convert to UTC first, THEN strip timezone.
+            # tz_localize(None) alone would leave values in local time (e.g., EST),
+            # but entry_date is stored in naive UTC, causing hour offsets that prevent
+            # any bars from being found after entry.
             df_index = df.index
             if df_index.tz is not None:
-                df_index = df_index.tz_localize(None)
+                df_index = df_index.tz_convert('UTC').tz_localize(None)
 
             # Convert entry_date to same dtype as index to avoid comparison errors
             entry_date = pd.Timestamp(entry_date)
 
+            # v9: Use entry regime's signal DataFrame for opposite signal detection
+            signal_df = df
+            if self.regime_aware and position.entry_regime and position.entry_regime in self._regime_signal_dfs:
+                signal_df = self._regime_signal_dfs[position.entry_regime]
+
             # Find bars AFTER position entry (use > not >= to exclude entry bar)
             # Entry bar cannot have exit signal - that would be same-bar exit
-            df_since_entry = df[df_index > entry_date]
+            signal_df_index = signal_df.index
+            if signal_df_index.tz is not None:
+                signal_df_index = signal_df_index.tz_convert('UTC').tz_localize(None)
+            df_since_entry = signal_df[signal_df_index > entry_date]
 
             # Determine which signal to look for based on position type
             is_long = position.position_type.lower() == 'long'
@@ -858,9 +1247,43 @@ class BaseTrader(ABC):
         if completed_bar is None or bar_time is None:
             return
 
-        # Check for buy signal
-        if not completed_bar.get('buy_signal', False):
-            return
+        # v9 regime-aware: check regime-specific buy signal
+        entry_regime = None
+        if self.regime_aware and self._regimes is not None and len(self._regimes) > 0:
+            # Get bar index for the completed bar
+            bar_idx = df.index.get_loc(bar_time) if bar_time in df.index else len(df) - 2
+            if bar_idx < 0 or bar_idx >= len(self._regimes):
+                return
+            regime_id = int(self._regimes[bar_idx])
+            regime_name = REGIME_NAMES.get(regime_id, 'unknown')
+
+            # Check high-vol suppression
+            suppress = self.config.get('regime_detector', {}).get('suppress_entries_high_vol', False)
+            if suppress and self._is_high_vol is not None and self._is_high_vol[bar_idx]:
+                print(f"   [v9] High-vol suppressed entry (regime={regime_name})")
+                return
+
+            # Check if regime is tradeable
+            if regime_name not in self._regime_signal_dfs:
+                return
+
+            # Use regime-specific signal DataFrame
+            regime_df = self._regime_signal_dfs[regime_name]
+            if bar_time in regime_df.index:
+                regime_bar = regime_df.loc[bar_time]
+                has_buy = regime_bar.get('buy_signal', False)
+            else:
+                has_buy = False
+
+            if not has_buy:
+                return
+
+            entry_regime = regime_name
+            print(f"   [v9] Buy signal in {regime_name.upper()} regime")
+        else:
+            # v8 path: use top-level buy signal
+            if not completed_bar.get('buy_signal', False):
+                return
 
         # Check if we already processed this signal
         signal_time_str = str(bar_time)[:19]
@@ -902,10 +1325,10 @@ class BaseTrader(ABC):
             # that as the NEXT bar's start, causing marker to appear in wrong location
             entry_time = bar_time
 
-        self._execute_entry(entry_price, entry_time)
+        self._execute_entry(entry_price, entry_time, entry_regime=entry_regime)
         self.last_signal_time = signal_time_str
 
-    def _execute_entry(self, entry_price: float, signal_time: datetime):
+    def _execute_entry(self, entry_price: float, signal_time: datetime, entry_regime: str = None):
         """Execute position entry."""
         # Use the signal bar's timestamp as entry date (not current wall-clock time)
         # This ensures entries appear on the correct bar in charts
@@ -918,11 +1341,13 @@ class BaseTrader(ABC):
             position_type='long',
             entry_price=entry_price,
             entry_date=entry_date,
-            entry_signal_bar=str(signal_time)
+            entry_signal_bar=str(signal_time),
+            entry_regime=entry_regime
         )
 
         if success:
-            print(f"   ENTRY: LONG @ ${entry_price:,.2f}")
+            regime_tag = f" [{entry_regime}]" if entry_regime else ""
+            print(f"   ENTRY: LONG @ ${entry_price:,.2f}{regime_tag}")
 
             # Only send Discord if DB was updated (prevents desync)
             if self.webhook_url:
@@ -953,6 +1378,10 @@ class BaseTrader(ABC):
                     # Naive timestamp - just format as-is
                     signal_time_str = str(signal_time)[:16]
 
+                # Add regime to signal time for Discord
+                if entry_regime:
+                    signal_time_str += f" | Regime: {entry_regime.upper()}"
+
                 # SIERRA CHART: Publish signal FIRST for fastest execution
                 if SIERRA_BRIDGE_AVAILABLE:
                     try:
@@ -974,14 +1403,17 @@ class BaseTrader(ABC):
                 stats_time = _time.time() - alert_start
                 print(f"   ⏱️ Stats prepared in {stats_time:.1f}s, sending Discord alert...")
 
+                # Use regime-aware SL/TP for Discord display
+                _sl = self._get_exit_param('stop_loss_pct', self.stop_loss_pct, self.pm.get_current_position()) if entry_regime else self.stop_loss_pct
+                _tp = self._get_exit_param('take_profit_pct', self.take_profit_pct, self.pm.get_current_position()) if entry_regime else self.take_profit_pct
                 send_entry_alert(
                     self.webhook_url,
                     self.strategy_name,
                     self.ticker,
                     entry_price,
                     signal_time_str,
-                    self.stop_loss_pct,
-                    self.take_profit_pct,
+                    _sl,
+                    _tp,
                     stats,
                     chart=None,  # No chart - send immediately
                     enhanced_stats=enhanced_stats
@@ -1350,6 +1782,127 @@ class BaseTrader(ABC):
         if self.webhook_url:
             send_error_alert(self.webhook_url, self.strategy_name, message)
 
+    def _send_regime_change_alert(self, old_regime: str, new_regime: str):
+        """Send regime change notification to Discord."""
+        try:
+            rd = self.config.get('regime_detector', {})
+            adx_threshold = rd.get('adx_threshold', 25.0)
+
+            # Get latest ADX/DI values
+            adx_val = float(self._adx_values[-1]) if self._adx_values is not None and len(self._adx_values) > 0 else 0.0
+            pdi_val = float(self._plus_di_values[-1]) if self._plus_di_values is not None and len(self._plus_di_values) > 0 else 0.0
+            mdi_val = float(self._minus_di_values[-1]) if self._minus_di_values is not None and len(self._minus_di_values) > 0 else 0.0
+
+            # Handle NaN
+            if np.isnan(adx_val):
+                adx_val = 0.0
+            if np.isnan(pdi_val):
+                pdi_val = 0.0
+            if np.isnan(mdi_val):
+                mdi_val = 0.0
+
+            # Check if new regime is tradeable
+            regime_params = self.config.get('regime_params', {})
+            is_tradeable = new_regime in regime_params and not regime_params[new_regime].get('dont_trade', False)
+
+            # High vol
+            is_hv = bool(self._is_high_vol[-1]) if self._is_high_vol is not None and len(self._is_high_vol) > 0 else False
+
+            detected_at = datetime.now().strftime('%Y-%m-%d %H:%M UTC')
+
+            send_regime_change_alert(
+                webhook_url=self.webhook_url,
+                strategy_name=self.strategy_name,
+                old_regime=old_regime,
+                new_regime=new_regime,
+                adx=adx_val,
+                adx_threshold=adx_threshold,
+                plus_di=pdi_val,
+                minus_di=mdi_val,
+                is_tradeable=is_tradeable,
+                is_high_vol=is_hv,
+                detected_at=detected_at,
+            )
+            print(f"   [v9] Regime change alert sent: {old_regime} -> {new_regime}")
+        except Exception as e:
+            print(f"   [v9] Regime change alert failed: {e}")
+
+    def _send_regime_status_update(self):
+        """Send periodic regime status update to Discord."""
+        try:
+            rd = self.config.get('regime_detector', {})
+
+            # Get latest values
+            adx_val = float(self._adx_values[-1]) if self._adx_values is not None and len(self._adx_values) > 0 else 0.0
+            pdi_val = float(self._plus_di_values[-1]) if self._plus_di_values is not None and len(self._plus_di_values) > 0 else 0.0
+            mdi_val = float(self._minus_di_values[-1]) if self._minus_di_values is not None and len(self._minus_di_values) > 0 else 0.0
+
+            if np.isnan(adx_val):
+                adx_val = 0.0
+            if np.isnan(pdi_val):
+                pdi_val = 0.0
+            if np.isnan(mdi_val):
+                mdi_val = 0.0
+
+            is_hv = bool(self._is_high_vol[-1]) if self._is_high_vol is not None and len(self._is_high_vol) > 0 else False
+
+            current_regime = REGIME_NAMES.get(int(self._regimes[-1]), 'unknown') if self._regimes is not None and len(self._regimes) > 0 else 'unknown'
+
+            # Trading status
+            regime_params = self.config.get('regime_params', {})
+            is_tradeable = current_regime in regime_params and not regime_params[current_regime].get('dont_trade', False)
+
+            suppress_hv = rd.get('suppress_entries_high_vol', False)
+            if not is_tradeable:
+                trading_status = f"PAUSED -- {current_regime} regime (not tradeable)"
+            elif suppress_hv and is_hv:
+                trading_status = "PAUSED -- high volatility (entries suppressed)"
+            else:
+                trading_status = "ACTIVE -- accepting signals"
+
+            # Position string
+            position = self.pm.get_current_position()
+            if position:
+                current_price = None
+                try:
+                    current_price = fetch_realtime_price(self.ticker)
+                except Exception:
+                    pass
+                if current_price:
+                    pnl_pct = ((current_price - position.entry_price) / position.entry_price) * 100
+                    position_str = f"LONG @ ${position.entry_price:,.2f} ({pnl_pct:+.1f}%)"
+                else:
+                    position_str = f"LONG @ ${position.entry_price:,.2f}"
+            else:
+                position_str = "Flat"
+
+            # Regime distribution from last 96 bars (~24h of 15m bars)
+            lookback = min(96, len(self._regimes)) if self._regimes is not None else 0
+            if lookback > 0:
+                recent_regimes = self._regimes[-lookback:]
+                regime_dist = get_regime_distribution(recent_regimes)
+            else:
+                regime_dist = {}
+
+            interval_hours = self.config.get('regime_status_interval_hours', 4)
+
+            send_regime_status_update(
+                webhook_url=self.webhook_url,
+                strategy_name=self.strategy_name,
+                current_regime=current_regime,
+                adx=adx_val,
+                plus_di=pdi_val,
+                minus_di=mdi_val,
+                is_high_vol=is_hv,
+                trading_status=trading_status,
+                position_str=position_str,
+                regime_distribution=regime_dist,
+                interval_hours=interval_hours,
+            )
+            print(f"   [v9] Regime status update sent ({current_regime})")
+        except Exception as e:
+            print(f"   [v9] Regime status update failed: {e}")
+
     def _write_health_status(self):
         """Write health status file for external monitoring."""
         import json
@@ -1374,6 +1927,64 @@ class BaseTrader(ABC):
                 json.dump(status, f, indent=2)
         except OSError:
             pass  # Non-critical
+
+    def _run_daily_retrain(self, df):
+        """
+        v10: Re-optimize numerical params on trailing data after market close.
+        Updates config in-place and saves to strategy bundle.
+        """
+        print(f"\n   {'='*50}")
+        print(f"   [v10] DAILY RETRAINING — {self.strategy_name}")
+        print(f"   {'='*50}")
+
+        try:
+            new_params = self._daily_retrainer.retrain(df)
+            if new_params is None:
+                print(f"   [v10] Retraining failed or insufficient data")
+                return
+
+            # Apply new params to live config
+            old_sl = self.config.get('stop_loss_pct')
+            old_tp = self.config.get('take_profit_pct')
+            self.config = self._daily_retrainer.apply_params(self.config, new_params)
+
+            # Update instance attributes that are read from config
+            self.stop_loss_pct = self.config.get('stop_loss_pct', self.stop_loss_pct)
+            self.take_profit_pct = self.config.get('take_profit_pct', self.take_profit_pct)
+            self.oversold_threshold = self.config.get('oversold_threshold', self.oversold_threshold)
+            self.overbought_threshold = self.config.get('overbought_threshold', self.overbought_threshold)
+            self.vel_smoothing = self.config.get('vel_smoothing', self.vel_smoothing)
+            self.extreme_zone_mult = self.config.get('extreme_zone_mult', self.extreme_zone_mult)
+
+            print(f"   [v10] Params updated: SL {old_sl:.2f}→{self.stop_loss_pct:.2f}, "
+                  f"TP {old_tp:.2f}→{self.take_profit_pct:.2f}")
+
+            # Save to strategy bundle directory
+            strategy_dir = os.path.join(PARENT_DIR, 'velocity_strategies', self.strategy_name)
+            if os.path.isdir(strategy_dir):
+                self._daily_retrainer.save_config(self.config, strategy_dir)
+
+            # Discord notification
+            if self.webhook_url:
+                try:
+                    from ..notifications.discord import send_status_update
+                    param_summary = ', '.join(f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}"
+                                              for k, v in sorted(new_params.items()))
+                    send_status_update(
+                        self.webhook_url,
+                        f"[v10] Daily retrain complete — {param_summary}",
+                        self.strategy_name,
+                    )
+                except Exception:
+                    pass
+
+            print(f"   [v10] Retraining complete")
+            print(f"   {'='*50}\n")
+
+        except Exception as e:
+            print(f"   [v10] Retraining error: {e}")
+            import traceback
+            traceback.print_exc()
 
     def stop(self):
         """Stop the trading loop."""

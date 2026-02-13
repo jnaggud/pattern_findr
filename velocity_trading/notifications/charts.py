@@ -140,12 +140,12 @@ def _format_signal_time_dual_tz(signal_time) -> Optional[str]:
             utc_dt = dt.astimezone(pytz.UTC)
             utc_str = utc_dt.strftime('%Y-%m-%d %H:%M')
 
-            # Convert to Chicago time
+            # Convert to Chicago time (use 12-hour AM/PM for clarity)
             chicago_tz = pytz.timezone('America/Chicago')
             chicago_dt = dt.astimezone(chicago_tz)
-            chicago_str = chicago_dt.strftime('%Y-%m-%d %H:%M')
+            chicago_str = chicago_dt.strftime('%Y-%m-%d %I:%M %p')
 
-            return f"Signal: {utc_str} UTC  /  {chicago_str} Chicago"
+            return f"Signal: {utc_str} UTC  /  {chicago_str} CT"
         else:
             # Fallback without pytz
             utc_str = dt.strftime('%Y-%m-%d %H:%M')
@@ -233,7 +233,10 @@ def generate_chart(
         if datetime_col:
             df_plot[datetime_col] = pd.to_datetime(df_plot[datetime_col])
             if df_plot[datetime_col].dt.tz is not None:
-                df_plot[datetime_col] = df_plot[datetime_col].dt.tz_localize(None)
+                # CRITICAL: Convert to UTC first, THEN strip timezone
+                # Trade dates in DB are stored as naive UTC (via normalize_timestamp),
+                # so chart bar timestamps must also be in naive UTC for marker alignment
+                df_plot[datetime_col] = df_plot[datetime_col].dt.tz_convert('UTC').dt.tz_localize(None)
 
         # Create date lookup for markers
         date_to_barnum = _build_date_lookup(df_plot, datetime_col)
@@ -285,7 +288,7 @@ def generate_chart(
                        linewidth=1, alpha=0.7, label=f'Entry ${entry_price:,.2f}')
             handles, labels = ax1.get_legend_handles_labels()
             if handles:
-                ax1.legend(loc='upper left', facecolor='#1a1a2e', labelcolor='white', fontsize=8)
+                ax1.legend(loc='lower left', facecolor='#1a1a2e', labelcolor='white', fontsize=8)
 
         ax1.set_ylabel("Price ($)", color='white', fontsize=9)
 
@@ -293,12 +296,13 @@ def generate_chart(
         chart_title = _build_chart_title(ticker, title_suffix, df_plot, datetime_col, is_intraday)
         ax1.set_title(chart_title, color='white', fontsize=12, fontweight='bold', pad=10)
 
-        # Add signal time in UTC and Chicago time (upper right corner)
+        # Add signal time in UTC and Chicago time (upper left corner)
+        # Moved from upper-right to avoid blocking price action bars
         if signal_time is not None:
             signal_time_str = _format_signal_time_dual_tz(signal_time)
             if signal_time_str:
-                ax1.text(0.99, 0.97, signal_time_str, transform=ax1.transAxes,
-                        ha='right', va='top', color='#00ffff', fontsize=9,
+                ax1.text(0.01, 0.97, signal_time_str, transform=ax1.transAxes,
+                        ha='left', va='top', color='#00ffff', fontsize=9,
                         bbox=dict(boxstyle='round,pad=0.3', facecolor='#0f3460', alpha=0.9, edgecolor='#00ffff'))
 
         _format_xaxis_dates(ax1, df_plot, datetime_col, is_intraday)
@@ -548,7 +552,7 @@ def _calculate_visible_stats(exits: List[Dict]) -> Dict:
         return {'num_trades': 0, 'win_rate': 0, 'total_return': 0, 'profit_factor': 0, 'max_drawdown': 0}
 
     # Sort exits by date for accurate chronological compounding
-    sorted_exits = sorted(exits, key=lambda x: pd.to_datetime(x.get('date', '1970-01-01')))
+    sorted_exits = sorted(exits, key=lambda x: _normalize_to_utc_naive(pd.to_datetime(x.get('date', '1970-01-01'))))
 
     num_trades = len(sorted_exits)
     wins = sum(1 for e in sorted_exits if e.get('pnl', 0) > 0)
@@ -588,7 +592,7 @@ def _calculate_max_drawdown(exits: List[Dict]) -> float:
         return 0.0
 
     # Sort exits by date for accurate chronological drawdown calculation
-    sorted_exits = sorted(exits, key=lambda x: pd.to_datetime(x.get('date', '1970-01-01')))
+    sorted_exits = sorted(exits, key=lambda x: _normalize_to_utc_naive(pd.to_datetime(x.get('date', '1970-01-01'))))
 
     # Build equity curve
     equity = [STARTING_CAPITAL]
@@ -682,7 +686,10 @@ def _draw_entry_exit_markers(ax, entries: List[Dict], exits: List[Dict], date_to
     """Draw entry and exit markers on the chart.
 
     Entry = green triangle UP (▲) positioned BELOW the bar low (charting convention)
-    Exit = RED triangle DOWN (▼) positioned ABOVE the bar high (charting convention)
+    Exit markers (positioned ABOVE bar high):
+      - Stop Loss  = red X (#ff5252)
+      - Take Profit = green X (#00e676)
+      - Signal/ML/Accel = red triangle DOWN (▼) (#ff5252)
 
     This matches the legacy velocity_live_trader.py behavior where markers are
     placed at the candle edges, not at the trade price.
@@ -773,11 +780,12 @@ def _draw_entry_exit_markers(ax, entries: List[Dict], exits: List[Dict], date_to
             ax.scatter(bar_num, y_pos, marker='^', s=marker_size, c='#00e676',
                       edgecolors='white', linewidths=0.5, zorder=10)
 
-    # Exit markers (RED triangles pointing down, ABOVE bar high)
+    # Exit markers: SL = red X, TP = green X, signal/ML = red down-triangle
     for exit_trade in exits:
         bar_num = _find_bar_num(exit_trade.get('date'), date_to_barnum, is_intraday=is_intraday, interval=interval)
         if bar_num is not None:
             exit_price = exit_trade.get('price')
+            exit_reason = exit_trade.get('reason', '') or ''
 
             # CRITICAL FIX for DAILY charts: Check if exit price falls within this bar's range
             # For daily strategies, exit_date may be signal bar, but exit happens on NEXT bar
@@ -813,8 +821,55 @@ def _draw_entry_exit_markers(ax, entries: List[Dict], exits: List[Dict], date_to
                 # Fallback to trade price if can't find bar
                 y_pos = exit_trade.get('price')
 
-            ax.scatter(bar_num, y_pos, marker='v', s=marker_size, c='#ff5252',
-                      edgecolors='white', linewidths=0.5, zorder=10)
+            # Determine marker style based on exit reason
+            reason_lower = exit_reason.lower()
+            is_stop_loss = 'stop loss' in reason_lower
+            is_take_profit = 'take profit' in reason_lower
+
+            if is_stop_loss:
+                # Red X for stop loss
+                ax.scatter(bar_num, y_pos, marker='X', s=marker_size, c='#ff5252',
+                          edgecolors='white', linewidths=0.5, zorder=10)
+            elif is_take_profit:
+                # Green X for take profit
+                ax.scatter(bar_num, y_pos, marker='X', s=marker_size, c='#00e676',
+                          edgecolors='white', linewidths=0.5, zorder=10)
+            else:
+                # Red down-triangle for signal, ML, accel, or unknown exits
+                ax.scatter(bar_num, y_pos, marker='v', s=marker_size, c='#ff5252',
+                          edgecolors='white', linewidths=0.5, zorder=10)
+
+    # Horizontal dashed price line + label for the most recent SL/TP exit
+    last_sltp = None
+    for exit_trade in reversed(exits):
+        reason_lower = (exit_trade.get('reason', '') or '').lower()
+        if 'stop loss' in reason_lower or 'take profit' in reason_lower:
+            bar_num = _find_bar_num(exit_trade.get('date'), date_to_barnum,
+                                    is_intraday=is_intraday, interval=interval)
+            if bar_num is not None:
+                last_sltp = exit_trade
+                break
+
+    if last_sltp is not None:
+        sltp_reason = (last_sltp.get('reason', '') or '').lower()
+        is_sl = 'stop loss' in sltp_reason
+        sltp_price = last_sltp.get('price')
+        sltp_pnl = last_sltp.get('pnl', 0)
+
+        line_color = '#ff5252' if is_sl else '#00e676'
+        label_prefix = 'SL' if is_sl else 'TP'
+        pnl_sign = '+' if sltp_pnl >= 0 else ''
+        price_label = f"{label_prefix} ${sltp_price:,.2f} ({pnl_sign}{sltp_pnl:.2f}%)"
+
+        # Dashed line spanning right ~20% of chart
+        ax.axhline(y=sltp_price, color=line_color, linestyle='--', linewidth=0.8,
+                   alpha=0.7, xmin=0.8, xmax=1.0, zorder=5)
+
+        # Label at right edge
+        ax.text(max_bar_num + 1, sltp_price, f" {price_label}",
+                color=line_color, fontsize=7, fontweight='bold',
+                va='center', ha='left', zorder=11,
+                bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.7, edgecolor=line_color))
 
     # Debug: Show how many markers were matched
     if len(entries) > 0 or len(exits) > 0:
@@ -933,6 +988,16 @@ def _find_bar_num(date_str, date_to_barnum: Dict, is_intraday: bool = True, inte
                     if fmt in date_to_barnum:
                         return date_to_barnum[fmt]
 
+                # Floored bar doesn't exist (hasn't closed yet) — fall back to previous bar
+                # E.g., TP at 06:50 -> floor to 06:45 (not in data) -> fall back to 06:30
+                prev_minutes = floored_minutes - interval_minutes
+                if prev_minutes >= 0:
+                    dt_prev = dt_minute.replace(hour=prev_minutes // 60, minute=prev_minutes % 60)
+                    for fmt in [dt_prev, dt_prev.strftime('%Y-%m-%dT%H:%M:%S'),
+                                dt_prev.strftime('%Y-%m-%d %H:%M:%S')]:
+                        if fmt in date_to_barnum:
+                            return date_to_barnum[fmt]
+
             # If timestamp is on bar boundary but not found, return None (bar not in chart)
             # This prevents entry/exit on same bar when exit bar doesn't exist yet
 
@@ -966,8 +1031,8 @@ def _draw_equity_curve(ax, exits: List[Dict], entries: List[Dict], date_to_barnu
         return
 
     # Sort exits by date chronologically
-    sorted_exits = sorted(exits, key=lambda x: pd.to_datetime(x.get('date', '1970-01-01')))
-    sorted_entries = sorted(entries, key=lambda x: pd.to_datetime(x.get('date', '1970-01-01'))) if entries else []
+    sorted_exits = sorted(exits, key=lambda x: _normalize_to_utc_naive(pd.to_datetime(x.get('date', '1970-01-01'))))
+    sorted_entries = sorted(entries, key=lambda x: _normalize_to_utc_naive(pd.to_datetime(x.get('date', '1970-01-01')))) if entries else []
 
     # Build equity curve with bar numbers for x-axis (aligned with price chart)
     equity_points = []  # List of (bar_num, equity_value) tuples

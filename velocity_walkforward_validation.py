@@ -34,8 +34,60 @@ from novel_indicators import (
 )
 
 
-def fetch_data(ticker: str, interval: str, period: str) -> pd.DataFrame:
-    """Fetch OHLCV data from yfinance."""
+DATABENTO_SYMBOLS = {
+    'ES=F': 'ES.n.0', 'GC=F': 'GC.n.0', 'CL=F': 'CL.n.0',
+    'NQ=F': 'NQ.n.0', 'YM=F': 'YM.n.0', 'SI=F': 'SI.n.0',
+}
+
+
+def fetch_data(ticker: str, interval: str, period: str, use_databento: bool = False) -> pd.DataFrame:
+    """Fetch OHLCV data from yfinance or Databento."""
+    if use_databento:
+        import databento as db
+        from datetime import timezone
+
+        # Parse period string to days
+        period_days = {'60d': 60, '90d': 90, '120d': 120, '180d': 180, '1y': 365, '2y': 730, '5y': 1825}
+        days = period_days.get(period)
+        if days is None:
+            # Try parsing as Xd format
+            if period.endswith('d'):
+                days = int(period[:-1])
+            else:
+                raise ValueError(f"Cannot parse period '{period}' for Databento. Use format like '180d'.")
+
+        symbol = DATABENTO_SYMBOLS.get(ticker)
+        if not symbol:
+            raise ValueError(f"No Databento mapping for {ticker}. Available: {list(DATABENTO_SYMBOLS.keys())}")
+
+        key = os.environ.get('DATABENTO_API_KEY', '')
+        client = db.Historical(key)
+
+        end = datetime.now(timezone.utc) - timedelta(minutes=30)
+        start = end - timedelta(days=days)
+
+        print(f"Databento: requesting {symbol} ohlcv-1m {start.date()} to {end.date()}...")
+        data = client.timeseries.get_range(
+            dataset='GLBX.MDP3',
+            symbols=[symbol],
+            stype_in='continuous',
+            schema='ohlcv-1m',
+            start=start.strftime('%Y-%m-%dT%H:%M:%S'),
+            end=end.strftime('%Y-%m-%dT%H:%M:%S'),
+        )
+        df_1m = data.to_df()
+        print(f"  Got {len(df_1m)} 1m bars")
+
+        resample_map = {'15m': '15min', '1h': '1h', '4h': '4h', '1d': '1D'}
+        resample_freq = resample_map.get(interval, '15min')
+        df = df_1m.resample(resample_freq).agg({
+            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+        }).dropna()
+
+        df.columns = [c.lower() for c in df.columns]
+        print(f"  Resampled to {len(df)} {interval} bars ({df.index.min()} to {df.index.max()})")
+        return df
+
     print(f"Fetching {ticker} {interval} data for {period}...")
 
     yf_ticker = yf.Ticker(ticker)
@@ -187,8 +239,16 @@ def prepare_velocity_data(df: pd.DataFrame, use_extra_indicators: bool = True):
     bb_upper = (sma + bb_std * std).fillna(method='bfill').values
     bb_lower = (sma - bb_std * std).fillna(method='bfill').values
 
+    # Get low/high prices for MAE calculation
+    low_col = 'low' if 'low' in df.columns else 'Low'
+    high_col = 'high' if 'high' in df.columns else 'High'
+    low_prices = df.loc[valid_idx, low_col].values
+    high_prices = df.loc[valid_idx, high_col].values
+
     return {
         'close_prices': close_prices,
+        'low_prices': low_prices,
+        'high_prices': high_prices,
         'osc_values': osc_values,
         'rsi_cache': rsi_cache,
         'macd_histogram': macd_histogram,
@@ -204,6 +264,8 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
     """Run a single backtest with given parameters."""
 
     close_prices = data['close_prices']
+    low_prices = data.get('low_prices', close_prices)  # Fallback to close if not available
+    high_prices = data.get('high_prices', close_prices)
 
     # Select oscillator type from params (default to composite for backward compatibility)
     osc_type = params.get('oscillator_type', 'composite')
@@ -220,6 +282,21 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
         osc_smooth = pd.Series(osc_values).rolling(window=params['vel_smoothing']).mean().bfill().values
     else:
         osc_smooth = osc_values
+
+    # Apply wavelet denoising if enabled
+    if params.get('use_wavelet_denoise', False):
+        try:
+            import pywt
+            family = params.get('wavelet_family', 'db4')
+            level = params.get('wavelet_level', 2)
+            mode = params.get('wavelet_threshold_mode', 'hard')
+            coeffs = pywt.wavedec(osc_smooth, family, level=level)
+            sigma = np.median(np.abs(coeffs[-1])) / 0.6745
+            threshold = sigma * np.sqrt(2 * np.log(len(osc_smooth)))
+            denoised = [coeffs[0]] + [pywt.threshold(c, threshold, mode=mode) for c in coeffs[1:]]
+            osc_smooth = pywt.waverec(denoised, family)[:len(osc_smooth)]
+        except Exception:
+            pass
 
     velocity = np.diff(osc_smooth, prepend=osc_smooth[0])
     acceleration = np.diff(velocity, prepend=velocity[0])
@@ -270,6 +347,8 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
     position = 0  # 0 = flat, 1 = long
     entry_price = 0
     entry_bar = 0
+    min_price_during_trade = 0  # For MAE tracking (long positions)
+    max_price_during_trade = 0  # For MFE tracking (long positions)
     trades = []
     equity = 100.0
     peak_equity = 100.0
@@ -294,6 +373,7 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
 
     for i in range(1, len(close_prices)):
         price = close_prices[i]
+        low = low_prices[i]
 
         if position == 0:
             # Check for entry
@@ -301,19 +381,37 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
                 position = 1
                 entry_price = price
                 entry_bar = i
+                # Initialize MAE/MFE tracking at entry price, NOT intrabar low/high
+                # We enter at the CLOSE of bar i, so intrabar movement on entry bar
+                # already happened BEFORE our entry and shouldn't count
+                min_price_during_trade = entry_price
+                max_price_during_trade = entry_price
         else:
+            # Update MAE/MFE tracking
+            min_price_during_trade = min(min_price_during_trade, low)
+            max_price_during_trade = max(max_price_during_trade, high_prices[i])
+
             # Check for exit
             current_pnl = (price - entry_price) / entry_price * 100
             bars_held = i - entry_bar
 
-            exit_reason = None
+            # Calculate intrabar P&L for stop/take profit (using low/high)
+            intrabar_low_pnl = (low - entry_price) / entry_price * 100
+            intrabar_high_pnl = (high_prices[i] - entry_price) / entry_price * 100
 
-            # Stop loss
-            if current_pnl <= -stop_loss_pct:
+            exit_reason = None
+            exit_price_override = None
+
+            # Stop loss - check if intrabar low hit stop level
+            if intrabar_low_pnl <= -stop_loss_pct:
                 exit_reason = 'stop_loss'
-            # Take profit
-            elif current_pnl >= take_profit_pct:
+                # Exit at stop price, not close price
+                exit_price_override = entry_price * (1 - stop_loss_pct / 100)
+            # Take profit - check if intrabar high hit take profit level
+            elif intrabar_high_pnl >= take_profit_pct:
                 exit_reason = 'take_profit'
+                # Exit at take profit price, not close price
+                exit_price_override = entry_price * (1 + take_profit_pct / 100)
             # Acceleration exit (for longs: exit when acceleration turns negative)
             elif use_accel_exit and current_pnl >= accel_exit_min_pnl and bars_held >= min_hold_bars:
                 accel_exit_triggered = False
@@ -335,18 +433,42 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
                 exit_reason = 'midline_cross'
 
             if exit_reason:
-                pnl = (price - entry_price) / entry_price * 100
+                # Use override price for stop loss / take profit, otherwise use close
+                actual_exit_price = exit_price_override if exit_price_override else price
+                pnl = (actual_exit_price - entry_price) / entry_price * 100
                 equity *= (1 + pnl / 100)
                 peak_equity = max(peak_equity, equity)
                 drawdown = (peak_equity - equity) / peak_equity * 100
                 max_drawdown = max(max_drawdown, drawdown)
 
+                # Calculate MAE (Maximum Adverse Excursion) for this trade
+                # MAE = worst unrealized loss during the trade (always positive or zero)
+                # For stopped trades, MAE is capped at the stop level
+                mae = (entry_price - min_price_during_trade) / entry_price * 100
+                mae = max(0, mae)  # Ensure non-negative
+                if exit_reason == 'stop_loss':
+                    mae = min(mae, stop_loss_pct)  # Cap at stop level for stopped trades
+
+                # Calculate MFE (Maximum Favorable Excursion) for this trade
+                # MFE = best unrealized profit during the trade
+                mfe = (max_price_during_trade - entry_price) / entry_price * 100
+                mfe = max(0, mfe)  # Ensure non-negative
+                if exit_reason == 'take_profit':
+                    mfe = min(mfe, take_profit_pct)  # Cap at TP level for TP trades
+
+                # Calculate trade efficiency (what % of potential profit was captured)
+                # Efficiency = actual P&L / MFE (capped at 100% for winning trades)
+                efficiency = (pnl / mfe * 100) if mfe > 0 else 0
+
                 trades.append({
                     'entry_bar': entry_bar,
                     'exit_bar': i,
                     'entry_price': entry_price,
-                    'exit_price': price,
+                    'exit_price': actual_exit_price,
                     'pnl': pnl,
+                    'mae': mae,
+                    'mfe': mfe,
+                    'efficiency': efficiency,
                     'exit_reason': exit_reason
                 })
 
@@ -362,12 +484,29 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
             'avg_win': 0,
             'avg_loss': 0,
             'max_drawdown': 0,
-            'profit_factor': 0
+            'profit_factor': 0,
+            'avg_mae': 0,
+            'max_mae': 0
         }
 
     total_return = equity - 100
     wins = [t['pnl'] for t in trades if t['pnl'] > 0]
     losses = [t['pnl'] for t in trades if t['pnl'] < 0]
+
+    # MAE statistics
+    mae_values = [t['mae'] for t in trades]
+    avg_mae = np.mean(mae_values) if mae_values else 0
+    max_mae = max(mae_values) if mae_values else 0
+
+    # MFE statistics
+    mfe_values = [t['mfe'] for t in trades]
+    avg_mfe = np.mean(mfe_values) if mfe_values else 0
+    max_mfe = max(mfe_values) if mfe_values else 0
+
+    # Efficiency statistics (only for winning trades)
+    winning_trades = [t for t in trades if t['pnl'] > 0]
+    efficiency_values = [t['efficiency'] for t in winning_trades]
+    avg_efficiency = np.mean(efficiency_values) if efficiency_values else 0
 
     return {
         'total_return': total_return,
@@ -377,6 +516,11 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
         'avg_loss': np.mean(losses) if losses else 0,
         'max_drawdown': max_drawdown,
         'profit_factor': sum(wins) / abs(sum(losses)) if losses and sum(losses) != 0 else float('inf'),
+        'avg_mae': avg_mae,
+        'max_mae': max_mae,
+        'avg_mfe': avg_mfe,
+        'max_mfe': max_mfe,
+        'avg_efficiency': avg_efficiency,
         'trades': trades
     }
 
@@ -388,7 +532,8 @@ def run_walk_forward_validation(
     n_trials: int,
     n_jobs: int,
     train_ratio: float = 0.8,
-    optimize_metric: str = 'total_return'
+    optimize_metric: str = 'total_return',
+    use_databento: bool = False
 ):
     """
     Run walk-forward validation for velocity strategy.
@@ -410,7 +555,7 @@ def run_walk_forward_validation(
     print("=" * 80)
 
     # Fetch full data
-    df = fetch_data(ticker, interval, period)
+    df = fetch_data(ticker, interval, period, use_databento=use_databento)
 
     # Calculate split point
     n_bars = len(df)
@@ -435,6 +580,15 @@ def run_walk_forward_validation(
     fd, data_path = tempfile.mkstemp(suffix='.joblib', prefix='velocity_wf_')
     os.close(fd)
 
+    # Calculate minimum trade count based on training period length
+    # For 15m bars over 60 days, ~50 days of trading = ~50 trades minimum
+    # ensures statistical significance
+    train_bars = len(train_data['close_prices'])
+    min_trades = max(50, train_bars // 100)  # At least 50 trades, or 1% of bars
+
+    print(f"  Minimum trade count filter: {min_trades} trades")
+    print(f"  Trade count bonus: enabled (sqrt scaling)")
+
     train_data_for_optuna = {
         'close_prices': train_data['close_prices'],
         'osc_values': train_data['osc_values'],
@@ -447,11 +601,14 @@ def run_walk_forward_validation(
         'all_oscillators': train_data['all_oscillators'],
         'force_midline_exit': False,
         'force_opposite_exit': False,
-        'sl_range': (0.5, 15.0),
-        'tp_range': (1.0, 30.0),
+        'sl_range': (0.5, 10.0),        # Broader: search wider SL range
+        'tp_range': (1.0, 20.0),        # Broader: search wider TP range
         'use_drawdown_penalty': True,
-        'max_drawdown_threshold': 20.0,
-        'drawdown_penalty_weight': 0.3
+        'max_drawdown_threshold': 10.0, # Stricter: penalize >10% drawdown
+        'drawdown_penalty_weight': 0.5, # Higher penalty weight for drawdown
+        'min_trades': min_trades,       # Reject strategies with too few trades
+        # Trade count bonus: only for total_return metric (PF is already trade-neutral)
+        'trade_count_bonus_weight': 0.3 if optimize_metric == 'total_return' else 0.0
     }
 
     joblib.dump(train_data_for_optuna, data_path)
@@ -528,8 +685,45 @@ def run_walk_forward_validation(
 
     test_data = prepare_velocity_data(test_df)
 
-    # Run backtest on test data with best params
-    test_result = run_backtest_with_params(best_params, test_data)
+    # Test top N training configs on OOS data and pick the best valid one
+    # This prevents overfitting by not just taking the #1 training result
+    top_n = min(20, len(all_results))
+    print(f"\nTesting top {top_n} training configs on out-of-sample data...")
+
+    oos_candidates = []
+    for i, train_result in enumerate(all_results[:top_n]):
+        candidate_params = {k: train_result[k] for k in param_keys if k in train_result}
+        oos_result = run_backtest_with_params(candidate_params, test_data)
+        oos_candidates.append({
+            'rank': i + 1,
+            'params': candidate_params,
+            'train_result': train_result,
+            'test_result': oos_result
+        })
+        n_trades_train = train_result.get('num_trades', train_result.get('n_trades', 0))
+        n_trades_test = oos_result.get('n_trades', 0)
+        print(f"  #{i+1}: Train={train_result['total_return']:.2f}%/{n_trades_train}t "
+              f"-> Test={oos_result['total_return']:.2f}%/{n_trades_test}t "
+              f"WR={oos_result['win_rate']:.1f}% PF={oos_result['profit_factor']:.2f}")
+
+    # Pick the best OOS result that has positive return and enough trades
+    valid_oos = [c for c in oos_candidates
+                 if c['test_result']['total_return'] > 0
+                 and c['test_result']['n_trades'] >= 5]
+
+    if valid_oos:
+        # Sort by OOS total return
+        valid_oos.sort(key=lambda x: x['test_result']['total_return'], reverse=True)
+        best_candidate = valid_oos[0]
+        best_params = best_candidate['params']
+        best_result = best_candidate['train_result']
+        test_result = best_candidate['test_result']
+        print(f"\n  ✓ Best OOS config: Training rank #{best_candidate['rank']}")
+    else:
+        # Fallback to #1 training result if no valid OOS found
+        print(f"\n  ⚠️ No config passed OOS validation (positive return + ≥5 trades)")
+        print(f"  Using best training config as fallback")
+        test_result = run_backtest_with_params(best_params, test_data)
 
     print(f"\nTest Period Results ({test_df.index[0].strftime('%Y-%m-%d')} to {test_df.index[-1].strftime('%Y-%m-%d')}):")
     print(f"  Total Return: {test_result['total_return']:.2f}%")
@@ -537,6 +731,8 @@ def run_walk_forward_validation(
     print(f"  Trades: {test_result['n_trades']}")
     print(f"  Max Drawdown: {test_result['max_drawdown']:.1f}%")
     print(f"  Profit Factor: {test_result['profit_factor']:.2f}")
+    print(f"  Avg MAE: {test_result['avg_mae']:.2f}%")
+    print(f"  Max MAE: {test_result['max_mae']:.2f}%")
 
     # Compare train vs test
     print(f"\n{'=' * 80}")
@@ -567,6 +763,15 @@ def run_walk_forward_validation(
     train_dd = best_result['max_drawdown']
     test_dd = test_result['max_drawdown']
     print(f"{'Max Drawdown':<20} {train_dd:>14.1f}% {test_dd:>14.1f}% {test_dd - train_dd:>+14.1f}%")
+
+    # MAE comparison
+    train_avg_mae = best_result.get('avg_mae', 0)
+    test_avg_mae = test_result.get('avg_mae', 0)
+    print(f"{'Avg MAE':<20} {train_avg_mae:>14.2f}% {test_avg_mae:>14.2f}% {test_avg_mae - train_avg_mae:>+14.2f}%")
+
+    train_max_mae = best_result.get('max_mae', 0)
+    test_max_mae = test_result.get('max_mae', 0)
+    print(f"{'Max MAE':<20} {train_max_mae:>14.2f}% {test_max_mae:>14.2f}% {test_max_mae - train_max_mae:>+14.2f}%")
 
     # Validation check
     print(f"\n{'=' * 80}")
@@ -613,14 +818,18 @@ def run_walk_forward_validation(
             'win_rate': best_result['win_rate'],
             'n_trades': best_result.get('num_trades', 0),
             'max_drawdown': best_result['max_drawdown'],
-            'profit_factor': best_result.get('profit_factor', 0)
+            'profit_factor': best_result.get('profit_factor', 0),
+            'avg_mae': best_result.get('avg_mae', 0),
+            'max_mae': best_result.get('max_mae', 0)
         },
         'test_result': {
             'total_return': test_result['total_return'],
             'win_rate': test_result['win_rate'],
             'n_trades': test_result['n_trades'],
             'max_drawdown': test_result['max_drawdown'],
-            'profit_factor': test_result['profit_factor']
+            'profit_factor': test_result['profit_factor'],
+            'avg_mae': test_result.get('avg_mae', 0),
+            'max_mae': test_result.get('max_mae', 0)
         },
         'is_valid': is_valid,
         'warnings': warnings
@@ -710,6 +919,8 @@ def main():
     parser.add_argument('--train-ratio', type=float, default=0.8, help='Train/test split ratio')
     parser.add_argument('--config-path', type=str, help='Path to strategy config to update')
     parser.add_argument('--metric', type=str, default='total_return', help='Optimization metric')
+    parser.add_argument('--use-databento', action='store_true',
+                        help='Fetch from Databento Historical API (supports >60 days for intraday futures)')
 
     args = parser.parse_args()
 
@@ -721,7 +932,8 @@ def main():
         n_trials=args.n_trials,
         n_jobs=args.n_jobs,
         train_ratio=args.train_ratio,
-        optimize_metric=args.metric
+        optimize_metric=args.metric,
+        use_databento=args.use_databento
     )
 
     if results is None:

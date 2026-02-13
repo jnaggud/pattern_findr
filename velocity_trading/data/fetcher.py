@@ -79,7 +79,8 @@ def fetch_price_data(
     ticker: str,
     days: int = 200,
     interval: str = '1d',
-    use_cache: bool = True
+    use_cache: bool = True,
+    yfinance_only: bool = False
 ) -> Optional[pd.DataFrame]:
     """
     Fetch OHLCV price data for a ticker.
@@ -94,12 +95,22 @@ def fetch_price_data(
         days: Number of days of history to fetch
         interval: Bar interval ('1d', '15m', '1h', etc.)
         use_cache: Whether to use cached data sources
+        yfinance_only: If True, skip Databento and use yfinance only (for oscillator consistency)
 
     Returns:
         DataFrame with columns: Open, High, Low, Close, Volume
         Index is datetime
         Returns None if fetch fails
     """
+    # yfinance_only mode: Skip all other sources, use yfinance directly
+    # This ensures consistent oscillator values (Databento/yfinance mixing causes discrepancies)
+    if yfinance_only:
+        print(f"   📊 Fetching {ticker} via yfinance (yfinance_only mode)")
+        df = _fetch_stock(ticker, days, interval)
+        if df is not None and not df.empty:
+            return _normalize_dataframe(df)
+        return None
+
     # Intraday intervals that benefit from DataPipeline's incremental updates
     intraday_intervals = {'1m', '2m', '5m', '15m', '30m', '1h', '2h', '4h'}
 
@@ -474,6 +485,146 @@ def _fetch_realtime_databento(ticker: str) -> Optional[float]:
         pass
 
     return None
+
+
+def fetch_latest_bar_multisource(
+    ticker: str,
+    interval: str = '15m',
+    expected_bar_time: Optional[datetime] = None
+) -> Optional[pd.DataFrame]:
+    """
+    Fetch the latest completed bar from multiple sources for redundancy.
+
+    When yfinance lags in making the latest completed bar available, this
+    function checks Databento and Polygon as alternative sources. Returns
+    a single-row DataFrame of the latest bar from whichever source has it first.
+
+    Args:
+        ticker: Trading symbol (e.g., 'GC=F', 'ES=F', 'BTC-USD')
+        interval: Bar interval ('15m', '1h', etc.)
+        expected_bar_time: The bar start time we're looking for (optional)
+
+    Returns:
+        DataFrame with the latest bar(s), or None if no source has it
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    results = {}
+
+    def _try_yfinance():
+        try:
+            df = _fetch_stock(ticker, days=2, interval=interval)
+            if df is not None and not df.empty:
+                return ('yfinance', _normalize_dataframe(df))
+        except Exception:
+            pass
+        return None
+
+    def _try_databento():
+        if not HAS_DATABENTO or not is_futures_ticker(ticker):
+            return None
+        try:
+            df = _fetch_futures_databento(ticker, days=2, interval=interval)
+            if df is not None and not df.empty:
+                return ('databento', _normalize_dataframe(df))
+        except Exception:
+            pass
+        return None
+
+    def _try_polygon():
+        try:
+            # Polygon timespan mapping
+            timespan_map = {
+                '1m': ('minute', 1), '5m': ('minute', 5),
+                '15m': ('minute', 15), '30m': ('minute', 30),
+                '1h': ('hour', 1), '1d': ('day', 1),
+            }
+            if interval not in timespan_map:
+                return None
+
+            timespan, multiplier = timespan_map[interval]
+
+            # Format ticker for Polygon
+            poly_ticker = ticker
+            if ticker.endswith('-USD'):
+                poly_ticker = f"X:{ticker.replace('-', '')}"
+            elif ticker.endswith('=F'):
+                # Polygon futures: not well-supported in current integration
+                return None
+
+            import requests
+            api_key = None
+            # Try to get Polygon API key from environment or config
+            api_key = os.environ.get('POLYGON_API_KEY')
+            if not api_key:
+                try:
+                    import json
+                    settings_path = os.path.join(PARENT_DIR, 'user_settings.json')
+                    if os.path.exists(settings_path):
+                        with open(settings_path) as f:
+                            settings = json.load(f)
+                            api_key = settings.get('polygon_api_key')
+                except Exception:
+                    pass
+            if not api_key:
+                return None
+
+            from_date = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d")
+            to_date = datetime.now().strftime("%Y-%m-%d")
+            url = (
+                f"https://api.polygon.io/v2/aggs/ticker/{poly_ticker}/range"
+                f"/{multiplier}/{timespan}/{from_date}/{to_date}"
+                f"?adjusted=true&sort=asc&limit=500&apiKey={api_key}"
+            )
+            resp = requests.get(url, timeout=5)
+            data = resp.json()
+            if 'results' in data and data['results']:
+                df = pd.DataFrame(data['results'])
+                df = df.rename(columns={
+                    'v': 'Volume', 'o': 'Open', 'c': 'Close',
+                    'h': 'High', 'l': 'Low', 't': 'datetime'
+                })
+                df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
+                df = df.set_index('datetime')
+                df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+                return ('polygon', df)
+        except Exception:
+            pass
+        return None
+
+    # Run all sources in parallel with short timeout
+    sources = [_try_yfinance, _try_databento, _try_polygon]
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(fn): fn.__name__ for fn in sources}
+        for future in as_completed(futures, timeout=10):
+            try:
+                result = future.result()
+                if result is not None:
+                    source_name, df = result
+                    results[source_name] = df
+            except Exception:
+                pass
+
+    if not results:
+        return None
+
+    # Find which source has the freshest data
+    freshest_source = None
+    freshest_time = None
+    for source_name, df in results.items():
+        last_time = df.index[-1]
+        # Normalize to naive for comparison
+        if hasattr(last_time, 'tzinfo') and last_time.tzinfo is not None:
+            import pytz
+            last_time = last_time.tz_convert(pytz.UTC).tz_localize(None)
+        if freshest_time is None or last_time > freshest_time:
+            freshest_time = last_time
+            freshest_source = source_name
+
+    print(f"   📡 Multi-source bar check: {', '.join(f'{s}={df.index[-1]}' for s, df in results.items())}")
+    print(f"   📡 Freshest: {freshest_source} ({freshest_time})")
+
+    return results[freshest_source]
 
 
 def _normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:

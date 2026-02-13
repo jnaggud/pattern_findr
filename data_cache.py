@@ -270,10 +270,15 @@ def fetch_and_cache(ticker: str, days: int = 200, interval: str = "1d",
                     save_price_data(new_df, ticker, interval, db_path)
                     # Return combined cached + new data
                     df = load_price_data(ticker, interval, start_date.strftime('%Y-%m-%d'), db_path=db_path)
+                    if len(df) > 0:
+                        print(f"   📦 Returning {len(df)} bars from cache: {df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')}")
                     return df
             except Exception as e:
                 print(f"   ⚠️ Failed to update cache: {e}, using existing cache")
-                return load_price_data(ticker, interval, start_date.strftime('%Y-%m-%d'), db_path=db_path)
+                df = load_price_data(ticker, interval, start_date.strftime('%Y-%m-%d'), db_path=db_path)
+                if len(df) > 0:
+                    print(f"   📦 Returning {len(df)} bars from cache: {df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')}")
+                return df
 
     # No usable cache, fetch full data
     print(f"   🌐 Fetching {days} days of {ticker} data from yfinance...")

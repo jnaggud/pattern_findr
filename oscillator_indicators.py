@@ -17,7 +17,7 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Tuple, Optional
 
-# Try to import novel indicators
+# Try to import novel indicators (V1)
 try:
     from novel_indicators import (
         calculate_arwo, calculate_dco, calculate_vcmo, calculate_ics,
@@ -26,7 +26,18 @@ try:
     NOVEL_INDICATORS_AVAILABLE = True
 except ImportError:
     NOVEL_INDICATORS_AVAILABLE = False
-    print("Note: Novel indicators not available in oscillator_indicators.py")
+    print("Note: Novel indicators V1 not available in oscillator_indicators.py")
+
+# Try to import novel indicators V2 (research-based 2025-2026)
+try:
+    from novel_indicators_v2 import (
+        calculate_all_novel_v2_indicators,
+        NOVEL_V2_INDICATOR_LIST
+    )
+    NOVEL_V2_AVAILABLE = True
+except ImportError:
+    NOVEL_V2_AVAILABLE = False
+    NOVEL_V2_INDICATOR_LIST = []
 
 
 # =============================================================================
@@ -286,7 +297,7 @@ def create_composite_oscillator_features(data: pd.DataFrame,
         df['osc_composite'] = composite
 
     # Smooth composite
-    df['osc_composite_smooth'] = df['osc_composite'].rolling(window=3, center=True).mean()
+    df['osc_composite_smooth'] = df['osc_composite'].rolling(window=3, center=False).mean()
     df['osc_composite_smooth'] = df['osc_composite_smooth'].fillna(df['osc_composite'])
 
     return df
@@ -399,7 +410,7 @@ def add_novel_oscillator_features(df: pd.DataFrame) -> pd.DataFrame:
 # MAIN INTEGRATION FUNCTION
 # =============================================================================
 
-def integrate_oscillator_indicators(data: pd.DataFrame) -> pd.DataFrame:
+def integrate_oscillator_indicators(data: pd.DataFrame, interval: str = '1d') -> pd.DataFrame:
     """
     Main function to integrate ALL oscillator-based indicators.
 
@@ -410,8 +421,13 @@ def integrate_oscillator_indicators(data: pd.DataFrame) -> pd.DataFrame:
     4. Rolling statistics (mean, std, min, max, range, position)
     5. Lagged values
     6. Momentum and trend features
-    7. All 8 novel oscillators with derivatives
+    7. All 8 novel oscillators V1 with derivatives
     8. Consensus/dispersion features
+    9. Novel V2 research-based indicators (13 columns)
+
+    Args:
+        data: DataFrame with OHLCV data
+        interval: Timeframe for scaling ('1d', '15m', etc.)
 
     Returns:
         DataFrame with all oscillator indicators added
@@ -424,8 +440,12 @@ def integrate_oscillator_indicators(data: pd.DataFrame) -> pd.DataFrame:
     # Step 2: Add derivatives and rolling features
     df = add_oscillator_derivatives(df)
 
-    # Step 3: Add novel oscillator features
+    # Step 3: Add novel oscillator features (V1)
     df = add_novel_oscillator_features(df)
+
+    # Step 4: Add novel V2 indicators (research-based 2025-2026)
+    if NOVEL_V2_AVAILABLE:
+        df = calculate_all_novel_v2_indicators(df, interval=interval)
 
     return df
 
@@ -467,4 +487,13 @@ OSCILLATOR_INDICATOR_LIST = [
     # Novel consensus
     'novel_consensus', 'novel_dispersion', 'novel_direction_agreement',
     'novel_all_positive', 'novel_all_negative',
+    # Novel V2 indicators (research-based 2025-2026)
+    'sei',  # Shannon Entropy
+    'rma_position', 'rma_momentum', 'rma_compression',  # Relative MA Framework
+    'vdi_intensity', 'vdi_direction', 'vdi_participation',  # Volume Dimensions
+    'stp_session', 'stp_volatility_adj',  # Session Time Pattern
+    'rsc_regime',  # Regime State Classifier
+    'mfi2',  # Market Fragility Index
+    'ofi',  # Order Flow Imbalance
+    'mtc',  # Multi-Timeframe Confirmation
 ]

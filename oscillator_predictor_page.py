@@ -74,6 +74,139 @@ try:
 except ImportError:
     MARKET_UTILS_AVAILABLE = False
 
+# Databento for futures data
+try:
+    import databento as db
+    DATABENTO_AVAILABLE = True
+except ImportError:
+    DATABENTO_AVAILABLE = False
+
+# Load environment variables for API keys
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+DATABENTO_API_KEY = os.environ.get("DATABENTO_API_KEY", None)
+
+# Map yfinance-style futures tickers to Databento continuous contract symbols
+FUTURES_TICKER_MAP = {
+    'ES=F': 'ES.c.0',   # E-mini S&P 500 continuous front month
+    'NQ=F': 'NQ.c.0',   # E-mini Nasdaq 100 continuous
+    'GC=F': 'GC.c.0',   # Gold continuous
+    'CL=F': 'CL.c.0',   # Crude Oil continuous
+    'SI=F': 'SI.c.0',   # Silver continuous
+    'ZB=F': 'ZB.c.0',   # 30-Year T-Bond continuous
+    'ZN=F': 'ZN.c.0',   # 10-Year T-Note continuous
+    'RTY=F': 'RTY.c.0', # Russell 2000 E-mini continuous
+    'YM=F': 'YM.c.0',   # Dow E-mini continuous
+    '6E=F': '6E.c.0',   # Euro FX continuous
+}
+
+def is_futures_ticker(ticker: str) -> bool:
+    """Check if ticker is a futures symbol."""
+    return ticker.endswith('=F') or ticker in FUTURES_TICKER_MAP
+
+
+def _fetch_futures_from_databento(ticker: str, days: int = 60, interval: str = "15m") -> pd.DataFrame:
+    """
+    Fetch futures data from Databento using continuous contract symbology.
+
+    Args:
+        ticker: yfinance-style ticker (e.g., 'ES=F')
+        days: Number of days of history
+        interval: Bar interval ('1d', '1h', '15m', '30m', '4h', '12h')
+
+    Returns:
+        DataFrame with OHLCV data
+    """
+    if not DATABENTO_AVAILABLE:
+        raise ImportError("databento package not installed")
+    if not DATABENTO_API_KEY:
+        raise ValueError("DATABENTO_API_KEY not set in environment")
+
+    # Map ticker to Databento symbol
+    db_symbol = FUTURES_TICKER_MAP.get(ticker)
+    if not db_symbol:
+        raise ValueError(f"No Databento mapping for {ticker}")
+
+    # Calculate date range
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days)
+
+    # Determine schema based on interval
+    # Databento supports: ohlcv-1m, ohlcv-1h, ohlcv-1d
+    if interval == '1d':
+        schema = 'ohlcv-1d'
+        needs_resample = False
+    elif interval == '1h':
+        schema = 'ohlcv-1h'
+        needs_resample = False
+    else:
+        # For 15m, 30m, 4h, 12h - fetch 1m data and resample
+        schema = 'ohlcv-1m'
+        needs_resample = True
+
+    try:
+        client = db.Historical(DATABENTO_API_KEY)
+
+        data = client.timeseries.get_range(
+            dataset="GLBX.MDP3",
+            symbols=[db_symbol],
+            stype_in="continuous",
+            schema=schema,
+            start=start_date.strftime('%Y-%m-%dT%H:%M:%S'),
+            end=end_date.strftime('%Y-%m-%dT%H:%M:%S'),
+        )
+
+        df = data.to_df()
+
+        if df.empty:
+            return pd.DataFrame()
+
+        # Databento returns: open, high, low, close, volume
+        # Ensure we have standard column names
+        df = df.rename(columns={
+            'open': 'open',
+            'high': 'high',
+            'low': 'low',
+            'close': 'close',
+            'volume': 'volume'
+        })
+
+        # Keep only OHLCV columns
+        ohlcv_cols = ['open', 'high', 'low', 'close', 'volume']
+        df = df[[c for c in ohlcv_cols if c in df.columns]]
+
+        # Resample if needed
+        if needs_resample and not df.empty:
+            resample_map = {
+                '15m': '15min' if pd.__version__ >= '2.0.0' else '15T',
+                '30m': '30min' if pd.__version__ >= '2.0.0' else '30T',
+                '4h': '4h' if pd.__version__ >= '2.0.0' else '4H',
+                '12h': '12h' if pd.__version__ >= '2.0.0' else '12H',
+            }
+            resample_rule = resample_map.get(interval, interval)
+
+            df = df.resample(resample_rule).agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            }).dropna()
+
+        # Drop rows with zero or NaN values
+        df = df.dropna()
+        df = df[df['volume'] > 0]
+
+        return df
+
+    except Exception as e:
+        print(f"Databento fetch error for {ticker}: {e}")
+        raise
+
 # Optimization timing tracking
 OPTIMIZATION_TIMING_FILE = "optimization_timing.json"
 
@@ -185,9 +318,28 @@ except ImportError:
 # EXPORT UTILITIES - Comprehensive CSV and Summary Text Exports
 # ============================================================================
 
-def ensure_export_directories():
-    """Create export directories if they don't exist."""
-    dirs = ['walk_forward', 'ptr', 'feature_analysis']
+def ensure_export_directories(interval: str = '1d'):
+    """Create export directories if they don't exist.
+
+    Args:
+        interval: Timeframe ('1d' for daily, '15m', '1h', etc. for intraday)
+
+    Returns:
+        List of created directory paths
+    """
+    if interval == '1d':
+        # Daily data uses root-level directories
+        dirs = ['walk_forward', 'ptr', 'feature_analysis', 'predictions']
+    else:
+        # Intraday data uses intraday/ subdirectories
+        base = 'intraday'
+        dirs = [
+            f'{base}/walk_forward',
+            f'{base}/ptr',
+            f'{base}/feature_analysis',
+            f'{base}/predictions',
+            f'{base}/configs'
+        ]
     for d in dirs:
         os.makedirs(d, exist_ok=True)
     return dirs
@@ -281,6 +433,18 @@ def export_walkforward_results(wf_df: pd.DataFrame, metrics: dict, settings: dic
     lines.append(f"Test R2 Low: {metrics.get('test_r2_low', 0):.4f}")
     lines.append(f"Train R2 (avg): {metrics.get('train_r2_avg', 0):.4f}")
     lines.append(f"Train RMSE (avg): {metrics.get('train_rmse_avg', 0):.4f}%")
+    lines.append("")
+
+    # Composite scores (same metric used during training optimization)
+    lines.append("=" * 80)
+    lines.append("COMPOSITE SCORES (Training Optimization Metric)")
+    lines.append("=" * 80)
+    lines.append(f"Formula: 0.6 * R² + 0.4 * (1 - MAPE/100)")
+    lines.append(f"Composite HIGH: {metrics.get('composite_high', 0):.4f}")
+    lines.append(f"Composite LOW: {metrics.get('composite_low', 0):.4f}")
+    lines.append(f"Composite AVG: {metrics.get('composite_avg', 0):.4f}")
+    lines.append(f"MAPE HIGH: {metrics.get('high_mape', 0):.2f}%")
+    lines.append(f"MAPE LOW: {metrics.get('low_mape', 0):.2f}%")
     lines.append("")
 
     # Confidence band info
@@ -862,7 +1026,7 @@ def create_composite_oscillator(data: pd.DataFrame, weights: dict = None) -> pd.
     df['composite_oscillator'] = composite / total_weight
 
     # Smooth the composite slightly to reduce noise
-    df['composite_smooth'] = df['composite_oscillator'].rolling(window=3, center=True).mean()
+    df['composite_smooth'] = df['composite_oscillator'].rolling(window=3, center=False).mean()
     df['composite_smooth'] = df['composite_smooth'].fillna(df['composite_oscillator'])
 
     return df
@@ -1692,7 +1856,10 @@ def render_oscillator_predictor_page():
 
     # Warning for intraday data limitations
     if interval != "1d":
-        st.sidebar.warning(f"⚠️ Intraday data ({interval_display}) limited to ~60 days history with free yfinance API.")
+        if is_futures_ticker(ticker) and DATABENTO_AVAILABLE and DATABENTO_API_KEY:
+            st.sidebar.info(f"📊 Futures data via Databento API (real-time)")
+        else:
+            st.sidebar.warning(f"⚠️ Intraday data ({interval_display}) limited to ~60 days history with free yfinance API.")
 
     # Peak detection settings
     st.sidebar.subheader("Peak Detection")
@@ -1790,12 +1957,33 @@ def render_oscillator_predictor_page():
             include_today: If True, extends end_date to include today's data.
                            Should be True when market is closed for daily data.
 
-        yfinance limitations:
+        Data sources:
+        - Futures (ES=F, GC=F, etc.): Databento API with yfinance fallback
+        - Stocks/ETFs: yfinance
+
+        yfinance limitations (for non-futures):
         - 1d: unlimited history
         - 1h: up to 730 days
         - 15m, 30m: up to 60 days
         - 4h, 12h: not directly supported, resample from 1h
         """
+        # For futures, try Databento first
+        if is_futures_ticker(ticker) and DATABENTO_AVAILABLE and DATABENTO_API_KEY:
+            try:
+                # Calculate days needed
+                if interval in ["15m", "30m"]:
+                    days_needed = min(years * 365, 59)
+                elif interval in ["1h", "4h", "12h"]:
+                    days_needed = min(years * 365, 729)
+                else:
+                    days_needed = years * 365
+
+                df = _fetch_futures_from_databento(ticker, days=days_needed, interval=interval)
+                if not df.empty:
+                    return df
+            except Exception as e:
+                print(f"Databento failed for {ticker}: {e}, falling back to yfinance")
+
         # yfinance end is EXCLUSIVE, add 1 day to include today when market is closed
         if include_today:
             end_date = datetime.now() + timedelta(days=1)
@@ -1829,6 +2017,12 @@ def render_oscillator_predictor_page():
         # Normalize column names to lowercase for consistency
         df.columns = df.columns.str.lower()
 
+        # Drop zero volume days (market holidays) - they cause inf in volume calculations
+        if 'volume' in df.columns and not df.empty:
+            zero_vol_count = (df['volume'] == 0).sum()
+            if zero_vol_count > 0:
+                df = df[df['volume'] > 0]
+
         # Resample if needed for 4h or 12h
         if interval == "4h" and not df.empty:
             df = df.resample('4h').agg({
@@ -1860,9 +2054,15 @@ def render_oscillator_predictor_page():
     # Force refresh button to clear cache for this ticker
     refresh_col1, refresh_col2 = st.columns([1, 4])
     with refresh_col1:
-        if st.button("🔄 Force Refresh", help="Clear cached data and fetch fresh from yfinance"):
+        if st.button("🔄 Force Refresh", help="Clear ALL cached data and fetch fresh data"):
             load_data.clear()  # Clear the @st.cache_data for this function
-            st.success("Cache cleared! Reloading fresh data...")
+            # Also clear session_state variables that might contain stale data
+            keys_to_clear = ['df', 'osc_df', 'osc_X_test', 'osc_y_test', 'test_df_vel',
+                           'vel_grid_results', 'wf_pred_df', 'wf_corr_df']
+            for key in keys_to_clear:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.success("All caches cleared! Reloading fresh data...")
             st.rerun()
 
     with st.spinner(f"Loading {ticker} data ({interval_display})..."):
@@ -1871,6 +2071,10 @@ def render_oscillator_predictor_page():
     if raw_data.empty:
         st.error("Failed to load data. Check ticker symbol.")
         return
+
+    # DEBUG: Show raw data range immediately after loading
+    data_source = "Databento" if (is_futures_ticker(ticker) and DATABENTO_AVAILABLE and DATABENTO_API_KEY) else "yfinance"
+    st.info(f"📊 RAW DATA from {data_source}: {len(raw_data)} bars, {raw_data.index[0]} to {raw_data.index[-1]}")
 
     # Display appropriate date/time info based on interval
     if interval == "1d":
@@ -1886,6 +2090,9 @@ def render_oscillator_predictor_page():
 
     with st.spinner("Calculating indicators and composite oscillator..."):
         df = create_composite_oscillator(raw_data)
+
+    # DEBUG: Show data range after oscillator creation
+    st.info(f"📊 AFTER OSCILLATOR: {len(df)} bars, {df.index[0]} to {df.index[-1]}")
 
     # Store full dataframe in session state for save buttons to access
     st.session_state['df'] = df
@@ -2120,8 +2327,21 @@ def render_oscillator_predictor_page():
     nan_counts = df.isna().sum()
     cols_with_nan = nan_counts[nan_counts > 0]
 
+    # DEBUG: Check for NaN values in RECENT data (last 20%)
+    recent_start_idx = int(len(df) * 0.8)
+    recent_data = df.iloc[recent_start_idx:]
+    recent_nan_counts = recent_data.isna().sum()
+    recent_cols_with_nan = recent_nan_counts[recent_nan_counts > 0]
+    if len(recent_cols_with_nan) > 0:
+        st.warning(f"⚠️ NaN values found in RECENT data (after {df.index[recent_start_idx].date()}):")
+        for col, count in recent_cols_with_nan.head(10).items():
+            st.write(f"  - {col}: {count} NaN values in recent data")
+
     df = df.dropna()
     rows_after_dropna = len(df)
+
+    # DEBUG: Show data range after dropna
+    st.info(f"📊 AFTER DROPNA: {len(df)} bars, {df.index[0]} to {df.index[-1]}")
 
     if rows_after_dropna < rows_before_dropna:
         st.caption(f"Dropped {rows_before_dropna - rows_after_dropna} rows with NaN values ({rows_after_dropna} remaining)")
@@ -2167,6 +2387,9 @@ def render_oscillator_predictor_page():
     col1.metric("Training Samples", len(X_train))
     col2.metric("Test Samples", len(X_test))
     col3.metric("SMOTE Applied", "Yes" if smote_applied else "No")
+
+    # Debug: Show test data date range
+    st.info(f"📅 Test Data Range: {X_test.index[0]} to {X_test.index[-1]} ({len(X_test)} bars)")
 
     if smote_applied:
         st.success("SMOTE applied to balance training classes")
@@ -2611,7 +2834,7 @@ def render_oscillator_predictor_page():
 
         # Row 3: Stop loss and take profit
         st.markdown("**Risk Management**")
-        vel_row3_col1, vel_row3_col2, vel_row3_col3 = st.columns(3)
+        vel_row3_col1, vel_row3_col2, vel_row3_col3, vel_row3_col4 = st.columns(4)
         with vel_row3_col1:
             stop_loss_pct = st.slider("Stop Loss %", 0.0, 10.0, 2.0, 0.1, key="vel_sl",
                                       help="Exit if price drops this % below entry (0 = disabled)")
@@ -2621,6 +2844,9 @@ def render_oscillator_predictor_page():
         with vel_row3_col3:
             trailing_stop_pct = st.slider("Trailing Stop %", 0.5, 10.0, 2.0, 0.1, key="vel_trail_pct",
                                           help="Trail stop this % below highest price (only if trailing stop enabled)")
+        with vel_row3_col4:
+            min_hold_bars = st.slider("Min Hold Bars", 1, 20, 1, 1, key="vel_min_hold",
+                                      help="Minimum bars to hold position before any exit allowed")
 
         # Row 4: Advanced filters
         st.markdown("**Signal Filters**")
@@ -2682,6 +2908,48 @@ def render_oscillator_predictor_page():
         with grid_col4:
             use_extra_indicators = st.checkbox("Extra Indicators", value=True, key="use_extra_ind",
                                                help="RSI, MACD, Bollinger Bands")
+
+        # Exit Strategy Constraints for Optimization
+        st.markdown("**Exit Strategy Constraints**")
+        exit_col1, exit_col2, exit_col3 = st.columns(3)
+        with exit_col1:
+            force_midline_exit = st.checkbox("Force Midline Cross Exit", value=False, key="force_midline_exit",
+                                             help="Always require exit_on_midline_cross=True (better crash protection)")
+        with exit_col2:
+            force_opposite_exit = st.checkbox("Force Opposite Signal Exit", value=True, key="force_opposite_exit",
+                                              help="Always require exit_on_opposite_signal=True")
+        with exit_col3:
+            use_drawdown_penalty = st.checkbox("Max Drawdown Penalty", value=True, key="use_dd_penalty",
+                                               help="Penalize strategies with large drawdowns")
+
+        # SL/TP Range Constraints
+        st.markdown("**Stop Loss / Take Profit Ranges**")
+        sl_tp_col1, sl_tp_col2, sl_tp_col3, sl_tp_col4 = st.columns(4)
+        with sl_tp_col1:
+            sl_min = st.slider("SL Min %", 0.5, 5.0, 1.0, 0.5, key="sl_min",
+                               help="Minimum stop loss percentage to test")
+        with sl_tp_col2:
+            sl_max = st.slider("SL Max %", 1.0, 10.0, 4.0, 0.5, key="sl_max",
+                               help="Maximum stop loss percentage to test")
+        with sl_tp_col3:
+            tp_min = st.slider("TP Min %", 0.5, 10.0, 1.0, 0.5, key="tp_min",
+                               help="Minimum take profit percentage to test")
+        with sl_tp_col4:
+            tp_max = st.slider("TP Max %", 1.0, 20.0, 8.0, 0.5, key="tp_max",
+                               help="Maximum take profit percentage to test")
+
+        # Drawdown penalty settings
+        if use_drawdown_penalty:
+            dd_col1, dd_col2 = st.columns(2)
+            with dd_col1:
+                max_drawdown_threshold = st.slider("Max Drawdown Threshold %", 5.0, 30.0, 15.0, 1.0, key="max_dd_thresh",
+                                                   help="Drawdowns above this get penalized")
+            with dd_col2:
+                drawdown_penalty_weight = st.slider("Penalty Weight", 0.1, 2.0, 0.5, 0.1, key="dd_penalty_weight",
+                                                    help="How much to penalize large drawdowns (higher = more penalty)")
+        else:
+            max_drawdown_threshold = 15.0
+            drawdown_penalty_weight = 0.5
 
         # Show time estimate based on historical data
         time_estimate = estimate_optimization_time(grid_iterations, n_workers)
@@ -2765,7 +3033,16 @@ def render_oscillator_predictor_page():
             data_path = optuna_worker.set_velocity_shared_data(
                 close_prices, osc_values, rsi_cache, macd_histogram, bb_upper, bb_lower,
                 optimize_metric=optimize_metric, use_extra_indicators=use_extra_indicators,
-                all_oscillators=all_oscillators  # Pass all oscillator types for search
+                all_oscillators=all_oscillators,  # Pass all oscillator types for search
+                # Exit strategy constraints
+                force_midline_exit=force_midline_exit,
+                force_opposite_exit=force_opposite_exit,
+                sl_range=(sl_min, sl_max),
+                tp_range=(tp_min, tp_max),
+                # Drawdown penalty settings
+                use_drawdown_penalty=use_drawdown_penalty,
+                max_drawdown_threshold=max_drawdown_threshold,
+                drawdown_penalty_weight=drawdown_penalty_weight
             )
 
             # Progress display
@@ -2849,6 +3126,18 @@ def render_oscillator_predictor_page():
                 # Store in session state
                 st.session_state['vel_grid_results'] = results_df
 
+                # Store backtest data for real-time tuning/recalculation
+                st.session_state['vel_backtest_data'] = {
+                    'close_prices': close_prices,
+                    'osc_values': osc_values,
+                    'all_oscillators': all_oscillators,
+                    'rsi_cache': rsi_cache,
+                    'macd_histogram': macd_histogram,
+                    'bb_upper': bb_upper,
+                    'bb_lower': bb_lower,
+                    'ticker': ticker,
+                }
+
                 # Show summary stats
                 best = results_df.iloc[0]
                 st.success(f"✅ Found {len(results_df):,} valid combinations! Best: {best['total_return']:.1f}% return, {int(best['num_trades'])} trades, {best['win_rate']:.0f}% win rate")
@@ -2873,6 +3162,47 @@ def render_oscillator_predictor_page():
             results_df = st.session_state['vel_grid_results']
 
             st.subheader(f"Top 10 of {len(results_df):,} Parameter Combinations")
+
+            # Helper function to assess crash protection risk
+            def assess_crash_risk(row, ticker='SPY'):
+                """Assess risk level and crash behavior for a strategy."""
+                sl = row.get('stop_loss_pct', 0)
+                midline_exit = row.get('exit_on_midline_cross', False)
+                is_crypto = 'BTC' in str(ticker).upper()
+                is_futures = '=F' in str(ticker).upper()
+
+                # Midline Safety
+                midline_safety = "PROTECTED" if midline_exit else "EXPOSED"
+
+                # Overall Risk Assessment
+                if midline_exit:
+                    risk = "LOW"
+                elif sl <= 1.5:
+                    risk = "LOW"  # Tight SL compensates
+                elif sl <= 3.0 and not (is_crypto or is_futures):
+                    risk = "MEDIUM"
+                elif sl <= 5.0 and not is_crypto:
+                    risk = "MEDIUM"
+                elif is_crypto or is_futures:
+                    risk = "HIGH"
+                else:
+                    risk = "MEDIUM"
+
+                # Crash behavior explanation
+                if midline_exit:
+                    crash_behavior = f"Exits when osc>0 OR at -{sl:.1f}% SL"
+                elif sl <= 1.5:
+                    crash_behavior = f"Tight SL exits at -{sl:.1f}% (quick exit)"
+                elif sl <= 3.0:
+                    crash_behavior = f"Holds until -{sl:.1f}% SL hit"
+                else:
+                    crash_behavior = f"RISK: Holds until -{sl:.1f}% SL (wide)"
+
+                return midline_safety, risk, crash_behavior
+
+            # Get ticker from session state
+            backtest_ticker = st.session_state.get('vel_backtest_data', {}).get('ticker', 'SPY')
+
             # Core columns first, then extra indicators
             display_cols = [
                 'oscillator_type', 'signal_type', 'vel_smoothing', 'oversold_threshold', 'overbought_threshold',
@@ -2888,6 +3218,13 @@ def render_oscillator_predictor_page():
 
             # Format the dataframe for better display
             display_df = results_df[display_cols].head(10).copy()
+
+            # Add risk assessment columns
+            risk_assessments = [assess_crash_risk(results_df.iloc[i], backtest_ticker) for i in range(min(10, len(results_df)))]
+            display_df['midline_safety'] = [r[0] for r in risk_assessments]
+            display_df['overall_risk'] = [r[1] for r in risk_assessments]
+            display_df['crash_behavior'] = [r[2] for r in risk_assessments]
+
             if 'total_return' in display_df.columns:
                 display_df['total_return'] = display_df['total_return'].apply(lambda x: f"{x:.1f}%")
             if 'win_rate' in display_df.columns:
@@ -2896,6 +3233,175 @@ def render_oscillator_predictor_page():
                 display_df['profit_factor'] = display_df['profit_factor'].apply(lambda x: f"{x:.2f}")
 
             st.dataframe(display_df, use_container_width=True)
+
+            # === STRATEGY TUNING SECTION ===
+            st.markdown("---")
+            st.subheader("🔧 Strategy Tuning (Real-Time Recalculation)")
+            st.caption("Adjust SL/TP and exit conditions to see how they affect performance. Changes recalculate using actual backtest.")
+
+            # Select which strategy to tune
+            tune_col1, tune_col2 = st.columns([1, 2])
+            with tune_col1:
+                tune_strategy_idx = st.selectbox(
+                    "Select strategy to tune:",
+                    options=list(range(min(10, len(results_df)))),
+                    format_func=lambda x: f"#{x+1} - {results_df.iloc[x]['total_return']:.1f}% return",
+                    key="tune_strategy_select"
+                )
+
+            # Get the selected strategy's original params
+            selected_strategy = results_df.iloc[tune_strategy_idx].to_dict()
+
+            with tune_col2:
+                st.info(f"**Original:** SL={selected_strategy.get('stop_loss_pct', 0):.2f}%, "
+                       f"TP={selected_strategy.get('take_profit_pct', 0):.2f}%, "
+                       f"Midline={selected_strategy.get('exit_on_midline_cross', False)}, "
+                       f"Opposite={selected_strategy.get('exit_on_opposite_signal', True)}")
+
+            # Tuning controls
+            tune_row1 = st.columns(4)
+            with tune_row1[0]:
+                tuned_sl = st.slider(
+                    "Stop Loss %",
+                    min_value=0.5, max_value=15.0,
+                    value=float(selected_strategy.get('stop_loss_pct', 5.0)),
+                    step=0.25,
+                    key="tuned_sl"
+                )
+            with tune_row1[1]:
+                tuned_tp = st.slider(
+                    "Take Profit %",
+                    min_value=0.5, max_value=25.0,
+                    value=float(selected_strategy.get('take_profit_pct', 10.0)),
+                    step=0.25,
+                    key="tuned_tp"
+                )
+            with tune_row1[2]:
+                tuned_midline = st.checkbox(
+                    "Exit on Midline Cross",
+                    value=bool(selected_strategy.get('exit_on_midline_cross', False)),
+                    key="tuned_midline",
+                    help="Exit when oscillator crosses from negative to positive (crash protection)"
+                )
+            with tune_row1[3]:
+                tuned_opposite = st.checkbox(
+                    "Exit on Opposite Signal",
+                    value=bool(selected_strategy.get('exit_on_opposite_signal', True)),
+                    key="tuned_opposite",
+                    help="Exit when a sell signal is generated (overbought zone)"
+                )
+
+            # Recalculate button and results
+            if st.button("🔄 Recalculate with Tuned Parameters", key="recalc_tuned"):
+                if 'vel_backtest_data' not in st.session_state:
+                    st.error("No backtest data available. Run optimization first.")
+                else:
+                    # Get backtest data
+                    bt_data = st.session_state['vel_backtest_data']
+
+                    # Build tuned params (start with original, override tuned values)
+                    tuned_params = selected_strategy.copy()
+                    tuned_params['stop_loss_pct'] = tuned_sl
+                    tuned_params['take_profit_pct'] = tuned_tp
+                    tuned_params['exit_on_midline_cross'] = tuned_midline
+                    tuned_params['exit_on_opposite_signal'] = tuned_opposite
+
+                    # Run backtest with tuned params
+                    from optuna_worker import VelocityOptunaObjective
+                    import tempfile
+                    import joblib
+
+                    # Create temp data file for backtest
+                    fd, temp_path = tempfile.mkstemp(suffix='.joblib', prefix='tune_backtest_')
+                    os.close(fd)
+
+                    try:
+                        # Get the right oscillator values
+                        osc_type = tuned_params.get('oscillator_type', 'composite_smooth')
+                        if osc_type in bt_data['all_oscillators']:
+                            osc_vals = bt_data['all_oscillators'][osc_type]
+                        else:
+                            osc_vals = bt_data['osc_values']
+
+                        # Run the backtest directly using the _run_backtest method
+                        objective = VelocityOptunaObjective(temp_path)
+                        objective._cached_data = {
+                            'close_prices': bt_data['close_prices'],
+                            'osc_values': osc_vals,
+                            'rsi_cache': bt_data['rsi_cache'],
+                            'macd_histogram': bt_data['macd_histogram'],
+                            'bb_upper': bt_data['bb_upper'],
+                            'bb_lower': bt_data['bb_lower'],
+                        }
+
+                        result = objective._run_backtest(
+                            tuned_params,
+                            bt_data['close_prices'],
+                            osc_vals,
+                            bt_data['rsi_cache'],
+                            bt_data['macd_histogram'],
+                            bt_data['bb_upper'],
+                            bt_data['bb_lower'],
+                            use_extra_indicators=True
+                        )
+
+                        if result:
+                            # Store tuned result
+                            st.session_state['tuned_result'] = result
+                            st.session_state['tuned_params'] = tuned_params
+
+                            # Get new risk assessment
+                            new_safety, new_risk, new_crash = assess_crash_risk(result, backtest_ticker)
+
+                            # Display comparison
+                            st.success("✅ Recalculation complete!")
+
+                            comp_cols = st.columns(2)
+                            with comp_cols[0]:
+                                st.markdown("**Original Strategy:**")
+                                st.write(f"- Return: {selected_strategy.get('total_return', 0):.1f}%")
+                                st.write(f"- Win Rate: {selected_strategy.get('win_rate', 0):.0f}%")
+                                st.write(f"- Trades: {int(selected_strategy.get('num_trades', 0))}")
+                                st.write(f"- Profit Factor: {selected_strategy.get('profit_factor', 0):.2f}")
+                                orig_safety, orig_risk, orig_crash = assess_crash_risk(selected_strategy, backtest_ticker)
+                                st.write(f"- Risk: **{orig_risk}** | {orig_crash}")
+
+                            with comp_cols[1]:
+                                st.markdown("**Tuned Strategy:**")
+                                st.write(f"- Return: {result.get('total_return', 0):.1f}%")
+                                st.write(f"- Win Rate: {result.get('win_rate', 0):.0f}%")
+                                st.write(f"- Trades: {int(result.get('num_trades', 0))}")
+                                st.write(f"- Profit Factor: {result.get('profit_factor', 0):.2f}")
+                                st.write(f"- Risk: **{new_risk}** | {new_crash}")
+
+                            # Show delta
+                            return_delta = result.get('total_return', 0) - selected_strategy.get('total_return', 0)
+                            if return_delta > 0:
+                                st.success(f"📈 Tuning improved return by +{return_delta:.1f}%")
+                            elif return_delta < 0:
+                                st.warning(f"📉 Tuning reduced return by {return_delta:.1f}% (but may have better risk protection)")
+                            else:
+                                st.info("📊 Return unchanged")
+                        else:
+                            st.warning("No trades generated with tuned parameters")
+
+                    finally:
+                        # Clean up temp file
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+
+            # Show last tuned result if available
+            if 'tuned_result' in st.session_state and 'tuned_params' in st.session_state:
+                st.markdown("---")
+                tuned_r = st.session_state['tuned_result']
+                tuned_p = st.session_state['tuned_params']
+                st.caption(f"**Last tuned:** SL={tuned_p.get('stop_loss_pct', 0):.2f}%, "
+                          f"TP={tuned_p.get('take_profit_pct', 0):.2f}%, "
+                          f"Midline={tuned_p.get('exit_on_midline_cross', False)} → "
+                          f"Return={tuned_r.get('total_return', 0):.1f}%, "
+                          f"Trades={int(tuned_r.get('num_trades', 0))}")
+
+            st.markdown("---")
 
             # Buttons to apply parameters
             apply_col1, apply_col2, apply_col3 = st.columns([2, 2, 3])
@@ -2946,6 +3452,15 @@ def render_oscillator_predictor_page():
                     selected = results_df.iloc[apply_rank - 1]
                     st.session_state['vel_best_params'] = extract_all_params(selected)
                     st.session_state['vel_apply_best'] = True  # Flag to trigger auto-apply
+                    st.rerun()
+
+            # Option to apply tuned strategy
+            if 'tuned_params' in st.session_state and st.session_state['tuned_params']:
+                tuned_p = st.session_state['tuned_params']
+                tuned_r = st.session_state.get('tuned_result', {})
+                if st.button(f"🔧 Apply Tuned Strategy (SL={tuned_p.get('stop_loss_pct', 0):.1f}%, Return={tuned_r.get('total_return', 0):.1f}%)", key="apply_tuned"):
+                    st.session_state['vel_best_params'] = tuned_p
+                    st.session_state['vel_apply_best'] = True
                     st.rerun()
 
             # Show currently applied params if any
@@ -3012,6 +3527,7 @@ def render_oscillator_predictor_page():
                                 'rsi_overbought': rsi_overbought,
                                 'use_macd_confirm': use_macd_confirm,
                                 'use_bb_filter': use_bb_filter,
+                                'min_hold_bars': min_hold_bars,
                             }
 
                         # Helper function to convert numpy types to native Python types
@@ -3046,6 +3562,7 @@ def render_oscillator_predictor_page():
                             # Risk management
                             "stop_loss_pct": float(to_native(params.get('stop_loss_pct', 5.0))),
                             "take_profit_pct": float(to_native(params.get('take_profit_pct', 10.0))),
+                            "min_hold_bars": int(to_native(params.get('min_hold_bars', 1))),
 
                             # Exit strategies
                             "exit_on_opposite_signal": bool(to_native(params.get('exit_on_opposite_signal', True))),
@@ -3078,13 +3595,33 @@ def render_oscillator_predictor_page():
 
                         # Save the FULL DataFrame for exact matching in live trader
                         # IMPORTANT: Save 'df' (full data), NOT 'test_df_vel' (which is only test portion ~20%)
+                        # BUG FIX: If oscillator_type is not 'composite', calculate the actual oscillator
                         try:
                             if 'df' in st.session_state and len(st.session_state['df']) > 0:
+                                df_to_save = st.session_state['df'].copy()
+
+                                # Calculate the correct oscillator based on oscillator_type
+                                osc_type = params.get('oscillator_type', st.session_state.get('selected_oscillator_type', 'composite_smooth'))
+                                if osc_type and osc_type.lower() not in ['composite', 'composite_smooth']:
+                                    try:
+                                        from novel_indicators import calculate_arwo, calculate_dco, calculate_vcmo, calculate_ics, calculate_mji, calculate_prf, calculate_ewaf, calculate_kfif
+                                        osc_calculators = {
+                                            'arwo': calculate_arwo, 'dco': calculate_dco, 'vcmo': calculate_vcmo,
+                                            'ics': calculate_ics, 'mji': calculate_mji, 'prf': calculate_prf, 'ewaf': calculate_ewaf,
+                                        }
+                                        if osc_type.lower() in osc_calculators:
+                                            df_to_save['osc_smooth'] = osc_calculators[osc_type.lower()](df_to_save)
+                                        elif osc_type.lower() == 'kfif':
+                                            kfif_val, _, _ = calculate_kfif(df_to_save)
+                                            df_to_save['osc_smooth'] = kfif_val
+                                    except Exception as e:
+                                        st.warning(f"Could not calculate {osc_type}: {e}")
+
                                 data_path = os.path.join(prod_dir, "velocity_data.parquet")
-                                st.session_state['df'].to_parquet(data_path)
-                                df_start = st.session_state['df'].index[0].strftime('%Y-%m-%d')
-                                df_end = st.session_state['df'].index[-1].strftime('%Y-%m-%d')
-                                st.info(f"📊 Saved {len(st.session_state['df'])} bars ({df_start} to {df_end})")
+                                df_to_save.to_parquet(data_path)
+                                df_start = df_to_save.index[0].strftime('%Y-%m-%d')
+                                df_end = df_to_save.index[-1].strftime('%Y-%m-%d')
+                                st.info(f"📊 Saved {len(df_to_save)} bars ({df_start} to {df_end})")
                             else:
                                 st.warning("No data in session - load data first")
                         except Exception as e:
@@ -3140,6 +3677,7 @@ def render_oscillator_predictor_page():
                             'rsi_overbought': rsi_overbought,
                             'use_macd_confirm': use_macd_confirm,
                             'use_bb_filter': use_bb_filter,
+                            'min_hold_bars': min_hold_bars,
                         }
 
                     # Helper function to convert numpy types to native Python types
@@ -3195,6 +3733,7 @@ def render_oscillator_predictor_page():
                         # Risk management
                         "stop_loss_pct": float(to_native(params.get('stop_loss_pct', 5.0))),
                         "take_profit_pct": float(to_native(params.get('take_profit_pct', 10.0))),
+                        "min_hold_bars": int(to_native(params.get('min_hold_bars', 1))),
 
                         # Exit strategies
                         "exit_on_opposite_signal": bool(to_native(params.get('exit_on_opposite_signal', True))),
@@ -3222,14 +3761,117 @@ def render_oscillator_predictor_page():
 
                     # Save the FULL dataframe so live trader uses identical data
                     # IMPORTANT: Save 'df' (full data), NOT 'test_df_vel' (which is only test portion ~20%)
+                    # BUG FIX: If oscillator_type is not 'composite', calculate the actual oscillator
+                    # and store in 'osc_smooth' column so live trader uses identical values
                     if 'df' in st.session_state and len(st.session_state['df']) > 0:
+                        df_to_save = st.session_state['df'].copy()
+
+                        # Calculate the correct oscillator based on oscillator_type
+                        osc_type = params.get('oscillator_type', st.session_state.get('selected_oscillator_type', 'composite_smooth'))
+                        if osc_type and osc_type.lower() not in ['composite', 'composite_smooth']:
+                            try:
+                                # Import novel oscillator calculator
+                                from novel_indicators import calculate_arwo, calculate_dco, calculate_vcmo, calculate_ics, calculate_mji, calculate_prf, calculate_ewaf, calculate_kfif
+
+                                osc_calculators = {
+                                    'arwo': calculate_arwo,
+                                    'dco': calculate_dco,
+                                    'vcmo': calculate_vcmo,
+                                    'ics': calculate_ics,
+                                    'mji': calculate_mji,
+                                    'prf': calculate_prf,
+                                    'ewaf': calculate_ewaf,
+                                }
+
+                                if osc_type.lower() in osc_calculators:
+                                    st.info(f"📊 Calculating {osc_type.upper()} oscillator for bundle...")
+                                    df_to_save['osc_smooth'] = osc_calculators[osc_type.lower()](df_to_save)
+                                    st.success(f"✓ {osc_type.upper()} oscillator stored in bundle")
+                                elif osc_type.lower() == 'kfif':
+                                    kfif_val, _, _ = calculate_kfif(df_to_save)
+                                    df_to_save['osc_smooth'] = kfif_val
+                                    st.success(f"✓ KFIF oscillator stored in bundle")
+                            except Exception as e:
+                                st.warning(f"Could not calculate {osc_type} oscillator: {e}. Using composite_smooth.")
+
                         data_path = os.path.join(bundle_dir, "data.parquet")
-                        st.session_state['df'].to_parquet(data_path)
-                        df_start = st.session_state['df'].index[0].strftime('%Y-%m-%d')
-                        df_end = st.session_state['df'].index[-1].strftime('%Y-%m-%d')
-                        st.info(f"📊 Saved {len(st.session_state['df'])} bars of data ({df_start} to {df_end})")
+                        df_to_save.to_parquet(data_path)
+                        df_start = df_to_save.index[0].strftime('%Y-%m-%d')
+                        df_end = df_to_save.index[-1].strftime('%Y-%m-%d')
+                        st.info(f"📊 Saved {len(df_to_save)} bars of data ({df_start} to {df_end})")
                     else:
                         st.warning("No data in session - load data first")
+
+                    # Save FULL backtest results (ALL trades from full data) for locked_backtest initialization
+                    # This ensures the live trader has the complete trading history for stats
+                    if 'df' in st.session_state and len(st.session_state['df']) > 0:
+                        try:
+                            from oscillator_predictor_testing_page import run_velocity_backtest
+
+                            # Run backtest on FULL data with the saved parameters
+                            full_backtest = run_velocity_backtest(st.session_state['df'], params)
+
+                            # Convert datetime objects to strings for JSON serialization
+                            def serialize_trade(trade):
+                                serialized = {}
+                                for k, v in trade.items():
+                                    if hasattr(v, 'isoformat'):
+                                        serialized[k] = v.isoformat()
+                                    elif hasattr(v, 'strftime'):
+                                        serialized[k] = v.strftime('%Y-%m-%d %H:%M:%S')
+                                    else:
+                                        serialized[k] = v
+                                return serialized
+
+                            # Convert trades to locked_backtest format
+                            entries = []
+                            exits = []
+                            for trade in full_backtest.get('trades', []):
+                                if 'entry_date' in trade and 'exit_date' in trade:
+                                    # This is an exit trade with full info
+                                    entries.append({
+                                        'date': str(trade['entry_date']),
+                                        'price': trade['entry_price'],
+                                        'position': 'long',
+                                    })
+                                    exits.append({
+                                        'date': str(trade['exit_date']),
+                                        'price': trade['exit_price'],
+                                        'pnl': trade['pnl'],
+                                        'reason': trade.get('exit_reason', 'Unknown'),
+                                        'entry_date': str(trade['entry_date']),
+                                        'entry_price': trade['entry_price'],
+                                    })
+
+                            # Handle open position
+                            current_position = None
+                            if full_backtest.get('open_position'):
+                                pos = full_backtest['open_position']
+                                current_position = {
+                                    'position': 'long',
+                                    'entry_price': pos.get('entry_price'),
+                                    'entry_date': str(pos.get('entry_date', '')),
+                                }
+
+                            serialized_results = {
+                                'entries': entries,
+                                'exits': exits,
+                                'current_position': current_position,
+                                'num_trades': len(exits),
+                                'win_rate': full_backtest.get('win_rate', 0),
+                                'total_return': full_backtest.get('total_return', 0),
+                                'profit_factor': full_backtest.get('profit_factor', 0),
+                                'saved_at': pd.Timestamp.now().isoformat(),
+                            }
+
+                            backtest_path = os.path.join(bundle_dir, "backtest_results.json")
+                            with open(backtest_path, 'w') as f:
+                                json.dump(serialized_results, f, indent=2)
+                            st.info(f"📈 Saved {len(exits)} full-period trades to backtest_results.json")
+                        except Exception as e:
+                            st.warning(f"Could not save backtest results: {e}")
+                    else:
+                        st.warning("No data in session - cannot save backtest results")
 
                     st.success(f"✅ Strategy saved permanently to: {bundle_dir}")
                     st.info("📦 This strategy will appear in the live trader's strategy selection menu")
@@ -3335,6 +3977,9 @@ def render_oscillator_predictor_page():
 
     # Calculate velocity and acceleration on test data
     test_df_vel = df.loc[X_test.index].copy()
+
+    # Debug: Show what data Step 5c is using
+    st.info(f"📅 Step 5c using data: {test_df_vel.index[0]} to {test_df_vel.index[-1]} ({len(test_df_vel)} bars)")
 
     # Handle oscillator type selection - calculate novel oscillator if selected
     osc_type_map = {
@@ -3695,6 +4340,14 @@ def render_oscillator_predictor_page():
             'osc_value': test_df_vel['osc_smooth'].iloc[-1],
         }
 
+    # Save backtest results to session state for deploy button
+    st.session_state['vel_backtest_results'] = {
+        'entries': vel_entries,
+        'exits': vel_exits,
+        'current_position': vel_open_position,
+        'num_trades': len(vel_exits),
+    }
+
     # Display velocity trading stats
     if vel_exits or vel_open_position:
         vel_pnls = [t.get('pnl', 0) for t in vel_exits] if vel_exits else []
@@ -3984,6 +4637,116 @@ def render_oscillator_predictor_page():
             })
 
         st.dataframe(pd.DataFrame(vel_trade_summary), use_container_width=True)
+
+        # Export Full Backtest Results
+        st.subheader("📥 Export Backtest Results")
+        export_col1, export_col2 = st.columns(2)
+
+        with export_col1:
+            if st.button("📊 Export Full Analysis (JSON)", key="export_vel_json"):
+                # Build comprehensive export
+                export_data = {
+                    'metadata': {
+                        'ticker': ticker,
+                        'interval': interval,
+                        'period_years': years,
+                        'data_start': str(test_df_vel.index[0]),
+                        'data_end': str(test_df_vel.index[-1]),
+                        'total_bars': len(test_df_vel),
+                        'exported_at': datetime.now().isoformat()
+                    },
+                    'parameters': {
+                        'signal_type': signal_type,
+                        'oscillator_type': selected_oscillator,
+                        'vel_smoothing': vel_smoothing,
+                        'oversold_threshold': oversold_threshold,
+                        'overbought_threshold': overbought_threshold,
+                        'extreme_zone_mult': extreme_zone_mult,
+                        'min_bars_between': min_bars_between,
+                        'require_accel': require_accel,
+                        'stop_loss_pct': stop_loss_pct,
+                        'take_profit_pct': take_profit_pct,
+                        'exit_on_opposite_signal': exit_on_opposite_signal,
+                        'exit_on_midline_cross': exit_on_midline_cross,
+                        'rsi_filter': rsi_filter,
+                        'use_macd_confirm': use_macd_confirm,
+                        'use_bb_filter': use_bb_filter,
+                        'min_hold_bars': min_hold_bars
+                    },
+                    'statistics': {
+                        'total_trades': len(vel_exits),
+                        'winning_trades': len(vel_wins),
+                        'losing_trades': len(vel_losses),
+                        'win_rate': vel_win_rate,
+                        'total_return': vel_total_return,
+                        'profit_factor': vel_profit_factor,
+                        'avg_winner': sum(t.get('pnl', 0) for t in vel_wins) / len(vel_wins) if vel_wins else 0,
+                        'avg_loser': sum(t.get('pnl', 0) for t in vel_losses) / len(vel_losses) if vel_losses else 0,
+                        'avg_hold_days': sum((t['date'] - t['entry_date']).days for t in vel_exits if t.get('entry_date')) / len(vel_exits) if vel_exits else 0,
+                        'signals_per_year': len(vel_exits) / years if years > 0 else 0,
+                        'best_trade': max(t.get('pnl', 0) for t in vel_exits) if vel_exits else 0,
+                        'worst_trade': min(t.get('pnl', 0) for t in vel_exits) if vel_exits else 0
+                    },
+                    'trades': [
+                        {
+                            'trade_num': i + 1,
+                            'entry_date': str(t.get('entry_date', '')),
+                            'entry_time': t.get('entry_time', ''),
+                            'entry_price': t.get('entry_price', 0),
+                            'exit_date': str(t.get('date', '')),
+                            'exit_time': t.get('time', ''),
+                            'exit_price': t.get('price', 0),
+                            'pnl_pct': t.get('pnl', 0),
+                            'hold_days': (t['date'] - t['entry_date']).days if t.get('entry_date') else 0,
+                            'exit_reason': t.get('reason', 'Signal'),
+                            'entry_osc_value': t.get('osc_value', 0)
+                        }
+                        for i, t in enumerate(vel_exits)
+                    ],
+                    'open_position': {
+                        'entry_date': str(vel_open_position['entry_date']) if vel_open_position else None,
+                        'entry_price': vel_open_position['entry_price'] if vel_open_position else None,
+                        'current_price': vel_open_position['current_price'] if vel_open_position else None,
+                        'unrealized_pnl': vel_open_position['unrealized_pnl'] if vel_open_position else None
+                    } if vel_open_position else None
+                }
+
+                # Save to file
+                export_filename = f"velocity_backtest_{ticker}_{years}y_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                export_path = os.path.join(os.path.dirname(__file__), export_filename)
+
+                with open(export_path, 'w') as f:
+                    json.dump(export_data, f, indent=2, default=str)
+
+                st.success(f"✅ Exported to: {export_filename}")
+                st.json(export_data['statistics'])
+
+        with export_col2:
+            if st.button("📋 Export Trades (CSV)", key="export_vel_csv"):
+                # Build CSV-friendly trade list
+                csv_data = []
+                for i, t in enumerate(vel_exits):
+                    csv_data.append({
+                        'Trade #': i + 1,
+                        'Entry Date': str(t.get('entry_date', ''))[:10],
+                        'Entry Time': t.get('entry_time', ''),
+                        'Entry Price': t.get('entry_price', 0),
+                        'Exit Date': str(t.get('date', ''))[:10],
+                        'Exit Time': t.get('time', ''),
+                        'Exit Price': t.get('price', 0),
+                        'P&L %': t.get('pnl', 0),
+                        'Hold Days': (t['date'] - t['entry_date']).days if t.get('entry_date') else 0,
+                        'Exit Reason': t.get('reason', 'Signal'),
+                        'Entry Oscillator': t.get('osc_value', 0)
+                    })
+
+                csv_df = pd.DataFrame(csv_data)
+                csv_filename = f"velocity_trades_{ticker}_{years}y_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                csv_path = os.path.join(os.path.dirname(__file__), csv_filename)
+                csv_df.to_csv(csv_path, index=False)
+
+                st.success(f"✅ Exported to: {csv_filename}")
+                st.dataframe(csv_df.describe())
 
         # Comparison with Scipy
         st.subheader("Comparison: Velocity vs Scipy Peaks")
@@ -5794,32 +6557,43 @@ def render_strategy_discovery_section(df: pd.DataFrame):
 
             if refresh_clicked:
                 # Re-fetch data for the ticker
-                import yfinance as yf
                 with st.spinner(f"Fetching fresh data for {pred_ticker}..."):
                     # Check market status to determine if today's bar is complete
-                    # yfinance end is EXCLUSIVE, so we add 1 day to include that date
                     market_closed = False
                     if MARKET_UTILS_AVAILABLE:
                         market_status = is_market_open(pred_ticker)
                         market_closed = not market_status.get('is_open', True)
 
                     if market_closed:
-                        # Market closed - today's bar is complete, include it
-                        end_date = datetime.now() + timedelta(days=1)
                         data_msg = "today's close (market closed)"
                     else:
-                        # Market open - today's bar is incomplete, exclude it
-                        end_date = datetime.now()
                         data_msg = "yesterday's close (market open)"
 
                     # Use the same years setting from session state (default 5 years for range prediction)
                     years_setting = st.session_state.get('years', 5)
                     days_to_fetch = years_setting * 365
-                    start_date = datetime.now() - timedelta(days=days_to_fetch)
-                    fresh_df = yf.download(pred_ticker, start=start_date, end=end_date, interval=pred_interval, progress=False)
 
-                    if not fresh_df.empty:
-                        fresh_df.columns = fresh_df.columns.get_level_values(0) if isinstance(fresh_df.columns, pd.MultiIndex) else fresh_df.columns
+                    # Try Databento for futures, fallback to yfinance
+                    fresh_df = None
+                    if is_futures_ticker(pred_ticker) and DATABENTO_AVAILABLE and DATABENTO_API_KEY:
+                        try:
+                            fresh_df = _fetch_futures_from_databento(pred_ticker, days=days_to_fetch, interval=pred_interval)
+                        except Exception as e:
+                            print(f"Databento refresh failed: {e}")
+
+                    if fresh_df is None or fresh_df.empty:
+                        # Fallback to yfinance
+                        import yfinance as yf
+                        if market_closed:
+                            end_date = datetime.now() + timedelta(days=1)
+                        else:
+                            end_date = datetime.now()
+                        start_date = datetime.now() - timedelta(days=days_to_fetch)
+                        fresh_df = yf.download(pred_ticker, start=start_date, end=end_date, interval=pred_interval, progress=False)
+
+                    if fresh_df is not None and not fresh_df.empty:
+                        if isinstance(fresh_df.columns, pd.MultiIndex):
+                            fresh_df.columns = fresh_df.columns.get_level_values(0)
                         fresh_df.columns = fresh_df.columns.str.lower()
                         st.session_state['df'] = fresh_df
                         st.success(f"Refreshed with {data_msg}! {len(fresh_df)} bars, last close: ${fresh_df['close'].iloc[-1]:,.2f}")
@@ -5862,7 +6636,7 @@ def render_strategy_discovery_section(df: pd.DataFrame):
 
             st.info(f"Loading data for **{pred_ticker}** ({pred_interval}) from saved strategy...")
 
-            # Fetch fresh data using yfinance
+            # Fetch fresh data (Databento for futures, yfinance fallback)
             @st.cache_data(ttl=60)  # Cache for 1 minute (reduced from 5)
             def fetch_strategy_data(ticker: str, interval: str, days: int = 1825, include_today: bool = False):
                 """Fetch fresh data for a strategy.
@@ -5872,12 +6646,6 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     include_today: If True, extends end_date to include today's data.
                                    Should be True when market is closed.
                 """
-                import yfinance as yf
-                # yfinance end is EXCLUSIVE, add 1 day to include today when market is closed
-                if include_today:
-                    end_date = datetime.now() + timedelta(days=1)
-                else:
-                    end_date = datetime.now()
                 fetch_time = datetime.now()  # Track when data was fetched
 
                 # Adjust days based on interval limitations
@@ -5887,6 +6655,22 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     max_days = min(days, 729)
                 else:
                     max_days = days
+
+                # Try Databento for futures
+                if is_futures_ticker(ticker) and DATABENTO_AVAILABLE and DATABENTO_API_KEY:
+                    try:
+                        df = _fetch_futures_from_databento(ticker, days=max_days, interval=interval)
+                        if not df.empty:
+                            return df, fetch_time
+                    except Exception as e:
+                        print(f"Databento failed for {ticker}: {e}")
+
+                # Fallback to yfinance
+                import yfinance as yf
+                if include_today:
+                    end_date = datetime.now() + timedelta(days=1)
+                else:
+                    end_date = datetime.now()
 
                 start_date = datetime.now() - timedelta(days=max_days)
 
@@ -7702,7 +8486,27 @@ def render_strategy_discovery_section(df: pd.DataFrame):
             # ==================== FIND BEST MODEL SECTION ====================
             st.markdown("---")
             st.markdown("##### Find Best Model Configuration")
-            st.caption("*Test all model combinations (Ridge, XGBoost, LightGBM, Ensembles × Top5-50, ALL features) and rank by R²*")
+
+            # Exhaustive search option
+            fbm_exhaustive = st.checkbox(
+                "**Exhaustive Search** (test ALL HIGH×LOW combinations)",
+                value=True,
+                help="If enabled, tests every combination of HIGH and LOW model independently (e.g., HIGH=Ridge_Top15, LOW=XGBoost_Top30). "
+                     "This finds the true optimal pairing but takes longer (~2400 combinations). "
+                     "If disabled, uses same model for both HIGH and LOW (~49 combinations)."
+            )
+
+            # Calculate and display config count
+            try:
+                from price_prediction import get_model_config_count
+                n_configs = get_model_config_count(exhaustive=fbm_exhaustive)
+                if fbm_exhaustive:
+                    n_individual = int(np.sqrt(n_configs))
+                    st.caption(f"*Testing {n_individual} HIGH models × {n_individual} LOW models = **{n_configs:,} combinations** (sorted by composite score)*")
+                else:
+                    st.caption(f"*Testing {n_configs} configurations (same model for HIGH and LOW, sorted by composite score)*")
+            except:
+                st.caption("*Test all model combinations and rank by composite score*")
 
             fbm_col1, fbm_col2, fbm_col3, fbm_col4 = st.columns([2, 2, 2, 2])
             with fbm_col1:
@@ -7723,11 +8527,11 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                 )
             with fbm_col3:
                 fbm_workers = st.number_input(
-                    "Workers",
-                    min_value=1,
-                    max_value=32,
-                    value=min(8, max(1, (os.cpu_count() or 4) - 1)),
-                    help="Parallel workers for testing"
+                    "Workers (CPU cores)",
+                    min_value=-1,
+                    max_value=64,
+                    value=-1,
+                    help="-1 = use ALL available cores (recommended). Otherwise specify number of parallel workers."
                 )
             with fbm_col4:
                 fbm_ci_level = st.selectbox(
@@ -7778,7 +8582,15 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                 if len(pred_df) < fbm_train_window + fbm_test_days:
                     st.error(f"Insufficient data. Need at least {fbm_train_window + fbm_test_days} days, have {len(pred_df)}.")
                 else:
-                    st.info(f"Testing all model combinations on {fbm_test_days} days with {fbm_train_window}-day training window...")
+                    # Get config count for display
+                    try:
+                        from price_prediction import get_model_config_count
+                        n_configs = get_model_config_count(exhaustive=fbm_exhaustive)
+                    except:
+                        n_configs = "?"
+                    mode_str = "EXHAUSTIVE (all HIGH×LOW combinations)" if fbm_exhaustive else "STANDARD (same model for HIGH and LOW)"
+                    workers_str = f"ALL {os.cpu_count()} cores" if fbm_workers == -1 else f"{fbm_workers} workers"
+                    st.info(f"🚀 **{mode_str}**: Testing {n_configs:,} configurations on {fbm_test_days} days with {fbm_train_window}-day window using {workers_str}...")
 
                     # Setup progress tracking
                     import tempfile
@@ -7806,6 +8618,7 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     _train_window = fbm_train_window
                     _ci_level = fbm_ci_level
                     _n_workers = fbm_workers
+                    _exhaustive = fbm_exhaustive
                     _progress_file = fbm_progress_file
 
                     def run_find_best():
@@ -7819,6 +8632,7 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                 train_window=_train_window,
                                 ci_level=_ci_level,
                                 n_workers=_n_workers,
+                                exhaustive=_exhaustive,
                                 progress_file=_progress_file
                             )
                         except Exception as e:
@@ -7988,7 +8802,14 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     st.error(f"Insufficient data. Need at least {fbm_train_window + fbm_test_days} days, have {len(pred_df)}.")
                 else:
                     st.markdown("### 🚀 Running Complete Model Comparison")
-                    st.info(f"Testing ALL fixed models + ALL regime configs on {fbm_test_days} days...")
+                    try:
+                        from price_prediction import get_model_config_count
+                        n_configs = get_model_config_count(exhaustive=fbm_exhaustive)
+                    except:
+                        n_configs = "?"
+                    mode_str = "EXHAUSTIVE" if fbm_exhaustive else "STANDARD"
+                    workers_str = f"ALL {os.cpu_count()} cores" if fbm_workers == -1 else f"{fbm_workers} workers"
+                    st.info(f"**{mode_str}**: Testing {n_configs:,} fixed models + regime configs on {fbm_test_days} days using {workers_str}...")
 
                     import threading
                     import time as time_module
@@ -8013,6 +8834,7 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     _train_window = fbm_train_window
                     _ci_level = fbm_ci_level
                     _n_workers = fbm_workers
+                    _exhaustive = fbm_exhaustive
                     _progress_file = fbm_progress_file
 
                     def run_fixed_models():
@@ -8025,6 +8847,7 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                 train_window=_train_window,
                                 ci_level=_ci_level,
                                 n_workers=_n_workers,
+                                exhaustive=_exhaustive,
                                 progress_file=_progress_file
                             )
                         except Exception as e:
@@ -8142,9 +8965,14 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                             all_results.append({
                                 'Type': 'FIXED',
                                 'Name': r.get('name', 'Unknown'),
+                                'Composite': r.get('composite_avg', 0),
+                                'Comp HIGH': r.get('composite_high', 0),
+                                'Comp LOW': r.get('composite_low', 0),
                                 'R² Avg': r.get('r2_avg', 0),
                                 'R² HIGH': r.get('r2_high', 0),
                                 'R² LOW': r.get('r2_low', 0),
+                                'MAPE HIGH': r.get('mape_high', 0),
+                                'MAPE LOW': r.get('mape_low', 0),
                                 'MAE HIGH': r.get('mae_high', 0),
                                 'MAE LOW': r.get('mae_low', 0),
                                 'N': r.get('n_predictions', 0),
@@ -8157,17 +8985,22 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                             all_results.append({
                                 'Type': 'REGIME',
                                 'Name': r.get('name', 'Unknown'),
+                                'Composite': r.get('composite_avg', 0),
+                                'Comp HIGH': r.get('composite_high', 0),
+                                'Comp LOW': r.get('composite_low', 0),
                                 'R² Avg': r.get('r2_avg', 0),
                                 'R² HIGH': r.get('r2_high', 0),
                                 'R² LOW': r.get('r2_low', 0),
+                                'MAPE HIGH': r.get('mape_high', 0),
+                                'MAPE LOW': r.get('mape_low', 0),
                                 'MAE HIGH': r.get('mae_high', 0),
                                 'MAE LOW': r.get('mae_low', 0),
                                 'N': r.get('n_predictions', 0),
                                 'raw_result': r
                             })
 
-                    # Sort by R² Avg
-                    all_results.sort(key=lambda x: x['R² Avg'], reverse=True)
+                    # Sort by Composite score (same metric used in training optimization)
+                    all_results.sort(key=lambda x: x['Composite'], reverse=True)
 
                     # Store in session state
                     st.session_state['all_model_results'] = all_results
@@ -8222,14 +9055,29 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                 st.markdown("---")
                 st.markdown(f"## 🥇 BEST OVERALL: **{winner['Name']}** ({winner['Type']})")
 
-                winner_cols = st.columns(4)
-                with winner_cols[0]:
+                # Composite score row (primary metric)
+                winner_cols1 = st.columns(4)
+                with winner_cols1[0]:
+                    st.metric("Composite Avg", f"{winner.get('Composite', 0):.4f}",
+                              help="0.6×R² + 0.4×(1-MAPE/100) - same as training optimization")
+                with winner_cols1[1]:
+                    st.metric("Composite HIGH", f"{winner.get('Comp HIGH', 0):.4f}")
+                with winner_cols1[2]:
+                    st.metric("Composite LOW", f"{winner.get('Comp LOW', 0):.4f}")
+                with winner_cols1[3]:
+                    mape_h = winner.get('MAPE HIGH', 0)
+                    mape_l = winner.get('MAPE LOW', 0)
+                    st.metric("MAPE H/L", f"{mape_h:.1f}% / {mape_l:.1f}%")
+
+                # R² row (secondary metric)
+                winner_cols2 = st.columns(4)
+                with winner_cols2[0]:
                     st.metric("R² Average", f"{winner['R² Avg']:.4f}")
-                with winner_cols[1]:
+                with winner_cols2[1]:
                     st.metric("R² HIGH", f"{winner['R² HIGH']:.4f}")
-                with winner_cols[2]:
+                with winner_cols2[2]:
                     st.metric("R² LOW", f"{winner['R² LOW']:.4f}")
-                with winner_cols[3]:
+                with winner_cols2[3]:
                     st.metric("MAE Avg", f"${(winner['MAE HIGH'] + winner['MAE LOW'])/2:.2f}")
 
                 # Quick apply button for winner
@@ -8255,7 +9103,7 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     selected_idx = st.selectbox(
                         "Choose model to apply",
                         options=range(len(all_model_results)),
-                        format_func=lambda i: f"#{i+1} {all_model_results[i]['Type']}: {all_model_results[i]['Name']} (R²={all_model_results[i]['R² Avg']:.4f})",
+                        format_func=lambda i: f"#{i+1} {all_model_results[i]['Type']}: {all_model_results[i]['Name']} (Comp={all_model_results[i].get('Composite', 0):.3f}, R²={all_model_results[i]['R² Avg']:.3f})",
                         key="select_from_all_results"
                     )
                 with select_col2:
@@ -8293,6 +9141,9 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                 # Display as table
                 regime_df = pd.DataFrame([{
                     'Config': r['name'],
+                    'Composite': r.get('composite_avg', 0),
+                    'Comp H': r.get('composite_high', 0),
+                    'Comp L': r.get('composite_low', 0),
                     'R² Avg': r['r2_avg'],
                     'R² HIGH': r['r2_high'],
                     'R² LOW': r['r2_low'],
@@ -8303,13 +9154,16 @@ def render_strategy_discovery_section(df: pd.DataFrame):
 
                 st.dataframe(
                     regime_df.style.format({
+                        'Composite': '{:.4f}',
+                        'Comp H': '{:.4f}',
+                        'Comp L': '{:.4f}',
                         'R² Avg': '{:.4f}',
                         'R² HIGH': '{:.4f}',
                         'R² LOW': '{:.4f}',
                         'MAE HIGH': '{:.4f}',
                         'MAE LOW': '{:.4f}',
                         'N': '{:.0f}'
-                    }).background_gradient(subset=['R² Avg'], cmap='Greens'),
+                    }).background_gradient(subset=['Composite'], cmap='Greens'),
                     use_container_width=True,
                     height=250
                 )
@@ -8346,34 +9200,53 @@ def render_strategy_discovery_section(df: pd.DataFrame):
             model_comparison_results = st.session_state.get('model_comparison_results')
             if model_comparison_results:
                 st.markdown("##### Model Comparison Results")
-                st.caption(f"*Sorted by R² Average (best first) - {len(model_comparison_results)} configurations tested*")
+                st.caption(f"*Sorted by Composite Score (best first) - {len(model_comparison_results)} configurations tested*")
 
                 # Convert to dataframe for display
                 results_df = pd.DataFrame(model_comparison_results)
 
-                # Format columns
-                display_cols = ['name', 'r2_avg', 'r2_high', 'r2_low', 'mae_high', 'mae_low',
-                               'containment_high', 'containment_low', 'bias_high', 'bias_low', 'n_predictions']
+                # Format columns - include composite scores if available
+                base_cols = ['name', 'r2_avg', 'r2_high', 'r2_low', 'mae_high', 'mae_low',
+                            'containment_high', 'containment_low', 'bias_high', 'bias_low', 'n_predictions']
+                comp_cols = ['composite_avg', 'composite_high', 'composite_low']
 
-                if all(col in results_df.columns for col in display_cols):
-                    display_df = results_df[display_cols].copy()
-                    display_df.columns = ['Model', 'R² Avg', 'R² HIGH', 'R² LOW', 'MAE HIGH', 'MAE LOW',
-                                         'Cont HIGH%', 'Cont LOW%', 'Bias HIGH', 'Bias LOW', 'N']
+                # Check if composite columns exist
+                has_composite = all(col in results_df.columns for col in comp_cols)
 
-                    # Highlight best model
+                if has_composite:
+                    display_cols = ['name', 'composite_avg', 'composite_high', 'composite_low',
+                                   'r2_avg', 'r2_high', 'r2_low', 'containment_high', 'containment_low', 'n_predictions']
+                    if all(col in results_df.columns for col in display_cols):
+                        display_df = results_df[display_cols].copy()
+                        display_df.columns = ['Model', 'Comp Avg', 'Comp H', 'Comp L',
+                                             'R² Avg', 'R² HIGH', 'R² LOW', 'Cont H%', 'Cont L%', 'N']
+                        gradient_col = 'Comp Avg'
+                    else:
+                        has_composite = False
+
+                if not has_composite:
+                    display_cols = ['name', 'r2_avg', 'r2_high', 'r2_low', 'mae_high', 'mae_low',
+                                   'containment_high', 'containment_low', 'bias_high', 'bias_low', 'n_predictions']
+                    if all(col in results_df.columns for col in display_cols):
+                        display_df = results_df[display_cols].copy()
+                        display_df.columns = ['Model', 'R² Avg', 'R² HIGH', 'R² LOW', 'MAE HIGH', 'MAE LOW',
+                                             'Cont HIGH%', 'Cont LOW%', 'Bias HIGH', 'Bias LOW', 'N']
+                        gradient_col = 'R² Avg'
+
+                if 'display_df' in dir():
+                    # Build format dict dynamically based on available columns
+                    format_dict = {}
+                    for col in display_df.columns:
+                        if 'Comp' in col or 'R²' in col or 'Bias' in col or 'MAE' in col:
+                            format_dict[col] = '{:.4f}'
+                        elif 'Cont' in col:
+                            format_dict[col] = '{:.1f}'
+                        elif col == 'N':
+                            format_dict[col] = '{:.0f}'
+
+                    # Highlight best model by gradient column
                     st.dataframe(
-                        display_df.style.format({
-                            'R² Avg': '{:.4f}',
-                            'R² HIGH': '{:.4f}',
-                            'R² LOW': '{:.4f}',
-                            'MAE HIGH': '{:.4f}',
-                            'MAE LOW': '{:.4f}',
-                            'Cont HIGH%': '{:.1f}',
-                            'Cont LOW%': '{:.1f}',
-                            'Bias HIGH': '{:.4f}',
-                            'Bias LOW': '{:.4f}',
-                            'N': '{:.0f}'
-                        }).background_gradient(subset=['R² Avg'], cmap='Greens'),
+                        display_df.style.format(format_dict).background_gradient(subset=[gradient_col], cmap='Greens'),
                         use_container_width=True,
                         height=400
                     )
@@ -8382,6 +9255,20 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     best = model_comparison_results[0]
                     st.markdown(f"**Best Model: {best['name']}**")
 
+                    # Composite scores row (if available)
+                    if 'composite_avg' in best:
+                        comp_cols = st.columns(4)
+                        with comp_cols[0]:
+                            st.metric("Composite Avg", f"{best.get('composite_avg', 0):.4f}",
+                                      help="0.6×R² + 0.4×(1-MAPE/100)")
+                        with comp_cols[1]:
+                            st.metric("Comp HIGH", f"{best.get('composite_high', 0):.4f}")
+                        with comp_cols[2]:
+                            st.metric("Comp LOW", f"{best.get('composite_low', 0):.4f}")
+                        with comp_cols[3]:
+                            st.metric("MAPE H/L", f"{best.get('mape_high', 0):.1f}% / {best.get('mape_low', 0):.1f}%")
+
+                    # R² row
                     best_cols = st.columns(4)
                     with best_cols[0]:
                         st.metric("R² Average", f"{best['r2_avg']:.4f}")
@@ -8397,10 +9284,17 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     apply_col1, apply_col2 = st.columns([3, 1])
 
                     with apply_col1:
+                        # Format with composite if available
+                        def format_model(i):
+                            m = model_comparison_results[i]
+                            if 'composite_avg' in m:
+                                return f"{i+1}. {m['name']} (Comp={m['composite_avg']:.3f}, R²={m['r2_avg']:.3f})"
+                            return f"{i+1}. {m['name']} (R²={m['r2_avg']:.4f})"
+
                         selected_model_idx = st.selectbox(
                             "Select model to apply",
                             options=range(len(model_comparison_results)),
-                            format_func=lambda i: f"{i+1}. {model_comparison_results[i]['name']} (R²={model_comparison_results[i]['r2_avg']:.4f})",
+                            format_func=format_model,
                             key="selected_model_to_apply"
                         )
 
@@ -8424,6 +9318,11 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                                 'name': selected['name'],
                                 'wf_config': st.session_state['wf_config'].copy(),
                                 'metrics': {
+                                    'composite_avg': selected.get('composite_avg', 0),
+                                    'composite_high': selected.get('composite_high', 0),
+                                    'composite_low': selected.get('composite_low', 0),
+                                    'mape_high': selected.get('mape_high', 0),
+                                    'mape_low': selected.get('mape_low', 0),
                                     'r2_high': selected['r2_high'],
                                     'r2_low': selected['r2_low'],
                                     'r2_avg': selected['r2_avg'],
@@ -9043,6 +9942,33 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                 ss_tot_low = ((actual_low_dev - actual_low_dev.mean()) ** 2).sum()
                 test_r2_low = 1 - (ss_res_low / ss_tot_low) if ss_tot_low > 0 else 0
 
+                # ================================================================
+                # COMPOSITE SCORE (matches training optimization metric)
+                # Formula: 0.6 * R² + 0.4 * (1 - MAPE/100)
+                # This is the same metric used during model training in optuna_worker.py
+                # ================================================================
+                # MAPE for HIGH (using deviations to match R² calculation)
+                actual_high_dev_safe = np.clip(np.abs(actual_high_dev), 0.01, None)
+                high_mape = np.mean(np.abs(actual_high_dev - pred_high_dev) / actual_high_dev_safe) * 100
+                high_mape = min(high_mape, 100)  # Cap at 100%
+
+                # MAPE for LOW (using deviations to match R² calculation)
+                actual_low_dev_safe = np.clip(np.abs(actual_low_dev), 0.01, None)
+                low_mape = np.mean(np.abs(actual_low_dev - pred_low_dev) / actual_low_dev_safe) * 100
+                low_mape = min(low_mape, 100)  # Cap at 100%
+
+                # Composite scores (same formula as training optimization)
+                r2_comp_high = max(0, test_r2_high)  # Clip negative R² to 0 for composite
+                mape_comp_high = max(0, 1 - high_mape / 100)  # Convert MAPE to 0-1 scale
+                composite_high = 0.6 * r2_comp_high + 0.4 * mape_comp_high
+
+                r2_comp_low = max(0, test_r2_low)  # Clip negative R² to 0 for composite
+                mape_comp_low = max(0, 1 - low_mape / 100)  # Convert MAPE to 0-1 scale
+                composite_low = 0.6 * r2_comp_low + 0.4 * mape_comp_low
+
+                # Average composite score
+                composite_avg = (composite_high + composite_low) / 2
+
                 with r2_col1:
                     st.metric("Train R² (avg)", f"{avg_train_r2:.3f}",
                               help="Average R² from training periods (how well model fits training data)")
@@ -9059,6 +9985,25 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                 with r2_col4:
                     st.metric("Train RMSE (avg)", f"{avg_train_rmse:.2f}%",
                               help="Average RMSE from training periods")
+
+                # Composite scores row (same metric used during training)
+                comp_col1, comp_col2, comp_col3, comp_col4 = st.columns(4)
+                with comp_col1:
+                    # Color-code composite avg
+                    comp_color = "🟢" if composite_avg > 0.3 else "🟡" if composite_avg > 0.2 else "🔴"
+                    st.metric(f"Composite Avg {comp_color}", f"{composite_avg:.3f}",
+                              help="Average composite score (0.6*R² + 0.4*MAPE). Same metric used in training optimization.")
+                with comp_col2:
+                    high_comp_color = "🟢" if composite_high > 0.3 else "🟡" if composite_high > 0.2 else "🔴"
+                    st.metric(f"Composite HIGH {high_comp_color}", f"{composite_high:.3f}",
+                              help=f"HIGH composite: 0.6×{r2_comp_high:.2f} + 0.4×{mape_comp_high:.2f}")
+                with comp_col3:
+                    low_comp_color = "🟢" if composite_low > 0.3 else "🟡" if composite_low > 0.2 else "🔴"
+                    st.metric(f"Composite LOW {low_comp_color}", f"{composite_low:.3f}",
+                              help=f"LOW composite: 0.6×{r2_comp_low:.2f} + 0.4×{mape_comp_low:.2f}")
+                with comp_col4:
+                    st.metric("MAPE HIGH/LOW", f"{high_mape:.1f}% / {low_mape:.1f}%",
+                              help="Mean Absolute Percentage Error for HIGH and LOW predictions")
 
                 # Explain negative R² if present
                 if test_r2_low < 0:
@@ -9090,6 +10035,12 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                         'train_rmse_avg': avg_train_rmse,
                         'confidence_method': 'quantile_regression' if quantile_pct > 50 else 'rmse_fallback',
                         'quantile_pct': quantile_pct,
+                        # Composite scores (same metric used during training optimization)
+                        'composite_high': composite_high,
+                        'composite_low': composite_low,
+                        'composite_avg': composite_avg,
+                        'high_mape': high_mape,
+                        'low_mape': low_mape,
                     }
 
                     # Extract model type info from results (if available)

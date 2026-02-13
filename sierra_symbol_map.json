@@ -1,0 +1,16 @@
+{
+  "SPY": "ES",
+  "QQQ": "NQ",
+  "IWM": "RTY",
+  "BTC-USD": "BTC.CME",
+  "ETH-USD": "ETH.CME",
+  "GC=F": "GC",
+  "ES=F": "ES",
+  "NQ=F": "NQ",
+  "RTY=F": "RTY",
+  "CL=F": "CL",
+  "SI=F": "SI",
+  "^GSPC": "ES",
+  "^NDX": "NQ",
+  "^RUT": "RTY"
+}

@@ -103,6 +103,15 @@ except ImportError:
         except Exception:
             return default
 
+# Import v9 regime detection (optional — graceful fallback if not available)
+try:
+    from velocity_trading.core.regime_detector_v9 import (
+        classify_regimes, REGIME_NAMES, REGIME_UPTREND, REGIME_DOWNTREND, REGIME_CHOP,
+    )
+    V9_REGIME_AVAILABLE = True
+except ImportError:
+    V9_REGIME_AVAILABLE = False
+
 # Import oscillator calculations directly from Streamlit source of truth
 from oscillator_predictor_page import (
     create_composite_oscillator,
@@ -1868,15 +1877,43 @@ def calculate_velocity_signals(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     use_macd_confirm = config.get('use_macd_confirm', False)
     use_bb_filter = config.get('use_bb_filter', False)
 
-    # Use smoothed oscillator
-    osc_col = 'composite_smooth' if 'composite_smooth' in df.columns else 'composite_oscillator'
+    # Use the oscillator specified in config - check if novel oscillator was already calculated
+    oscillator_type = config.get('oscillator_type', 'composite_smooth')
 
-    # Apply smoothing
-    if vel_smoothing > 1:
-        df['osc_smooth'] = df[osc_col].rolling(window=vel_smoothing, center=False).mean()
-        df['osc_smooth'] = df['osc_smooth'].bfill()
+    # If using a novel oscillator (arwo, dco, etc), osc_smooth was already set by calculate_composite_oscillator
+    # Don't overwrite it with composite_smooth!
+    if oscillator_type != 'composite_smooth' and 'osc_smooth' in df.columns:
+        # Novel oscillator already calculated - just apply smoothing if needed
+        if vel_smoothing > 1:
+            df['osc_smooth'] = df['osc_smooth'].rolling(window=vel_smoothing, center=False).mean()
+            df['osc_smooth'] = df['osc_smooth'].bfill()
+        # osc_smooth is already set correctly, don't overwrite
     else:
-        df['osc_smooth'] = df[osc_col]
+        # Use composite oscillator
+        osc_col = 'composite_smooth' if 'composite_smooth' in df.columns else 'composite_oscillator'
+        # Apply smoothing
+        if vel_smoothing > 1:
+            df['osc_smooth'] = df[osc_col].rolling(window=vel_smoothing, center=False).mean()
+            df['osc_smooth'] = df['osc_smooth'].bfill()
+        else:
+            df['osc_smooth'] = df[osc_col]
+
+    # Apply wavelet denoising if enabled
+    if config.get('use_wavelet_denoise', False):
+        try:
+            import pywt
+            raw = df['osc_smooth'].values.copy()
+            family = config.get('wavelet_family', 'db4')
+            level = config.get('wavelet_level', 2)
+            mode = config.get('wavelet_threshold_mode', 'hard')
+            coeffs = pywt.wavedec(raw, family, level=level)
+            sigma = np.median(np.abs(coeffs[-1])) / 0.6745
+            threshold = sigma * np.sqrt(2 * np.log(len(raw)))
+            denoised = [coeffs[0]] + [pywt.threshold(c, threshold, mode=mode) for c in coeffs[1:]]
+            osc_denoised = pywt.waverec(denoised, family)[:len(raw)]
+            df['osc_smooth'] = pd.Series(osc_denoised, index=df.index)
+        except Exception as e:
+            print(f"   Wavelet denoising failed: {e}")
 
     # Calculate velocity (first derivative), acceleration (second derivative), and jerk (third derivative)
     df['velocity'] = df['osc_smooth'].diff()
@@ -2665,6 +2702,19 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                 # Look up in date_to_barnum mapping
                 if target_date in date_to_barnum:
                     return date_to_barnum[target_date]
+
+                # For DAILY charts: try date-only matching (ignore time component)
+                # This fixes issues where entry dates and bar dates have different times
+                if not is_intraday:
+                    target_date_only = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                    if target_date_only in date_to_barnum:
+                        return date_to_barnum[target_date_only]
+                    # Also try the original date's date portion
+                    for dt, bar in date_to_barnum.items():
+                        if hasattr(dt, 'date') and hasattr(target_date, 'date'):
+                            if dt.date() == target_date.date():
+                                return bar
+
                 # Try to find closest date (within 1 interval)
                 closest_bar = None
                 min_diff = None
@@ -2714,7 +2764,17 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                 entry_date = normalize_tz(entry_date)
 
                 # SKIP markers outside the chart's date range (prevents clustering at edges)
-                if entry_date < chart_start or entry_date > chart_end:
+                # For DAILY charts: use date-only comparison to handle timezone/time mismatches
+                if is_intraday:
+                    outside_range = entry_date < chart_start or entry_date > chart_end
+                else:
+                    # Daily charts: compare dates only (ignore time component)
+                    entry_date_only = entry_date.date() if hasattr(entry_date, 'date') else entry_date
+                    chart_start_date = chart_start.date() if hasattr(chart_start, 'date') else chart_start
+                    chart_end_date = chart_end.date() if hasattr(chart_end, 'date') else chart_end
+                    outside_range = entry_date_only < chart_start_date or entry_date_only > chart_end_date
+
+                if outside_range:
                     if entries_total <= 20:  # Only log for low-volume strategies
                         print(f"   [Chart] Skipping entry {entry_date} - outside range [{chart_start} to {chart_end}]")
                     continue
@@ -2786,7 +2846,17 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
                 exit_date = normalize_tz(exit_date)
 
                 # SKIP markers outside the chart's date range (prevents clustering at edges)
-                if exit_date < chart_start or exit_date > chart_end:
+                # For DAILY charts: use date-only comparison to handle timezone/time mismatches
+                if is_intraday:
+                    outside_range = exit_date < chart_start or exit_date > chart_end
+                else:
+                    # Daily charts: compare dates only (ignore time component)
+                    exit_date_only = exit_date.date() if hasattr(exit_date, 'date') else exit_date
+                    chart_start_date = chart_start.date() if hasattr(chart_start, 'date') else chart_start
+                    chart_end_date = chart_end.date() if hasattr(chart_end, 'date') else chart_end
+                    outside_range = exit_date_only < chart_start_date or exit_date_only > chart_end_date
+
+                if outside_range:
                     continue
 
                 # SKIP exits whose entry occurred AFTER tracked position entry
@@ -2967,7 +3037,9 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
 
             # Add a STAR marker for the tracked position entry point
             # This visually distinguishes the user's ACTUAL position from historical backtest markers
-            tracked_entry_time = current_position.get('entry_time') or current_position.get('entry_signal_bar')
+            # IMPORTANT: Use entry_signal_bar (bar START time) for chart placement, NOT entry_time (bar CLOSE time)
+            # For daily data especially, entry_time is 24h after the bar index, causing marker to be placed on wrong bar
+            tracked_entry_time = current_position.get('entry_signal_bar') or current_position.get('entry_time')
             if tracked_entry_time:
                 try:
                     tracked_entry_dt = normalize_tz(pd.to_datetime(tracked_entry_time))
@@ -3087,10 +3159,10 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
         ax3.legend(loc='upper left', facecolor='#1a1a2e', labelcolor='white', fontsize='small')
         format_xaxis(ax3)
 
-        # 4. Equity Curve - Use backtest (period-specific) for equity to match displayed timeframe
+        # 4. Equity Curve - Use locked_backtest (frozen historical data) to prevent repainting
         # For "signal" charts, filter exits to match df_plot date range so equity curve matches price chart
         ax4 = axes[3]
-        equity_source = backtest if backtest and backtest.get('exits') else locked_backtest
+        equity_source = locked_backtest if locked_backtest and locked_backtest.get('exits') else backtest
         STARTING_CAPITAL = 100000  # $100k starting capital
 
         # Initialize exits_for_equity (used for both equity curve and stats)
@@ -3227,9 +3299,9 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
         ax4.set_ylabel("Equity ($)", color='white')
         ax4.set_xlabel("Date", color='white')
 
-        # Stats annotation - Use backtest (period-specific) to match displayed timeframe
+        # Stats annotation - Use locked_backtest (frozen data) to prevent repainting
         # For signal charts, calculate stats from filtered exits to match visible period
-        stats_source = backtest if backtest and backtest.get('num_trades') else locked_backtest
+        stats_source = locked_backtest if locked_backtest and locked_backtest.get('num_trades') else backtest
 
         # For signal charts, ALWAYS recalculate stats from filtered exits to match equity curve
         # This ensures stats shown match the visible chart period, not full backtest
@@ -3287,6 +3359,45 @@ def generate_velocity_chart(df: pd.DataFrame, backtest: dict, config: dict, tick
         return None
 
 
+def compute_bar_regimes(df, config):
+    """Compute regime classification for each bar. Returns (regimes, is_high_vol, regime_names_map).
+    Only active when config has regime_aware=True and v9 module is available."""
+    if not config.get('regime_aware', False) or not V9_REGIME_AVAILABLE:
+        return None, None
+
+    rd = config.get('regime_detector', {})
+    close_col = 'close' if 'close' in df.columns else 'Close'
+    high_col = 'high' if 'high' in df.columns else 'High'
+    low_col = 'low' if 'low' in df.columns else 'Low'
+
+    regimes, is_high_vol = classify_regimes(
+        df[high_col].values.astype(float),
+        df[low_col].values.astype(float),
+        df[close_col].values.astype(float),
+        adx_period=rd.get('adx_period', 14),
+        adx_threshold=rd.get('adx_threshold', 25.0),
+        atr_period=rd.get('atr_period', 14),
+        atr_high_vol_percentile=rd.get('atr_high_vol_percentile', 90.0),
+        atr_high_vol_lookback=rd.get('atr_high_vol_lookback', 100),
+        regime_min_bars=rd.get('regime_min_bars', 4),
+    )
+    return regimes, is_high_vol
+
+
+def get_regime_params(config, regime_id):
+    """Get the regime-specific config dict for a given regime_id.
+    Falls back to top-level config if regime_aware is off."""
+    if not config.get('regime_aware', False):
+        return config
+
+    regime_params = config.get('regime_params', {})
+    regime_name = REGIME_NAMES.get(regime_id, 'chop')
+    r_config = regime_params.get(regime_name, {})
+    if r_config.get('dont_trade', False):
+        return None  # Signal: don't trade this regime
+    return r_config
+
+
 def run_historical_backtest(df: pd.DataFrame, config: dict) -> dict:
     """
     Run a backtest on historical data to determine current state.
@@ -3295,10 +3406,36 @@ def run_historical_backtest(df: pd.DataFrame, config: dict) -> dict:
     IMPORTANT: All trade dates use BAR CLOSE time (when the signal fires and trade executes),
     not bar START time. This matches how live trading works.
     """
-    # Calculate signals
-    df = calculate_velocity_signals(df, config)
+    # Regime-aware mode: compute regimes and per-regime signals
+    is_regime_aware = config.get('regime_aware', False) and V9_REGIME_AVAILABLE
+    regimes = None
+    is_high_vol = None
+    regime_signal_dfs = {}  # regime_name -> df with that regime's signals
 
-    # Get config params
+    if is_regime_aware:
+        regimes, is_high_vol = compute_bar_regimes(df, config)
+        suppress_high_vol = config.get('regime_detector', {}).get('suppress_entries_high_vol', True)
+        # Generate signals for each regime's config
+        regime_params_dict = config.get('regime_params', {})
+        for regime_name, r_cfg in regime_params_dict.items():
+            if r_cfg.get('dont_trade', False):
+                continue
+            # Merge top-level wavelet/oscillator settings into regime config
+            merged = {**config, **r_cfg}
+            regime_signal_dfs[regime_name] = calculate_velocity_signals(df.copy(), merged)
+        # Use first active regime's df for shared columns (osc_smooth, velocity, etc.)
+        if regime_signal_dfs:
+            first_regime_df = next(iter(regime_signal_dfs.values()))
+            for col in ['osc_smooth', 'velocity', 'acceleration', 'jerk']:
+                if col in first_regime_df.columns:
+                    df[col] = first_regime_df[col]
+        # Also generate default signals for charting (uses top-level config)
+        df = calculate_velocity_signals(df, config)
+    else:
+        # Standard v8 path
+        df = calculate_velocity_signals(df, config)
+
+    # Get default config params (v8 or fallback)
     stop_loss_pct = config.get('stop_loss_pct', 5.0)
     take_profit_pct = config.get('take_profit_pct', 10.0)
     min_bars_between = config.get('min_bars_between', 1)
@@ -3326,6 +3463,7 @@ def run_historical_backtest(df: pd.DataFrame, config: dict) -> dict:
     entry_price = None
     entry_date = None
     entry_osc = None
+    entry_regime = None  # Track which regime we entered under (for v9)
     last_trade_bar = -min_bars_between
     trades = []
 
@@ -3334,47 +3472,71 @@ def run_historical_backtest(df: pd.DataFrame, config: dict) -> dict:
         price = row['close']
         bar_start_time = df.index[i]
         bar_close_time = bar_start_time + bar_offset  # When signal fires and trade executes
-        osc = row['osc_smooth']
+        osc = row['osc_smooth'] if 'osc_smooth' in df.columns else 0
         bars_since = i - last_trade_bar
+
+        # Get current bar's regime (v9) or None (v8)
+        current_regime_id = int(regimes[i]) if regimes is not None else None
+        current_regime_name = REGIME_NAMES.get(current_regime_id) if current_regime_id is not None else None
+
+        # For exits, use ENTRY regime's params (v9) or top-level config (v8)
+        def _exit_param(key, default):
+            if is_regime_aware and entry_regime is not None:
+                r_cfg = config.get('regime_params', {}).get(entry_regime, {})
+                return r_cfg.get(key, config.get(key, default))
+            return config.get(key, default)
 
         # Check exits first
         if position == 1 and entry_price:
             pnl_pct = ((price - entry_price) / entry_price) * 100
             exit_reason = None
 
-            if stop_loss_pct > 0 and pnl_pct <= -stop_loss_pct:
+            # Use entry regime's exit params
+            e_stop_loss = _exit_param('stop_loss_pct', stop_loss_pct)
+            e_take_profit = _exit_param('take_profit_pct', take_profit_pct)
+            e_use_accel = _exit_param('use_accel_exit', use_accel_exit)
+            e_accel_type = _exit_param('accel_exit_type', accel_exit_type)
+            e_accel_threshold = _exit_param('accel_exit_threshold', accel_exit_threshold)
+            e_accel_min_pnl = _exit_param('accel_exit_min_pnl', accel_exit_min_pnl)
+            e_accel_lookback = _exit_param('accel_exit_lookback', accel_exit_lookback)
+            e_jerk_confirm = _exit_param('use_jerk_confirm', use_jerk_confirm)
+            e_jerk_threshold = _exit_param('jerk_confirm_threshold', jerk_confirm_threshold)
+            e_exit_midline = _exit_param('exit_on_midline_cross', exit_on_midline)
+            e_exit_opposite = _exit_param('exit_on_opposite_signal', exit_on_opposite)
+
+            if e_stop_loss > 0 and pnl_pct <= -e_stop_loss:
                 exit_reason = "Stop Loss"
-            elif take_profit_pct > 0 and pnl_pct >= take_profit_pct:
+            elif e_take_profit > 0 and pnl_pct >= e_take_profit:
                 exit_reason = "Take Profit"
             # Acceleration Reversal Exit (early warning before stop loss)
-            elif use_accel_exit and 'acceleration' in df.columns and i >= accel_exit_lookback:
+            elif e_use_accel and 'acceleration' in df.columns and i >= e_accel_lookback:
                 # Check if conditions are met
-                pnl_ok = pnl_pct >= accel_exit_min_pnl or pnl_pct < 0
+                pnl_ok = pnl_pct >= e_accel_min_pnl or pnl_pct < 0
                 if pnl_ok:
-                    accel_values = df['acceleration'].iloc[i-accel_exit_lookback+1:i+1].values
+                    accel_values = df['acceleration'].iloc[i-e_accel_lookback+1:i+1].values
                     current_accel = df['acceleration'].iloc[i]
                     # For LONG positions: negative acceleration is bearish
                     accel_cond = False
-                    if accel_exit_type == 'sign_reversal':
+                    if e_accel_type == 'sign_reversal':
                         accel_cond = all(a < 0 for a in accel_values)
-                    elif accel_exit_type == 'magnitude':
-                        accel_cond = current_accel < -accel_exit_threshold
-                    elif accel_exit_type == 'both':
-                        accel_cond = all(a < 0 for a in accel_values) and abs(current_accel) > accel_exit_threshold
+                    elif e_accel_type == 'magnitude':
+                        accel_cond = current_accel < -e_accel_threshold
+                    elif e_accel_type == 'both':
+                        accel_cond = all(a < 0 for a in accel_values) and abs(current_accel) > e_accel_threshold
                     # Jerk confirmation (optional)
                     jerk_cond = True
-                    if use_jerk_confirm and 'jerk' in df.columns and jerk_confirm_threshold > 0:
+                    if e_jerk_confirm and 'jerk' in df.columns and e_jerk_threshold > 0:
                         current_jerk = df['jerk'].iloc[i]
-                        jerk_cond = current_jerk < -jerk_confirm_threshold
+                        jerk_cond = current_jerk < -e_jerk_threshold
                     if accel_cond and jerk_cond:
                         exit_reason = "Accel Reversal"
-            elif exit_on_midline and osc > 0:
+            elif e_exit_midline and osc > 0:
                 exit_reason = "Midline Cross"
-            elif exit_on_opposite and row['sell_signal'] and bars_since >= min_bars_between:
+            elif e_exit_opposite and row.get('sell_signal', False) and bars_since >= min_bars_between:
                 exit_reason = "Opposite Signal"
 
             if exit_reason:
-                trades.append({
+                trade_exit = {
                     'type': 'exit',
                     'date': bar_close_time,  # Use bar CLOSE time
                     'price': price,
@@ -3382,25 +3544,49 @@ def run_historical_backtest(df: pd.DataFrame, config: dict) -> dict:
                     'reason': exit_reason,
                     'entry_date': entry_date,
                     'entry_price': entry_price,
-                })
+                }
+                if entry_regime:
+                    trade_exit['regime'] = entry_regime
+                trades.append(trade_exit)
                 position = 0
                 entry_price = None
                 entry_date = None
+                entry_regime = None
                 last_trade_bar = i
 
         # Check entries
-        if position == 0 and row['buy_signal'] and bars_since >= min_bars_between:
-            position = 1
-            entry_price = price
-            entry_date = bar_close_time  # Use bar CLOSE time
-            entry_osc = osc
-            last_trade_bar = i
-            trades.append({
-                'type': 'entry',
-                'date': bar_close_time,  # Use bar CLOSE time
-                'price': price,
-                'osc': osc,
-            })
+        if position == 0 and bars_since >= min_bars_between:
+            # Determine if we have a buy signal
+            has_buy = False
+
+            if is_regime_aware and current_regime_name is not None:
+                # v9: check regime allows trading + regime-specific buy signal
+                if suppress_high_vol and is_high_vol is not None and is_high_vol[i]:
+                    has_buy = False
+                elif current_regime_name in regime_signal_dfs:
+                    regime_df = regime_signal_dfs[current_regime_name]
+                    has_buy = bool(regime_df.iloc[i].get('buy_signal', False))
+                # Regimes not in regime_signal_dfs are dont_trade
+            else:
+                # v8: standard buy signal check
+                has_buy = bool(row.get('buy_signal', False))
+
+            if has_buy:
+                position = 1
+                entry_price = price
+                entry_date = bar_close_time  # Use bar CLOSE time
+                entry_osc = osc
+                entry_regime = current_regime_name  # None for v8
+                last_trade_bar = i
+                trade_entry = {
+                    'type': 'entry',
+                    'date': bar_close_time,  # Use bar CLOSE time
+                    'price': price,
+                    'osc': osc,
+                }
+                if entry_regime:
+                    trade_entry['regime'] = entry_regime
+                trades.append(trade_entry)
 
     # Calculate stats
     exits = [t for t in trades if t['type'] == 'exit']
@@ -3435,6 +3621,14 @@ def run_historical_backtest(df: pd.DataFrame, config: dict) -> dict:
             'current_price': current_price,
             'unrealized_pnl': unrealized_pnl,
         }
+        if entry_regime:
+            current_position['entry_regime'] = entry_regime
+
+    # Current regime for the latest bar (for display)
+    current_regime_info = None
+    if is_regime_aware and regimes is not None and len(regimes) > 0:
+        last_regime_id = int(regimes[-1])
+        current_regime_info = REGIME_NAMES.get(last_regime_id, 'unknown')
 
     return {
         'trades': trades,
@@ -3446,6 +3640,7 @@ def run_historical_backtest(df: pd.DataFrame, config: dict) -> dict:
         'profit_factor': profit_factor,
         'num_trades': len(exits),
         'current_position': current_position,
+        'current_regime': current_regime_info,
     }
 
 
@@ -4774,12 +4969,15 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
         full_days = len(df)
 
         # --- CHART 1: Full Timeframe ---
-        chart_buf_full = generate_velocity_chart(df, backtest, config, ticker,
+        # Use locked_backtest for stats to prevent repainting (fresh backtest may have different trades)
+        stats_source_full = locked_backtest if locked_backtest and locked_backtest.get('num_trades') else backtest
+        chart_buf_full = generate_velocity_chart(df, stats_source_full, config, ticker,
                                                   title_suffix=f" (Full: {full_days} bars)",
                                                   trade_history=trade_history,
                                                   current_position=trade_state,
-                                                  locked_backtest=locked_backtest)
-        pos_section = build_position_section(current_price, trade_state, backtest, config)
+                                                  locked_backtest=locked_backtest,
+                                                  full_period_backtest=stats_source_full)
+        pos_section = build_position_section(current_price, trade_state, stats_source_full, config)
 
         # Check for stale data warning (accounts for weekend/futures market closure)
         data_stale_warning = ""
@@ -4798,8 +4996,8 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
             f"{pos_section}\n"
             f"---\n"
             f"📊 **Full Period Stats:**\n"
-            f"• Trades: {backtest['num_trades']} | Win Rate: {backtest['win_rate']:.0f}%\n"
-            f"• Return: {backtest['total_return']:.1f}% | PF: {backtest['profit_factor']:.1f}\n"
+            f"• Trades: {stats_source_full['num_trades']} | Win Rate: {stats_source_full['win_rate']:.0f}%\n"
+            f"• Return: {stats_source_full['total_return']:.1f}% | PF: {stats_source_full['profit_factor']:.1f}\n"
             f"---\n"
             f"_Updated: {datetime.now(CHICAGO_TZ).strftime('%Y-%m-%d %H:%M CT')}_{data_stale_warning}"
         )
@@ -4845,6 +5043,10 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
             # Filter locked_backtest to get stats and exits for just the subset period
             # EXCLUDE missed/sync trades from stats (consistent with trade_history filtering)
             subset_start = normalize_tz(df_subset.index[0])
+            # For daily charts: use date-only comparison for consistency
+            is_daily = config.get('interval', '1d') == '1d'
+            if is_daily:
+                subset_start_date = subset_start.date() if hasattr(subset_start, 'date') else subset_start
             subset_exits = []
             if locked_backtest and locked_backtest.get('exits'):
                 for exit_trade in locked_backtest['exits']:
@@ -4855,8 +5057,14 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
                     if '[SYNC]' in reason or '[MISSED]' in reason:
                         continue
                     exit_date = normalize_tz(pd.to_datetime(exit_trade['date']))
-                    if exit_date >= subset_start:
-                        subset_exits.append(exit_trade)
+                    # For daily charts: use date-only comparison
+                    if is_daily:
+                        exit_date_only = exit_date.date() if hasattr(exit_date, 'date') else exit_date
+                        if exit_date_only >= subset_start_date:
+                            subset_exits.append(exit_trade)
+                    else:
+                        if exit_date >= subset_start:
+                            subset_exits.append(exit_trade)
 
             # Build backtest_subset with exits for equity curve
             # Use centralized stats calculation (R6.1: single source of truth)
@@ -4879,7 +5087,8 @@ def send_status_update(webhook_url: str, df: pd.DataFrame, backtest: dict, confi
                                                         title_suffix=f" ({period_label})",
                                                         trade_history=trade_history,
                                                         current_position=trade_state,
-                                                        locked_backtest=locked_backtest)
+                                                        locked_backtest=locked_backtest,
+                                                        full_period_backtest=stats_source_full)
 
             # Position section stays the same (current position)
             pos_section_subset = build_position_section(current_price, trade_state, backtest_subset, config)
@@ -5353,14 +5562,19 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
     locked_backtest = None
     if existing_locked:
-        # Existing locked backtest - use fresh_backtest to add new signals only
-        # (save_locked_backtest will preserve existing data and only append new)
-        print(f"\n🔒 Updating locked backtest with any new signals...")
-        if fresh_backtest:
-            locked_backtest = save_locked_backtest(fresh_backtest, strategy_name=strategy_name, ticker=ticker, trade_state=trade_state)
+        # CRITICAL FIX: Just LOAD the existing locked_backtest - don't merge with fresh_backtest!
+        # The save_locked_backtest was incorrectly adding fresh backtest entries on every startup,
+        # causing trade count to grow from 25 to 62. New signals should only be added when they
+        # actually occur during live trading (via append_to_locked_backtest).
+        print(f"\n🔒 Loading existing locked backtest (preserving historical data)...")
+        print(f"   📁 Path: {locked_backtest_path}")
+        locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
+        if locked_backtest:
+            print(f"   ✅ Loaded: {locked_backtest.get('num_trades', 0)} trades, {locked_backtest.get('win_rate', 0):.1f}% win rate, {locked_backtest.get('total_return', 0):.1f}% return")
         else:
-            locked_backtest = load_locked_backtest(strategy_name=strategy_name, ticker=ticker)
-            print(f"🔒 Loaded existing locked backtest from previous session")
+            print(f"   ⚠️ Failed to load locked_backtest from {locked_backtest_path}")
+            # Don't create new one here - we'll fall through to the else block below
+            existing_locked = False  # Force creation of new locked_backtest
     else:
         # FIRST STARTUP - seed from bundled backtest_results.json if available
         # This ensures we use EXACT same trades as shown in Streamlit UI
@@ -5483,7 +5697,14 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
         # Build stats sections - show tracked stats from locked_backtest (excludes missed trades)
         # Use locked_backtest for tracked stats if available, otherwise fall back to bundled backtest
+        # DEBUG: Log which source is being used
+        print(f"📊 Stats source selection:")
+        print(f"   locked_backtest exists: {locked_backtest is not None}")
+        if locked_backtest:
+            print(f"   locked_backtest trades: {locked_backtest.get('num_trades', 'N/A')}, WR: {locked_backtest.get('win_rate', 'N/A')}")
+        print(f"   backtest trades: {backtest.get('num_trades', 'N/A') if backtest else 'N/A'}")
         stats_source = locked_backtest if locked_backtest else backtest
+        print(f"   USING: {'locked_backtest' if stats_source == locked_backtest else 'backtest'} ({stats_source.get('num_trades', 0)} trades)")
         num_tracked = stats_source.get('num_trades', 0)
         num_missed = stats_source.get('num_missed', 0)
 
@@ -5639,13 +5860,13 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             except Exception as e:
                 print(f"📊 Using bundled data for charts (error checking fresh: {e})")
 
-            # FULL PERIOD chart - use all available data
-            full_period_chart = generate_velocity_chart(chart_df, backtest, config, ticker,
+            # FULL PERIOD chart - use locked_backtest for stats to prevent repainting
+            full_period_chart = generate_velocity_chart(chart_df, locked_backtest, config, ticker,
                                                         title_suffix=" - Full Period",
                                                         trade_history=startup_trade_history,
                                                         current_position=trade_state,
                                                         locked_backtest=locked_backtest,
-                                                        full_period_backtest=backtest,
+                                                        full_period_backtest=locked_backtest,
                                                         missed_signals=missed_signals)
             print("✅ Generated full period chart")
 
@@ -5971,6 +6192,22 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             df = calculate_composite_oscillator(df, config)
             df = calculate_velocity_signals(df, config)
 
+            # v9 regime detection
+            live_regimes, live_is_high_vol = compute_bar_regimes(df, config) if config.get('regime_aware', False) and V9_REGIME_AVAILABLE else (None, None)
+            live_regime_signal_dfs = {}
+            if live_regimes is not None:
+                regime_params_dict = config.get('regime_params', {})
+                for rname, rcfg in regime_params_dict.items():
+                    if rcfg.get('dont_trade', False):
+                        continue
+                    merged = {**config, **rcfg}
+                    live_regime_signal_dfs[rname] = calculate_velocity_signals(df.copy(), merged)
+                current_regime_id = int(live_regimes[-1]) if len(live_regimes) > 0 else None
+                current_regime_name = REGIME_NAMES.get(current_regime_id, 'unknown') if current_regime_id is not None else None
+            else:
+                current_regime_id = None
+                current_regime_name = None
+
             # Get latest row
             latest = df.iloc[-1]
             bar_close_price = latest['close']  # Daily bar close (for signal logic)
@@ -5981,6 +6218,8 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
             current_price = realtime_price if realtime_price else bar_close_price
 
             print(f"Current Price: ${current_price:.2f} (real-time)" if realtime_price else f"Current Price: ${current_price:.2f} (bar close)")
+            if current_regime_name is not None:
+                print(f"Regime: {current_regime_name.upper()}")
             print(f"Oscillator: {latest['osc_smooth']:.4f}")
             print(f"Velocity: {latest['velocity']:.4f}")
             print(f"Acceleration: {latest['acceleration']:.4f}")
@@ -6065,8 +6304,9 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     sync_chart = None
                     try:
                         sync_backtest = run_historical_backtest(df, config)
-                        sync_chart = generate_velocity_chart(df, sync_backtest, config, ticker,
+                        sync_chart = generate_velocity_chart(df, locked_backtest, config, ticker,
                                                             locked_backtest=locked_backtest,
+                                                            full_period_backtest=locked_backtest,
                                                             current_position=trade_state,
                                                             chart_type="signal")
                         print(f"   ✅ Generated sync chart with entry marker")
@@ -6178,8 +6418,9 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 sync_chart = None
                 try:
                     sync_backtest = run_historical_backtest(df, config)
-                    sync_chart = generate_velocity_chart(df, sync_backtest, config, ticker,
+                    sync_chart = generate_velocity_chart(df, locked_backtest, config, ticker,
                                                         locked_backtest=locked_backtest,
+                                                        full_period_backtest=locked_backtest,
                                                         chart_type="signal")
                     print(f"   ✅ Generated sync chart with exit marker")
                 except Exception as chart_err:
@@ -6332,16 +6573,27 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     continue
                 pnl_pct = ((current_price - entry_price) / entry_price) * 100
 
+                # v9: Use entry regime's params for exit decisions
+                entry_regime_name = trade_state.get('entry_regime')  # None for v8
+                def _exit_p(key, default_val):
+                    if entry_regime_name and config.get('regime_aware', False):
+                        r_cfg = config.get('regime_params', {}).get(entry_regime_name, {})
+                        return r_cfg.get(key, config.get(key, default_val))
+                    return config.get(key, default_val)
+
+                live_stop_loss = _exit_p('stop_loss_pct', stop_loss_pct)
+                live_take_profit = _exit_p('take_profit_pct', take_profit_pct)
+
                 exit_reason = None
                 exit_bar_close_time = None  # Will be set for signal-based exits
                 signal_bar_time = None  # Will be set when checking signal-based exits
                 can_check_signal_exits = False  # Will be set True when checking signal-based exits
 
                 # Stop loss - uses real-time price (can trigger anytime)
-                if pnl_pct <= -stop_loss_pct:
+                if pnl_pct <= -live_stop_loss:
                     exit_reason = f"Stop Loss ({pnl_pct:.2f}%)"
                 # Take profit - uses real-time price (can trigger anytime)
-                elif pnl_pct >= take_profit_pct:
+                elif pnl_pct >= live_take_profit:
                     exit_reason = f"Take Profit ({pnl_pct:.2f}%)"
                 # Signal-based exits (opposite signal, midline cross)
                 # For daily strategies: use COMPLETED bar (df.iloc[-2]) to prevent repainting
@@ -6390,49 +6642,52 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     if can_check_signal_exits:
                         # Acceleration Reversal Exit (early warning before stop loss)
                         # Check if enabled and we have acceleration data
-                        use_accel_exit = config.get('use_accel_exit', False)
-                        if use_accel_exit and 'acceleration' in df.columns:
-                            accel_exit_type = config.get('accel_exit_type', 'sign_reversal')
-                            accel_exit_threshold = config.get('accel_exit_threshold', 0.0)
-                            accel_exit_min_pnl = config.get('accel_exit_min_pnl', 0.5)
-                            accel_exit_lookback = config.get('accel_exit_lookback', 1)
-                            use_jerk_confirm = config.get('use_jerk_confirm', False)
-                            jerk_confirm_threshold = config.get('jerk_confirm_threshold', 0.0)
+                        # v9: use entry regime's params for exit decisions
+                        live_use_accel = _exit_p('use_accel_exit', False)
+                        if live_use_accel and 'acceleration' in df.columns:
+                            live_accel_type = _exit_p('accel_exit_type', 'sign_reversal')
+                            live_accel_threshold = _exit_p('accel_exit_threshold', 0.0)
+                            live_accel_min_pnl = _exit_p('accel_exit_min_pnl', 0.5)
+                            live_accel_lookback = _exit_p('accel_exit_lookback', 1)
+                            live_jerk_confirm = _exit_p('use_jerk_confirm', False)
+                            live_jerk_threshold = _exit_p('jerk_confirm_threshold', 0.0)
 
                             # Check if conditions are met
-                            pnl_ok = pnl_pct >= accel_exit_min_pnl or pnl_pct < 0
+                            pnl_ok = pnl_pct >= live_accel_min_pnl or pnl_pct < 0
                             if pnl_ok:
                                 # Get index of signal_bar in df
                                 bar_idx = df.index.get_loc(signal_bar_time) if signal_bar_time in df.index else -1
-                                if bar_idx >= accel_exit_lookback:
-                                    accel_values = df['acceleration'].iloc[bar_idx-accel_exit_lookback+1:bar_idx+1].values
+                                if bar_idx >= live_accel_lookback:
+                                    accel_values = df['acceleration'].iloc[bar_idx-live_accel_lookback+1:bar_idx+1].values
                                     current_accel = df['acceleration'].iloc[bar_idx]
                                     # For LONG positions: negative acceleration is bearish
                                     accel_cond = False
-                                    if accel_exit_type == 'sign_reversal':
+                                    if live_accel_type == 'sign_reversal':
                                         accel_cond = all(a < 0 for a in accel_values)
-                                    elif accel_exit_type == 'magnitude':
-                                        accel_cond = current_accel < -accel_exit_threshold
-                                    elif accel_exit_type == 'both':
-                                        accel_cond = all(a < 0 for a in accel_values) and abs(current_accel) > accel_exit_threshold
+                                    elif live_accel_type == 'magnitude':
+                                        accel_cond = current_accel < -live_accel_threshold
+                                    elif live_accel_type == 'both':
+                                        accel_cond = all(a < 0 for a in accel_values) and abs(current_accel) > live_accel_threshold
                                     # Jerk confirmation (optional)
                                     jerk_cond = True
-                                    if use_jerk_confirm and 'jerk' in df.columns and jerk_confirm_threshold > 0:
+                                    if live_jerk_confirm and 'jerk' in df.columns and live_jerk_threshold > 0:
                                         current_jerk = df['jerk'].iloc[bar_idx]
-                                        jerk_cond = current_jerk < -jerk_confirm_threshold
+                                        jerk_cond = current_jerk < -live_jerk_threshold
                                     if accel_cond and jerk_cond:
                                         exit_reason = f"Accel Reversal ({pnl_pct:.2f}%)"
                                         interval_minutes = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440}.get(interval, 15)
                                         exit_bar_close_time = pd.to_datetime(signal_bar_time) + pd.Timedelta(minutes=interval_minutes)
 
-                        # Exit on opposite signal
-                        if not exit_reason and exit_on_opposite_signal and signal_bar['sell_signal']:
+                        # Exit on opposite signal (v9: use entry regime's params)
+                        live_exit_opposite = _exit_p('exit_on_opposite_signal', exit_on_opposite_signal)
+                        live_exit_midline = _exit_p('exit_on_midline_cross', exit_on_midline_cross)
+                        if not exit_reason and live_exit_opposite and signal_bar['sell_signal']:
                             exit_reason = f"Opposite Signal ({pnl_pct:.2f}%)"
                             # Calculate bar close time for signal-based exit
                             interval_minutes = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440}.get(interval, 15)
                             exit_bar_close_time = pd.to_datetime(signal_bar_time) + pd.Timedelta(minutes=interval_minutes)
                         # Exit on midline cross (oscillator crosses above 0 = bearish for long)
-                        elif not exit_reason and exit_on_midline_cross and signal_bar['osc_smooth'] > 0:
+                        elif not exit_reason and live_exit_midline and signal_bar['osc_smooth'] > 0:
                             exit_reason = f"Midline Cross ({pnl_pct:.2f}%)"
                             # Calculate bar close time for signal-based exit
                             interval_minutes = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440}.get(interval, 15)
@@ -6445,6 +6700,14 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 else:
                     exit_timestamp = current_time
 
+                # For CHART MARKERS in locked_backtest: use signal_bar_time (bar START) not bar CLOSE
+                # This is consistent with run_historical_backtest which uses bar_start for daily data
+                # Chart indexes by bar START time, so exit must use bar START time for correct marker placement
+                if can_check_signal_exits and signal_bar_time is not None:
+                    locked_backtest_exit_date = signal_bar_time  # Bar START time for chart markers
+                else:
+                    locked_backtest_exit_date = exit_timestamp  # Fallback for SL/TP (real-time)
+
                 if exit_reason:
                     # CRITICAL: Validate with append_to_locked_backtest FIRST before ANY Discord
                     # This prevents spam if the exit is rejected (e.g., orphan exit, timestamp mismatch)
@@ -6453,7 +6716,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     # Pre-validation: Check if this exit would be accepted
                     append_success = append_to_locked_backtest(
                         exit_trade={
-                            'date': exit_timestamp,  # Bar close time for signal exits
+                            'date': locked_backtest_exit_date,  # Bar START time for chart markers
                             'price': current_price,
                             'pnl': pnl_pct,
                             'reason': exit_reason,
@@ -6493,7 +6756,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         if 'exits' not in locked_backtest_with_exit:
                             locked_backtest_with_exit['exits'] = []
                         locked_backtest_with_exit['exits'].append({
-                            'date': exit_timestamp,  # Use bar close time for signal exits
+                            'date': locked_backtest_exit_date,  # Bar START time for chart markers
                             'price': current_price,
                             'pnl': pnl_pct,
                             'reason': exit_reason,
@@ -6505,21 +6768,34 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
                         # Use locked backtest WITH current exit for markers
                         # chart_type="signal" for focused view on exit signals
-                        exit_chart = generate_velocity_chart(df, exit_backtest, config, ticker,
+                        exit_chart = generate_velocity_chart(df, locked_backtest_with_exit, config, ticker,
                                                             locked_backtest=locked_backtest_with_exit,
+                                                            full_period_backtest=locked_backtest_with_exit,
                                                             chart_type="signal")
                     except Exception as e:
                         print(f"Could not generate exit chart: {e}")
 
-                    # Build stats section
+                    # Build stats section - use locked_backtest_with_exit for stats (includes this exit)
                     stats_section = ""
-                    if exit_backtest:
-                        stats_section = (
-                            f"---\n"
-                            f"📊 **Strategy Stats:**\n"
-                            f"• Trades: {exit_backtest['num_trades']} | Win Rate: {exit_backtest['win_rate']:.0f}%\n"
-                            f"• Total Return: {exit_backtest['total_return']:.1f}% | PF: {exit_backtest['profit_factor']:.1f}\n"
-                        )
+                    stats_src = locked_backtest_with_exit if locked_backtest_with_exit and locked_backtest_with_exit.get('exits') else exit_backtest
+                    if stats_src:
+                        # Calculate stats from locked_backtest_with_exit exits
+                        if stats_src == locked_backtest_with_exit:
+                            from velocity_live_trader import calculate_exit_stats
+                            calc_stats = calculate_exit_stats(stats_src.get('exits', []), exclude_missed=True)
+                            stats_section = (
+                                f"---\n"
+                                f"📊 **Strategy Stats:**\n"
+                                f"• Trades: {calc_stats['num_trades']} | Win Rate: {calc_stats['win_rate']:.0f}%\n"
+                                f"• Total Return: {calc_stats['total_return']:.1f}% | PF: {calc_stats['profit_factor']:.1f}\n"
+                            )
+                        else:
+                            stats_section = (
+                                f"---\n"
+                                f"📊 **Strategy Stats:**\n"
+                                f"• Trades: {stats_src['num_trades']} | Win Rate: {stats_src['win_rate']:.0f}%\n"
+                                f"• Total Return: {stats_src['total_return']:.1f}% | PF: {stats_src['profit_factor']:.1f}\n"
+                            )
 
                     pnl_emoji = "✅" if pnl_pct > 0 else "❌"
 
@@ -6649,6 +6925,7 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     trade_state['entry_price'] = None
                     trade_state['entry_time'] = None
                     trade_state['entry_signal_bar'] = None  # Clear signal bar
+                    trade_state['entry_regime'] = None  # Clear v9 regime
                     save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
 
                     # CRITICAL: Set flag to prevent immediate re-entry on buy signal from previous bar
@@ -6743,6 +7020,35 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                 recent_buy_signal = None
                 recent_sell_signal = None
 
+                # v9 helper: check regime-aware buy signal for a bar at index bar_iloc
+                def _has_regime_buy(bar_iloc_idx):
+                    """Check if bar has a buy signal, considering regime if v9."""
+                    if live_regimes is None:
+                        return bar_iloc_idx >= 0 and df.iloc[bar_iloc_idx].get('buy_signal', False)
+                    # v9: get regime for this bar
+                    abs_idx = len(df) + bar_iloc_idx if bar_iloc_idx < 0 else bar_iloc_idx
+                    if abs_idx < 0 or abs_idx >= len(live_regimes):
+                        return False
+                    bar_regime_id = int(live_regimes[abs_idx])
+                    bar_regime_name = REGIME_NAMES.get(bar_regime_id, 'chop')
+                    # Check high-vol suppression
+                    suppress_hv = config.get('regime_detector', {}).get('suppress_entries_high_vol', True)
+                    if suppress_hv and live_is_high_vol is not None and live_is_high_vol[abs_idx]:
+                        return False
+                    # Check regime-specific signal
+                    if bar_regime_name not in live_regime_signal_dfs:
+                        return False  # dont_trade regime
+                    return bool(live_regime_signal_dfs[bar_regime_name].iloc[abs_idx].get('buy_signal', False))
+
+                def _get_bar_regime_name(bar_iloc_idx):
+                    """Get regime name for a bar index."""
+                    if live_regimes is None:
+                        return None
+                    abs_idx = len(df) + bar_iloc_idx if bar_iloc_idx < 0 else bar_iloc_idx
+                    if abs_idx < 0 or abs_idx >= len(live_regimes):
+                        return None
+                    return REGIME_NAMES.get(int(live_regimes[abs_idx]), 'unknown')
+
                 if should_check_signals and interval == "1d" and len(df) >= 2:
                     # Only check the COMPLETED bar for daily strategies
                     bar = completed_bar
@@ -6751,9 +7057,11 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
                     # Skip if already processed this bar (use safe timestamp comparison)
                     if not (last_signal_time and timestamps_equal(bar_time, last_signal_time)):
-                        if bar['buy_signal']:
-                            recent_buy_signal = {'bar': bar, 'time': bar_time, 'index': -2}
-                            print(f"   ✅ BUY signal on completed bar {bar_time}")
+                        if _has_regime_buy(-2) if live_regimes is not None else bar['buy_signal']:
+                            recent_buy_signal = {'bar': bar, 'time': bar_time, 'index': -2,
+                                                 'regime': _get_bar_regime_name(-2)}
+                            print(f"   ✅ BUY signal on completed bar {bar_time}" +
+                                  (f" [{recent_buy_signal['regime'].upper()}]" if recent_buy_signal.get('regime') else ""))
                         if bar['sell_signal']:
                             recent_sell_signal = {'bar': bar, 'time': bar_time, 'index': -2}
                             print(f"   ✅ SELL signal on completed bar {bar_time}")
@@ -6776,8 +7084,10 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                         if last_signal_time and timestamps_equal(bar_time, last_signal_time):
                             continue
 
-                        if bar['buy_signal'] and recent_buy_signal is None:
-                            recent_buy_signal = {'bar': bar, 'time': bar_time, 'index': -i}
+                        if recent_buy_signal is None:
+                            if _has_regime_buy(-i) if live_regimes is not None else bar['buy_signal']:
+                                recent_buy_signal = {'bar': bar, 'time': bar_time, 'index': -i,
+                                                     'regime': _get_bar_regime_name(-i)}
                         if bar['sell_signal'] and recent_sell_signal is None:
                             recent_sell_signal = {'bar': bar, 'time': bar_time, 'index': -i}
 
@@ -6853,12 +7163,14 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     signal_note = f" (Signal from {signal_time_display} - entering at market)" if is_delayed else ""
 
                     # Append new entry to locked backtest (for future charts)
-                    # IMPORTANT: Use bar CLOSE time - entry happens when bar closes, not at bar start
+                    # IMPORTANT: Use signal_time_utc (bar START time) for chart markers, NOT bar_close_time
+                    # This is consistent with run_historical_backtest which uses bar_start for daily data
+                    # Chart indexes by bar START time, so entry must use bar START time for correct marker placement
                     # Live trading signals are NEVER missed - we're acting on them!
                     # CRITICAL: Check return value - if False, DON'T send Discord or update trade_state
                     # This prevents desync between locked_backtest and trade_state
                     append_success = append_to_locked_backtest(
-                        entry={'date': bar_close_time, 'price': current_price, 'position': 'long'},
+                        entry={'date': signal_time_utc, 'price': current_price, 'position': 'long'},
                         strategy_name=strategy_name, ticker=ticker, missed=False
                     )
                     if not append_success:
@@ -6871,20 +7183,31 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
 
                     # IMMEDIATE ALERT: Send quick text notification FIRST before slow chart generation
                     # This ensures traders get the signal within seconds of bar close
-                    entry_sl_price_quick = current_price * (1 - stop_loss_pct / 100)
-                    entry_tp_price_quick = current_price * (1 + take_profit_pct / 100)
+                    # v9: use entry regime's SL/TP for display
+                    entry_regime_for_msg = recent_buy_signal.get('regime') if recent_buy_signal else None
+                    if entry_regime_for_msg and config.get('regime_aware', False):
+                        r_cfg = config.get('regime_params', {}).get(entry_regime_for_msg, {})
+                        display_sl = r_cfg.get('stop_loss_pct', stop_loss_pct)
+                        display_tp = r_cfg.get('take_profit_pct', take_profit_pct)
+                    else:
+                        display_sl = stop_loss_pct
+                        display_tp = take_profit_pct
+                    entry_sl_price_quick = current_price * (1 - display_sl / 100)
+                    entry_tp_price_quick = current_price * (1 + display_tp / 100)
 
                     # Use consistent position status (respect is_delayed like the full message does)
                     quick_position_status = "🟢 **Position: LONG**" if not is_delayed else "🟡 **Position: LONG** (late entry)"
+                    regime_line = f"**Regime:** {entry_regime_for_msg.upper()}\n" if entry_regime_for_msg else ""
 
                     quick_buy_msg = (
                         f"@here\n"
                         f"📈 **[{strategy_label}] BUY SIGNAL**{signal_note}\n"
                         f"**Signal Time:** {signal_time_display}\n"
                         f"**Entry Price:** ${current_price:,.2f}\n"
+                        f"{regime_line}"
                         f"{quick_position_status}\n"
                         f"---\n"
-                        f"_SL: {stop_loss_pct:.1f}% (${entry_sl_price_quick:,.2f}) | TP: {take_profit_pct:.1f}% (${entry_tp_price_quick:,.2f})_\n"
+                        f"_SL: {display_sl:.1f}% (${entry_sl_price_quick:,.2f}) | TP: {display_tp:.1f}% (${entry_tp_price_quick:,.2f})_\n"
                         f"_Chart and stats loading..._"
                     )
                     send_discord_alert(webhook_url, quick_buy_msg, strategy_name=strategy_name)
@@ -6895,22 +7218,24 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     signal_chart = None
                     try:
                         signal_backtest = run_historical_backtest(df, config)
-                        # Use locked backtest for markers to prevent repainting
+                        # Use locked backtest for markers and stats to prevent repainting
                         # chart_type="signal" for focused view on entry signals
-                        signal_chart = generate_velocity_chart(df, signal_backtest, config, ticker,
+                        signal_chart = generate_velocity_chart(df, locked_backtest, config, ticker,
                                                               locked_backtest=locked_backtest,
+                                                              full_period_backtest=locked_backtest,
                                                               chart_type="signal")
                     except Exception as e:
                         print(f"Could not generate signal chart: {e}")
 
-                    # Build comprehensive buy message with stats
+                    # Build comprehensive buy message with stats - use locked_backtest to prevent repainting
                     stats_section = ""
-                    if signal_backtest:
+                    stats_src = locked_backtest if locked_backtest and locked_backtest.get('num_trades') else signal_backtest
+                    if stats_src:
                         stats_section = (
                             f"---\n"
                             f"📊 **Strategy Stats:**\n"
-                            f"• Trades: {signal_backtest['num_trades']} | Win Rate: {signal_backtest['win_rate']:.0f}%\n"
-                            f"• Total Return: {signal_backtest['total_return']:.1f}% | PF: {signal_backtest['profit_factor']:.1f}\n"
+                            f"• Trades: {stats_src['num_trades']} | Win Rate: {stats_src['win_rate']:.0f}%\n"
+                            f"• Total Return: {stats_src['total_return']:.1f}% | PF: {stats_src['profit_factor']:.1f}\n"
                         )
 
                     # Build position status line
@@ -6918,19 +7243,20 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     # is_delayed means signal came from a past bar (still valid, just entering late)
                     position_status = "🟢 **Position: LONG**" if not is_delayed else "🟡 **Position: LONG** (late entry)"
 
-                    # Calculate SL/TP prices
-                    entry_sl_price = current_price * (1 - stop_loss_pct / 100)
-                    entry_tp_price = current_price * (1 + take_profit_pct / 100)
+                    # Calculate SL/TP prices (v9: use regime-specific values)
+                    entry_sl_price = current_price * (1 - display_sl / 100)
+                    entry_tp_price = current_price * (1 + display_tp / 100)
 
                     buy_msg = (
                         f"@here\n"
                         f"📈 **[{strategy_label}] BUY SIGNAL**{signal_note}\n"
                         f"**Signal Time:** {signal_time_display}\n"
                         f"**Entry Price:** ${current_price:,.2f}\n"
+                        f"{regime_line}"
                         f"{position_status}\n"
                         f"{stats_section}"
                         f"---\n"
-                        f"_SL: {stop_loss_pct:.1f}% (${entry_sl_price:,.2f}) | TP: {take_profit_pct:.1f}% (${entry_tp_price:,.2f})_"
+                        f"_SL: {display_sl:.1f}% (${entry_sl_price:,.2f}) | TP: {display_tp:.1f}% (${entry_tp_price:,.2f})_"
                     )
 
                     # Generate trade log CSV (last 10 completed trades)
@@ -6965,6 +7291,9 @@ def run_live_trader(config_path: str = "production_env/velocity_config.json", sk
                     trade_state['entry_time'] = to_chicago_str(bar_close_time)  # Bar close time (Chicago)
                     trade_state['entry_signal_bar'] = to_chicago_str(signal_time_utc)  # Bar start time (Chicago)
                     trade_state['last_signal_time'] = to_chicago_str(bar_close_time)  # Use bar close for deduplication
+                    # v9: store entry regime so exits use the correct params
+                    if recent_buy_signal and recent_buy_signal.get('regime'):
+                        trade_state['entry_regime'] = recent_buy_signal['regime']
                     save_trade_state(trade_state, strategy_name=strategy_name, ticker=ticker)
 
                 elif effective_sell:

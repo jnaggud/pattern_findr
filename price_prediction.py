@@ -35,8 +35,9 @@ try:
     from sklearn.preprocessing import StandardScaler
     from sklearn.model_selection import TimeSeriesSplit
     from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
-    from sklearn.linear_model import Ridge
+    from sklearn.linear_model import Ridge, QuantileRegressor
     SKLEARN_AVAILABLE = True
+    QUANTILE_REGRESSOR_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
 
@@ -162,6 +163,7 @@ FEATURE_CONFIG = {
     'dollar_features': True,         # Dollar index (DXY) - currency context
     'correlation_features': True,    # SPY/QQQ correlation - market structure
     'earnings_features': True,       # Earnings calendar for top SPY holdings
+    'cross_asset_features': True,    # IWM, TLT, GLD cross-asset correlation/lead-lag (from hybrid model)
 
     # News Sentiment Features (requires Finnhub API key or scraper)
     'news_sentiment': True,          # News sentiment for big move prediction
@@ -2578,6 +2580,87 @@ class PriceRangePredictor:
                            'spy_qqq_ratio', 'spy_qqq_ratio_zscore', 'spy_qqq_return_diff']:
                     features[col] = 0
 
+        # --- 6b. Cross-Asset Features (from hybrid model) ---
+        # IWM (small caps), TLT (bonds), GLD (gold) - correlation, lag, relative strength
+        # These features showed strong predictive power in hybrid range prediction testing
+        if FEATURE_CONFIG.get('cross_asset_features', True):
+            cross_assets = {
+                'IWM': 'Small caps - risk on/off indicator',
+                'TLT': 'Long-term bonds - flight to safety',
+                'GLD': 'Gold - inflation/uncertainty hedge',
+            }
+
+            spy_returns = df['close'].pct_change()
+            cross_asset_cols = []
+
+            for asset_ticker, description in cross_assets.items():
+                try:
+                    # Fetch asset data using market_data_db
+                    if MARKET_DB_AVAILABLE:
+                        market_db = get_market_db()
+                        end_date = df.index[-1]
+                        start_date = df.index[0] - pd.Timedelta(days=30)
+                        asset_df = market_db.get_data(
+                            asset_ticker,
+                            start_date.strftime('%Y-%m-%d'),
+                            end_date.strftime('%Y-%m-%d')
+                        )
+                    elif YF_AVAILABLE:
+                        end_date = df.index[-1] + pd.Timedelta(days=1)
+                        start_date = df.index[0] - pd.Timedelta(days=30)
+                        asset_df = yf.download(asset_ticker, start=start_date, end=end_date, progress=False)
+                        asset_df.columns = [c.lower() for c in asset_df.columns]
+                    else:
+                        asset_df = pd.DataFrame()
+
+                    if asset_df is not None and len(asset_df) > 20:
+                        # Normalize index
+                        if 'date' in asset_df.columns:
+                            asset_df['date'] = pd.to_datetime(asset_df['date'])
+                            asset_df.set_index('date', inplace=True)
+                        asset_df.columns = [c.lower() for c in asset_df.columns]
+
+                        # Calculate returns
+                        asset_returns = asset_df['close'].pct_change()
+
+                        # Align to main df index
+                        asset_aligned = asset_returns.reindex(df.index).ffill().bfill()
+
+                        # Feature 1: 20-day rolling correlation with SPY
+                        col_corr = f'{asset_ticker.lower()}_corr_20d'
+                        features[col_corr] = spy_returns.rolling(20).corr(asset_aligned)
+                        cross_asset_cols.append(col_corr)
+
+                        # Feature 2: 1-day lagged return (lead indicator)
+                        col_lag = f'{asset_ticker.lower()}_lag1'
+                        features[col_lag] = asset_aligned.shift(1)
+                        cross_asset_cols.append(col_lag)
+
+                        # Feature 3: 10-day relative strength (SPY vs asset cumulative return)
+                        col_rel = f'{asset_ticker.lower()}_rel_strength'
+                        features[col_rel] = spy_returns.rolling(10).sum() - asset_aligned.rolling(10).sum()
+                        cross_asset_cols.append(col_rel)
+
+                        # Feature 4: Return divergence (today's difference)
+                        col_div = f'{asset_ticker.lower()}_divergence'
+                        features[col_div] = (spy_returns - asset_aligned) * 100
+                        cross_asset_cols.append(col_div)
+
+                except Exception as e:
+                    # Fill with zeros on error
+                    for suffix in ['_corr_20d', '_lag1', '_rel_strength', '_divergence']:
+                        col = f'{asset_ticker.lower()}{suffix}'
+                        features[col] = 0
+                        cross_asset_cols.append(col)
+
+            # Fill any remaining NaN with 0
+            for col in cross_asset_cols:
+                if col in features.columns:
+                    features[col] = features[col].fillna(0)
+
+            if cross_asset_cols:
+                print(f"   Cross-asset features added: {len(cross_asset_cols)} features (IWM, TLT, GLD)")
+
         # --- 7. Earnings Calendar Features ---
         # Big tech earnings drive SPY volatility
         if FEATURE_CONFIG.get('earnings_features', True):
@@ -3323,7 +3406,7 @@ class PriceRangePredictor:
             # Uses cross-validation to find optimal alpha, parallelized across workers
             # ============================================================
             from joblib import Parallel, delayed
-            from sklearn.model_selection import cross_val_score
+            from sklearn.model_selection import cross_val_score, TimeSeriesSplit
 
             # Alpha values to search (log-spaced from 0.01 to 100)
             alpha_grid = [0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]
@@ -3331,19 +3414,21 @@ class PriceRangePredictor:
             print(f"\n[RIDGE TRAINING] Parallel alpha grid search ({len(alpha_grid)} values, {n_workers} workers)...")
             print(f"   Data shape: X={X_train_scaled.shape}, y={len(y_train_np)}")
             print(f"   Alpha grid: {alpha_grid}")
+            print(f"   Using TimeSeriesSplit CV (no look-ahead bias)")
 
             def evaluate_alpha(alpha):
-                """Evaluate a single alpha value using cross-validation."""
+                """Evaluate a single alpha value using TIME SERIES cross-validation."""
                 model = Ridge(alpha=alpha)
-                # Use 5-fold time series cross-validation
-                n_splits = min(5, len(y_train_np) // 10)  # At least 10 samples per fold
+                # Use TimeSeriesSplit for proper time series CV (no look-ahead bias)
+                n_splits = min(5, len(y_train_np) // 20)  # At least 20 samples per fold for time series
                 if n_splits < 2:
                     # Not enough data for CV, just fit and score on training
                     model.fit(X_train_scaled, y_train_np)
                     score = model.score(X_train_scaled, y_train_np)
                 else:
+                    tscv = TimeSeriesSplit(n_splits=n_splits)
                     scores = cross_val_score(model, X_train_scaled, y_train_np,
-                                            cv=n_splits, scoring='r2')
+                                            cv=tscv, scoring='r2')
                     score = np.mean(scores)
                 return {'alpha': alpha, 'cv_score': score}
 
@@ -3549,7 +3634,7 @@ class PriceRangePredictor:
             # RIDGE: Parallel alpha search for HIGH and LOW predictions
             # ============================================================
             from joblib import Parallel, delayed
-            from sklearn.model_selection import cross_val_score
+            from sklearn.model_selection import cross_val_score, TimeSeriesSplit
 
             # Use the best alpha from range training as starting point
             base_alpha = getattr(self, 'best_alpha', 1.0)
@@ -3557,16 +3642,18 @@ class PriceRangePredictor:
 
             print(f"\n[HIGH/LOW RIDGE] Parallel alpha search for HIGH and LOW...")
             print(f"   Base alpha from RANGE: {base_alpha}")
+            print(f"   Using TimeSeriesSplit CV (no look-ahead bias)")
 
             def evaluate_alpha_target(alpha, X, y_target, target_name):
-                """Evaluate alpha for a specific target."""
+                """Evaluate alpha for a specific target using TIME SERIES CV."""
                 model = Ridge(alpha=alpha)
-                n_splits = min(5, len(y_target) // 10)
+                n_splits = min(5, len(y_target) // 20)  # At least 20 samples per fold
                 if n_splits < 2:
                     model.fit(X, y_target)
                     score = model.score(X, y_target)
                 else:
-                    scores = cross_val_score(model, X, y_target, cv=n_splits, scoring='r2')
+                    tscv = TimeSeriesSplit(n_splits=n_splits)
+                    scores = cross_val_score(model, X, y_target, cv=tscv, scoring='r2')
                     score = np.mean(scores)
                 return {'alpha': alpha, 'cv_score': score, 'target': target_name}
 
@@ -3823,9 +3910,9 @@ class PriceRangePredictor:
             print(f"   HIGH residual std: {self.high_residual_std:.4f}")
             print(f"   LOW residual std: {self.low_residual_std:.4f}")
 
-            # Also train XGBoost quantile models for learned confidence bands
-            # This gives better bands than simple RMSE fallback
-            print("\n[QUANTILE REGRESSION] Training XGBoost quantile models for confidence bands...")
+            # Train sklearn QuantileRegressor for learned confidence bands
+            # QuantileRegressor is more stable for tail estimation than XGBoost
+            print("\n[QUANTILE REGRESSION] Training sklearn QuantileRegressor for confidence bands...")
 
             quantile_levels = {
                 0.50: (0.25, 0.75),  # 50% confidence
@@ -3835,34 +3922,20 @@ class PriceRangePredictor:
                 0.95: (0.025, 0.975) # 95% confidence
             }
 
-            # Simple XGBoost params for quantile models
-            quantile_params = {
-                'objective': 'reg:quantileerror',
-                'n_estimators': 50,
-                'max_depth': 4,
-                'learning_rate': 0.1,
-                'n_jobs': 1,
-                'verbosity': 0
-            }
-
             for conf_level, (q_low, q_high) in quantile_levels.items():
                 try:
-                    # Train quantile models for HIGH
-                    params_high_lower = {**quantile_params, 'quantile_alpha': q_low}
-                    model_high_lower = xgb.XGBRegressor(**params_high_lower)
+                    # Train QuantileRegressor for HIGH predictions
+                    model_high_lower = QuantileRegressor(quantile=q_low, alpha=0.1, solver='highs')
                     model_high_lower.fit(X_train_scaled, y_high_train_arr)
 
-                    params_high_upper = {**quantile_params, 'quantile_alpha': q_high}
-                    model_high_upper = xgb.XGBRegressor(**params_high_upper)
+                    model_high_upper = QuantileRegressor(quantile=q_high, alpha=0.1, solver='highs')
                     model_high_upper.fit(X_train_scaled, y_high_train_arr)
 
-                    # Train quantile models for LOW
-                    params_low_lower = {**quantile_params, 'quantile_alpha': q_low}
-                    model_low_lower = xgb.XGBRegressor(**params_low_lower)
+                    # Train QuantileRegressor for LOW predictions
+                    model_low_lower = QuantileRegressor(quantile=q_low, alpha=0.1, solver='highs')
                     model_low_lower.fit(X_train_scaled, y_low_train_arr)
 
-                    params_low_upper = {**quantile_params, 'quantile_alpha': q_high}
-                    model_low_upper = xgb.XGBRegressor(**params_low_upper)
+                    model_low_upper = QuantileRegressor(quantile=q_high, alpha=0.1, solver='highs')
                     model_low_upper.fit(X_train_scaled, y_low_train_arr)
 
                     self.quantile_models[conf_level] = {
@@ -3872,18 +3945,17 @@ class PriceRangePredictor:
                         'low_upper': model_low_upper,
                         'quantiles': (q_low, q_high)
                     }
-                    print(f"   {int(conf_level*100)}% CI: Trained 4 quantile models")
+                    print(f"   {int(conf_level*100)}% CI: Trained 4 QuantileRegressor models")
 
                 except Exception as q_err:
                     print(f"   {int(conf_level*100)}% CI: Failed - {q_err}")
 
         if y_high_train_arr is not None and y_low_train_arr is not None and len(y_high_train_arr) == X_train_scaled.shape[0] and model_type != 'ridge':
             # XGBoost: Use quantile regression for learned confidence bands
-            print("\n[QUANTILE REGRESSION] Training models for learned confidence bands...")
+            # XGBoost path: Also train sklearn QuantileRegressor for more reliable confidence bands
+            # sklearn's QuantileRegressor is more stable for tail estimation than XGBoost quantile
+            print("\n[QUANTILE REGRESSION] Training sklearn QuantileRegressor (XGBoost path)...")
 
-            # Quantile levels for different confidence intervals
-            # For TRADING, tighter bands (50-68%) are more actionable
-            # For RISK MANAGEMENT, wider bands (80-95%) are safer
             quantile_levels = {
                 0.50: (0.25, 0.75),  # 50% confidence - TIGHT, most actionable
                 0.68: (0.16, 0.84),  # 68% confidence - ~1 std dev, good balance
@@ -3892,57 +3964,30 @@ class PriceRangePredictor:
                 0.95: (0.025, 0.975) # 95% confidence - widest
             }
 
-            # Use HIGH-optimized params for HIGH quantile models
-            quantile_high_params = self.high_best_params.copy()
-            quantile_high_params['objective'] = 'reg:quantileerror'
-            quantile_high_params['n_jobs'] = 1
-            quantile_high_params['verbosity'] = 0
-            # Reduce complexity slightly for quantile models
-            quantile_high_params['max_depth'] = min(quantile_high_params.get('max_depth', 6), 6)
-            quantile_high_params['n_estimators'] = min(quantile_high_params.get('n_estimators', 100), 100)
-
-            # Use LOW-optimized params for LOW quantile models
-            quantile_low_params = self.low_best_params.copy()
-            quantile_low_params['objective'] = 'reg:quantileerror'
-            quantile_low_params['n_jobs'] = 1
-            quantile_low_params['verbosity'] = 0
-            quantile_low_params['max_depth'] = min(quantile_low_params.get('max_depth', 6), 6)
-            quantile_low_params['n_estimators'] = min(quantile_low_params.get('n_estimators', 100), 100)
-
             for conf_level, (q_low, q_high) in quantile_levels.items():
                 try:
-                    # Train lower quantile model for HIGH predictions (using HIGH-optimized params)
-                    params_high_lower = quantile_high_params.copy()
-                    params_high_lower['quantile_alpha'] = q_low
-                    model_high_lower = xgb.XGBRegressor(**params_high_lower)
+                    # Train QuantileRegressor for HIGH predictions
+                    model_high_lower = QuantileRegressor(quantile=q_low, alpha=0.1, solver='highs')
                     model_high_lower.fit(X_train_scaled, y_high_train_arr)
 
-                    # Train upper quantile model for HIGH predictions
-                    params_high_upper = quantile_high_params.copy()
-                    params_high_upper['quantile_alpha'] = q_high
-                    model_high_upper = xgb.XGBRegressor(**params_high_upper)
+                    model_high_upper = QuantileRegressor(quantile=q_high, alpha=0.1, solver='highs')
                     model_high_upper.fit(X_train_scaled, y_high_train_arr)
 
-                    # Train lower quantile model for LOW predictions (using LOW-optimized params)
-                    params_low_lower = quantile_low_params.copy()
-                    params_low_lower['quantile_alpha'] = q_low
-                    model_low_lower = xgb.XGBRegressor(**params_low_lower)
+                    # Train QuantileRegressor for LOW predictions
+                    model_low_lower = QuantileRegressor(quantile=q_low, alpha=0.1, solver='highs')
                     model_low_lower.fit(X_train_scaled, y_low_train_arr)
 
-                    # Train upper quantile model for LOW predictions
-                    params_low_upper = quantile_low_params.copy()
-                    params_low_upper['quantile_alpha'] = q_high
-                    model_low_upper = xgb.XGBRegressor(**params_low_upper)
+                    model_low_upper = QuantileRegressor(quantile=q_high, alpha=0.1, solver='highs')
                     model_low_upper.fit(X_train_scaled, y_low_train_arr)
 
                     self.quantile_models[conf_level] = {
-                        'high_lower': model_high_lower,  # 5th percentile of high
-                        'high_upper': model_high_upper,  # 95th percentile of high
-                        'low_lower': model_low_lower,    # 5th percentile of low
-                        'low_upper': model_low_upper,    # 95th percentile of low
+                        'high_lower': model_high_lower,  # lower percentile of high
+                        'high_upper': model_high_upper,  # upper percentile of high
+                        'low_lower': model_low_lower,    # lower percentile of low
+                        'low_upper': model_low_upper,    # upper percentile of low
                         'quantiles': (q_low, q_high)
                     }
-                    print(f"   {int(conf_level*100)}% CI: Trained 4 quantile models (q={q_low}, {q_high})")
+                    print(f"   {int(conf_level*100)}% CI: Trained 4 QuantileRegressor models (q={q_low:.2f}, {q_high:.2f})")
 
                 except Exception as q_err:
                     print(f"   {int(conf_level*100)}% CI: Failed - {q_err}")
@@ -4280,6 +4325,11 @@ class PriceRangePredictor:
             high_uncertainty = (high_upper - high_lower) / 2
             low_uncertainty = (low_upper - low_lower) / 2
 
+            # Log band widths for monitoring
+            high_band_pct = (high_upper - high_lower) / current_close * 100
+            low_band_pct = (low_upper - low_lower) / current_close * 100
+            print(f"   Band widths: HIGH={high_band_pct:.2f}%, LOW={low_band_pct:.2f}%")
+
             conformal_bounds = {
                 'method': 'quantile_regression',
                 'confidence_level': confidence_level,
@@ -4290,6 +4340,7 @@ class PriceRangePredictor:
 
             print(f"[DEBUG predict] Quantile bands: High=[${high_lower:.2f}, ${high_upper:.2f}], "
                   f"Low=[${low_lower:.2f}, ${low_upper:.2f}]")
+            print(f"[DEBUG predict] Band widths: HIGH=${high_upper - high_lower:.2f}, LOW=${low_upper - low_lower:.2f}")
 
         else:
             # Fallback to RMSE-based bands if quantile models not available
@@ -4314,7 +4365,11 @@ class PriceRangePredictor:
                 'base_z': base_z
             }
 
+            # Log band widths for monitoring
+            high_band_pct = (high_upper - high_lower) / current_close * 100
+            low_band_pct = (low_upper - low_lower) / current_close * 100
             print(f"[DEBUG predict] Fallback bands: RMSE={rmse:.4f}, z={base_z:.2f}")
+            print(f"   Band widths: HIGH={high_band_pct:.2f}%, LOW={low_band_pct:.2f}%")
 
         print(f"[DEBUG predict] Returning prediction dict...")
 
@@ -5975,15 +6030,21 @@ def get_parallel_progress(progress_file: str = None) -> dict:
 # FIND BEST MODEL - Run All Combinations
 # =============================================================================
 
-def generate_model_configs() -> list:
+def generate_model_configs(exhaustive: bool = True) -> list:
     """
     Generate all model configurations to test.
+
+    Args:
+        exhaustive: If True, test ALL combinations of HIGH and LOW models separately.
+                   If False, use same model for both HIGH and LOW (faster, fewer configs).
+
     Returns list of dicts with 'name', 'high_config', 'low_config'.
     """
-    configs = []
-
     # Feature selection levels
     top_n_values = [5, 10, 15, 20, 30, 50, 0]  # 0 = ALL
+
+    # Build list of individual model configs
+    individual_configs = []
 
     # Single models
     single_models = ['ridge']
@@ -5995,13 +6056,12 @@ def generate_model_configs() -> list:
     for model_type in single_models:
         for top_n in top_n_values:
             top_n_str = "ALL" if top_n == 0 else f"Top{top_n}"
-            configs.append({
+            individual_configs.append({
                 'name': f"{model_type.upper()}_{top_n_str}",
-                'high_config': {'model_type': model_type, 'top_n_features': top_n},
-                'low_config': {'model_type': model_type, 'top_n_features': top_n},
+                'config': {'model_type': model_type, 'top_n_features': top_n},
             })
 
-    # Ensemble combinations (HIGH and LOW use same ensemble)
+    # Ensemble combinations
     ensemble_combos = []
     if XGB_AVAILABLE and LGBM_AVAILABLE:
         ensemble_combos = [
@@ -6022,13 +6082,61 @@ def generate_model_configs() -> list:
     for models, name_prefix in ensemble_combos:
         for top_n in top_n_values:
             top_n_str = "ALL" if top_n == 0 else f"Top{top_n}"
-            configs.append({
+            individual_configs.append({
                 'name': f"{name_prefix}_{top_n_str}",
-                'high_config': {'model_type': 'ensemble', 'ensemble_models': models, 'top_n_features': top_n},
-                'low_config': {'model_type': 'ensemble', 'ensemble_models': models, 'top_n_features': top_n},
+                'config': {'model_type': 'ensemble', 'ensemble_models': models, 'top_n_features': top_n},
+            })
+
+    # Generate final configs
+    configs = []
+
+    if exhaustive:
+        # EXHAUSTIVE: Test ALL combinations of HIGH and LOW models
+        # This gives N × N combinations where N = number of individual configs
+        for high_cfg in individual_configs:
+            for low_cfg in individual_configs:
+                configs.append({
+                    'name': f"H:{high_cfg['name']}|L:{low_cfg['name']}",
+                    'high_config': high_cfg['config'].copy(),
+                    'low_config': low_cfg['config'].copy(),
+                })
+    else:
+        # NON-EXHAUSTIVE: Same model for both HIGH and LOW (original behavior)
+        for cfg in individual_configs:
+            configs.append({
+                'name': cfg['name'],
+                'high_config': cfg['config'].copy(),
+                'low_config': cfg['config'].copy(),
             })
 
     return configs
+
+
+def get_model_config_count(exhaustive: bool = True) -> int:
+    """Get the number of configurations that will be tested."""
+    # Feature selection levels
+    top_n_values = [5, 10, 15, 20, 30, 50, 0]  # 7 options
+
+    # Count single models
+    single_count = 1  # ridge always available
+    if XGB_AVAILABLE:
+        single_count += 1
+    if LGBM_AVAILABLE:
+        single_count += 1
+
+    # Count ensembles
+    ensemble_count = 0
+    if XGB_AVAILABLE and LGBM_AVAILABLE:
+        ensemble_count = 4  # Ridge+XGB, Ridge+LGB, XGB+LGB, Ridge+XGB+LGB
+    elif XGB_AVAILABLE or LGBM_AVAILABLE:
+        ensemble_count = 1
+
+    n_individual = (single_count + ensemble_count) * len(top_n_values)
+
+    if exhaustive:
+        return n_individual * n_individual
+    else:
+        return n_individual
 
 
 def run_all_model_combinations(
@@ -6037,7 +6145,8 @@ def run_all_model_combinations(
     test_days: int = 60,
     train_window: int = 250,
     ci_level: float = 0.68,
-    n_workers: int = 4,
+    n_workers: int = -1,  # -1 = use all available cores
+    exhaustive: bool = True,  # True = test all HIGH×LOW combinations
     progress_callback=None,
     progress_file: str = None
 ) -> list:
@@ -6050,39 +6159,55 @@ def run_all_model_combinations(
         test_days: Number of days to test on
         train_window: Rolling training window size
         ci_level: Confidence interval level
-        n_workers: Number of parallel workers
+        n_workers: Number of parallel workers (-1 = all available cores)
+        exhaustive: If True, test ALL combinations of HIGH and LOW models separately.
+                   This gives N×N combinations (e.g., 49×49=2401 for full feature set).
+                   If False, use same model for both HIGH and LOW (faster, ~49 configs).
         progress_callback: Optional callback(current, total, status) for progress updates
         progress_file: Optional file path for progress JSON
 
     Returns:
-        List of result dicts sorted by R² (best first), each containing:
-        - name: Configuration name
+        List of result dicts sorted by composite score (best first), each containing:
+        - name: Configuration name (format: "H:MODEL|L:MODEL" for exhaustive)
+        - composite_avg, composite_high, composite_low: Composite scores
         - r2_high, r2_low, r2_avg: R² metrics
+        - mape_high, mape_low: MAPE metrics
         - mae_high, mae_low: Mean Absolute Error
         - containment_high, containment_low: % of actual within predicted bands
         - bias_high, bias_low: Average prediction bias
         - n_predictions: Number of valid predictions
         - high_config, low_config: The model configurations used
     """
-    from joblib import Parallel, delayed
+    from joblib import Parallel, delayed, cpu_count
     from sklearn.preprocessing import StandardScaler
     from sklearn.metrics import r2_score, mean_absolute_error
     import tempfile
     import json
+
+    # Use all available cores if n_workers is -1
+    if n_workers == -1:
+        n_workers = cpu_count()
 
     # Setup progress file
     if progress_file is None:
         progress_file = os.path.join(tempfile.gettempdir(), 'find_best_model_progress.json')
 
     # Generate all configurations
-    configs = generate_model_configs()
+    configs = generate_model_configs(exhaustive=exhaustive)
     total_configs = len(configs)
 
+    # Calculate individual model count for display
+    n_individual = int(np.sqrt(total_configs)) if exhaustive else total_configs
+
     print(f"\n{'='*70}")
-    print(f"FIND BEST MODEL - Running {total_configs} Configurations")
+    print(f"FIND BEST MODEL - {'EXHAUSTIVE' if exhaustive else 'STANDARD'} SEARCH")
     print(f"{'='*70}")
+    if exhaustive:
+        print(f"Testing {n_individual} HIGH models × {n_individual} LOW models = {total_configs} combinations")
+    else:
+        print(f"Testing {total_configs} configurations (same model for HIGH and LOW)")
     print(f"Test period: {test_days} days | Train window: {train_window} days")
-    print(f"Workers: {n_workers} | Confidence: {ci_level*100:.0f}%")
+    print(f"Workers: {n_workers} cores | Confidence: {ci_level*100:.0f}%")
     print(f"{'='*70}\n")
 
     # Initialize progress
@@ -6313,6 +6438,35 @@ def run_all_model_combinations(
             r2_low = r2_score(actual_low_pct, pred_low_pct)
             r2_avg = (r2_high + r2_low) / 2
 
+            # ================================================================
+            # COMPOSITE SCORE (same metric as training optimization)
+            # Formula: 0.6 * R² + 0.4 * (1 - MAPE/100)
+            # ================================================================
+            # MAPE for HIGH
+            actual_high_arr = np.array(actual_high_pct)
+            pred_high_arr = np.array(pred_high_pct)
+            actual_high_safe = np.clip(np.abs(actual_high_arr), 0.01, None)
+            mape_high = np.mean(np.abs(actual_high_arr - pred_high_arr) / actual_high_safe) * 100
+            mape_high = min(mape_high, 100)
+
+            # MAPE for LOW
+            actual_low_arr = np.array(actual_low_pct)
+            pred_low_arr = np.array(pred_low_pct)
+            actual_low_safe = np.clip(np.abs(actual_low_arr), 0.01, None)
+            mape_low = np.mean(np.abs(actual_low_arr - pred_low_arr) / actual_low_safe) * 100
+            mape_low = min(mape_low, 100)
+
+            # Composite scores
+            r2_comp_high = max(0, r2_high)
+            mape_comp_high = max(0, 1 - mape_high / 100)
+            composite_high = 0.6 * r2_comp_high + 0.4 * mape_comp_high
+
+            r2_comp_low = max(0, r2_low)
+            mape_comp_low = max(0, 1 - mape_low / 100)
+            composite_low = 0.6 * r2_comp_low + 0.4 * mape_comp_low
+
+            composite_avg = (composite_high + composite_low) / 2
+
             # MAE on DOLLAR values (for consistent display with REGIME models)
             actual_high_dollars = [p['actual_high'] for p in predictions]
             actual_low_dollars = [p['actual_low'] for p in predictions]
@@ -6340,6 +6494,11 @@ def run_all_model_combinations(
                 'r2_high': r2_high,
                 'r2_low': r2_low,
                 'r2_avg': r2_avg,
+                'composite_high': composite_high,
+                'composite_low': composite_low,
+                'composite_avg': composite_avg,
+                'mape_high': mape_high,
+                'mape_low': mape_low,
                 'mae_high': mae_high,
                 'mae_low': mae_low,
                 'containment_high': containment_high,
@@ -6355,29 +6514,47 @@ def run_all_model_combinations(
             print(f"   Error in config {config['name']}: {e}")
             return None
 
-    # Run all configs in parallel
+    # Run configs in BATCHES for progress tracking
+    # joblib.Parallel blocks until all jobs complete, so we batch to get progress updates
     results = []
     completed = 0
 
-    # Use joblib for parallelization
-    parallel_results = Parallel(n_jobs=n_workers, backend='loky', verbose=0)(
-        delayed(run_single_config)(config, i) for i, config in enumerate(configs)
-    )
+    # Batch size: process n_workers * 2 configs at a time for good parallelization + progress
+    batch_size = max(n_workers * 2, 20)  # At least 20 per batch for efficiency
+    n_batches = (total_configs + batch_size - 1) // batch_size
 
-    # Collect valid results
-    for i, result in enumerate(parallel_results):
-        if result is not None:
-            results.append(result)
+    print(f"Processing in {n_batches} batches of ~{batch_size} configs each...")
 
-        completed = i + 1
+    for batch_idx in range(n_batches):
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, total_configs)
+        batch_configs = configs[batch_start:batch_end]
+
+        # Run this batch in parallel
+        batch_results = Parallel(n_jobs=n_workers, backend='loky', verbose=0)(
+            delayed(run_single_config)(config, batch_start + i) for i, config in enumerate(batch_configs)
+        )
+
+        # Collect valid results from this batch
+        for result in batch_results:
+            if result is not None:
+                results.append(result)
+
+        completed = batch_end
+        pct = completed / total_configs * 100
+
+        # Update progress file
         with open(progress_file, 'w') as f:
             json.dump({'completed': completed, 'total': total_configs, 'status': 'running_configs'}, f)
 
         if progress_callback:
             progress_callback(completed, total_configs, 'running_configs')
 
-    # Sort by R² average (best first)
-    results.sort(key=lambda x: x['r2_avg'], reverse=True)
+        # Console progress
+        print(f"   Batch {batch_idx + 1}/{n_batches}: {completed}/{total_configs} configs ({pct:.1f}%) | Valid results: {len(results)}", flush=True)
+
+    # Sort by COMPOSITE SCORE average (best first) - same metric used in training optimization
+    results.sort(key=lambda x: x['composite_avg'], reverse=True)
 
     # Mark complete
     with open(progress_file, 'w') as f:
@@ -6391,9 +6568,10 @@ def run_all_model_combinations(
     print(f"{'='*70}")
     if results:
         best = results[0]
-        print(f"BEST: {best['name']}")
-        print(f"  R² HIGH: {best['r2_high']:.4f} | R² LOW: {best['r2_low']:.4f} | R² AVG: {best['r2_avg']:.4f}")
-        print(f"  MAE HIGH: {best['mae_high']:.4f} | MAE LOW: {best['mae_low']:.4f}")
+        print(f"BEST: {best['name']} (Composite: {best['composite_avg']:.4f})")
+        print(f"  Composite: HIGH={best['composite_high']:.4f} | LOW={best['composite_low']:.4f} | AVG={best['composite_avg']:.4f}")
+        print(f"  R²: HIGH={best['r2_high']:.4f} | LOW={best['r2_low']:.4f} | AVG={best['r2_avg']:.4f}")
+        print(f"  MAPE: HIGH={best['mape_high']:.1f}% | LOW={best['mape_low']:.1f}%")
         print(f"  Containment: HIGH {best['containment_high']:.1f}% | LOW {best['containment_low']:.1f}%")
     print(f"{'='*70}\n")
 

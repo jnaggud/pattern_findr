@@ -149,8 +149,18 @@ def list_saved_strategies() -> list:
     return strategies
 
 
-def save_strategy_bundle(config: dict, name: str = None) -> str:
-    """Save a strategy config as a permanent bundle."""
+def save_strategy_bundle(config: dict, name: str = None, optimization_info: dict = None) -> str:
+    """Save a strategy config as a permanent bundle.
+
+    Args:
+        config: Strategy configuration dictionary
+        name: Optional bundle name (auto-generated if not provided)
+        optimization_info: Optional dict with optimization method tracking:
+            - script: The optimization script used
+            - n_trials: Number of optimization trials
+            - n_jobs: Number of parallel workers
+            - metric: Optimization metric used
+    """
     ensure_strategies_dir()
 
     ticker = config.get('ticker', 'UNKNOWN')
@@ -168,6 +178,16 @@ def save_strategy_bundle(config: dict, name: str = None) -> str:
     config_path = os.path.join(bundle_path, "velocity_config.json")
     config['bundle_name'] = bundle_name
     config['saved_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Add optimization method tracking if provided
+    if optimization_info:
+        config['optimization_method'] = {
+            'script': optimization_info.get('script'),
+            'n_trials': optimization_info.get('n_trials'),
+            'n_jobs': optimization_info.get('n_jobs'),
+            'metric': optimization_info.get('metric'),
+            'optimized_at': optimization_info.get('optimized_at', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        }
 
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=4)

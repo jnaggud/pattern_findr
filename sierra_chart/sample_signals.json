@@ -1,0 +1,54 @@
+{
+  "version": "1.0",
+  "last_updated": "2026-02-03T09:15:00Z",
+  "signals": [
+    {
+      "id": "velocity_ES_20260203_083000",
+      "signal_type": "ENTRY",
+      "direction": "LONG",
+      "ticker": "ES=F",
+      "sierra_symbol": "ES",
+      "signal_time": "2026-02-03T08:30:00Z",
+      "price": 6940.00,
+      "strategy_name": "velocity_ES=F_15m_v5",
+      "stop_loss": 6920.00,
+      "take_profit": 6980.00
+    },
+    {
+      "id": "velocity_ES_20260203_091500",
+      "signal_type": "EXIT",
+      "direction": "LONG",
+      "ticker": "ES=F",
+      "sierra_symbol": "ES",
+      "signal_time": "2026-02-03T09:15:00Z",
+      "price": 6961.00,
+      "strategy_name": "velocity_ES=F_15m_v5",
+      "entry_price": 6940.00,
+      "pnl_pts": 21.0,
+      "pnl_pct": 0.30,
+      "exit_reason": "opposite_signal"
+    },
+    {
+      "id": "velocity_GC_20260203_100000",
+      "signal_type": "ENTRY",
+      "direction": "LONG",
+      "ticker": "GC=F",
+      "sierra_symbol": "GC",
+      "signal_time": "2026-02-03T10:00:00Z",
+      "price": 2875.50,
+      "strategy_name": "velocity_GC=F_any_reversal_JD1",
+      "stop_loss": 2865.50,
+      "take_profit": 2895.50
+    }
+  ],
+  "active_positions": [
+    {
+      "ticker": "GC=F",
+      "sierra_symbol": "GC",
+      "direction": "LONG",
+      "entry_price": 2875.50,
+      "entry_time": "2026-02-03T10:00:00Z",
+      "strategy_name": "velocity_GC=F_any_reversal_JD1"
+    }
+  ]
+}

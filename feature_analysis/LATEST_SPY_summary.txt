@@ -1,7 +1,7 @@
 ================================================================================
 FEATURE ANALYSIS SUMMARY
 ================================================================================
-Generated: 2026-01-12 06:53:47
+Generated: 2026-01-15 10:04:27
 Ticker: SPY
 Total Features Analyzed: 15
 Training Iterations: 1
@@ -11,79 +11,79 @@ TOP 20 FEATURES BY CORRELATION WITH TARGET
 ================================================================================
 Rank   Feature                                        Correlation     |Corr|
 ---------------------------------------------------------------------------
-1      super_master                                        0.7115     0.7115
-2      super_range_upside                                  0.6846     0.6846
+1      super_master                                        0.7118     0.7118
+2      super_range_upside                                  0.6851     0.6851
 3      vol_regime_minus_position                           0.6822     0.6822
-4      range_plus_upside                                   0.6815     0.6815
-5      range_times_upside                                  0.6794     0.6794
-6      daily_range_plus_upside                             0.6779     0.6779
-7      super_upside_vol                                    0.6749     0.6749
-8      upside_times_atr7                                   0.6730     0.6730
-9      super_vol_regime                                    0.6720     0.6720
-10     upside_times_atr14                                  0.6676     0.6676
-11     upside_plus_range_mean20                            0.6660     0.6660
-12     range_times_high_stretch                            0.6571     0.6571
-13     vol_regime_minus_trend                              0.6475     0.6475
-14     momentum_trend_divergence                           0.6445     0.6445
-15     range_mean_3d                                       0.6439     0.6439
-16     vol_regime_plus_range                               0.6379     0.6379
-17     vol_regime_interaction                              0.6364     0.6364
-18     drawdown_from_high_20d                             -0.6309     0.6309
-19     upside_potential_x_price_vs_sma50                  -0.6245     0.6245
-20     range_max_3d                                        0.6228     0.6228
+4      range_plus_upside                                   0.6820     0.6820
+5      range_times_upside                                  0.6798     0.6798
+6      daily_range_plus_upside                             0.6784     0.6784
+7      super_upside_vol                                    0.6750     0.6750
+8      upside_times_atr7                                   0.6741     0.6741
+9      super_vol_regime                                    0.6721     0.6721
+10     upside_times_atr14                                  0.6678     0.6678
+11     upside_plus_range_mean20                            0.6661     0.6661
+12     range_times_high_stretch                            0.6569     0.6569
+13     vol_regime_minus_trend                              0.6477     0.6477
+14     momentum_trend_divergence                           0.6447     0.6447
+15     range_mean_3d                                       0.6441     0.6441
+16     vol_regime_plus_range                               0.6381     0.6381
+17     vol_regime_interaction                              0.6366     0.6366
+18     drawdown_from_high_20d                             -0.6310     0.6310
+19     upside_potential_x_price_vs_sma50                  -0.6247     0.6247
+20     range_max_3d                                        0.6229     0.6229
 
 ================================================================================
 TOP 20 FEATURES BY MODEL IMPORTANCE
 ================================================================================
 Rank   Feature                                           Mean Imp        Std  Consistency
 ---------------------------------------------------------------------------------------
-1      price_vs_sma20                                      0.5517        nan          nan
-2      range_times_upside                                  0.4165        nan          nan
-3      drawdown_from_high_20d                              0.3599        nan          nan
-4      upside_times_atr7                                   0.3521        nan          nan
-5      range_times_high_stretch                            0.3423        nan          nan
-6      price_position                                      0.3204        nan          nan
-7      trend_dislocation                                   0.2649        nan          nan
-8      breakdown_signal                                    0.2426        nan          nan
-9      vix_percentile                                      0.2403        nan          nan
-10     composite_osc                                       0.2007        nan          nan
-11     super_upside_vol                                    0.1619        nan          nan
-12     sector_above_sma_pct                                0.1461        nan          nan
-13     sector_above_sma_count                              0.1461        nan          nan
-14     vix                                                 0.0751        nan          nan
-15     upside_times_atr14                                  0.0543        nan          nan
+1      dxy                                                 0.1401        nan          nan
+2      vix                                                 0.0988        nan          nan
+3      composite_osc_smooth                                0.0905        nan          nan
+4      range_times_upside                                  0.0728        nan          nan
+5      super_range_upside                                  0.0642        nan          nan
+6      upside_times_atr14                                  0.0577        nan          nan
+7      upside_plus_range_mean20                            0.0519        nan          nan
+8      range_times_high_stretch                            0.0446        nan          nan
+9      drawdown_from_high_20d                              0.0316        nan          nan
+10     range_plus_upside                                   0.0303        nan          nan
+11     upside_potential                                    0.0289        nan          nan
+12     super_upside_vol                                    0.0280        nan          nan
+13     cci_norm                                            0.0203        nan          nan
+14     bb_position                                         0.0145        nan          nan
+15     upside_times_atr7                                   0.0102        nan          nan
 
 ================================================================================
 TOP 20 DISCOVERED FEATURES
 ================================================================================
 Rank   Feature                                  Type             Correlation
 ---------------------------------------------------------------------------
-1      upside_plus_range_mean20_*_range_mean_3d Interaction           0.7147
-2      vol_regime_minus_position_+_upside_times_atr7 Interaction           0.7143
-3      upside_plus_range_mean20_*_range_mean_5d Interaction           0.7116
-4      upside_plus_range_mean20_+_range_max_3d  Interaction           0.7080
-5      vol_regime_minus_position_+_upside_times_atr14 Interaction           0.7079
-6      daily_range_plus_upside_+_range_mean_5d  Interaction           0.7076
-7      range_plus_upside_+_daily_range          Interaction           0.7076
-8      daily_range_plus_upside_*_range_mean_5d  Interaction           0.7074
-9      upside_plus_range_mean20_+_range_mean_3d Interaction           0.7063
-10     range_plus_upside_+_range_mean_3d        Interaction           0.7063
-11     range_plus_upside_+_range_max_3d         Interaction           0.7059
-12     upside_plus_range_mean20_+_daily_range   Interaction           0.7054
-13     daily_range_plus_upside_+_range_mean_3d  Interaction           0.7052
-14     daily_range_plus_upside_+_range_max_3d   Interaction           0.7050
-15     upside_plus_range_mean20_*_range_max_3d  Interaction           0.7048
-16     range_plus_upside_+_range_mean_5d        Interaction           0.7025
-17     upside_plus_range_mean20_+_range_mean_5d Interaction           0.7020
-18     upside_times_atr7_+_vol_regime_minus_trend Interaction           0.6999
-19     momentum_trend_divergence_+_range_mean_3d Interaction           0.6991
-20     upside_plus_range_mean20_*_daily_range   Interaction           0.6970
+1      vol_regime_minus_position_+_upside_times_atr7 Interaction           0.7143
+2      upside_plus_range_mean20_+_vol_weighted_range Interaction           0.7083
+3      vol_regime_minus_position_+_upside_times_atr14 Interaction           0.7079
+4      range_plus_upside_+_vol_weighted_range   Interaction           0.7051
+5      upside_times_atr7_+_vol_regime_minus_trend Interaction           0.7000
+6      range_plus_upside_+_momentum_trend_divergence Interaction           0.6936
+7      upside_times_atr14_+_vol_regime_minus_trend Interaction           0.6931
+8      range_plus_upside_+_oversold_range       Interaction           0.6903
+9      range_plus_upside_-_upside_potential_x_price_vs_sma50 Interaction           0.6902
+10     daily_range_plus_upside_+_range_times_high_stretch Interaction           0.6890
+11     daily_range_plus_upside_+_momentum_trend_divergence Interaction           0.6885
+12     upside_plus_range_mean20_+_range_times_high_stretch Interaction           0.6881
+13     range_times_high_stretch_+_vol_weighted_range Interaction           0.6879
+14     range_plus_upside_+_range_times_high_stretch Interaction           0.6860
+15     daily_range_plus_upside_-_upside_potential_x_price_vs_sma50 Interaction           0.6857
+16     upside_times_atr7_+_vol_weighted_range   Interaction           0.6856
+17     vol_regime_minus_position_+_range_times_high_stretch Interaction           0.6855
+18     daily_range_plus_upside_+_oversold_range Interaction           0.6853
+19     upside_times_atr7_+_range_times_high_stretch Interaction           0.6852
+20     vol_regime_minus_position_+_range_plus_upside Interaction           0.6850
 
 ================================================================================
 EXPORTED FILES
 ================================================================================
-Correlations CSV: feature_analysis/SPY_correlations_20260112_065347.csv
-Importances CSV: feature_analysis/SPY_importances_20260112_065347.csv
-Discovered Features CSV: feature_analysis/SPY_discovered_features_20260112_065347.csv
-Summary: feature_analysis/SPY_feature_analysis_20260112_065347_summary.txt
+Correlations CSV: feature_analysis/SPY_correlations_20260115_100427.csv
+Importances CSV: feature_analysis/SPY_importances_20260115_100427.csv
+Discovered Features CSV: feature_analysis/SPY_discovered_features_20260115_100427.csv
+Summary: feature_analysis/SPY_feature_analysis_20260115_100427_summary.txt
 ================================================================================

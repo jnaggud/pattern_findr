@@ -163,8 +163,35 @@ def create_predictive_news_features(price_df: pd.DataFrame, ticker: str) -> pd.D
     sent_mean_10d = merged['sentiment_score'].rolling(10, min_periods=3).mean()
     merged['news_sentiment_surprise'] = merged['sentiment_score'] - sent_mean_10d
 
+    # ========================================
+    # VALIDATED SENTIMENT × TECHNICAL INTERACTIONS
+    # (From walk-forward testing Jan 2026)
+    # Best for: LOW_VOL (+1.2% R²), RANGE_BOUND (+50% R²)
+    # ========================================
+
+    # 15. Sentiment Cumsum × Trend (best for LOW_VOL regime)
+    # Captures cumulative sentiment direction aligned with price trend
+    if 'close' in price_df.columns:
+        sma_20 = price_df['close'].rolling(20, min_periods=5).mean()
+        price_vs_sma20 = (price_df['close'] - sma_20) / sma_20 * 100
+        sent_cumsum_5d = merged['sentiment_score'].rolling(5, min_periods=1).sum()
+        merged['news_sent_cumsum_x_trend'] = sent_cumsum_5d * price_vs_sma20.values
+
+    # 16. Sentiment × Range Momentum (best for RANGE_BOUND regime)
+    # Captures sentiment direction aligned with recent range expansion/contraction
+    range_momentum = merged['_daily_range_pct'].diff(3) if '_daily_range_pct' in merged.columns else (
+        (price_df['high'] - price_df['low']) / price_df['close'] * 100
+    ).diff(3)
+    merged['news_sent_x_range_momentum'] = merged['sentiment_score'] * range_momentum
+
+    # 17. Sentiment × Volatility 20d (general sentiment-vol interaction)
+    # Uses rolling volatility instead of daily range
+    vol_20d = price_df['close'].pct_change().rolling(20, min_periods=5).std() * np.sqrt(252) * 100
+    merged['news_sent_x_volatility_20d'] = merged['sentiment_score'] * vol_20d.values
+
     # Clean up temp column
-    merged.drop('_daily_range_pct', axis=1, inplace=True)
+    if '_daily_range_pct' in merged.columns:
+        merged.drop('_daily_range_pct', axis=1, inplace=True)
 
     # Count how many features were created
     news_cols = [c for c in merged.columns if c.startswith('news_')]

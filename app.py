@@ -32,6 +32,42 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+from datetime import timedelta
+
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+# Databento for futures data (preferred over yfinance for CME futures)
+try:
+    import databento as db
+    DATABENTO_AVAILABLE = True
+except ImportError:
+    DATABENTO_AVAILABLE = False
+
+# Databento API key from environment
+DATABENTO_API_KEY = os.environ.get("DATABENTO_API_KEY", None)
+
+# Futures ticker mapping: yfinance ticker -> Databento continuous contract symbol
+FUTURES_TICKER_MAP = {
+    'ES=F': 'ES.c.0',   # E-mini S&P 500 continuous
+    'NQ=F': 'NQ.c.0',   # E-mini Nasdaq 100 continuous
+    'YM=F': 'YM.c.0',   # E-mini Dow continuous
+    'RTY=F': 'RTY.c.0', # E-mini Russell 2000 continuous
+    'GC=F': 'GC.c.0',   # Gold continuous
+    'SI=F': 'SI.c.0',   # Silver continuous
+    'CL=F': 'CL.c.0',   # Crude Oil continuous
+    'NG=F': 'NG.c.0',   # Natural Gas continuous
+    'ZB=F': 'ZB.c.0',   # 30-Year Treasury Bond continuous
+    'ZN=F': 'ZN.c.0',   # 10-Year Treasury Note continuous
+}
+
+def is_futures_ticker(ticker: str) -> bool:
+    """Check if ticker is a futures contract."""
+    return ticker.endswith('=F') or ticker in FUTURES_TICKER_MAP
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
@@ -85,7 +121,7 @@ st.title("📈 Pattern_FindR - Professional Trading Strategy Discovery")
 # === NEW PAGE NAVIGATION SYSTEM ===
 page = st.selectbox(
     "📋 Select Page:",
-    ["Strategy Optimization", "🤖 ML Trading Signals", "🎯 Peak/Valley ML Signals", "🆕 Peak/Valley ML v2 (Clean)", "📊 Oscillator Predictor", "🧪 Oscillator Predictor Testing"],
+    ["Strategy Optimization", "🤖 ML Trading Signals", "🎯 Peak/Valley ML Signals", "🆕 Peak/Valley ML v2 (Clean)", "📊 Oscillator Predictor", "📊 Oscillator Predictor Intraday", "🧪 Oscillator Predictor Testing"],
     index=0
 )
 
@@ -110,6 +146,12 @@ if page == "🆕 Peak/Valley ML v2 (Clean)":
 if page == "📊 Oscillator Predictor":
     from oscillator_predictor_page import render_oscillator_predictor_page
     render_oscillator_predictor_page()
+    st.stop()
+
+# === OSCILLATOR PREDICTOR INTRADAY (Velocity + Price Prediction for Intraday) ===
+if page == "📊 Oscillator Predictor Intraday":
+    from oscillator_predictor_intraday_page import render_oscillator_predictor_intraday_page
+    render_oscillator_predictor_intraday_page()
     st.stop()
 
 # === OSCILLATOR PREDICTOR TESTING (Strategy Validation Suite) ===
@@ -803,31 +845,117 @@ from datetime import datetime, timedelta
 CACHE_DIR = "data_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+def _fetch_futures_from_databento(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    """Fetch futures data from Databento API."""
+    if not DATABENTO_AVAILABLE or not DATABENTO_API_KEY:
+        return None
+
+    # Map period string to days
+    period_days = {
+        '1d': 1, '5d': 5, '1mo': 30, '3mo': 90, '6mo': 180,
+        '1y': 365, '2y': 730, '5y': 1825, '10y': 3650, 'max': 3650,
+        '60d': 60, '58d': 58,
+    }
+    days = period_days.get(period, 60)
+
+    # Map yfinance ticker to Databento symbol
+    db_symbol = FUTURES_TICKER_MAP.get(ticker)
+    if not db_symbol:
+        if ticker.endswith('=F'):
+            root = ticker[:-2]
+            db_symbol = f"{root}.c.0"
+        else:
+            return None
+
+    # Map interval to Databento schema
+    schema_map = {
+        '1m': 'ohlcv-1m', '5m': 'ohlcv-1m', '15m': 'ohlcv-1m',
+        '30m': 'ohlcv-1m', '1h': 'ohlcv-1h', '1d': 'ohlcv-1d',
+    }
+    schema = schema_map.get(interval, 'ohlcv-1m')
+
+    try:
+        client = db.Historical(DATABENTO_API_KEY)
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
+
+        logging.info(f"Fetching {ticker} via Databento ({days} days, {interval}) -> {db_symbol}")
+
+        data = client.timeseries.get_range(
+            dataset="GLBX.MDP3",
+            symbols=[db_symbol],
+            stype_in="continuous",
+            schema=schema,
+            start=start_date.strftime('%Y-%m-%dT%H:%M:%S'),
+            end=end_date.strftime('%Y-%m-%dT%H:%M:%S'),
+        )
+
+        df = data.to_df()
+        if df.empty:
+            return None
+
+        # Keep only OHLCV columns
+        ohlcv_cols = ['open', 'high', 'low', 'close', 'volume']
+        df = df[[c for c in ohlcv_cols if c in df.columns]]
+
+        # Resample if needed
+        if interval in ['5m', '15m', '30m']:
+            resample_rule = interval.replace('m', 'min')
+            df = df.resample(resample_rule).agg({
+                'open': 'first', 'high': 'max', 'low': 'min',
+                'close': 'last', 'volume': 'sum'
+            }).dropna()
+
+        # Convert index to timezone-naive and reset
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+
+        df = df.reset_index()
+        df.columns = [str(col).lower() for col in df.columns]
+
+        # Rename index column to 'date'
+        if 'ts_event' in df.columns:
+            df.rename(columns={'ts_event': 'date'}, inplace=True)
+        elif 'index' in df.columns:
+            df.rename(columns={'index': 'date'}, inplace=True)
+
+        logging.info(f"Databento: Loaded {len(df)} bars for {ticker}")
+        return df
+
+    except Exception as e:
+        logging.error(f"Databento error for {ticker}: {e}")
+        return None
+
+
 def load_and_validate_data(ticker, period, interval):
-    """Load and validate market data from yfinance, with on-disk caching."""
-    
+    """Load and validate market data, using Databento for futures or yfinance for stocks."""
+
     cache_filename = f"{ticker}_{period}_{interval}.csv"
     cache_path = os.path.join(CACHE_DIR, cache_filename)
-    
+
     # Determine cache expiry based on interval
     if interval in ['1m', '5m']:
-        cache_expiry = timedelta(minutes=30)  # Refresh intraday data frequently
+        cache_expiry = timedelta(minutes=30)
     elif interval in ['15m', '30m']:
-        cache_expiry = timedelta(hours=2)
+        cache_expiry = timedelta(hours=1)  # Shorter for intraday futures
     elif interval in ['1h']:
         cache_expiry = timedelta(hours=6)
     elif interval in ['1d']:
-        cache_expiry = timedelta(days=1)  # Daily data refreshes daily
+        cache_expiry = timedelta(days=1)
     else:
-        cache_expiry = timedelta(days=3)  # Weekly/monthly can be cached longer
-    
+        cache_expiry = timedelta(days=3)
+
+    # For futures with Databento, use shorter cache or skip cache entirely for intraday
+    is_futures = is_futures_ticker(ticker)
+    if is_futures and interval in ['15m', '30m', '1h']:
+        cache_expiry = timedelta(minutes=15)  # Very short cache for intraday futures
+
     if os.path.exists(cache_path):
         try:
             file_mod_time = datetime.fromtimestamp(os.path.getmtime(cache_path))
             if datetime.now() - file_mod_time < cache_expiry:
                 logging.info(f"Loading data from cache: {cache_path}")
                 cached_data = pd.read_csv(cache_path, parse_dates=['date'])
-                # Final validation on cached data
                 required = {'open', 'high', 'low', 'close', 'volume', 'date'}
                 if required.issubset(cached_data.columns):
                     return cached_data
@@ -836,7 +964,21 @@ def load_and_validate_data(ticker, period, interval):
         except Exception as e:
             logging.error(f"Error reading from cache: {e}. Fetching fresh data.")
 
-    logging.info(f"Cache not found or expired. Fetching data for {ticker} from yfinance.")
+    # Try Databento for futures first
+    if is_futures and DATABENTO_AVAILABLE and DATABENTO_API_KEY:
+        logging.info(f"Fetching {ticker} via Databento (futures)")
+        data = _fetch_futures_from_databento(ticker, period, interval)
+        if data is not None and not data.empty:
+            required = {'open', 'high', 'low', 'close', 'volume', 'date'}
+            if required.issubset(data.columns):
+                data['date'] = pd.to_datetime(data['date'])
+                data.to_csv(cache_path, index=False)
+                logging.info(f"Saved Databento data to cache: {cache_path}")
+                return data
+        logging.warning(f"Databento failed for {ticker}, falling back to yfinance")
+
+    # Fallback to yfinance
+    logging.info(f"Fetching data for {ticker} from yfinance.")
     try:
         data = yf.download(ticker, period=period, interval=interval)
         if data.empty:
@@ -846,14 +988,11 @@ def load_and_validate_data(ticker, period, interval):
         logging.info(f"yfinance returned columns: {data.columns.tolist()}")
 
         if isinstance(data.columns, pd.MultiIndex):
-            # Select the first level of the MultiIndex, which contains OHLCV
             data.columns = data.columns.get_level_values(0)
 
         data = data.reset_index()
-        # Standardize all columns, including the one from reset_index
         data.columns = [str(col).lower() for col in data.columns]
-        
-        # Handle both 'date' and 'datetime' column names (depends on interval)
+
         if 'datetime' in data.columns and 'date' not in data.columns:
             data.rename(columns={'datetime': 'date'}, inplace=True)
 
@@ -864,11 +1003,11 @@ def load_and_validate_data(ticker, period, interval):
             return None
 
         data['date'] = pd.to_datetime(data['date'])
-        
+
         logging.info(f"Successfully validated and standardized data for {ticker}.")
         data.to_csv(cache_path, index=False)
         logging.info(f"Saved data to cache: {cache_path}")
-        
+
         return data
 
     except Exception as e:
@@ -1875,18 +2014,42 @@ if st.session_state.get('show_saved_strategies', False):
 st.sidebar.header("User Inputs")
 
 # Ticker input with quick-select options
-col1, col2 = st.sidebar.columns([3, 1])
+col1, col2, col3 = st.sidebar.columns([3, 1, 1])
 with col1:
     ticker = st.text_input("Stock Ticker", "SPY").upper()
     # Share ticker with ML page
     st.session_state.main_app_ticker = ticker
 with col2:
     st.write("")
-    st.write("Quick:")
-    if st.button("MSTY", key="btn_msty"):
-        ticker = "MSTY"
-    if st.button("MSTR", key="btn_mstr"):
-        ticker = "MSTR"
+    st.write("Stocks:")
+    if st.button("SPY", key="btn_spy"):
+        ticker = "SPY"
+    if st.button("QQQ", key="btn_qqq"):
+        ticker = "QQQ"
+with col3:
+    st.write("")
+    st.write("Futures:")
+    if st.button("ES=F", key="btn_es", help="E-mini S&P 500"):
+        ticker = "ES=F"
+    if st.button("GC=F", key="btn_gc", help="Gold"):
+        ticker = "GC=F"
+
+# Show info if futures ticker selected
+if is_futures_ticker(ticker):
+    futures_info = {
+        'ES=F': 'E-mini S&P 500 Futures (CME)',
+        'NQ=F': 'E-mini Nasdaq 100 Futures (CME)',
+        'GC=F': 'Gold Futures (COMEX)',
+        'SI=F': 'Silver Futures (COMEX)',
+        'CL=F': 'Crude Oil Futures (NYMEX)',
+        'YM=F': 'E-mini Dow Futures (CBOT)',
+        'RTY=F': 'E-mini Russell 2000 Futures (CME)',
+    }
+    info_text = futures_info.get(ticker, f'{ticker} Futures')
+    if DATABENTO_AVAILABLE and DATABENTO_API_KEY:
+        st.sidebar.success(f"📊 {info_text} - Using Databento real-time data")
+    else:
+        st.sidebar.warning(f"📊 {info_text} - Using yfinance (may be delayed)")
 
 interval = st.sidebar.selectbox(
     "Select Timeframe",

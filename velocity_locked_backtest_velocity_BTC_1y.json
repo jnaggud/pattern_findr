@@ -1,5 +1,5 @@
 {
-  "locked_at": "2026-01-13T08:19:41.037519",
+  "locked_at": "2026-01-23T05:37:04.845596",
   "entries": [
     {
       "date": "2025-06-23 00:00:00",
@@ -129,6 +129,11 @@
     {
       "date": "2026-01-12 00:00:00",
       "price": 91192.9921875,
+      "position": "long"
+    },
+    {
+      "date": "2026-01-21 18:00:00-0600",
+      "price": 89462.453125,
       "position": "long"
     }
   ],
@@ -342,10 +347,13 @@
       "entry_date": "2026-01-12 00:00:00"
     }
   ],
-  "current_position": null,
+  "current_position": {
+    "position": "long",
+    "entry_price": 89462.453125,
+    "entry_date": "2026-01-22 00:00:00"
+  },
   "num_trades": 26,
   "win_rate": 92.3076923076923,
   "total_return": 96.20022931409497,
-  "profit_factor": 28.012132219388693,
-  "num_missed": 0
+  "profit_factor": 28.012132219388693
 }
