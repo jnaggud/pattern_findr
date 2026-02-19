@@ -12,6 +12,7 @@ Based on quantitative finance research findings from recent literature:
 6. Market Fragility Index (MFI2) - Tail risk measurement
 7. Order Flow Imbalance (OFI) - Microstructure-based buy/sell pressure
 8. Multi-Timeframe Confirmation (MTC) - Higher timeframe trend filter
+9. Money Flow Velocity (MFV) - Dollar flow velocity with time-of-day normalization
 
 Research Sources:
 - State Street: Decoding Market Regimes with ML (2025)
@@ -542,6 +543,106 @@ def calculate_mtc(df: pd.DataFrame, tf_multipliers: List[int] = [4, 12],
 
 
 # =============================================================================
+# 9. MONEY FLOW VELOCITY (MFV)
+# =============================================================================
+
+def calculate_mfv(df: pd.DataFrame, period: int = 20,
+                  interval: str = '1d') -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    Money Flow Velocity - Directional dollar flow with time-of-day normalization.
+
+    Computes dollar flow per bar (typical_price x volume), normalizes for
+    intraday volume patterns, decomposes into buying/selling pressure, then
+    calculates velocity (1st derivative) and acceleration (2nd derivative).
+
+    Args:
+        df: DataFrame with OHLCV data and datetime index
+        period: Smoothing/accumulation period for flow
+        interval: Timeframe for window scaling ('1d', '15m', etc.)
+
+    Returns:
+        Tuple of three series, all normalized to [-1, +1]:
+        - mfv_flow: Accumulated directional money flow (positive = buying pressure)
+        - mfv_velocity: Rate of change of flow (1st derivative)
+        - mfv_acceleration: Rate of change of velocity (2nd derivative)
+    """
+    scaled_period = _scale_window(period, interval)
+
+    close = df['close'] if 'close' in df.columns else df['Close']
+    high = df['high'] if 'high' in df.columns else df['High']
+    low = df['low'] if 'low' in df.columns else df['Low']
+    volume = df.get('volume', df.get('Volume', pd.Series(1, index=df.index)))
+
+    # --- Step 1: Raw Dollar Flow ---
+    typical_price = (high + low + close) / 3
+    raw_dollar_flow = typical_price * volume
+
+    # --- Step 2: Time-of-Day Normalization ---
+    # For intraday: normalize volume against rolling median of same time slot
+    # For daily: normalize by rolling mean
+    is_intraday = interval not in ['1d', '1wk', '1mo']
+    if is_intraday and hasattr(df.index, 'hour'):
+        time_key = pd.Series(df.index.hour * 100 + df.index.minute, index=df.index)
+        tod_expected = pd.Series(np.nan, index=df.index)
+
+        tod_lookback = 10  # ~2 weeks of trading days
+        for tk in time_key.unique():
+            mask = time_key == tk
+            slot_volumes = volume[mask]
+            rolling_med = slot_volumes.rolling(
+                window=tod_lookback, min_periods=max(2, tod_lookback // 3)
+            ).median()
+            tod_expected[mask] = rolling_med
+
+        # Fallback for bars without enough history
+        tod_expected = tod_expected.fillna(volume.rolling(scaled_period, min_periods=1).median())
+        tod_expected = tod_expected.replace(0, np.nan).fillna(1)
+
+        volume_relative = volume / tod_expected
+    else:
+        vol_rolling_mean = volume.rolling(scaled_period, min_periods=1).mean().replace(0, 1)
+        volume_relative = volume / vol_rolling_mean
+
+    # Normalized dollar flow
+    normalized_dollar_flow = typical_price * volume_relative
+
+    # --- Step 3: Directional Decomposition ---
+    bar_range = high - low
+    bar_range = bar_range.replace(0, np.nan).fillna(1e-10)
+    close_position = (close - low) / bar_range  # 0 = closed at low, 1 = closed at high
+
+    # Direction factor: -1 to +1
+    direction = (close_position - 0.5) * 2
+
+    # Signed flow: positive = buying pressure, negative = selling pressure
+    signed_flow = normalized_dollar_flow * direction
+
+    # --- Step 4: Accumulated Flow ---
+    cumulative_flow = signed_flow.rolling(window=scaled_period, min_periods=1).sum()
+
+    # Z-score normalize to [-1, +1]
+    flow_lookback = scaled_period * 3
+    flow_mean = cumulative_flow.rolling(window=flow_lookback, min_periods=scaled_period).mean()
+    flow_std = cumulative_flow.rolling(window=flow_lookback, min_periods=scaled_period).std().replace(0, 1)
+    mfv_flow = ((cumulative_flow - flow_mean) / (flow_std * 2)).clip(-1, 1)
+
+    # --- Step 5: Velocity (1st derivative) ---
+    flow_velocity = mfv_flow.diff()
+    smooth_window = max(2, scaled_period // 5)
+    flow_velocity = flow_velocity.rolling(window=smooth_window, min_periods=1, center=False).mean()
+
+    vel_std = flow_velocity.rolling(window=scaled_period * 2, min_periods=scaled_period).std().replace(0, 1)
+    mfv_velocity = (flow_velocity / (vel_std * 2)).clip(-1, 1)
+
+    # --- Step 6: Acceleration (2nd derivative) ---
+    flow_acceleration = mfv_velocity.diff()
+    acc_std = flow_acceleration.rolling(window=scaled_period * 2, min_periods=scaled_period).std().replace(0, 1)
+    mfv_acceleration = (flow_acceleration / (acc_std * 2)).clip(-1, 1)
+
+    return mfv_flow.fillna(0), mfv_velocity.fillna(0), mfv_acceleration.fillna(0)
+
+
+# =============================================================================
 # MASTER FUNCTION: Calculate All Novel V2 Indicators
 # =============================================================================
 
@@ -604,7 +705,14 @@ def calculate_all_novel_v2_indicators(df: pd.DataFrame,
     print("  - MTC (Multi-TF Confirmation)...")
     result['mtc'] = calculate_mtc(result, interval=interval)
 
-    print("Done calculating Novel V2 Indicators (13 columns added).")
+    # 9. Money Flow Velocity
+    print("  - MFV (Money Flow Velocity)...")
+    mfv_flow, mfv_vel, mfv_acc = calculate_mfv(result, interval=interval)
+    result['mfv_flow'] = mfv_flow
+    result['mfv_velocity'] = mfv_vel
+    result['mfv_acceleration'] = mfv_acc
+
+    print("Done calculating Novel V2 Indicators (16 columns added).")
 
     return result
 
@@ -622,6 +730,7 @@ NOVEL_V2_INDICATORS = {
     'mfi2': calculate_mfi2,
     'ofi': calculate_ofi,
     'mtc': calculate_mtc,
+    'mfv': calculate_mfv,
 }
 
 NOVEL_V2_INDICATOR_LIST = [
@@ -633,6 +742,7 @@ NOVEL_V2_INDICATOR_LIST = [
     'mfi2',
     'ofi',
     'mtc',
+    'mfv_flow', 'mfv_velocity', 'mfv_acceleration',
 ]
 
 
@@ -680,5 +790,13 @@ def get_novel_v2_indicator(df: pd.DataFrame, name: str,
         return calculate_ofi(df, interval=interval)
     elif name_lower == 'mtc':
         return calculate_mtc(df, interval=interval)
+    elif name_lower in ['mfv_flow', 'mfv_velocity', 'mfv_acceleration']:
+        mfv_f, mfv_v, mfv_a = calculate_mfv(df, interval=interval)
+        if 'flow' in name_lower:
+            return mfv_f
+        elif 'velocity' in name_lower:
+            return mfv_v
+        else:
+            return mfv_a
     else:
         raise ValueError(f"Unknown indicator: {name}. Available: {NOVEL_V2_INDICATOR_LIST}")

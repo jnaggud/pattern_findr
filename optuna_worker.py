@@ -306,7 +306,9 @@ def set_velocity_shared_data(close_prices, osc_values, rsi_cache, macd_histogram
                               # V2 filter constraints (from UI checkboxes)
                               v2_filter_settings=None,
                               # Additional OHLCV data for signal improvements
-                              high_prices=None, low_prices=None, volume=None):
+                              high_prices=None, low_prices=None, volume=None,
+                              # Volatility regime (ATR percentile) for vol regime filter
+                              vol_regime=None):
     """
     Save velocity optimization data to a temp file for parallel workers.
     Returns the path to the temp file.
@@ -399,6 +401,7 @@ def set_velocity_shared_data(close_prices, osc_values, rsi_cache, macd_histogram
         'high_prices': np.array(high_prices) if high_prices is not None else None,
         'low_prices': np.array(low_prices) if low_prices is not None else None,
         'volume': np.array(volume) if volume is not None else None,
+        'vol_regime': np.array(vol_regime) if vol_regime is not None else None,
     }
     joblib.dump(data, path)
 
@@ -453,6 +456,7 @@ class VelocityOptunaObjective:
         # Exit strategy constraints from UI
         force_midline_exit = data.get('force_midline_exit', False)
         force_opposite_exit = data.get('force_opposite_exit', False)
+        force_signal_type = data.get('force_signal_type', None)  # Force specific signal type
         sl_range = data.get('sl_range', (0.0, 10.0))
         tp_range = data.get('tp_range', (0.0, 20.0))
 
@@ -503,11 +507,17 @@ class VelocityOptunaObjective:
         else:
             exit_midline = trial.suggest_categorical('exit_on_midline_cross', [True, False])
 
-        params.update({
-            'signal_type': trial.suggest_categorical('signal_type', [
+        # Signal type: forced or searchable
+        if force_signal_type:
+            _signal_type = force_signal_type
+        else:
+            _signal_type = trial.suggest_categorical('signal_type', [
                 'velocity_crossover_and_zone', 'velocity_crossover_or_zone', 'zone_only',
                 'momentum', 'any_reversal', 'double_bottom', 'divergence', 'breakout'
-            ]),
+            ])
+
+        params.update({
+            'signal_type': _signal_type,
             'vel_smoothing': trial.suggest_int('vel_smoothing', 1, 15),
             'oversold_threshold': trial.suggest_float('oversold_threshold', -0.6, -0.02),
             'overbought_threshold': trial.suggest_float('overbought_threshold', 0.02, 0.6),
@@ -534,7 +544,12 @@ class VelocityOptunaObjective:
             'jerk_confirm_threshold': trial.suggest_float('jerk_confirm_threshold', 0.0, 0.05),
             # Trailing stop - replaces fixed stop loss with dynamic trailing stop
             'use_trailing_stop': trial.suggest_categorical('use_trailing_stop', [True, False]),
-            'trailing_stop_pct': trial.suggest_float('trailing_stop_pct', 0.5, 10.0),
+            'trailing_stop_pct': trial.suggest_float('trailing_stop_pct', 0.2, 3.0),
+            'trailing_stop_activation_pct': trial.suggest_float('trailing_stop_activation_pct', 0.1, 2.0),
+            # Break-even stop - move SL to entry after profit reached
+            'use_breakeven_stop': trial.suggest_categorical('use_breakeven_stop', [True, False]),
+            'breakeven_trigger_pct': trial.suggest_float('breakeven_trigger_pct', 0.1, 2.0),
+            'breakeven_offset_pct': trial.suggest_float('breakeven_offset_pct', 0.01, 0.2),
             # === SIGNAL IMPROVEMENTS (1-8) ===
             # #1: Adaptive smoothing - reduce oscillator noise
             'smoothing_type': trial.suggest_categorical('smoothing_type', ['sma', 'ema', 'adaptive']),
@@ -609,6 +624,33 @@ class VelocityOptunaObjective:
             params['use_fragility_filter'] = False
             params['use_entropy_filter'] = False
 
+        # Volatility regime filter (ATR percentile) — independent of v2_indicators
+        vol_regime = data.get('vol_regime')
+        if vol_regime is not None:
+            params['use_vol_regime_filter'] = trial.suggest_categorical('use_vol_regime_filter', [True, False])
+            if params['use_vol_regime_filter']:
+                params['vol_regime_percentile_threshold'] = trial.suggest_float('vol_regime_percentile_threshold', 0.1, 0.5)
+            else:
+                params['vol_regime_percentile_threshold'] = 0.25
+        else:
+            params['use_vol_regime_filter'] = False
+            params['vol_regime_percentile_threshold'] = 0.25
+
+        # Money Flow Velocity filter — independent of v2_indicators
+        mfv_flow = data.get('mfv_flow')
+        if mfv_flow is not None:
+            params['use_mfv_filter'] = trial.suggest_categorical('use_mfv_filter', [True, False])
+            if params['use_mfv_filter']:
+                params['mfv_mode'] = trial.suggest_categorical('mfv_mode', ['velocity', 'flow', 'both'])
+                params['mfv_threshold'] = trial.suggest_float('mfv_threshold', 0.0, 0.5)
+            else:
+                params['mfv_mode'] = 'velocity'
+                params['mfv_threshold'] = 0.0
+        else:
+            params['use_mfv_filter'] = False
+            params['mfv_mode'] = 'velocity'
+            params['mfv_threshold'] = 0.0
+
         # Select the oscillator values based on the chosen type and MTF setting
         selected_osc_type = params['oscillator_type']
         if selected_osc_type in active_oscillators:
@@ -630,7 +672,8 @@ class VelocityOptunaObjective:
                                      high_prices=data.get('high_prices'),
                                      low_prices=data.get('low_prices'),
                                      volume=data.get('volume'),
-                                     all_oscillators=active_oscillators)
+                                     all_oscillators=active_oscillators,
+                                     vol_regime=data.get('vol_regime'))
 
         if result is None:
             return float('-inf')
@@ -680,7 +723,7 @@ class VelocityOptunaObjective:
     def _run_backtest(self, params, close_prices, osc_values, rsi_cache,
                       macd_histogram, bb_upper, bb_lower, use_extra_indicators,
                       v2_indicators=None, high_prices=None, low_prices=None,
-                      volume=None, all_oscillators=None):
+                      volume=None, all_oscillators=None, vol_regime=None):
         """Fast vectorized backtest with V2 indicator filters and signal improvements."""
         import pandas as pd
 
@@ -894,6 +937,11 @@ class VelocityOptunaObjective:
                 entropy_thresh = params.get('entropy_threshold', 0.7)
                 buy_cond = buy_cond & (sei < entropy_thresh)
 
+        # Volatility regime filter (ATR percentile)
+        if params.get('use_vol_regime_filter', False) and vol_regime is not None:
+            vol_thresh = params.get('vol_regime_percentile_threshold', 0.25)
+            buy_cond = buy_cond & (vol_regime > vol_thresh)
+
         # === IMPROVEMENT #3: Pre-compute ATR for dynamic trailing stop ===
         trailing_stop_type = params.get('trailing_stop_type', 'fixed_pct')
         atr_values = None
@@ -934,6 +982,10 @@ class VelocityOptunaObjective:
         min_hold_bars = params.get('min_hold_bars', 1)
         use_trailing_stop = params.get('use_trailing_stop', False)
         trailing_stop_pct = params.get('trailing_stop_pct', 2.0)
+        trailing_stop_activation_pct = params.get('trailing_stop_activation_pct', 0.3)
+        use_breakeven_stop = params.get('use_breakeven_stop', False)
+        breakeven_trigger_pct = params.get('breakeven_trigger_pct', 0.3)
+        breakeven_offset_pct = params.get('breakeven_offset_pct', 0.05)
 
         # Track equity curve for max drawdown calculation
         equity = 100.0  # Start with $100
@@ -946,47 +998,74 @@ class VelocityOptunaObjective:
             bars_held = i - entry_bar_idx
             can_exit = bars_held >= min_hold_bars
 
-            # Update highest price for trailing stop
+            # Update highest price for trailing stop (use intrabar high)
             if position == 1:
-                highest_price = max(highest_price, price)
+                bar_high_ts = high_prices[i] if high_prices is not None else price
+                highest_price = max(highest_price, bar_high_ts)
 
-            if position == 1 and can_exit:
-                # Stop loss: trailing or fixed
-                if use_trailing_stop and trailing_stop_pct > 0:
-                    # === IMPROVEMENT #3: ATR-based trailing stop ===
-                    if trailing_stop_type == 'atr' and atr_values is not None:
-                        trail_stop_price = highest_price - atr_values[i] * atr_mult
-                    else:
-                        trail_stop_price = highest_price * (1 - trailing_stop_pct / 100)
-                    if price <= trail_stop_price:
-                        pnl_pct = (price - entry_price) / entry_price * 100
+            if position == 1:
+                exited = False
+                # Priority 1: Fixed Stop Loss (ALWAYS fires)
+                if params['stop_loss_pct'] > 0:
+                    sl_price_level = entry_price * (1 - params['stop_loss_pct'] / 100)
+                    bar_low = low_prices[i] if low_prices is not None else price
+                    if bar_low <= sl_price_level:
+                        pnl_pct = -params['stop_loss_pct']
                         trades.append(pnl_pct)
                         equity *= (1 + pnl_pct / 100)
                         equity_curve.append(equity)
                         peak_equity = max(peak_equity, equity)
                         position = 0
                         last_trade_bar = i
-                        continue
-                elif params['stop_loss_pct'] > 0 and price <= entry_price * (1 - params['stop_loss_pct'] / 100):
-                    pnl_pct = (price - entry_price) / entry_price * 100
-                    trades.append(pnl_pct)
-                    equity *= (1 + pnl_pct / 100)
-                    equity_curve.append(equity)
-                    peak_equity = max(peak_equity, equity)
-                    position = 0
-                    last_trade_bar = i
-                    continue
-                if params['take_profit_pct'] > 0 and price >= entry_price * (1 + params['take_profit_pct'] / 100):
-                    pnl_pct = (price - entry_price) / entry_price * 100
-                    trades.append(pnl_pct)
-                    equity *= (1 + pnl_pct / 100)
-                    equity_curve.append(equity)
-                    peak_equity = max(peak_equity, equity)
-                    position = 0
-                    last_trade_bar = i
-                    continue
-                # Acceleration Reversal Exit - exit on momentum reversal before stop loss
-                if params.get('use_accel_exit', False):
+                        exited = True
+                # Priority 2: Take Profit (ALWAYS fires)
+                if not exited and params['take_profit_pct'] > 0:
+                    tp_price_level = entry_price * (1 + params['take_profit_pct'] / 100)
+                    bar_high = high_prices[i] if high_prices is not None else price
+                    if bar_high >= tp_price_level:
+                        pnl_pct = params['take_profit_pct']
+                        trades.append(pnl_pct)
+                        equity *= (1 + pnl_pct / 100)
+                        equity_curve.append(equity)
+                        peak_equity = max(peak_equity, equity)
+                        position = 0
+                        last_trade_bar = i
+                        exited = True
+                # Priority 3: Trailing Stop (fires once activated, ignores min_hold_bars)
+                if not exited and use_trailing_stop and trailing_stop_pct > 0:
+                    hwm_pnl = (highest_price - entry_price) / entry_price * 100
+                    if hwm_pnl >= trailing_stop_activation_pct:
+                        if trailing_stop_type == 'atr' and atr_values is not None:
+                            trail_stop_price = highest_price - atr_values[i] * atr_mult
+                        else:
+                            trail_stop_price = highest_price * (1 - trailing_stop_pct / 100)
+                        bar_low_ts = low_prices[i] if low_prices is not None else price
+                        if bar_low_ts <= trail_stop_price:
+                            pnl_pct = (trail_stop_price - entry_price) / entry_price * 100
+                            trades.append(pnl_pct)
+                            equity *= (1 + pnl_pct / 100)
+                            equity_curve.append(equity)
+                            peak_equity = max(peak_equity, equity)
+                            position = 0
+                            last_trade_bar = i
+                            exited = True
+                # Priority 4: Break-Even Stop (fires once activated, ignores min_hold_bars)
+                if not exited and use_breakeven_stop:
+                    hwm_pnl = (highest_price - entry_price) / entry_price * 100
+                    if hwm_pnl >= breakeven_trigger_pct:
+                        be_price = entry_price * (1 + breakeven_offset_pct / 100)
+                        bar_low_be = low_prices[i] if low_prices is not None else price
+                        if bar_low_be <= be_price:
+                            pnl_pct = (be_price - entry_price) / entry_price * 100
+                            trades.append(pnl_pct)
+                            equity *= (1 + pnl_pct / 100)
+                            equity_curve.append(equity)
+                            peak_equity = max(peak_equity, equity)
+                            position = 0
+                            last_trade_bar = i
+                            exited = True
+                # Remaining exits require min_hold_bars
+                if not exited and can_exit and params.get('use_accel_exit', False):
                     current_pnl = (price - entry_price) / entry_price * 100
                     accel_min_pnl = params.get('accel_exit_min_pnl', 0.5)
                     accel_type = params.get('accel_exit_type', 'sign_reversal')
@@ -1027,15 +1106,15 @@ class VelocityOptunaObjective:
                         peak_equity = max(peak_equity, equity)
                         position = 0
                         last_trade_bar = i
-                        continue
+                        exited = True
                 # === IMPROVEMENT #8: Midline exit delay ===
                 midline_met = False
-                if exit_on_midline:
+                if not exited and can_exit and exit_on_midline:
                     if midline_exit_bars_required > 1:
                         midline_met = consecutive_above[i] >= midline_exit_bars_required
                     else:
                         midline_met = osc_smooth[i] > 0 and osc_smooth[i-1] <= 0
-                if midline_met:
+                if not exited and midline_met:
                     pnl_pct = (price - entry_price) / entry_price * 100
                     trades.append(pnl_pct)
                     equity *= (1 + pnl_pct / 100)
@@ -1043,8 +1122,8 @@ class VelocityOptunaObjective:
                     peak_equity = max(peak_equity, equity)
                     position = 0
                     last_trade_bar = i
-                    continue
-                if exit_on_opposite and sell_cond[i] and bars_since >= params['min_bars_between']:
+                    exited = True
+                if not exited and can_exit and exit_on_opposite and sell_cond[i] and bars_since >= params['min_bars_between']:
                     pnl_pct = (price - entry_price) / entry_price * 100
                     trades.append(pnl_pct)
                     equity *= (1 + pnl_pct / 100)
@@ -1052,6 +1131,8 @@ class VelocityOptunaObjective:
                     peak_equity = max(peak_equity, equity)
                     position = 0
                     last_trade_bar = i
+                    exited = True
+                if exited:
                     continue
 
             if buy_cond[i] and position == 0 and bars_since >= params['min_bars_between']:

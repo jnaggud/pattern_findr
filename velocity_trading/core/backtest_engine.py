@@ -161,6 +161,72 @@ def prepare_backtest_arrays(
         buy_signals = buy_signals & vel_mag
         sell_signals = sell_signals & vel_mag
 
+    # --- RSI filter ---
+    rsi_filter = config.get('rsi_filter', 'none')
+    if rsi_filter != 'none' and 'RSI' in result.columns:
+        rsi = result['RSI'].values
+        rsi_os = config.get('rsi_oversold', 30)
+        rsi_ob = config.get('rsi_overbought', 70)
+        if rsi_filter == 'oversold_only':
+            buy_signals = buy_signals & (rsi < rsi_os)
+        elif rsi_filter == 'overbought_only':
+            sell_signals = sell_signals & (rsi > rsi_ob)
+        elif rsi_filter == 'both':
+            buy_signals = buy_signals & (rsi < rsi_os)
+            sell_signals = sell_signals & (rsi > rsi_ob)
+
+    # --- MACD confirmation filter ---
+    if config.get('use_macd_confirm', False) and 'MACD_histogram' in result.columns:
+        macd_h = result['MACD_histogram'].values
+        macd_improving = macd_h > np.roll(macd_h, 1)
+        macd_declining = macd_h < np.roll(macd_h, 1)
+        buy_signals = buy_signals & macd_improving
+        sell_signals = sell_signals & macd_declining
+
+    # --- Bollinger Band filter ---
+    if config.get('use_bb_filter', False) and 'BB_lower' in result.columns:
+        _close_col = 'close' if 'close' in result.columns else 'Close'
+        close_vals = result[_close_col].values
+        buy_signals = buy_signals & (close_vals < result['BB_lower'].values)
+        sell_signals = sell_signals & (close_vals > result['BB_upper'].values)
+
+    # --- V2 indicator filters (Regime, Fragility, Entropy) ---
+    if config.get('use_regime_filter', False) and 'RSC' in result.columns:
+        regime_thresh = config.get('regime_threshold', 0.0)
+        buy_signals = buy_signals & (result['RSC'].values > regime_thresh)
+
+    if config.get('use_fragility_filter', False) and 'MFI2' in result.columns:
+        frag_thresh = config.get('fragility_threshold', 0.5)
+        buy_signals = buy_signals & (result['MFI2'].values < frag_thresh)
+
+    if config.get('use_entropy_filter', False) and 'SEI' in result.columns:
+        entropy_thresh = config.get('entropy_threshold', 0.7)
+        buy_signals = buy_signals & (result['SEI'].values < entropy_thresh)
+
+    # --- Volatility regime filter (ATR percentile) ---
+    if config.get('use_vol_regime_filter', False) and 'VOL_REGIME' in result.columns:
+        vol_thresh = config.get('vol_regime_percentile_threshold', 0.25)
+        buy_signals = buy_signals & (result['VOL_REGIME'].values > vol_thresh)
+
+    # --- Money Flow Velocity filter ---
+    if config.get('use_mfv_filter', False):
+        mfv_mode = config.get('mfv_mode', 'velocity')
+        mfv_thresh = config.get('mfv_threshold', 0.0)
+
+        if mfv_mode == 'velocity' and 'MFV_VEL' in result.columns:
+            mfv_vel = result['MFV_VEL'].values
+            buy_signals = buy_signals & (mfv_vel > mfv_thresh)
+            sell_signals = sell_signals & (mfv_vel < -mfv_thresh)
+        elif mfv_mode == 'flow' and 'MFV_FLOW' in result.columns:
+            mfv_flow = result['MFV_FLOW'].values
+            buy_signals = buy_signals & (mfv_flow > mfv_thresh)
+            sell_signals = sell_signals & (mfv_flow < -mfv_thresh)
+        elif mfv_mode == 'both' and 'MFV_FLOW' in result.columns and 'MFV_VEL' in result.columns:
+            mfv_flow = result['MFV_FLOW'].values
+            mfv_vel = result['MFV_VEL'].values
+            buy_signals = buy_signals & (mfv_flow > mfv_thresh) & (mfv_vel > mfv_thresh)
+            sell_signals = sell_signals & (mfv_flow < -mfv_thresh) & (mfv_vel < -mfv_thresh)
+
     # Get close/high/low arrays
     close_col = 'close' if 'close' in result.columns else 'Close'
     high_col = 'high' if 'high' in result.columns else 'High'
@@ -197,6 +263,14 @@ def run_backtest(
     # Exit toggles
     exit_on_opposite: bool = True,
     exit_on_midline: bool = False,
+    # Trailing stop
+    use_trailing_stop: bool = False,
+    trailing_stop_pct: float = 1.0,
+    trailing_stop_activation_pct: float = 0.3,
+    # Break-even stop
+    use_breakeven_stop: bool = False,
+    breakeven_trigger_pct: float = 0.3,
+    breakeven_offset_pct: float = 0.05,
     # Accel exit
     use_accel_exit: bool = False,
     accel_exit_type: str = 'sign_reversal',
@@ -229,6 +303,12 @@ def run_backtest(
         min_bars_between: Minimum bars between trades
         exit_on_opposite: Exit on opposite signal
         exit_on_midline: Exit on midline cross (osc > 0)
+        use_trailing_stop: Enable trailing stop from high watermark
+        trailing_stop_pct: Trail distance from high watermark (%)
+        trailing_stop_activation_pct: Min profit to activate trailing stop (%)
+        use_breakeven_stop: Enable break-even stop
+        breakeven_trigger_pct: Min profit to move SL to breakeven (%)
+        breakeven_offset_pct: Buffer above entry price for breakeven (%)
         use_accel_exit: Enable acceleration exit
         accel_exit_*: Accel exit parameters
         use_jerk_confirm: Require jerk confirmation for accel exit
@@ -277,14 +357,14 @@ def run_backtest(
                 in_position = True
                 entry_price = close[i]
                 entry_bar = i
-                high_watermark = close[i]
+                high_watermark = high[i]
                 min_price_in_trade = low[i]
                 max_price_in_trade = high[i]
         else:
             # --- IN POSITION: track MAE/MFE ---
             min_price_in_trade = min(min_price_in_trade, low[i])
             max_price_in_trade = max(max_price_in_trade, high[i])
-            high_watermark = max(high_watermark, close[i])
+            high_watermark = max(high_watermark, high[i])
 
             bars_held = i - entry_bar
             close_pnl = (close[i] - entry_price) / entry_price * 100
@@ -304,10 +384,30 @@ def run_backtest(
                 exit_reason = 'Take Profit'
                 exit_price = entry_price * (1 + take_profit_pct / 100)
 
-            # All remaining exits require min_hold_bars
-            elif bars_held >= min_hold_bars:
+            # Priority 3: Trailing Stop (ALWAYS fires once activated, ignores min_hold_bars)
+            if not exit_reason and use_trailing_stop:
+                hwm_pnl = (high_watermark - entry_price) / entry_price * 100
+                if hwm_pnl >= trailing_stop_activation_pct:
+                    trail_level = high_watermark * (1 - trailing_stop_pct / 100)
+                    if low[i] <= trail_level:
+                        exit_reason = 'Trailing Stop'
+                        exit_price = trail_level
 
-                # Priority 3: Accel Exit
+            # Priority 4: Break-Even Stop (ALWAYS fires once activated, ignores min_hold_bars)
+            if not exit_reason and use_breakeven_stop:
+                # Check if trade ever reached the trigger profit level
+                hwm_pnl = (high_watermark - entry_price) / entry_price * 100
+                if hwm_pnl >= breakeven_trigger_pct:
+                    # SL is now at entry + small offset
+                    be_price = entry_price * (1 + breakeven_offset_pct / 100)
+                    if low[i] <= be_price:
+                        exit_reason = 'Break-Even Stop'
+                        exit_price = be_price
+
+            # All remaining exits require min_hold_bars
+            if not exit_reason and bars_held >= min_hold_bars:
+
+                # Priority 5: Accel Exit
                 if (not exit_reason and use_accel_exit
                         and i >= accel_exit_lookback):
                     pnl_ok = close_pnl >= accel_exit_min_pnl or close_pnl < 0
@@ -329,7 +429,7 @@ def run_backtest(
                         if accel_cond and jerk_ok:
                             exit_reason = 'Accel Exit'
 
-                # Priority 4: ML Exit (via callable)
+                # Priority 6: ML Exit (via callable)
                 if not exit_reason and exit_model_fn is not None:
                     try:
                         should_exit, prob, reason = exit_model_fn(
@@ -340,12 +440,12 @@ def run_backtest(
                     except Exception:
                         pass
 
-                # Priority 5: Midline Cross
+                # Priority 7: Midline Cross
                 if not exit_reason and exit_on_midline:
                     if osc_smooth[i] > 0:
                         exit_reason = 'Midline Cross'
 
-                # Priority 6: Opposite Signal
+                # Priority 8: Opposite Signal
                 if not exit_reason and exit_on_opposite and sell_signals[i]:
                     exit_reason = 'Opposite Signal'
 

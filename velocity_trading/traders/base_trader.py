@@ -259,6 +259,9 @@ class BaseTrader(ABC):
         self.entropy_threshold = self.config.get('entropy_threshold', 0.7)
         self.use_vol_regime_filter = self.config.get('use_vol_regime_filter', False)
         self.vol_regime_percentile_threshold = self.config.get('vol_regime_percentile_threshold', 0.25)
+        self.use_mfv_filter = self.config.get('use_mfv_filter', False)
+        self.mfv_mode = self.config.get('mfv_mode', 'velocity')
+        self.mfv_threshold = self.config.get('mfv_threshold', 0.0)
         self.rsi_filter = self.config.get('rsi_filter', 'none')
         self.rsi_period = self.config.get('rsi_period', 14)
         self.rsi_oversold = self.config.get('rsi_oversold', 30)
@@ -874,6 +877,9 @@ class BaseTrader(ABC):
                 rsi_overbought=self.rsi_overbought,
                 use_macd_confirm=self.use_macd_confirm,
                 use_bb_filter=self.use_bb_filter,
+                use_mfv_filter=self.use_mfv_filter,
+                mfv_mode=self.mfv_mode,
+                mfv_threshold=self.mfv_threshold,
             )
 
             # Train ML entry + exit models (v7+) — needs signals computed first

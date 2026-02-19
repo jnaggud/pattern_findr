@@ -61,7 +61,8 @@ try:
     from novel_indicators_v2 import (
         calculate_rsc,   # Regime State Classifier
         calculate_mfi2,  # Market Fragility Index v2
-        calculate_sei    # Shannon Entropy Index
+        calculate_sei,   # Shannon Entropy Index
+        calculate_mfv,   # Money Flow Velocity
     )
     HAS_V2_FILTERS = True
 except ImportError:
@@ -233,6 +234,43 @@ def calculate_composite_oscillator(
     result['velocity'] = result['velocity'].fillna(0)
     result['acceleration'] = result['acceleration'].fillna(0)
 
+    # Compute supplementary indicators for backtest engine filters
+    close_vals = result.get('Close', result.get('close', pd.Series()))
+    if not close_vals.empty:
+        # RSI (0-100 scale)
+        if 'RSI' not in result.columns:
+            try:
+                _rsi_period = config.get('rsi_period', 14) if config else 14
+                delta = close_vals.diff()
+                gain = delta.where(delta > 0, 0.0).rolling(_rsi_period, min_periods=1).mean()
+                loss = (-delta.where(delta < 0, 0.0)).rolling(_rsi_period, min_periods=1).mean()
+                rs = gain / (loss + 1e-10)
+                result['RSI'] = 100 - (100 / (1 + rs))
+            except Exception:
+                result['RSI'] = 50.0
+
+        # MACD histogram
+        if 'MACD_histogram' not in result.columns:
+            try:
+                ema12 = close_vals.ewm(span=12, adjust=False).mean()
+                ema26 = close_vals.ewm(span=26, adjust=False).mean()
+                macd_line = ema12 - ema26
+                signal_line = macd_line.ewm(span=9, adjust=False).mean()
+                result['MACD_histogram'] = macd_line - signal_line
+            except Exception:
+                result['MACD_histogram'] = 0.0
+
+        # Bollinger Bands
+        if 'BB_lower' not in result.columns:
+            try:
+                bb_sma = close_vals.rolling(20, min_periods=1).mean()
+                bb_std = close_vals.rolling(20, min_periods=1).std().fillna(0)
+                result['BB_upper'] = bb_sma + 2 * bb_std
+                result['BB_lower'] = bb_sma - 2 * bb_std
+            except Exception:
+                result['BB_upper'] = close_vals
+                result['BB_lower'] = close_vals
+
     return result
 
 
@@ -306,6 +344,45 @@ def calculate_novel_oscillator(
         print(f"Error calculating {oscillator_type}: {e}, falling back to ARWO")
         result['JD_Osc'] = calculate_arwo(result)
 
+    # Compute supplementary indicators for filters (RSI, MACD, BB)
+    # These are needed by backtest_engine.py's prepare_backtest_arrays() filters
+    close_col = 'close' if 'close' in result.columns else 'Close'
+    close_vals = result[close_col]
+
+    # RSI (0-100 scale, used by rsi_filter)
+    if 'RSI' not in result.columns:
+        try:
+            rsi_period = config.get('rsi_period', 14)
+            delta = close_vals.diff()
+            gain = delta.where(delta > 0, 0.0).rolling(rsi_period, min_periods=1).mean()
+            loss = (-delta.where(delta < 0, 0.0)).rolling(rsi_period, min_periods=1).mean()
+            rs = gain / (loss + 1e-10)
+            result['RSI'] = 100 - (100 / (1 + rs))
+        except Exception:
+            result['RSI'] = 50.0
+
+    # MACD histogram (used by use_macd_confirm)
+    if 'MACD_histogram' not in result.columns:
+        try:
+            ema12 = close_vals.ewm(span=12, adjust=False).mean()
+            ema26 = close_vals.ewm(span=26, adjust=False).mean()
+            macd_line = ema12 - ema26
+            signal_line = macd_line.ewm(span=9, adjust=False).mean()
+            result['MACD_histogram'] = macd_line - signal_line
+        except Exception:
+            result['MACD_histogram'] = 0.0
+
+    # Bollinger Bands (used by use_bb_filter)
+    if 'BB_lower' not in result.columns:
+        try:
+            bb_sma = close_vals.rolling(20, min_periods=1).mean()
+            bb_std = close_vals.rolling(20, min_periods=1).std().fillna(0)
+            result['BB_upper'] = bb_sma + 2 * bb_std
+            result['BB_lower'] = bb_sma - 2 * bb_std
+        except Exception:
+            result['BB_upper'] = close_vals
+            result['BB_lower'] = close_vals
+
     # Calculate V2 filters if enabled in config
     if config.get('use_regime_filter') and HAS_V2_FILTERS:
         try:
@@ -327,6 +404,28 @@ def calculate_novel_oscillator(
         except Exception as e:
             print(f"Warning: SEI calculation failed: {e}")
             result['SEI'] = 0.0
+
+    # Volatility regime filter (ATR percentile)
+    if config.get('use_vol_regime_filter', False):
+        try:
+            result['VOL_REGIME'] = calculate_vol_regime(result)
+        except Exception as e:
+            print(f"Warning: VOL_REGIME calculation failed: {e}")
+            result['VOL_REGIME'] = 0.5
+
+    # Money Flow Velocity filter
+    if config.get('use_mfv_filter') and HAS_V2_FILTERS:
+        try:
+            _interval = config.get('interval', '15m')
+            mfv_flow, mfv_vel, mfv_acc = calculate_mfv(result, interval=_interval)
+            result['MFV_FLOW'] = mfv_flow
+            result['MFV_VEL'] = mfv_vel
+            result['MFV_ACC'] = mfv_acc
+        except Exception as e:
+            print(f"Warning: MFV calculation failed: {e}")
+            result['MFV_FLOW'] = 0.0
+            result['MFV_VEL'] = 0.0
+            result['MFV_ACC'] = 0.0
 
     # Alias for compatibility with signal detection
     result['osc_smooth'] = result['JD_Osc']
@@ -530,3 +629,33 @@ def detect_crossings(
     result['cross_down'] = (prev_values > threshold) & (values <= threshold)
 
     return result
+
+
+def calculate_vol_regime(df, atr_period=14, lookback=50):
+    """Calculate ATR-based volatility regime as a rolling percentile (0-1).
+
+    Returns a Series where 0 = lowest volatility, 1 = highest volatility.
+    Low-volatility bars (< 0.25) correspond to choppy, low-movement periods
+    where mean-reversion signals tend to be noise.
+
+    Args:
+        df: DataFrame with 'close', 'high', 'low' columns (lowercase)
+        atr_period: Period for ATR calculation (default 14)
+        lookback: Rolling window for percentile rank (default 50)
+    """
+    close = df['close'] if 'close' in df.columns else df['Close']
+    high = df['high'] if 'high' in df.columns else df['High']
+    low = df['low'] if 'low' in df.columns else df['Low']
+    prev_close = close.shift(1)
+
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+
+    atr = tr.rolling(atr_period, min_periods=1).mean()
+    atr_pct = atr / close * 100  # Normalize as % of price
+
+    vol_regime = atr_pct.rolling(lookback, min_periods=10).rank(pct=True).fillna(0.5)
+    return vol_regime

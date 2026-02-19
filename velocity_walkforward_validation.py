@@ -63,7 +63,10 @@ def fetch_data(ticker: str, interval: str, period: str, use_databento: bool = Fa
         key = os.environ.get('DATABENTO_API_KEY', '')
         client = db.Historical(key)
 
-        end = datetime.now(timezone.utc) - timedelta(minutes=30)
+        # Cap end at midnight UTC today to avoid data_end_after_available_end errors
+        now_utc = datetime.now(timezone.utc)
+        today_midnight = datetime(now_utc.year, now_utc.month, now_utc.day, tzinfo=timezone.utc)
+        end = today_midnight
         start = end - timedelta(days=days)
 
         print(f"Databento: requesting {symbol} ohlcv-1m {start.date()} to {end.date()}...")
@@ -245,6 +248,40 @@ def prepare_velocity_data(df: pd.DataFrame, use_extra_indicators: bool = True):
     low_prices = df.loc[valid_idx, low_col].values
     high_prices = df.loc[valid_idx, high_col].values
 
+    # Compute volatility regime (ATR percentile) for vol regime filter
+    from velocity_trading.indicators.oscillators import calculate_vol_regime
+    try:
+        vol_regime = calculate_vol_regime(df_lower, atr_period=14, lookback=50)
+        vol_regime_arr = vol_regime.loc[valid_idx].values
+    except Exception as e:
+        print(f"  Warning: vol_regime calculation failed: {e}")
+        vol_regime_arr = np.full(len(close_prices), 0.5)
+
+    # Compute Money Flow Velocity arrays for MFV filter
+    mfv_flow_arr = None
+    mfv_vel_arr = None
+    mfv_acc_arr = None
+    try:
+        from novel_indicators_v2 import calculate_mfv
+        # Determine interval from df index spacing
+        _interval = '15m'  # default
+        if len(df_lower) >= 2:
+            delta = (df_lower.index[1] - df_lower.index[0]).total_seconds()
+            if delta >= 86400:
+                _interval = '1d'
+            elif delta >= 3600:
+                _interval = '1h'
+            elif delta >= 900:
+                _interval = '15m'
+            elif delta >= 300:
+                _interval = '5m'
+        mfv_f, mfv_v, mfv_a = calculate_mfv(df_lower, interval=_interval)
+        mfv_flow_arr = mfv_f.loc[valid_idx].values
+        mfv_vel_arr = mfv_v.loc[valid_idx].values
+        mfv_acc_arr = mfv_a.loc[valid_idx].values
+    except Exception as e:
+        print(f"  Warning: MFV calculation failed: {e}")
+
     return {
         'close_prices': close_prices,
         'low_prices': low_prices,
@@ -256,7 +293,11 @@ def prepare_velocity_data(df: pd.DataFrame, use_extra_indicators: bool = True):
         'bb_lower': bb_lower,
         'dates': valid_idx,
         'use_extra_indicators': use_extra_indicators,
-        'all_oscillators': all_oscillators
+        'all_oscillators': all_oscillators,
+        'vol_regime': vol_regime_arr,
+        'mfv_flow': mfv_flow_arr,
+        'mfv_vel': mfv_vel_arr,
+        'mfv_acc': mfv_acc_arr,
     }
 
 
@@ -343,6 +384,61 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
         buy_cond = buy_cond & (acceleration > 0)
         sell_cond = sell_cond & (acceleration < 0)
 
+    # RSI filter
+    use_extra_indicators = data.get('use_extra_indicators', False)
+    rsi_cache = data.get('rsi_cache', {})
+    if use_extra_indicators and params.get('rsi_filter', 'none') != 'none':
+        rsi_period = params.get('rsi_period', 14)
+        rsi = rsi_cache.get(rsi_period, rsi_cache.get(14, np.zeros_like(close_prices)))
+        rsi_os = params.get('rsi_oversold', 30)
+        rsi_ob = params.get('rsi_overbought', 70)
+        if params['rsi_filter'] == 'oversold_only':
+            buy_cond = buy_cond & (rsi < rsi_os)
+        elif params['rsi_filter'] == 'overbought_only':
+            sell_cond = sell_cond & (rsi > rsi_ob)
+        elif params['rsi_filter'] == 'both':
+            buy_cond = buy_cond & (rsi < rsi_os)
+            sell_cond = sell_cond & (rsi > rsi_ob)
+
+    # MACD confirmation filter
+    macd_histogram = data.get('macd_histogram')
+    if use_extra_indicators and params.get('use_macd_confirm', False) and macd_histogram is not None:
+        macd_improving = macd_histogram > np.roll(macd_histogram, 1)
+        macd_declining = macd_histogram < np.roll(macd_histogram, 1)
+        buy_cond = buy_cond & macd_improving
+        sell_cond = sell_cond & macd_declining
+
+    # Bollinger Band filter
+    bb_lower = data.get('bb_lower')
+    bb_upper = data.get('bb_upper')
+    if use_extra_indicators and params.get('use_bb_filter', False) and bb_lower is not None:
+        buy_cond = buy_cond & (close_prices < bb_lower)
+        sell_cond = sell_cond & (close_prices > bb_upper)
+
+    # Volatility regime filter (ATR percentile)
+    if params.get('use_vol_regime_filter', False):
+        vol_regime = data.get('vol_regime')
+        if vol_regime is not None:
+            vol_thresh = params.get('vol_regime_percentile_threshold', 0.25)
+            buy_cond = buy_cond & (vol_regime > vol_thresh)
+
+    # Money Flow Velocity filter
+    if params.get('use_mfv_filter', False):
+        mfv_mode = params.get('mfv_mode', 'velocity')
+        mfv_thresh = params.get('mfv_threshold', 0.0)
+        mfv_flow = data.get('mfv_flow')
+        mfv_vel = data.get('mfv_vel')
+
+        if mfv_mode == 'velocity' and mfv_vel is not None:
+            buy_cond = buy_cond & (mfv_vel > mfv_thresh)
+            sell_cond = sell_cond & (mfv_vel < -mfv_thresh)
+        elif mfv_mode == 'flow' and mfv_flow is not None:
+            buy_cond = buy_cond & (mfv_flow > mfv_thresh)
+            sell_cond = sell_cond & (mfv_flow < -mfv_thresh)
+        elif mfv_mode == 'both' and mfv_flow is not None and mfv_vel is not None:
+            buy_cond = buy_cond & (mfv_flow > mfv_thresh) & (mfv_vel > mfv_thresh)
+            sell_cond = sell_cond & (mfv_flow < -mfv_thresh) & (mfv_vel < -mfv_thresh)
+
     # Trading simulation
     position = 0  # 0 = flat, 1 = long
     entry_price = 0
@@ -369,6 +465,17 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
     use_jerk_confirm = params.get('use_jerk_confirm', False)
     jerk_confirm_threshold = params.get('jerk_confirm_threshold', 0.0)
 
+    # Trailing stop params
+    use_trailing_stop = params.get('use_trailing_stop', False)
+    trailing_stop_pct = params.get('trailing_stop_pct', 1.0)
+    trailing_stop_activation_pct = params.get('trailing_stop_activation_pct', 0.3)
+
+    # Break-even stop params
+    use_breakeven_stop = params.get('use_breakeven_stop', False)
+    breakeven_trigger_pct = params.get('breakeven_trigger_pct', 0.3)
+    breakeven_offset_pct = params.get('breakeven_offset_pct', 0.05)
+
+    high_watermark = 0.0
     last_trade_bar = -min_bars_between
 
     for i in range(1, len(close_prices)):
@@ -386,10 +493,12 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
                 # already happened BEFORE our entry and shouldn't count
                 min_price_during_trade = entry_price
                 max_price_during_trade = entry_price
+                high_watermark = high_prices[i]
         else:
             # Update MAE/MFE tracking
             min_price_during_trade = min(min_price_during_trade, low)
             max_price_during_trade = max(max_price_during_trade, high_prices[i])
+            high_watermark = max(high_watermark, high_prices[i])
 
             # Check for exit
             current_pnl = (price - entry_price) / entry_price * 100
@@ -402,18 +511,35 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
             exit_reason = None
             exit_price_override = None
 
-            # Stop loss - check if intrabar low hit stop level
+            # Priority 1: Stop loss - check if intrabar low hit stop level
             if intrabar_low_pnl <= -stop_loss_pct:
                 exit_reason = 'stop_loss'
-                # Exit at stop price, not close price
                 exit_price_override = entry_price * (1 - stop_loss_pct / 100)
-            # Take profit - check if intrabar high hit take profit level
+            # Priority 2: Take profit - check if intrabar high hit take profit level
             elif intrabar_high_pnl >= take_profit_pct:
                 exit_reason = 'take_profit'
-                # Exit at take profit price, not close price
                 exit_price_override = entry_price * (1 + take_profit_pct / 100)
-            # Acceleration exit (for longs: exit when acceleration turns negative)
-            elif use_accel_exit and current_pnl >= accel_exit_min_pnl and bars_held >= min_hold_bars:
+
+            # Priority 3: Trailing stop
+            if not exit_reason and use_trailing_stop:
+                hwm_pnl = (high_watermark - entry_price) / entry_price * 100
+                if hwm_pnl >= trailing_stop_activation_pct:
+                    trail_level = high_watermark * (1 - trailing_stop_pct / 100)
+                    if low <= trail_level:
+                        exit_reason = 'trailing_stop'
+                        exit_price_override = trail_level
+
+            # Priority 4: Break-even stop
+            if not exit_reason and use_breakeven_stop:
+                hwm_pnl = (high_watermark - entry_price) / entry_price * 100
+                if hwm_pnl >= breakeven_trigger_pct:
+                    be_price = entry_price * (1 + breakeven_offset_pct / 100)
+                    if low <= be_price:
+                        exit_reason = 'breakeven_stop'
+                        exit_price_override = be_price
+
+            # Priority 5: Acceleration exit (requires min_hold_bars)
+            if not exit_reason and use_accel_exit and current_pnl >= accel_exit_min_pnl and bars_held >= min_hold_bars:
                 accel_exit_triggered = False
                 if accel_exit_type == 'sign_reversal':
                     accel_exit_triggered = acceleration[i] < 0
@@ -425,11 +551,11 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
                 if accel_exit_triggered:
                     if not use_jerk_confirm or jerk[i] < -jerk_confirm_threshold:
                         exit_reason = 'accel_exit'
-            # Opposite signal
-            elif exit_opposite and sell_cond[i] and bars_held >= min_hold_bars:
+            # Priority 6: Opposite signal
+            if not exit_reason and exit_opposite and sell_cond[i] and bars_held >= min_hold_bars:
                 exit_reason = 'opposite_signal'
-            # Midline cross
-            elif exit_midline and osc_smooth[i] > 0 and bars_held >= min_hold_bars:
+            # Priority 7: Midline cross
+            if not exit_reason and exit_midline and osc_smooth[i] > 0 and bars_held >= min_hold_bars:
                 exit_reason = 'midline_cross'
 
             if exit_reason:
@@ -533,7 +659,8 @@ def run_walk_forward_validation(
     n_jobs: int,
     train_ratio: float = 0.8,
     optimize_metric: str = 'total_return',
-    use_databento: bool = False
+    use_databento: bool = False,
+    force_signal_type: str = None
 ):
     """
     Run walk-forward validation for velocity strategy.
@@ -580,11 +707,13 @@ def run_walk_forward_validation(
     fd, data_path = tempfile.mkstemp(suffix='.joblib', prefix='velocity_wf_')
     os.close(fd)
 
-    # Calculate minimum trade count based on training period length
-    # For 15m bars over 60 days, ~50 days of trading = ~50 trades minimum
-    # ensures statistical significance
+    # Calculate minimum trade count based on trading days
+    # For 15m intraday strategies: expect 3-9 trades/day, floor at 3/day
     train_bars = len(train_data['close_prices'])
-    min_trades = max(50, train_bars // 100)  # At least 50 trades, or 1% of bars
+    train_days = (train_df.index[-1] - train_df.index[0]).days
+    # Estimate trading days (~5/7 of calendar days)
+    train_trading_days = max(1, int(train_days * 5 / 7))
+    min_trades = max(50, train_trading_days * 3)  # At least 3 trades/day
 
     print(f"  Minimum trade count filter: {min_trades} trades")
     print(f"  Trade count bonus: enabled (sqrt scaling)")
@@ -599,6 +728,10 @@ def run_walk_forward_validation(
         'optimize_metric': optimize_metric,
         'use_extra_indicators': True,
         'all_oscillators': train_data['all_oscillators'],
+        'vol_regime': train_data.get('vol_regime'),
+        'mfv_flow': train_data.get('mfv_flow'),
+        'mfv_vel': train_data.get('mfv_vel'),
+        'mfv_acc': train_data.get('mfv_acc'),
         'force_midline_exit': False,
         'force_opposite_exit': False,
         'sl_range': (0.5, 10.0),        # Broader: search wider SL range
@@ -608,8 +741,13 @@ def run_walk_forward_validation(
         'drawdown_penalty_weight': 0.5, # Higher penalty weight for drawdown
         'min_trades': min_trades,       # Reject strategies with too few trades
         # Trade count bonus: only for total_return metric (PF is already trade-neutral)
-        'trade_count_bonus_weight': 0.3 if optimize_metric == 'total_return' else 0.0
+        'trade_count_bonus_weight': 0.3 if optimize_metric == 'total_return' else 0.0,
+        # Force signal type if specified
+        'force_signal_type': force_signal_type
     }
+
+    if force_signal_type:
+        print(f"  Forced signal type: {force_signal_type}")
 
     joblib.dump(train_data_for_optuna, data_path)
 
@@ -657,7 +795,8 @@ def run_walk_forward_validation(
         'use_accel_exit', 'accel_exit_type', 'accel_exit_threshold',
         'accel_exit_min_pnl', 'accel_exit_lookback', 'use_jerk_confirm', 'jerk_confirm_threshold',
         'rsi_filter', 'rsi_period', 'rsi_oversold', 'rsi_overbought',
-        'use_macd_confirm', 'use_bb_filter', 'use_regime_filter', 'use_fragility_filter', 'use_entropy_filter'
+        'use_macd_confirm', 'use_bb_filter', 'use_regime_filter', 'use_fragility_filter', 'use_entropy_filter',
+        'use_mfv_filter', 'mfv_mode', 'mfv_threshold'
     ]
     best_params = {k: best_result[k] for k in param_keys if k in best_result}
 
@@ -706,22 +845,55 @@ def run_walk_forward_validation(
               f"-> Test={oos_result['total_return']:.2f}%/{n_trades_test}t "
               f"WR={oos_result['win_rate']:.1f}% PF={oos_result['profit_factor']:.2f}")
 
-    # Pick the best OOS result that has positive return and enough trades
+    # Pick the best OOS result — require proportional trade count
+    # Same trades/day density as training minimum
+    test_days = (test_df.index[-1] - test_df.index[0]).days
+    test_trading_days = max(1, int(test_days * 5 / 7))
+    test_min_trades = max(30, test_trading_days * 3)  # 3 trades/day minimum
+    print(f"\n  OOS minimum trade filter: {test_min_trades} trades "
+          f"({test_trading_days} trading days × 3 trades/day)")
+
     valid_oos = [c for c in oos_candidates
                  if c['test_result']['total_return'] > 0
-                 and c['test_result']['n_trades'] >= 5]
+                 and c['test_result']['n_trades'] >= test_min_trades]
 
     if valid_oos:
-        # Sort by OOS total return
-        valid_oos.sort(key=lambda x: x['test_result']['total_return'], reverse=True)
+        # Score: profit_factor * log2(n_trades) — rewards both edge and frequency
+        import math
+        def oos_score(candidate):
+            tr = candidate['test_result']
+            n = tr['n_trades']
+            pf = max(tr.get('profit_factor', 1.0), 0.01)
+            ret = tr['total_return']
+            dd = max(tr['max_drawdown'], 0.1)
+            # PF-weighted return with trade confidence
+            return ret * pf * math.log2(max(n, 2)) / (1 + dd)
+
+        valid_oos.sort(key=oos_score, reverse=True)
+
+        # Show top 5 scored candidates
+        print(f"\n  Top 5 OOS candidates by score:")
+        for j, c in enumerate(valid_oos[:5]):
+            tr = c['test_result']
+            sc = oos_score(c)
+            print(f"    #{c['rank']}: score={sc:.2f} | "
+                  f"return={tr['total_return']:.2f}% | "
+                  f"trades={tr['n_trades']} | "
+                  f"WR={tr['win_rate']:.1f}% | "
+                  f"PF={tr['profit_factor']:.2f} | "
+                  f"DD={tr['max_drawdown']:.1f}%")
+
         best_candidate = valid_oos[0]
         best_params = best_candidate['params']
         best_result = best_candidate['train_result']
         test_result = best_candidate['test_result']
-        print(f"\n  ✓ Best OOS config: Training rank #{best_candidate['rank']}")
+        score = oos_score(best_candidate)
+        print(f"\n  ✓ Selected: Training rank #{best_candidate['rank']} "
+              f"(score={score:.2f}, trades={test_result['n_trades']}, "
+              f"return={test_result['total_return']:.2f}%, DD={test_result['max_drawdown']:.1f}%)")
     else:
         # Fallback to #1 training result if no valid OOS found
-        print(f"\n  ⚠️ No config passed OOS validation (positive return + ≥5 trades)")
+        print(f"\n  ⚠️ No config passed OOS validation (positive return + ≥20 trades)")
         print(f"  Using best training config as fallback")
         test_result = run_backtest_with_params(best_params, test_data)
 
@@ -921,6 +1093,8 @@ def main():
     parser.add_argument('--metric', type=str, default='total_return', help='Optimization metric')
     parser.add_argument('--use-databento', action='store_true',
                         help='Fetch from Databento Historical API (supports >60 days for intraday futures)')
+    parser.add_argument('--signal-type', type=str, default=None,
+                        help='Force specific signal type (e.g., any_reversal, velocity_crossover_or_zone)')
 
     args = parser.parse_args()
 
@@ -933,7 +1107,8 @@ def main():
         n_jobs=args.n_jobs,
         train_ratio=args.train_ratio,
         optimize_metric=args.metric,
-        use_databento=args.use_databento
+        use_databento=args.use_databento,
+        force_signal_type=args.signal_type
     )
 
     if results is None:

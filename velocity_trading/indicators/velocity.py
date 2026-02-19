@@ -62,7 +62,18 @@ def calculate_velocity_signals(
     use_fragility_filter: bool = False,
     fragility_threshold: float = 0.5,
     use_entropy_filter: bool = False,
-    entropy_threshold: float = 0.7
+    entropy_threshold: float = 0.7,
+    use_vol_regime_filter: bool = False,
+    vol_regime_percentile_threshold: float = 0.25,
+    rsi_filter: str = 'none',
+    rsi_period: int = 14,
+    rsi_oversold: float = 30,
+    rsi_overbought: float = 70,
+    use_macd_confirm: bool = False,
+    use_bb_filter: bool = False,
+    use_mfv_filter: bool = False,
+    mfv_mode: str = 'velocity',
+    mfv_threshold: float = 0.0,
 ) -> pd.DataFrame:
     """
     Generate buy/sell signals based on velocity strategy.
@@ -210,6 +221,31 @@ def calculate_velocity_signals(
         result['buy_signal'] = result['buy_signal'] & buy_accel_cond
         result['sell_signal'] = result['sell_signal'] & sell_accel_cond
 
+    # RSI filter (matches optuna_worker.py logic)
+    if rsi_filter != 'none' and 'RSI' in result.columns:
+        rsi = result['RSI']
+        if rsi_filter == 'oversold_only':
+            result['buy_signal'] = result['buy_signal'] & (rsi < rsi_oversold)
+        elif rsi_filter == 'overbought_only':
+            result['sell_signal'] = result['sell_signal'] & (rsi > rsi_overbought)
+        elif rsi_filter == 'both':
+            result['buy_signal'] = result['buy_signal'] & (rsi < rsi_oversold)
+            result['sell_signal'] = result['sell_signal'] & (rsi > rsi_overbought)
+
+    # MACD confirmation filter
+    if use_macd_confirm and 'MACD_histogram' in result.columns:
+        macd_h = result['MACD_histogram']
+        macd_improving = macd_h > macd_h.shift(1)
+        macd_declining = macd_h < macd_h.shift(1)
+        result['buy_signal'] = result['buy_signal'] & macd_improving
+        result['sell_signal'] = result['sell_signal'] & macd_declining
+
+    # Bollinger Band filter
+    if use_bb_filter and 'BB_lower' in result.columns:
+        _close_col = 'close' if 'close' in result.columns else 'Close'
+        result['buy_signal'] = result['buy_signal'] & (result[_close_col] < result['BB_lower'])
+        result['sell_signal'] = result['sell_signal'] & (result[_close_col] > result['BB_upper'])
+
     # Apply V2 filters (Regime, Fragility, Entropy)
     # These filters are calculated in oscillators.py and stored in the dataframe
 
@@ -230,6 +266,27 @@ def calculate_velocity_signals(
         entropy_ok = result['SEI'] < entropy_threshold
         result['buy_signal'] = result['buy_signal'] & entropy_ok
         result['sell_signal'] = result['sell_signal'] & entropy_ok
+
+    # Volatility regime filter: Block signals in low-volatility periods
+    if use_vol_regime_filter and 'VOL_REGIME' in result.columns:
+        vol_ok = result['VOL_REGIME'] > vol_regime_percentile_threshold
+        result['buy_signal'] = result['buy_signal'] & vol_ok
+
+    # Money Flow Velocity filter: require money flow confirmation for signals
+    if use_mfv_filter:
+        if mfv_mode == 'velocity' and 'MFV_VEL' in result.columns:
+            mfv_v = result['MFV_VEL']
+            result['buy_signal'] = result['buy_signal'] & (mfv_v > mfv_threshold)
+            result['sell_signal'] = result['sell_signal'] & (mfv_v < -mfv_threshold)
+        elif mfv_mode == 'flow' and 'MFV_FLOW' in result.columns:
+            mfv_f = result['MFV_FLOW']
+            result['buy_signal'] = result['buy_signal'] & (mfv_f > mfv_threshold)
+            result['sell_signal'] = result['sell_signal'] & (mfv_f < -mfv_threshold)
+        elif mfv_mode == 'both' and 'MFV_FLOW' in result.columns and 'MFV_VEL' in result.columns:
+            mfv_f = result['MFV_FLOW']
+            mfv_v = result['MFV_VEL']
+            result['buy_signal'] = result['buy_signal'] & (mfv_f > mfv_threshold) & (mfv_v > mfv_threshold)
+            result['sell_signal'] = result['sell_signal'] & (mfv_f < -mfv_threshold) & (mfv_v < -mfv_threshold)
 
     # Calculate signal strength based on zone depth
     result['signal_strength'] = 0.5  # Default
@@ -426,6 +483,15 @@ def check_exit_conditions(
     take_profit_pct: float = 5.0,
     use_opposite_signal: bool = True,
     use_midline_cross: bool = False,
+    # Trailing stop parameters
+    use_trailing_stop: bool = False,
+    trailing_stop_pct: float = 1.0,
+    trailing_stop_activation_pct: float = 0.3,
+    high_watermark: float = 0.0,
+    # Break-even stop parameters
+    use_breakeven_stop: bool = False,
+    breakeven_trigger_pct: float = 0.3,
+    breakeven_offset_pct: float = 0.05,
     # Acceleration exit parameters
     use_accel_exit: bool = False,
     accel_exit_type: str = 'sign_reversal',
@@ -441,9 +507,11 @@ def check_exit_conditions(
     Exit Priority Order:
     1. Stop Loss (hard limit)
     2. Take Profit (hard limit)
-    3. Acceleration Reversal Exit (early warning based on momentum)
-    4. Midline Cross
-    5. Opposite Signal
+    3. Trailing Stop (dynamic, tracks high watermark)
+    4. Break-Even Stop (protects capital after profit reached)
+    5. Acceleration Reversal Exit (early warning based on momentum)
+    6. Midline Cross
+    7. Opposite Signal
 
     Args:
         df: DataFrame with price and signal data
@@ -453,6 +521,13 @@ def check_exit_conditions(
         take_profit_pct: Take profit percentage
         use_opposite_signal: Exit on opposite signal
         use_midline_cross: Exit on midline cross
+        use_trailing_stop: Enable trailing stop from high watermark
+        trailing_stop_pct: Trail distance from high watermark (%)
+        trailing_stop_activation_pct: Min profit to activate trailing stop (%)
+        high_watermark: Highest price since entry (caller must track this)
+        use_breakeven_stop: Enable break-even stop
+        breakeven_trigger_pct: Min profit to move SL to breakeven (%)
+        breakeven_offset_pct: Buffer above entry price for breakeven (%)
         use_accel_exit: Enable acceleration-based exit
         accel_exit_type: 'sign_reversal', 'magnitude', or 'both'
         accel_exit_threshold: Min acceleration magnitude for exit
@@ -484,7 +559,23 @@ def check_exit_conditions(
     if pnl_pct >= take_profit_pct:
         return True, f"Take Profit ({pnl_pct:.2f}%)", current_price
 
-    # 3. Acceleration Reversal Exit (early warning)
+    # 3. Trailing Stop (fires once activated, regardless of min_hold_bars)
+    if use_trailing_stop and high_watermark > 0:
+        hwm_pnl = ((high_watermark - entry_price) / entry_price) * 100
+        if hwm_pnl >= trailing_stop_activation_pct:
+            trail_level = high_watermark * (1 - trailing_stop_pct / 100)
+            if current_price <= trail_level:
+                return True, f"Trailing Stop ({pnl_pct:.2f}%)", current_price
+
+    # 4. Break-Even Stop (fires once activated, regardless of min_hold_bars)
+    if use_breakeven_stop and high_watermark > 0:
+        hwm_pnl = ((high_watermark - entry_price) / entry_price) * 100
+        if hwm_pnl >= breakeven_trigger_pct:
+            be_price = entry_price * (1 + breakeven_offset_pct / 100)
+            if current_price <= be_price:
+                return True, f"Break-Even Stop ({pnl_pct:.2f}%)", current_price
+
+    # 5. Acceleration Reversal Exit (early warning)
     if use_accel_exit:
         should_exit, reason = check_acceleration_exit(
             df=df,
@@ -500,7 +591,7 @@ def check_exit_conditions(
         if should_exit:
             return True, reason, current_price
 
-    # 4. Midline Cross
+    # 6. Midline Cross
     if use_midline_cross:
         osc = current.get('osc_smooth', 0)
         prev_osc = df.iloc[-2].get('osc_smooth', 0) if len(df) >= 2 else 0
@@ -510,7 +601,7 @@ def check_exit_conditions(
         if position_type == 'short' and prev_osc < 0 and osc >= 0:
             return True, f"Midline Cross ({pnl_pct:.2f}%)", current_price
 
-    # 5. Opposite Signal
+    # 7. Opposite Signal
     if use_opposite_signal:
         if position_type == 'long' and current.get('sell_signal', False):
             return True, f"Opposite Signal ({pnl_pct:.2f}%)", current_price
