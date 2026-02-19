@@ -1627,31 +1627,34 @@ class BaseTrader(ABC):
                         # Fallback to cached data if fresh fetch fails
                         print(f"   ⚠️ Fresh fetch failed, using cached data...")
                         df = getattr(self, '_cached_df', None)
-                        if df is not None and not df.empty:
-                            if self.use_legacy:
-                                df = calculate_composite_oscillator_legacy(df)
-                                df = calculate_velocity_signals_legacy(df, self.config)
-                            else:
-                                df = calculate_composite_oscillator(df, oscillator_type=self.oscillator_type, config=self.config)
-                                df = calculate_velocity_signals(
-                                    df,
-                                    signal_type=self.signal_type,
-                                    oversold_threshold=self.oversold_threshold,
-                                    overbought_threshold=self.overbought_threshold,
-                                    vel_smoothing=self.vel_smoothing,
-                                    extreme_zone_mult=self.extreme_zone_mult,
-                                    require_accel=self.require_accel,
-                                    use_regime_filter=self.use_regime_filter,
-                                    regime_threshold=self.regime_threshold,
-                                    use_vol_regime_filter=self.use_vol_regime_filter,
-                                    vol_regime_percentile_threshold=self.vol_regime_percentile_threshold,
-                                    rsi_filter=self.rsi_filter,
-                                    rsi_period=self.rsi_period,
-                                    rsi_oversold=self.rsi_oversold,
-                                    rsi_overbought=self.rsi_overbought,
-                                    use_macd_confirm=self.use_macd_confirm,
-                                    use_bb_filter=self.use_bb_filter,
-                                )
+
+                    # Calculate indicators on full data window before chart cropping
+                    # (ensures proper oscillator warmup — generate_chart slices to tail)
+                    if df is not None and not df.empty:
+                        if self.use_legacy:
+                            df = calculate_composite_oscillator_legacy(df)
+                            df = calculate_velocity_signals_legacy(df, self.config)
+                        else:
+                            df = calculate_composite_oscillator(df, oscillator_type=self.oscillator_type, config=self.config)
+                            df = calculate_velocity_signals(
+                                df,
+                                signal_type=self.signal_type,
+                                oversold_threshold=self.oversold_threshold,
+                                overbought_threshold=self.overbought_threshold,
+                                vel_smoothing=self.vel_smoothing,
+                                extreme_zone_mult=self.extreme_zone_mult,
+                                require_accel=self.require_accel,
+                                use_regime_filter=self.use_regime_filter,
+                                regime_threshold=self.regime_threshold,
+                                use_vol_regime_filter=self.use_vol_regime_filter,
+                                vol_regime_percentile_threshold=self.vol_regime_percentile_threshold,
+                                rsi_filter=self.rsi_filter,
+                                rsi_period=self.rsi_period,
+                                rsi_oversold=self.rsi_oversold,
+                                rsi_overbought=self.rsi_overbought,
+                                use_macd_confirm=self.use_macd_confirm,
+                                use_bb_filter=self.use_bb_filter,
+                            )
 
                     if df is not None and not df.empty:
                         trade_data = self.pm.get_entries_and_exits()
@@ -1814,31 +1817,34 @@ class BaseTrader(ABC):
                         # Fallback to cached data if fresh fetch fails
                         print(f"   ⚠️ Fresh fetch failed, using cached data...")
                         df = getattr(self, '_cached_df', None)
-                        if df is not None and not df.empty:
-                            if self.use_legacy:
-                                df = calculate_composite_oscillator_legacy(df)
-                                df = calculate_velocity_signals_legacy(df, self.config)
-                            else:
-                                df = calculate_composite_oscillator(df, oscillator_type=self.oscillator_type, config=self.config)
-                                df = calculate_velocity_signals(
-                                    df,
-                                    signal_type=self.signal_type,
-                                    oversold_threshold=self.oversold_threshold,
-                                    overbought_threshold=self.overbought_threshold,
-                                    vel_smoothing=self.vel_smoothing,
-                                    extreme_zone_mult=self.extreme_zone_mult,
-                                    require_accel=self.require_accel,
-                                    use_regime_filter=self.use_regime_filter,
-                                    regime_threshold=self.regime_threshold,
-                                    use_vol_regime_filter=self.use_vol_regime_filter,
-                                    vol_regime_percentile_threshold=self.vol_regime_percentile_threshold,
-                                    rsi_filter=self.rsi_filter,
-                                    rsi_period=self.rsi_period,
-                                    rsi_oversold=self.rsi_oversold,
-                                    rsi_overbought=self.rsi_overbought,
-                                    use_macd_confirm=self.use_macd_confirm,
-                                    use_bb_filter=self.use_bb_filter,
-                                )
+
+                    # Calculate indicators on full data window before chart cropping
+                    # (ensures proper oscillator warmup — generate_chart slices to tail)
+                    if df is not None and not df.empty:
+                        if self.use_legacy:
+                            df = calculate_composite_oscillator_legacy(df)
+                            df = calculate_velocity_signals_legacy(df, self.config)
+                        else:
+                            df = calculate_composite_oscillator(df, oscillator_type=self.oscillator_type, config=self.config)
+                            df = calculate_velocity_signals(
+                                df,
+                                signal_type=self.signal_type,
+                                oversold_threshold=self.oversold_threshold,
+                                overbought_threshold=self.overbought_threshold,
+                                vel_smoothing=self.vel_smoothing,
+                                extreme_zone_mult=self.extreme_zone_mult,
+                                require_accel=self.require_accel,
+                                use_regime_filter=self.use_regime_filter,
+                                regime_threshold=self.regime_threshold,
+                                use_vol_regime_filter=self.use_vol_regime_filter,
+                                vol_regime_percentile_threshold=self.vol_regime_percentile_threshold,
+                                rsi_filter=self.rsi_filter,
+                                rsi_period=self.rsi_period,
+                                rsi_oversold=self.rsi_oversold,
+                                rsi_overbought=self.rsi_overbought,
+                                use_macd_confirm=self.use_macd_confirm,
+                                use_bb_filter=self.use_bb_filter,
+                            )
 
                     if df is not None and not df.empty:
                         trade_data = self.pm.get_entries_and_exits()
