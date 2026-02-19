@@ -513,12 +513,14 @@ class PositionManager:
 
                 # CRITICAL: Check for overlapping trades (new entry falls within existing trade's duration)
                 # This prevents creating duplicate entries when process_new_bars runs on restart
-                # and processes bars that already have closed trades covering them
+                # and processes bars that already have closed trades covering them.
+                # Uses >= (not >) so an entry at the exact exit timestamp is also rejected —
+                # the same bar cannot be both exit of old trade and entry of new trade.
                 overlapping = conn.execute(
                     """SELECT id, entry_date, exit_date FROM trades
                        WHERE strategy_name = ?
                          AND entry_date < ?
-                         AND (exit_date IS NULL OR exit_date > ?)
+                         AND (exit_date IS NULL OR exit_date >= ?)
                        ORDER BY entry_date DESC LIMIT 1""",
                     (self.strategy_name, entry_date, entry_date)
                 ).fetchone()
@@ -1198,7 +1200,7 @@ class PositionManager:
                     # Enter position
                     in_position = True
                     entry_price = row['Close']
-                    entry_date = str(i)
+                    entry_date = normalize_timestamp(str(i))
                     entry_bar_idx = idx_pos
                     high_watermark = entry_price
                     entries.append({
@@ -1238,7 +1240,7 @@ class PositionManager:
 
                     if exit_reason:
                         exits.append({
-                            'date': str(i),
+                            'date': normalize_timestamp(str(i)),
                             'price': current_price,
                             'entry_date': entry_date,
                             'entry_price': entry_price,
@@ -2004,7 +2006,7 @@ class PositionManager:
                           exit_reason
                    FROM trades
                    WHERE strategy_name = ? AND exit_date IS NOT NULL
-                   ORDER BY exit_date DESC
+                   ORDER BY entry_date DESC
                    LIMIT ?""",
                 (self.strategy_name, limit)
             ).fetchall()
