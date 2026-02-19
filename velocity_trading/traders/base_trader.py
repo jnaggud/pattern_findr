@@ -97,6 +97,56 @@ def _bar_close_time(bar_start, interval_minutes: int):
         return bar_start
 
 
+def _format_display_time(ts, ticker: str = 'ES=F', shift_minutes: int = 0) -> str:
+    """Format a timestamp for Discord display as 'YYYY-MM-DD HH:MM UTC (MM/DD HH:MM AM/PM CT)'.
+
+    Args:
+        ts: Timestamp string, datetime, or Timestamp
+        ticker: Ticker symbol (determines local timezone)
+        shift_minutes: Minutes to add (e.g., bar interval for bar-start → bar-close)
+
+    Returns:
+        Formatted string like '2026-02-19 08:45 UTC (02/19 02:45 AM CT)'
+    """
+    import pytz
+    from datetime import timedelta
+
+    if ts is None:
+        return 'N/A'
+
+    # Determine local timezone from ticker
+    if ticker in ('ES=F', 'GC=F', 'NQ=F', 'CL=F', 'SI=F', 'HG=F'):
+        local_tz = pytz.timezone('America/Chicago')
+        tz_abbrev = 'CT'
+    elif ticker in ('BTC-USD', 'ETH-USD'):
+        local_tz = pytz.UTC
+        tz_abbrev = 'UTC'
+    else:
+        local_tz = pytz.timezone('America/New_York')
+        tz_abbrev = 'ET'
+
+    try:
+        dt = pd.to_datetime(ts)
+        if shift_minutes:
+            dt = dt + timedelta(minutes=shift_minutes)
+        # Normalize to UTC
+        if dt.tzinfo is None:
+            dt = dt.tz_localize('UTC')
+        else:
+            dt = dt.tz_convert('UTC')
+
+        utc_str = dt.strftime('%Y-%m-%d %H:%M') + ' UTC'
+
+        if tz_abbrev == 'UTC':
+            return utc_str
+
+        local_dt = dt.tz_convert(local_tz)
+        local_str = local_dt.strftime(f'%m/%d %I:%M %p {tz_abbrev}')
+        return f"{utc_str} ({local_str})"
+    except Exception:
+        return str(ts)[:16]
+
+
 class BaseTrader(ABC):
     """
     Abstract base class for velocity traders.
@@ -1516,15 +1566,11 @@ class BaseTrader(ABC):
                 except Exception as e:
                     print(f"   Warning: Enhanced stats failed: {e}")
 
-                # Format signal time — show bar CLOSE time (start + interval)
-                # so the displayed time matches when the signal is actionable
-                import pytz
-                display_time = _bar_close_time(signal_time, self._get_interval_minutes())
-                if hasattr(display_time, 'tzinfo') and display_time.tzinfo is not None:
-                    utc_time = display_time.astimezone(pytz.UTC)
-                    signal_time_str = utc_time.strftime('%Y-%m-%d %H:%M') + " UTC"
-                else:
-                    signal_time_str = str(display_time)[:16]
+                # Format signal time — show bar CLOSE time with both UTC and local
+                signal_time_str = _format_display_time(
+                    signal_time, ticker=self.ticker,
+                    shift_minutes=self._get_interval_minutes()
+                )
 
                 # Add regime to signal time for Discord
                 if entry_regime:
@@ -1696,24 +1742,18 @@ class BaseTrader(ABC):
                 except Exception as e:
                     print(f"   Warning: Enhanced stats failed: {e}")
 
-                # Format times — all displayed in UTC for consistency.
-                # Entry: bar start + interval = bar close time (when signal is actionable).
-                # Exit: bar close time for signal exits, or realtime UTC for SL/TP/Accel.
+                # Format times — show both UTC and local (CT/ET) for clarity.
                 _int_mins = self._get_interval_minutes()
-                # Entry is always bar-based → always add interval
-                entry_time_str = str(_bar_close_time(result.get('entry_date', ''), _int_mins))[:16]
-                # Exit: add interval for bar-start exits, convert to UTC for realtime exits
-                if getattr(self, '_exit_is_bar_time', False):
-                    exit_time_str = str(_bar_close_time(exit_date, _int_mins))[:16]
-                else:
-                    # Realtime exit (SL/TP/Accel/ML) — normalize to UTC for display
-                    try:
-                        _exit_dt = pd.to_datetime(exit_date)
-                        if _exit_dt.tzinfo is not None:
-                            _exit_dt = _exit_dt.tz_convert('UTC')
-                        exit_time_str = _exit_dt.strftime('%Y-%m-%d %H:%M')
-                    except Exception:
-                        exit_time_str = str(exit_date)[:16]
+                # Entry is always bar-based → shift by interval to show bar close time
+                entry_time_str = _format_display_time(
+                    result.get('entry_date', ''), ticker=self.ticker,
+                    shift_minutes=_int_mins
+                )
+                # Exit: shift for signal-based exits (bar start), no shift for realtime exits
+                exit_shift = _int_mins if getattr(self, '_exit_is_bar_time', False) else 0
+                exit_time_str = _format_display_time(
+                    exit_date, ticker=self.ticker, shift_minutes=exit_shift
+                )
 
                 # SIERRA CHART: Publish signal FIRST for fastest execution
                 if SIERRA_BRIDGE_AVAILABLE:
