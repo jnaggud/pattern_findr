@@ -1639,12 +1639,27 @@ class PositionManager:
                     current_price = row['Close']
                     pnl_pct = ((current_price - entry_price) / entry_price) * 100
 
-                    if high_watermark_inc is not None and current_price > high_watermark_inc:
-                        high_watermark_inc = current_price
+                    # Update high watermark with intrabar high
+                    bar_high = row.get('High', current_price)
+                    if high_watermark_inc is not None and bar_high > high_watermark_inc:
+                        high_watermark_inc = bar_high
 
                     exit_reason = None
-                    # SL > TP > ML Exit > Signal
-                    if pnl_pct <= -stop_loss_pct:
+                    # INTRABAR SL/TP: Check bar High/Low (matches WF validator)
+                    bar_low = row.get('Low', current_price)
+                    bar_low_pnl = ((bar_low - entry_price) / entry_price) * 100
+                    bar_high_pnl = ((bar_high - entry_price) / entry_price) * 100
+
+                    if bar_low_pnl <= -stop_loss_pct:
+                        # Exit at exact SL price level
+                        current_price = entry_price * (1 - stop_loss_pct / 100)
+                        exit_reason = f'Stop Loss ({-stop_loss_pct:.2f}%)'
+                    elif bar_high_pnl >= take_profit_pct:
+                        # Exit at exact TP price level
+                        current_price = entry_price * (1 + take_profit_pct / 100)
+                        exit_reason = f'Take Profit ({take_profit_pct:.2f}%)'
+                    # Fallback: Close-based SL/TP
+                    elif pnl_pct <= -stop_loss_pct:
                         exit_reason = f'Stop Loss ({pnl_pct:.2f}%)'
                     elif pnl_pct >= take_profit_pct:
                         exit_reason = f'Take Profit ({pnl_pct:.2f}%)'
@@ -1949,7 +1964,8 @@ class PositionManager:
             'profit_factor': profit_factor if profit_factor != float('inf') else 999.9
         }
 
-    def get_trade_log_csv(self, limit: int = 10, local_tz: str = 'America/Chicago') -> str:
+    def get_trade_log_csv(self, limit: int = 10, local_tz: str = 'America/Chicago',
+                          interval: str = '15m') -> str:
         """
         Generate a CSV trade log with the last N trades.
 
@@ -1957,19 +1973,35 @@ class PositionManager:
         #,Entry Time,Entry $,Exit Time,Exit $,P&L,Result
 
         Times are shown in both UTC and local timezone.
+        Timestamps are shifted by the bar interval so they show bar CLOSE times
+        (when the signal is actionable), matching the Discord alert messages.
 
         Args:
             limit: Number of trades to include (default 10)
             local_tz: Local timezone for display (default CT for futures)
+            interval: Bar interval string (e.g. '15m', '1h') for timestamp adjustment
 
         Returns:
             CSV string
         """
         import pytz
+        from datetime import timedelta
+
+        # Parse interval to minutes for bar close time adjustment
+        interval_minutes = 15  # default
+        if interval:
+            iv = str(interval).lower()
+            if iv.endswith('m'):
+                interval_minutes = int(iv[:-1])
+            elif iv.endswith('h'):
+                interval_minutes = int(iv[:-1]) * 60
+            elif iv.endswith('d'):
+                interval_minutes = int(iv[:-1]) * 1440
 
         with self._db.connection() as conn:
             rows = conn.execute(
-                """SELECT entry_date, entry_price, exit_date, exit_price, pnl_pct
+                """SELECT entry_date, entry_price, exit_date, exit_price, pnl_pct,
+                          exit_reason
                    FROM trades
                    WHERE strategy_name = ? AND exit_date IS NOT NULL
                    ORDER BY exit_date DESC
@@ -1999,15 +2031,19 @@ class PositionManager:
             entry_price = row['entry_price']
             exit_price = row['exit_price']
             pnl = row['pnl_pct'] or 0
+            exit_reason = row['exit_reason'] or ''
 
             # Format times with both UTC and local
-            def format_time(ts_str):
+            # shift_minutes: adds bar interval to convert bar-start → bar-close time
+            def format_time(ts_str, shift_minutes=0):
                 try:
                     dt = pd.to_datetime(ts_str)
                     if dt.tzinfo is None:
                         dt = dt.tz_localize('UTC')
                     else:
                         dt = dt.tz_convert('UTC')
+                    if shift_minutes:
+                        dt = dt + timedelta(minutes=shift_minutes)
                     utc_str = dt.strftime('%Y-%m-%d %H:%M UTC')
 
                     local_dt = dt.tz_convert(local_tz_obj)
@@ -2019,8 +2055,15 @@ class PositionManager:
                 except:
                     return ts_str[:19] if ts_str else 'N/A'
 
-            entry_time_str = format_time(entry_date)
-            exit_time_str = format_time(exit_date)
+            # Entry is always bar-based → always shift to bar close time
+            entry_time_str = format_time(entry_date, shift_minutes=interval_minutes)
+            # Exit: only signal-based exits (Opposite Signal) use bar start times.
+            # SL/TP/Accel/ML exits store realtime timestamps → no shift needed.
+            exit_is_bar_time = 'Opposite Signal' in exit_reason
+            exit_time_str = format_time(
+                exit_date,
+                shift_minutes=interval_minutes if exit_is_bar_time else 0
+            )
 
             result = "WIN" if pnl > 0 else "LOSS"
             pnl_str = f"+{pnl:.2f}%" if pnl > 0 else f"{pnl:.2f}%"
@@ -2159,8 +2202,9 @@ class PositionManager:
         else:
             local_tz = 'America/New_York'
 
-        # Get trade log CSV
-        trade_log = self.get_trade_log_csv(limit=10, local_tz=local_tz)
+        # Get trade log CSV (pass interval for bar close time adjustment)
+        interval = config.get('interval', '15m')
+        trade_log = self.get_trade_log_csv(limit=10, local_tz=local_tz, interval=interval)
 
         return {
             'strategy_name': self.strategy_name,
