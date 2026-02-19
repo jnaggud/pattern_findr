@@ -80,6 +80,23 @@ except ImportError:
     DAILY_RETRAINER_AVAILABLE = False
 
 
+def _bar_close_time(bar_start, interval_minutes: int):
+    """Convert a bar start timestamp to its close timestamp for display.
+
+    Financial data labels bars by start time, but the signal isn't actionable
+    until bar close (start + interval). This helper adds the interval so that
+    displayed timestamps match when the signal was actually available.
+    """
+    from datetime import timedelta
+    if bar_start is None:
+        return bar_start
+    try:
+        dt = pd.to_datetime(bar_start)
+        return dt + timedelta(minutes=interval_minutes)
+    except Exception:
+        return bar_start
+
+
 class BaseTrader(ABC):
     """
     Abstract base class for velocity traders.
@@ -111,6 +128,7 @@ class BaseTrader(ABC):
         self.interval = interval
         self.webhook_url = webhook_url
         self.config = config or {}
+        self._exit_is_bar_time = False  # Tracks if last exit_date is bar-start (needs +interval for display)
 
         # Auto-backup the strategy bundle config on startup (daily)
         self._backup_config_if_needed()
@@ -189,6 +207,14 @@ class BaseTrader(ABC):
         self.fragility_threshold = self.config.get('fragility_threshold', 0.5)
         self.use_entropy_filter = self.config.get('use_entropy_filter', False)
         self.entropy_threshold = self.config.get('entropy_threshold', 0.7)
+        self.use_vol_regime_filter = self.config.get('use_vol_regime_filter', False)
+        self.vol_regime_percentile_threshold = self.config.get('vol_regime_percentile_threshold', 0.25)
+        self.rsi_filter = self.config.get('rsi_filter', 'none')
+        self.rsi_period = self.config.get('rsi_period', 14)
+        self.rsi_oversold = self.config.get('rsi_oversold', 30)
+        self.rsi_overbought = self.config.get('rsi_overbought', 70)
+        self.use_macd_confirm = self.config.get('use_macd_confirm', False)
+        self.use_bb_filter = self.config.get('use_bb_filter', False)
 
         # Acceleration Reversal Exit parameters
         self.use_accel_exit = self.config.get('use_accel_exit', False)
@@ -198,6 +224,15 @@ class BaseTrader(ABC):
         self.accel_exit_lookback = self.config.get('accel_exit_lookback', 1)
         self.use_jerk_confirm = self.config.get('use_jerk_confirm', False)
         self.jerk_confirm_threshold = self.config.get('jerk_confirm_threshold', 0.0)
+
+        # Trailing Stop parameters (v7+)
+        self.use_trailing_stop = self.config.get('use_trailing_stop', False)
+        self.trailing_stop_pct = self.config.get('trailing_stop_pct', 1.0)
+        self.trailing_stop_activation_pct = self.config.get('trailing_stop_activation_pct', 0.3)
+        # Break-Even Stop parameters (v7+)
+        self.use_breakeven_stop = self.config.get('use_breakeven_stop', False)
+        self.breakeven_trigger_pct = self.config.get('breakeven_trigger_pct', 0.3)
+        self.breakeven_offset_pct = self.config.get('breakeven_offset_pct', 0.05)
 
         # Non-legacy mode now produces identical results to old system
         # Legacy mode is kept as fallback but not required by default
@@ -215,6 +250,7 @@ class BaseTrader(ABC):
         # State
         self.running = False
         self.last_signal_time = None
+        self._high_watermark = 0.0  # Tracks highest price since entry (for trailing/BE stops)
         self.consecutive_errors = 0
         self.max_consecutive_errors = 5
 
@@ -351,6 +387,14 @@ class BaseTrader(ABC):
                 fragility_threshold=merged.get('fragility_threshold', 0.5),
                 use_entropy_filter=merged.get('use_entropy_filter', False),
                 entropy_threshold=merged.get('entropy_threshold', 0.7),
+                use_vol_regime_filter=merged.get('use_vol_regime_filter', False),
+                vol_regime_percentile_threshold=merged.get('vol_regime_percentile_threshold', 0.25),
+                rsi_filter=merged.get('rsi_filter', 'none'),
+                rsi_period=merged.get('rsi_period', 14),
+                rsi_oversold=merged.get('rsi_oversold', 30),
+                rsi_overbought=merged.get('rsi_overbought', 70),
+                use_macd_confirm=merged.get('use_macd_confirm', False),
+                use_bb_filter=merged.get('use_bb_filter', False),
             )
         return regime_signal_dfs
 
@@ -771,7 +815,15 @@ class BaseTrader(ABC):
                 use_fragility_filter=self.use_fragility_filter,
                 fragility_threshold=self.fragility_threshold,
                 use_entropy_filter=self.use_entropy_filter,
-                entropy_threshold=self.entropy_threshold
+                entropy_threshold=self.entropy_threshold,
+                use_vol_regime_filter=self.use_vol_regime_filter,
+                vol_regime_percentile_threshold=self.vol_regime_percentile_threshold,
+                rsi_filter=self.rsi_filter,
+                rsi_period=self.rsi_period,
+                rsi_oversold=self.rsi_oversold,
+                rsi_overbought=self.rsi_overbought,
+                use_macd_confirm=self.use_macd_confirm,
+                use_bb_filter=self.use_bb_filter,
             )
 
             # Train ML entry + exit models (v7+) — needs signals computed first
@@ -1058,6 +1110,7 @@ class BaseTrader(ABC):
         """Check if position should be exited."""
         import time as _exit_time
         self._last_exit_check_time = _exit_time.time()
+        self._exit_is_stale = False  # Track if exit is from a stale missed signal
         # Get current price
         current_price = fetch_realtime_price(self.ticker)
         price_source = "realtime"
@@ -1087,19 +1140,89 @@ class BaseTrader(ABC):
         exit_price = current_price
         signal_bar_time = None  # Only set for signal-based exits
 
-        # Stop Loss
-        if pnl_pct <= -sl_pct:
+        # INTRABAR SL/TP: Check completed bar's High/Low for SL/TP touches
+        # The realtime price check below only sees the current instant.
+        # If the bar's Low dipped below SL (or High above TP) and then recovered,
+        # the realtime check would miss it. This matches WF validator behavior.
+        completed_bar, completed_bar_time = self.get_completed_bar(df)
+        if completed_bar is not None and exit_reason is None:
+            bar_low = completed_bar.get('Low', current_price)
+            bar_high = completed_bar.get('High', current_price)
+            bar_low_pnl = ((bar_low - entry_price) / entry_price) * 100
+            bar_high_pnl = ((bar_high - entry_price) / entry_price) * 100
+
+            if bar_low_pnl <= -sl_pct:
+                exit_price = sl_price  # Exit at exact SL level
+                exit_reason = f"Stop Loss ({-sl_pct:.2f}%)"
+                signal_bar_time = completed_bar_time
+                print(f"   🛑 INTRABAR STOP LOSS! Bar Low ${bar_low:,.2f} hit SL ${sl_price:,.2f}")
+            elif bar_high_pnl >= tp_pct:
+                exit_price = tp_price  # Exit at exact TP level
+                exit_reason = f"Take Profit ({tp_pct:.2f}%)"
+                signal_bar_time = completed_bar_time
+                print(f"   🎯 INTRABAR TAKE PROFIT! Bar High ${bar_high:,.2f} hit TP ${tp_price:,.2f}")
+
+        # Realtime price SL/TP (fallback for current incomplete bar)
+        if exit_reason is None and pnl_pct <= -sl_pct:
             exit_reason = f"Stop Loss ({pnl_pct:.2f}%)"
             print(f"   🛑 STOP LOSS TRIGGERED! P&L {pnl_pct:.2f}% <= -{sl_pct}%")
 
         # Take Profit
-        elif pnl_pct >= tp_pct:
+        elif exit_reason is None and pnl_pct >= tp_pct:
             exit_reason = f"Take Profit ({pnl_pct:.2f}%)"
             print(f"   🎯 TAKE PROFIT TRIGGERED! P&L {pnl_pct:.2f}% >= +{tp_pct}%")
 
+        # Update high watermark for trailing/breakeven stops
+        # Use bar high if available, otherwise current price
+        bar_high_for_hwm = current_price
+        if completed_bar is not None:
+            bar_high_for_hwm = max(current_price, completed_bar.get('High', current_price))
+        self._high_watermark = max(self._high_watermark, bar_high_for_hwm)
+
+        # Trailing Stop (fires once activated)
+        _use_trailing = self._get_exit_param('use_trailing_stop', self.use_trailing_stop, position)
+        if exit_reason is None and _use_trailing and self._high_watermark > 0:
+            _trail_pct = self._get_exit_param('trailing_stop_pct', self.trailing_stop_pct, position)
+            _trail_act = self._get_exit_param('trailing_stop_activation_pct', self.trailing_stop_activation_pct, position)
+            hwm_pnl = ((self._high_watermark - entry_price) / entry_price) * 100
+            if hwm_pnl >= _trail_act:
+                trail_level = self._high_watermark * (1 - _trail_pct / 100)
+                # Check intrabar low if available
+                check_price = current_price
+                if completed_bar is not None:
+                    bar_low = completed_bar.get('Low', current_price)
+                    if bar_low <= trail_level:
+                        exit_price = trail_level
+                        exit_reason = f"Trailing Stop ({pnl_pct:.2f}%)"
+                        signal_bar_time = completed_bar_time
+                        print(f"   📉 TRAILING STOP! Bar Low ${bar_low:,.2f} hit trail ${trail_level:,.2f} (HWM ${self._high_watermark:,.2f})")
+                if exit_reason is None and current_price <= trail_level:
+                    exit_reason = f"Trailing Stop ({pnl_pct:.2f}%)"
+                    print(f"   📉 TRAILING STOP! Price ${current_price:,.2f} <= trail ${trail_level:,.2f} (HWM ${self._high_watermark:,.2f})")
+
+        # Break-Even Stop (fires once activated)
+        _use_be = self._get_exit_param('use_breakeven_stop', self.use_breakeven_stop, position)
+        if exit_reason is None and _use_be and self._high_watermark > 0:
+            _be_trigger = self._get_exit_param('breakeven_trigger_pct', self.breakeven_trigger_pct, position)
+            _be_offset = self._get_exit_param('breakeven_offset_pct', self.breakeven_offset_pct, position)
+            hwm_pnl = ((self._high_watermark - entry_price) / entry_price) * 100
+            if hwm_pnl >= _be_trigger:
+                be_price = entry_price * (1 + _be_offset / 100)
+                # Check intrabar low if available
+                if completed_bar is not None:
+                    bar_low = completed_bar.get('Low', current_price)
+                    if bar_low <= be_price:
+                        exit_price = be_price
+                        exit_reason = f"Break-Even Stop ({pnl_pct:.2f}%)"
+                        signal_bar_time = completed_bar_time
+                        print(f"   🔒 BREAK-EVEN STOP! Bar Low ${bar_low:,.2f} hit BE ${be_price:,.2f}")
+                if exit_reason is None and current_price <= be_price:
+                    exit_reason = f"Break-Even Stop ({pnl_pct:.2f}%)"
+                    print(f"   🔒 BREAK-EVEN STOP! Price ${current_price:,.2f} <= BE ${be_price:,.2f}")
+
         # Acceleration Reversal Exit (early warning before stop loss)
         # Resolve accel params from entry regime (v9) or top-level (v8)
-        elif self._get_exit_param('use_accel_exit', self.use_accel_exit, position) and 'acceleration' in df.columns:
+        if exit_reason is None and self._get_exit_param('use_accel_exit', self.use_accel_exit, position) and 'acceleration' in df.columns:
             _accel_exit_type = self._get_exit_param('accel_exit_type', self.accel_exit_type, position)
             _accel_exit_threshold = self._get_exit_param('accel_exit_threshold', self.accel_exit_threshold, position)
             _accel_exit_min_pnl = self._get_exit_param('accel_exit_min_pnl', self.accel_exit_min_pnl, position)
@@ -1211,7 +1334,32 @@ class BaseTrader(ABC):
                     first_signal = opposite_signals.iloc[0]
                     first_signal_time = opposite_signals.index[0]
 
-                    exit_price = first_signal['Close']
+                    # Check if signal is stale (from a past bar, not the most recent)
+                    completed_bar_exit, completed_bar_time_exit = self.get_completed_bar(df)
+                    first_signal_time_dt = pd.to_datetime(first_signal_time)
+                    if first_signal_time_dt.tzinfo is not None:
+                        first_signal_time_dt = first_signal_time_dt.tz_convert('UTC').tz_localize(None)
+                    completed_time_dt = pd.to_datetime(completed_bar_time_exit) if completed_bar_time_exit else None
+                    if completed_time_dt is not None and completed_time_dt.tzinfo is not None:
+                        completed_time_dt = completed_time_dt.tz_convert('UTC').tz_localize(None)
+
+                    is_stale_signal = (completed_time_dt is not None and
+                                       first_signal_time_dt < completed_time_dt)
+                    self._exit_is_stale = is_stale_signal
+
+                    if is_stale_signal:
+                        # Signal is from a past bar — use current market price
+                        stale_price = fetch_realtime_price(self.ticker)
+                        if stale_price and stale_price > 0:
+                            exit_price = stale_price
+                            print(f"   📍 Found STALE {signal_col} at {first_signal_time}, using current price ${exit_price:,.2f}")
+                        else:
+                            exit_price = first_signal['Close']
+                            print(f"   📍 Found STALE {signal_col} at {first_signal_time}, realtime unavailable, using bar close ${exit_price:,.2f}")
+                    else:
+                        # Timely signal — use bar close (matches backtest)
+                        exit_price = first_signal['Close']
+                        print(f"   📍 Found {signal_col} at {first_signal_time}")
 
                     # Calculate P&L based on position type
                     if is_long:
@@ -1222,10 +1370,7 @@ class BaseTrader(ABC):
                     exit_reason = f"Opposite Signal ({bar_pnl_pct:.2f}%)"
 
                     # Use bar START time so chart plots marker on signal bar
-                    # The exit_price is the signal bar's Close, so marker appears at bar's close level
                     signal_bar_time = first_signal_time
-
-                    print(f"   📍 Found missed {signal_col} at {first_signal_time}")
 
         # Execute exit if triggered
         if exit_reason:
@@ -1236,7 +1381,9 @@ class BaseTrader(ABC):
                 print(f"   ⚠️ Position no longer exists in database - skipping exit")
                 print(f"   ℹ️  This can happen if another process exited the position or ran a rebuild")
                 return
-            self._execute_exit(exit_price, exit_reason, signal_bar_time)
+            # Mark as missed if this was a stale opposite signal recovery
+            _is_missed = getattr(self, '_exit_is_stale', False)
+            self._execute_exit(exit_price, exit_reason, signal_bar_time, is_missed=_is_missed)
 
     def _check_entry(self, df: pd.DataFrame):
         """Check for entry signals."""
@@ -1346,6 +1493,8 @@ class BaseTrader(ABC):
         )
 
         if success:
+            # Reset high watermark for trailing/breakeven stops
+            self._high_watermark = entry_price
             regime_tag = f" [{entry_regime}]" if entry_regime else ""
             print(f"   ENTRY: LONG @ ${entry_price:,.2f}{regime_tag}")
 
@@ -1367,16 +1516,15 @@ class BaseTrader(ABC):
                 except Exception as e:
                     print(f"   Warning: Enhanced stats failed: {e}")
 
-                # Format signal time with timezone indicator
-                # Convert to UTC for display to avoid confusion
+                # Format signal time — show bar CLOSE time (start + interval)
+                # so the displayed time matches when the signal is actionable
                 import pytz
-                if hasattr(signal_time, 'tzinfo') and signal_time.tzinfo is not None:
-                    # Convert to UTC for consistent display
-                    utc_time = signal_time.astimezone(pytz.UTC)
+                display_time = _bar_close_time(signal_time, self._get_interval_minutes())
+                if hasattr(display_time, 'tzinfo') and display_time.tzinfo is not None:
+                    utc_time = display_time.astimezone(pytz.UTC)
                     signal_time_str = utc_time.strftime('%Y-%m-%d %H:%M') + " UTC"
                 else:
-                    # Naive timestamp - just format as-is
-                    signal_time_str = str(signal_time)[:16]
+                    signal_time_str = str(display_time)[:16]
 
                 # Add regime to signal time for Discord
                 if entry_regime:
@@ -1448,7 +1596,15 @@ class BaseTrader(ABC):
                                     extreme_zone_mult=self.extreme_zone_mult,
                                     require_accel=self.require_accel,
                                     use_regime_filter=self.use_regime_filter,
-                                    regime_threshold=self.regime_threshold
+                                    regime_threshold=self.regime_threshold,
+                                    use_vol_regime_filter=self.use_vol_regime_filter,
+                                    vol_regime_percentile_threshold=self.vol_regime_percentile_threshold,
+                                    rsi_filter=self.rsi_filter,
+                                    rsi_period=self.rsi_period,
+                                    rsi_oversold=self.rsi_oversold,
+                                    rsi_overbought=self.rsi_overbought,
+                                    use_macd_confirm=self.use_macd_confirm,
+                                    use_bb_filter=self.use_bb_filter,
                                 )
 
                     if df is not None and not df.empty:
@@ -1465,7 +1621,7 @@ class BaseTrader(ABC):
                             interval=self.interval,
                             oversold_threshold=self.oversold_threshold,
                             overbought_threshold=self.overbought_threshold,
-                            signal_time=signal_time  # Show UTC + Chicago time on chart
+                            signal_time=_bar_close_time(signal_time, self._get_interval_minutes())
                         )
                 except Exception as e:
                     print(f"   Warning: Entry chart generation failed: {e}")
@@ -1482,7 +1638,7 @@ class BaseTrader(ABC):
         else:
             print(f"   Entry rejected: {result.get('error')} - {result.get('message')}")
 
-    def _execute_exit(self, exit_price: float, exit_reason: str, signal_bar_time=None):
+    def _execute_exit(self, exit_price: float, exit_reason: str, signal_bar_time=None, is_missed: bool = False):
         """Execute position exit."""
         from ..core.position_manager import normalize_timestamp
         from ..data.market_hours import get_current_market_time
@@ -1490,16 +1646,19 @@ class BaseTrader(ABC):
         # Use signal bar timestamp for signal-based exits, current time for SL/TP
         if signal_bar_time is not None:
             exit_date = normalize_timestamp(signal_bar_time)
+            self._exit_is_bar_time = True  # exit_date is bar start → display needs +interval
         else:
             # SL/TP exits use current time (they're triggered by price, not bar completion)
             exit_date = get_current_market_time(self.ticker).isoformat()
+            self._exit_is_bar_time = False  # exit_date is already realtime → no offset needed
 
         # CRITICAL: Use PositionManager for atomic exit
         success, result = self.pm.exit_position(
             exit_price=exit_price,
             exit_date=exit_date,
             exit_reason=exit_reason,
-            interval=self.interval
+            interval=self.interval,
+            is_missed=is_missed
         )
 
         if success:
@@ -1537,10 +1696,24 @@ class BaseTrader(ABC):
                 except Exception as e:
                     print(f"   Warning: Enhanced stats failed: {e}")
 
-                # Format times - just use local time without confusing UTC label
-                # The times shown are when the signal was actionable (bar close time)
-                entry_time_str = str(result.get('entry_date', ''))[:16]
-                exit_time_str = str(exit_date)[:16]
+                # Format times — all displayed in UTC for consistency.
+                # Entry: bar start + interval = bar close time (when signal is actionable).
+                # Exit: bar close time for signal exits, or realtime UTC for SL/TP/Accel.
+                _int_mins = self._get_interval_minutes()
+                # Entry is always bar-based → always add interval
+                entry_time_str = str(_bar_close_time(result.get('entry_date', ''), _int_mins))[:16]
+                # Exit: add interval for bar-start exits, convert to UTC for realtime exits
+                if getattr(self, '_exit_is_bar_time', False):
+                    exit_time_str = str(_bar_close_time(exit_date, _int_mins))[:16]
+                else:
+                    # Realtime exit (SL/TP/Accel/ML) — normalize to UTC for display
+                    try:
+                        _exit_dt = pd.to_datetime(exit_date)
+                        if _exit_dt.tzinfo is not None:
+                            _exit_dt = _exit_dt.tz_convert('UTC')
+                        exit_time_str = _exit_dt.strftime('%Y-%m-%d %H:%M')
+                    except Exception:
+                        exit_time_str = str(exit_date)[:16]
 
                 # SIERRA CHART: Publish signal FIRST for fastest execution
                 if SIERRA_BRIDGE_AVAILABLE:
@@ -1616,7 +1789,15 @@ class BaseTrader(ABC):
                                     extreme_zone_mult=self.extreme_zone_mult,
                                     require_accel=self.require_accel,
                                     use_regime_filter=self.use_regime_filter,
-                                    regime_threshold=self.regime_threshold
+                                    regime_threshold=self.regime_threshold,
+                                    use_vol_regime_filter=self.use_vol_regime_filter,
+                                    vol_regime_percentile_threshold=self.vol_regime_percentile_threshold,
+                                    rsi_filter=self.rsi_filter,
+                                    rsi_period=self.rsi_period,
+                                    rsi_oversold=self.rsi_oversold,
+                                    rsi_overbought=self.rsi_overbought,
+                                    use_macd_confirm=self.use_macd_confirm,
+                                    use_bb_filter=self.use_bb_filter,
                                 )
 
                     if df is not None and not df.empty:
@@ -1633,7 +1814,7 @@ class BaseTrader(ABC):
                             interval=self.interval,
                             oversold_threshold=self.oversold_threshold,
                             overbought_threshold=self.overbought_threshold,
-                            signal_time=exit_date  # Show UTC + Chicago time on chart
+                            signal_time=_bar_close_time(exit_date, self._get_interval_minutes()) if getattr(self, '_exit_is_bar_time', False) else exit_date
                         )
                 except Exception as e:
                     print(f"   Warning: Exit chart generation failed: {e}")
@@ -1724,7 +1905,15 @@ class BaseTrader(ABC):
                         extreme_zone_mult=self.extreme_zone_mult,
                         require_accel=self.require_accel,
                         use_regime_filter=self.use_regime_filter,
-                        regime_threshold=self.regime_threshold
+                        regime_threshold=self.regime_threshold,
+                        use_vol_regime_filter=self.use_vol_regime_filter,
+                        vol_regime_percentile_threshold=self.vol_regime_percentile_threshold,
+                        rsi_filter=self.rsi_filter,
+                        rsi_period=self.rsi_period,
+                        rsi_oversold=self.rsi_oversold,
+                        rsi_overbought=self.rsi_overbought,
+                        use_macd_confirm=self.use_macd_confirm,
+                        use_bb_filter=self.use_bb_filter,
                     )
 
                 # Get trade history for chart markers
@@ -1738,11 +1927,16 @@ class BaseTrader(ABC):
                 # If in position: show entry time
                 # If flat: show last exit time
                 chart_signal_time = None
+                _startup_is_bar_time = False
                 if position:
                     chart_signal_time = position.entry_signal_bar or position.entry_date
+                    _startup_is_bar_time = True  # entry dates are always bar-start
                 elif exits:
-                    # Get most recent exit time
+                    # Get most recent exit time — could be bar-start or realtime
                     chart_signal_time = exits[-1].get('date')
+                    # Check if exit reason suggests bar-based or realtime exit
+                    last_exit_reason = exits[-1].get('reason', '')
+                    _startup_is_bar_time = 'Stop Loss' not in last_exit_reason and 'Take Profit' not in last_exit_reason
 
                 # Generate chart
                 chart = generate_chart(
@@ -1757,7 +1951,7 @@ class BaseTrader(ABC):
                     interval=self.interval,
                     oversold_threshold=self.oversold_threshold,
                     overbought_threshold=self.overbought_threshold,
-                    signal_time=chart_signal_time  # Show UTC + Chicago time
+                    signal_time=_bar_close_time(chart_signal_time, self._get_interval_minutes()) if _startup_is_bar_time else chart_signal_time
                 )
                 print("   ✓ Chart generated")
         except Exception as e:
