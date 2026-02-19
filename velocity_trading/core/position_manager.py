@@ -1167,6 +1167,30 @@ class PositionManager:
             stop_loss_pct = config['stop_loss_pct']
             take_profit_pct = config['take_profit_pct']
 
+            # Exit parameters from config (must match live trader + WF validator)
+            _use_accel_exit = config.get('use_accel_exit', False)
+            _accel_exit_type = config.get('accel_exit_type', 'sign_reversal')
+            _accel_exit_threshold = config.get('accel_exit_threshold', 0.0)
+            _accel_exit_min_pnl = config.get('accel_exit_min_pnl', 0.5)
+            _accel_exit_lookback = config.get('accel_exit_lookback', 1)
+            _use_jerk_confirm = config.get('use_jerk_confirm', False)
+            _jerk_confirm_threshold = config.get('jerk_confirm_threshold', 0.0)
+            _exit_on_midline = config.get('exit_on_midline_cross', False)
+            _min_hold_bars = config.get('min_hold_bars', 1)
+            _use_trailing = config.get('use_trailing_stop', False)
+            _trailing_pct = config.get('trailing_stop_pct', 1.0)
+            _trailing_activation = config.get('trailing_stop_activation_pct', 0.5)
+            _use_breakeven = config.get('use_breakeven_stop', False)
+            _breakeven_trigger = config.get('breakeven_trigger_pct', 0.3)
+            _breakeven_offset = config.get('breakeven_offset_pct', 0.05)
+
+            # Pre-extract arrays for accel/jerk lookups
+            import numpy as np
+            _has_accel = _use_accel_exit and 'acceleration' in df.columns
+            _has_jerk = 'jerk' in df.columns
+            _has_osc = 'JD_Osc' in df.columns or 'osc_smooth' in df.columns
+            _osc_col = 'JD_Osc' if 'JD_Osc' in df.columns else 'osc_smooth'
+
             # Pre-compute novel filter bar indices for fast lookup
             _novel_rejected = set()
             if novel_filters is not None and novel_filters.trained:
@@ -1191,6 +1215,7 @@ class PositionManager:
 
             entry_bar_idx = None
             high_watermark = None
+            bars_held = 0
 
             for idx_pos, (i, row) in enumerate(df.iterrows()):
                 if not in_position and row.get('buy_signal', False):
@@ -1203,6 +1228,7 @@ class PositionManager:
                     entry_date = normalize_timestamp(str(i))
                     entry_bar_idx = idx_pos
                     high_watermark = entry_price
+                    bars_held = 0
                     entries.append({
                         'date': entry_date,
                         'price': entry_price,
@@ -1210,41 +1236,112 @@ class PositionManager:
                     })
 
                 elif in_position:
+                    bars_held += 1
                     current_price = row['Close']
                     pnl_pct = ((current_price - entry_price) / entry_price) * 100
 
-                    if current_price > high_watermark:
-                        high_watermark = current_price
+                    bar_high = row.get('High', current_price)
+                    bar_low = row.get('Low', current_price)
+                    if bar_high > high_watermark:
+                        high_watermark = bar_high
 
                     exit_reason = None
+                    exit_price = current_price
 
-                    # Check exit conditions: SL > TP > ML Exit > Signal
-                    if pnl_pct <= -stop_loss_pct:
+                    # Priority 1: Intrabar SL (check bar Low)
+                    bar_low_pnl = ((bar_low - entry_price) / entry_price) * 100
+                    if bar_low_pnl <= -stop_loss_pct:
+                        exit_price = entry_price * (1 - stop_loss_pct / 100)
+                        exit_reason = f'Stop Loss ({-stop_loss_pct:.2f}%)'
+
+                    # Priority 2: Intrabar TP (check bar High)
+                    if not exit_reason:
+                        bar_high_pnl = ((bar_high - entry_price) / entry_price) * 100
+                        if bar_high_pnl >= take_profit_pct:
+                            exit_price = entry_price * (1 + take_profit_pct / 100)
+                            exit_reason = f'Take Profit ({take_profit_pct:.2f}%)'
+
+                    # Priority 3: Close-based SL/TP fallback
+                    if not exit_reason and pnl_pct <= -stop_loss_pct:
                         exit_reason = f'Stop Loss ({pnl_pct:.2f}%)'
-                    elif pnl_pct >= take_profit_pct:
+                    if not exit_reason and pnl_pct >= take_profit_pct:
                         exit_reason = f'Take Profit ({pnl_pct:.2f}%)'
-                    elif _has_ml_exit:
-                        # ML Exit Model: check if model says exit
-                        try:
-                            should_exit, prob, reason = novel_filters.exit_model.should_exit(
-                                df, entry_price, entry_bar_idx, idx_pos,
-                                high_watermark=high_watermark
-                            )
-                            if should_exit:
-                                exit_reason = f'ML Exit ({pnl_pct:.2f}%, p={prob:.2f})'
-                        except Exception:
-                            pass
-                    # Fallback to signal-based exit when no ML model
-                    if exit_reason is None and row.get('sell_signal', False):
-                        exit_reason = f'Opposite Signal ({pnl_pct:.2f}%)'
+
+                    # Remaining exits require min_hold_bars
+                    if not exit_reason and bars_held >= _min_hold_bars:
+
+                        # Priority 4: Trailing Stop
+                        if not exit_reason and _use_trailing:
+                            hwm_pnl = ((high_watermark - entry_price) / entry_price) * 100
+                            if hwm_pnl >= _trailing_activation:
+                                trail_level = high_watermark * (1 - _trailing_pct / 100)
+                                if bar_low <= trail_level:
+                                    exit_price = trail_level
+                                    exit_reason = f'Trailing Stop ({pnl_pct:.2f}%)'
+
+                        # Priority 5: Break-Even Stop
+                        if not exit_reason and _use_breakeven:
+                            hwm_pnl = ((high_watermark - entry_price) / entry_price) * 100
+                            if hwm_pnl >= _breakeven_trigger:
+                                be_price = entry_price * (1 + _breakeven_offset / 100)
+                                if bar_low <= be_price:
+                                    exit_price = be_price
+                                    exit_reason = f'Break-Even Stop ({pnl_pct:.2f}%)'
+
+                        # Priority 6: Accel Exit
+                        if not exit_reason and _has_accel and idx_pos >= _accel_exit_lookback:
+                            pnl_ok = pnl_pct >= _accel_exit_min_pnl or pnl_pct < 0
+                            if pnl_ok:
+                                accel_vals = df['acceleration'].iloc[
+                                    idx_pos - _accel_exit_lookback + 1:idx_pos + 1
+                                ].values
+                                current_accel = df['acceleration'].iloc[idx_pos]
+
+                                accel_cond = False
+                                if _accel_exit_type == 'sign_reversal':
+                                    accel_cond = np.all(accel_vals < 0)
+                                elif _accel_exit_type == 'magnitude':
+                                    accel_cond = current_accel < -_accel_exit_threshold
+                                elif _accel_exit_type == 'both':
+                                    accel_cond = (np.all(accel_vals < 0)
+                                                  and abs(current_accel) > _accel_exit_threshold)
+
+                                jerk_ok = True
+                                if _use_jerk_confirm and _has_jerk and _jerk_confirm_threshold > 0:
+                                    jerk_ok = df['jerk'].iloc[idx_pos] < -_jerk_confirm_threshold
+
+                                if accel_cond and jerk_ok:
+                                    exit_reason = f'Accel Exit ({pnl_pct:.2f}%)'
+
+                        # Priority 7: ML Exit
+                        if not exit_reason and _has_ml_exit:
+                            try:
+                                should_exit, prob, reason = novel_filters.exit_model.should_exit(
+                                    df, entry_price, entry_bar_idx, idx_pos,
+                                    high_watermark=high_watermark
+                                )
+                                if should_exit:
+                                    exit_reason = f'ML Exit ({pnl_pct:.2f}%, p={prob:.2f})'
+                            except Exception:
+                                pass
+
+                        # Priority 8: Midline Cross
+                        if not exit_reason and _exit_on_midline and _has_osc:
+                            osc_val = row.get(_osc_col, 0)
+                            if osc_val > 0:
+                                exit_reason = f'Midline Cross ({pnl_pct:.2f}%)'
+
+                        # Priority 9: Opposite Signal
+                        if exit_reason is None and row.get('sell_signal', False):
+                            exit_reason = f'Opposite Signal ({pnl_pct:.2f}%)'
 
                     if exit_reason:
                         exits.append({
                             'date': normalize_timestamp(str(i)),
-                            'price': current_price,
+                            'price': exit_price,
                             'entry_date': entry_date,
                             'entry_price': entry_price,
-                            'pnl': pnl_pct,
+                            'pnl': ((exit_price - entry_price) / entry_price) * 100,
                             'reason': exit_reason
                         })
                         in_position = False
@@ -1252,6 +1349,7 @@ class PositionManager:
                         entry_date = None
                         entry_bar_idx = None
                         high_watermark = None
+                        bars_held = 0
 
             print(f"   ✓ Backtest complete: {len(entries)} entries, {len(exits)} exits")
 
@@ -1545,6 +1643,27 @@ class PositionManager:
             stop_loss_pct = config['stop_loss_pct']
             take_profit_pct = config['take_profit_pct']
 
+            # Exit parameters from config (must match live trader + WF validator)
+            import numpy as np
+            _use_accel_exit_inc = config.get('use_accel_exit', False)
+            _accel_exit_type_inc = config.get('accel_exit_type', 'sign_reversal')
+            _accel_exit_threshold_inc = config.get('accel_exit_threshold', 0.0)
+            _accel_exit_min_pnl_inc = config.get('accel_exit_min_pnl', 0.5)
+            _accel_exit_lookback_inc = config.get('accel_exit_lookback', 1)
+            _use_jerk_confirm_inc = config.get('use_jerk_confirm', False)
+            _jerk_confirm_threshold_inc = config.get('jerk_confirm_threshold', 0.0)
+            _exit_on_midline_inc = config.get('exit_on_midline_cross', False)
+            _min_hold_bars_inc = config.get('min_hold_bars', 1)
+            _use_trailing_inc = config.get('use_trailing_stop', False)
+            _trailing_pct_inc = config.get('trailing_stop_pct', 1.0)
+            _trailing_activation_inc = config.get('trailing_stop_activation_pct', 0.5)
+            _use_breakeven_inc = config.get('use_breakeven_stop', False)
+            _breakeven_trigger_inc = config.get('breakeven_trigger_pct', 0.3)
+            _breakeven_offset_inc = config.get('breakeven_offset_pct', 0.05)
+            _has_accel_inc = _use_accel_exit_inc and 'acceleration' in df.columns
+            _has_jerk_inc = 'jerk' in df.columns
+            _osc_col_inc = 'JD_Osc' if 'JD_Osc' in df.columns else 'osc_smooth'
+
             # ML exit model availability
             _has_ml_exit_inc = (novel_filters_inc is not None
                                 and novel_filters_inc.exit_model.trained)
@@ -1552,6 +1671,7 @@ class PositionManager:
             # Track entry bar position and high watermark for ML exit
             entry_bar_pos_inc = None
             high_watermark_inc = None
+            bars_held_inc = 0
             if in_position and entry_price:
                 high_watermark_inc = entry_price
                 # Try to find entry bar in df
@@ -1633,56 +1753,119 @@ class PositionManager:
                         entry_price = row['Close']
                         entry_bar_pos_inc = df.index.get_loc(bar_time)
                         high_watermark_inc = entry_price
+                        bars_held_inc = 0
                         new_entries += 1
                         tag = " [missed]" if force_from_last_trade else ""
                         print(f"      📈 Entry @ ${row['Close']:,.2f} on {bar_timestamp[:10]}{tag}")
 
                 elif in_position:
+                    bars_held_inc += 1
                     current_price = row['Close']
                     pnl_pct = ((current_price - entry_price) / entry_price) * 100
 
                     # Update high watermark with intrabar high
                     bar_high = row.get('High', current_price)
+                    bar_low = row.get('Low', current_price)
                     if high_watermark_inc is not None and bar_high > high_watermark_inc:
                         high_watermark_inc = bar_high
 
                     exit_reason = None
-                    # INTRABAR SL/TP: Check bar High/Low (matches WF validator)
-                    bar_low = row.get('Low', current_price)
-                    bar_low_pnl = ((bar_low - entry_price) / entry_price) * 100
-                    bar_high_pnl = ((bar_high - entry_price) / entry_price) * 100
+                    exit_price = current_price
 
+                    # Priority 1: Intrabar SL (check bar Low)
+                    bar_low_pnl = ((bar_low - entry_price) / entry_price) * 100
                     if bar_low_pnl <= -stop_loss_pct:
-                        # Exit at exact SL price level
-                        current_price = entry_price * (1 - stop_loss_pct / 100)
+                        exit_price = entry_price * (1 - stop_loss_pct / 100)
                         exit_reason = f'Stop Loss ({-stop_loss_pct:.2f}%)'
-                    elif bar_high_pnl >= take_profit_pct:
-                        # Exit at exact TP price level
-                        current_price = entry_price * (1 + take_profit_pct / 100)
-                        exit_reason = f'Take Profit ({take_profit_pct:.2f}%)'
-                    # Fallback: Close-based SL/TP
-                    elif pnl_pct <= -stop_loss_pct:
+
+                    # Priority 2: Intrabar TP (check bar High)
+                    if not exit_reason:
+                        bar_high_pnl = ((bar_high - entry_price) / entry_price) * 100
+                        if bar_high_pnl >= take_profit_pct:
+                            exit_price = entry_price * (1 + take_profit_pct / 100)
+                            exit_reason = f'Take Profit ({take_profit_pct:.2f}%)'
+
+                    # Priority 3: Close-based SL/TP fallback
+                    if not exit_reason and pnl_pct <= -stop_loss_pct:
                         exit_reason = f'Stop Loss ({pnl_pct:.2f}%)'
-                    elif pnl_pct >= take_profit_pct:
+                    if not exit_reason and pnl_pct >= take_profit_pct:
                         exit_reason = f'Take Profit ({pnl_pct:.2f}%)'
-                    elif _has_ml_exit_inc and entry_bar_pos_inc is not None:
-                        try:
-                            bar_pos_now = df.index.get_loc(bar_time)
-                            should_exit, prob, reason = novel_filters_inc.exit_model.should_exit(
-                                df, entry_price, entry_bar_pos_inc, bar_pos_now,
-                                high_watermark=high_watermark_inc
-                            )
-                            if should_exit:
-                                exit_reason = f'ML Exit ({pnl_pct:.2f}%, p={prob:.2f})'
-                        except Exception:
-                            pass
-                    # Fallback to signal-based exit
-                    if exit_reason is None and row.get('sell_signal', False):
-                        exit_reason = f'Opposite Signal ({pnl_pct:.2f}%)'
+
+                    # Remaining exits require min_hold_bars
+                    if not exit_reason and bars_held_inc >= _min_hold_bars_inc:
+
+                        # Priority 4: Trailing Stop
+                        if not exit_reason and _use_trailing_inc and high_watermark_inc:
+                            hwm_pnl = ((high_watermark_inc - entry_price) / entry_price) * 100
+                            if hwm_pnl >= _trailing_activation_inc:
+                                trail_level = high_watermark_inc * (1 - _trailing_pct_inc / 100)
+                                if bar_low <= trail_level:
+                                    exit_price = trail_level
+                                    exit_reason = f'Trailing Stop ({pnl_pct:.2f}%)'
+
+                        # Priority 5: Break-Even Stop
+                        if not exit_reason and _use_breakeven_inc and high_watermark_inc:
+                            hwm_pnl = ((high_watermark_inc - entry_price) / entry_price) * 100
+                            if hwm_pnl >= _breakeven_trigger_inc:
+                                be_price = entry_price * (1 + _breakeven_offset_inc / 100)
+                                if bar_low <= be_price:
+                                    exit_price = be_price
+                                    exit_reason = f'Break-Even Stop ({pnl_pct:.2f}%)'
+
+                        # Priority 6: Accel Exit
+                        if not exit_reason and _has_accel_inc:
+                            bar_pos_abs = df.index.get_loc(bar_time) if bar_time in df.index else -1
+                            if bar_pos_abs >= _accel_exit_lookback_inc:
+                                pnl_ok = pnl_pct >= _accel_exit_min_pnl_inc or pnl_pct < 0
+                                if pnl_ok:
+                                    accel_vals = df['acceleration'].iloc[
+                                        bar_pos_abs - _accel_exit_lookback_inc + 1:bar_pos_abs + 1
+                                    ].values
+                                    current_accel = df['acceleration'].iloc[bar_pos_abs]
+
+                                    accel_cond = False
+                                    if _accel_exit_type_inc == 'sign_reversal':
+                                        accel_cond = np.all(accel_vals < 0)
+                                    elif _accel_exit_type_inc == 'magnitude':
+                                        accel_cond = current_accel < -_accel_exit_threshold_inc
+                                    elif _accel_exit_type_inc == 'both':
+                                        accel_cond = (np.all(accel_vals < 0)
+                                                      and abs(current_accel) > _accel_exit_threshold_inc)
+
+                                    jerk_ok = True
+                                    if (_use_jerk_confirm_inc and _has_jerk_inc
+                                            and _jerk_confirm_threshold_inc > 0):
+                                        jerk_ok = df['jerk'].iloc[bar_pos_abs] < -_jerk_confirm_threshold_inc
+
+                                    if accel_cond and jerk_ok:
+                                        exit_reason = f'Accel Exit ({pnl_pct:.2f}%)'
+
+                        # Priority 7: ML Exit
+                        if not exit_reason and _has_ml_exit_inc and entry_bar_pos_inc is not None:
+                            try:
+                                bar_pos_now = df.index.get_loc(bar_time)
+                                should_exit, prob, reason = novel_filters_inc.exit_model.should_exit(
+                                    df, entry_price, entry_bar_pos_inc, bar_pos_now,
+                                    high_watermark=high_watermark_inc
+                                )
+                                if should_exit:
+                                    exit_reason = f'ML Exit ({pnl_pct:.2f}%, p={prob:.2f})'
+                            except Exception:
+                                pass
+
+                        # Priority 8: Midline Cross
+                        if not exit_reason and _exit_on_midline_inc:
+                            osc_val = row.get(_osc_col_inc, 0)
+                            if osc_val > 0:
+                                exit_reason = f'Midline Cross ({pnl_pct:.2f}%)'
+
+                        # Priority 9: Opposite Signal
+                        if exit_reason is None and row.get('sell_signal', False):
+                            exit_reason = f'Opposite Signal ({pnl_pct:.2f}%)'
 
                     if exit_reason:
                         success, result = self.exit_position(
-                            exit_price=current_price,
+                            exit_price=exit_price,
                             exit_date=bar_timestamp,
                             exit_reason=exit_reason,
                             interval=interval
@@ -1692,8 +1875,9 @@ class PositionManager:
                             entry_price = None
                             entry_bar_pos_inc = None
                             high_watermark_inc = None
+                            bars_held_inc = 0
                             new_exits += 1
-                            print(f"      📉 Exit @ ${current_price:,.2f} on {bar_timestamp[:10]} ({exit_reason})")
+                            print(f"      📉 Exit @ ${exit_price:,.2f} on {bar_timestamp[:10]} ({exit_reason})")
 
                 # CRITICAL: Mark this bar as processed (even if no signal)
                 # This ensures we never re-evaluate it
