@@ -634,6 +634,42 @@ def generate_report(results: Dict, tickers: List[str]) -> str:
     return "\n".join(report)
 
 
+class OptionsSnapshotCollector:
+    """Collect daily SPY options snapshot for influence zone building."""
+
+    def __init__(self, polygon_manager, db):
+        self.polygon = polygon_manager
+        self.db = db
+
+    def collect(self) -> dict:
+        """
+        Collect full SPY options analysis and store zones to market_data.db.
+        Called once daily after market close.
+        """
+        try:
+            # Compute influence zones (calls get_full_options_analysis internally)
+            result = self.polygon.compute_influence_zones('SPY')
+            if not result.get('available'):
+                return {'status': 'no_data', 'reason': 'Options data unavailable'}
+
+            today = datetime.now().strftime('%Y-%m-%d')
+            self.db.save_options_snapshot(today, result)
+
+            zones = result.get('zones', {})
+            return {
+                'status': 'ok',
+                'date': today,
+                'max_pain': result.get('max_pain'),
+                'spy_price': result.get('current_price'),
+                'gamma_zone': zones.get('gamma_zone', 0),
+                'max_pain_zone': zones.get('max_pain_zone', 0),
+                'wall_zone': zones.get('wall_zone', 0),
+                'days_collected': self.db.options_snapshot_days(),
+            }
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
+
+
 # =============================================================================
 # MAIN PIPELINE
 # =============================================================================
@@ -699,6 +735,23 @@ def run_pipeline(tickers: List[str], skip_iv: bool = False, skip_news: bool = Fa
     else:
         print("\n[3/4] Skipping IV Data (no Polygon API or --skip-iv)")
         results['iv'] = {'success': 0, 'no_options': 0, 'error': 0, 'tickers': []}
+
+    # ==========================================================================
+    # STEP 2.5: Collect Options Snapshot (SPY only)
+    # ==========================================================================
+    if polygon:
+        print("\n[2.5/4] Collecting Options Snapshot (SPY)...")
+        options_collector = OptionsSnapshotCollector(polygon, db)
+        results['options'] = options_collector.collect()
+        if results['options'].get('status') == 'ok':
+            print(f"       Max Pain: {results['options'].get('max_pain')}")
+            print(f"       SPY Price: {results['options'].get('spy_price')}")
+            print(f"       Gamma Zone: {results['options'].get('gamma_zone', 0):.3f}")
+            print(f"       Days Collected: {results['options'].get('days_collected', 0)}")
+        else:
+            print(f"       Status: {results['options'].get('status')} - {results['options'].get('error', results['options'].get('reason', ''))}")
+    else:
+        results['options'] = {'status': 'skipped', 'reason': 'No Polygon API'}
 
     # ==========================================================================
     # STEP 3: Collect News Sentiment

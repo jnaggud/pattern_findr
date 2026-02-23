@@ -282,6 +282,43 @@ def prepare_velocity_data(df: pd.DataFrame, use_extra_indicators: bool = True):
     except Exception as e:
         print(f"  Warning: MFV calculation failed: {e}")
 
+    # Compute Options Influence Zone arrays (from daily snapshots if available)
+    options_gamma_zone_arr = None
+    options_mp_zone_arr = None
+    options_wall_zone_arr = None
+    options_combined_zone_arr = None
+    try:
+        from market_data_db import get_market_db
+        _mdb = get_market_db(suppress_init_message=True)
+        if _mdb.options_snapshot_days() >= 30:
+            start_str = valid_idx[0].strftime('%Y-%m-%d') if hasattr(valid_idx[0], 'strftime') else str(valid_idx[0])[:10]
+            end_str = valid_idx[-1].strftime('%Y-%m-%d') if hasattr(valid_idx[-1], 'strftime') else str(valid_idx[-1])[:10]
+            snapshots = _mdb.get_options_snapshots_range(start_str, end_str)
+            if not snapshots.empty and len(snapshots) >= 10:
+                # Forward-fill daily zones to each intraday bar
+                gamma_daily = snapshots['gamma_zone']
+                mp_daily = snapshots['max_pain_zone']
+                wall_daily = snapshots['wall_zone']
+                combined_daily = snapshots['combined_zone']
+
+                # Reindex: normalize intraday timestamps to date, align to daily zones
+                # Strip timezone from bar dates to match tz-naive DB index
+                bar_dates = pd.Series(valid_idx).dt.normalize().dt.tz_localize(None)
+                options_gamma_zone_arr = gamma_daily.reindex(bar_dates).ffill().bfill().values
+                options_mp_zone_arr = mp_daily.reindex(bar_dates).ffill().bfill().values
+                options_wall_zone_arr = wall_daily.reindex(bar_dates).ffill().bfill().values
+                options_combined_zone_arr = combined_daily.reindex(bar_dates).ffill().bfill().values
+                print(f"  Options zones: {len(snapshots)} daily snapshots loaded")
+        else:
+            days = _mdb.options_snapshot_days()
+            if days > 0:
+                print(f"  Options zones: {days} days collected (need 30+ for walkforward)")
+    except Exception as e:
+        print(f"  Warning: Options zone data not available: {e}")
+
+    # KNN arrays are computed on the FULL dataset in run_walkforward() and injected later.
+    # This avoids the test set being too small for MIN_HISTORY_BARS (500).
+
     return {
         'close_prices': close_prices,
         'low_prices': low_prices,
@@ -292,12 +329,19 @@ def prepare_velocity_data(df: pd.DataFrame, use_extra_indicators: bool = True):
         'bb_upper': bb_upper,
         'bb_lower': bb_lower,
         'dates': valid_idx,
+        'bar_hours': valid_idx.hour.values if hasattr(valid_idx, 'hour') else None,
         'use_extra_indicators': use_extra_indicators,
         'all_oscillators': all_oscillators,
         'vol_regime': vol_regime_arr,
         'mfv_flow': mfv_flow_arr,
         'mfv_vel': mfv_vel_arr,
         'mfv_acc': mfv_acc_arr,
+        'options_gamma_zone': options_gamma_zone_arr,
+        'options_mp_zone': options_mp_zone_arr,
+        'options_wall_zone': options_wall_zone_arr,
+        'options_combined_zone': options_combined_zone_arr,
+        'knn_prob_arrays': None,  # Injected by run_walk_forward_validation() after full-df KNN
+        'knn_confidence_arrays': None,
     }
 
 
@@ -339,6 +383,12 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
         except Exception:
             pass
 
+    # Wall zone directional bias: shift oscillator toward wall-predicted direction
+    oz_wb = params.get('oz_wall_bias', 0.0)
+    options_wall_zone = data.get('options_wall_zone')
+    if oz_wb > 0 and options_wall_zone is not None:
+        osc_smooth = osc_smooth - options_wall_zone * oz_wb
+
     velocity = np.diff(osc_smooth, prepend=osc_smooth[0])
     acceleration = np.diff(velocity, prepend=velocity[0])
     jerk = np.diff(acceleration, prepend=acceleration[0])
@@ -378,6 +428,71 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
     else:
         buy_cond = vel_cross_up | extreme_oversold
         sell_cond = vel_cross_down | extreme_overbought
+
+    # Multi-oscillator OR: catch blind spots where primary oscillator misses a move
+    if params.get('use_multi_osc_or', False) and all_oscillators:
+        osc_keys = [k for k in sorted(all_oscillators.keys()) if k != params.get('oscillator_type', 'composite')]
+        secondary_buy = np.zeros(len(close_prices), dtype=bool)
+        vel_smoothing = params.get('vel_smoothing', 1)
+        for sec_key in osc_keys[:8]:
+            sec_osc = all_oscillators[sec_key]
+            if vel_smoothing > 1:
+                sec_smooth = pd.Series(sec_osc).rolling(window=vel_smoothing).mean().bfill().values
+            else:
+                sec_smooth = sec_osc.copy()
+            if oz_wb > 0 and options_wall_zone is not None:
+                sec_smooth = sec_smooth - options_wall_zone * oz_wb
+            sec_vel = np.diff(sec_smooth, prepend=sec_smooth[0])
+            sec_cross_up = (sec_vel > 0) & (np.roll(sec_vel, 1) <= 0)
+            sec_extreme_os = sec_smooth < (params.get('oversold_threshold', -0.2) * extreme_mult)
+            if sig_type in ('velocity_crossover_or_zone', 'zone_only'):
+                sec_signal = sec_cross_up | sec_extreme_os
+            elif sig_type == 'any_reversal':
+                sec_std = pd.Series(sec_vel).rolling(vel_std_window, min_periods=1).std().fillna(np.std(sec_vel)).values
+                sec_in_os = sec_smooth < params.get('oversold_threshold', -0.2)
+                sec_signal = sec_cross_up | sec_extreme_os | ((sec_vel > sec_std * momentum_mult) & sec_in_os)
+            else:
+                sec_signal = sec_cross_up | sec_extreme_os
+            secondary_buy = secondary_buy | sec_signal
+        buy_cond = buy_cond | secondary_buy
+
+    # Entry velocity magnitude filter: reject weak zero-crossings
+    if params.get('use_vel_magnitude_filter', False):
+        min_vel = params.get('min_entry_velocity', 0.01)
+        buy_cond = buy_cond & (np.abs(velocity) > min_vel)
+
+    # Oscillator consensus voting: require N oscillators to agree
+    buy_votes = np.zeros(len(close_prices), dtype=int)
+    consensus_count = params.get('consensus_count', 2)
+    if params.get('use_consensus', False) and all_oscillators and len(all_oscillators) >= 3:
+        sell_votes = np.zeros(len(close_prices), dtype=int)
+        for osc_name, osc_vals in all_oscillators.items():
+            if len(osc_vals) != len(close_prices):
+                continue
+            o_smooth = osc_vals
+            if params.get('vel_smoothing', 1) > 1:
+                o_smooth = pd.Series(osc_vals).rolling(window=params['vel_smoothing']).mean().bfill().values
+            o_vel = np.diff(o_smooth, prepend=o_smooth[0])
+            o_cross_up = (o_vel > 0) & (np.roll(o_vel, 1) <= 0)
+            o_cross_down = (o_vel < 0) & (np.roll(o_vel, 1) >= 0)
+            o_oversold = o_smooth < params.get('oversold_threshold', -0.2)
+            o_overbought = o_smooth > params.get('overbought_threshold', 0.2)
+            buy_votes += (o_cross_up | o_oversold).astype(int)
+            sell_votes += (o_cross_down | o_overbought).astype(int)
+        buy_cond = buy_cond & (buy_votes >= consensus_count)
+        sell_cond = sell_cond & (sell_votes >= consensus_count)
+
+    # RTH vs overnight signal strength: require stronger signals overnight
+    bar_hours = data.get('bar_hours')
+    if params.get('use_rth_filter', False) and bar_hours is not None:
+        is_rth = (bar_hours >= 9) & (bar_hours < 16)
+        overnight_boost = params.get('overnight_consensus_boost', 2)
+        if params.get('use_consensus', False) and all_oscillators and len(all_oscillators) >= 3:
+            overnight_ok = buy_votes >= (consensus_count + overnight_boost)
+        else:
+            min_vel = params.get('min_entry_velocity', 0.01)
+            overnight_ok = np.abs(velocity) > min_vel * 2
+        buy_cond = buy_cond & (is_rth | overnight_ok)
 
     # Acceleration requirement
     if params.get('require_accel', False):
@@ -439,6 +554,36 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
             buy_cond = buy_cond & (mfv_flow > mfv_thresh) & (mfv_vel > mfv_thresh)
             sell_cond = sell_cond & (mfv_flow < -mfv_thresh) & (mfv_vel < -mfv_thresh)
 
+    # Combined zone extreme conviction: ADD signals when zone is strongly directional
+    options_combined_zone = data.get('options_combined_zone')
+    oz_eb = params.get('oz_extreme_boost', 0.0)
+    oz_et = params.get('oz_extreme_thresh', 0.7)
+    if oz_eb > 0 and options_combined_zone is not None:
+        extreme_bull = options_combined_zone > oz_et
+        extreme_bear = options_combined_zone < -oz_et
+        relaxed_oversold = osc_smooth < (params['oversold_threshold'] * (1 - oz_eb))
+        relaxed_overbought = osc_smooth > (params['overbought_threshold'] * (1 - oz_eb))
+        buy_cond = buy_cond | (extreme_bull & relaxed_oversold & (velocity > 0))
+        sell_cond = sell_cond | (extreme_bear & relaxed_overbought & (velocity < 0))
+
+    # Options zone entry filter: block longs when combined zone is too bearish
+    if params.get('use_oz_entry_filter', False) and options_combined_zone is not None:
+        oz_entry_thresh = params.get('oz_entry_threshold', 0.0)
+        buy_cond = buy_cond & (options_combined_zone >= oz_entry_thresh)
+
+    # KNN Pattern Matcher filter
+    if params.get('use_knn_filter', False):
+        knn_prob_arrays = data.get('knn_prob_arrays') or {}
+        knn_conf_arrays = data.get('knn_confidence_arrays') or {}
+        knn_h = params.get('knn_horizon', 8)
+        knn_pt = params.get('knn_prob_threshold', 0.55)
+        knn_ct = params.get('knn_confidence_threshold', 0.1)
+        prob = knn_prob_arrays.get(knn_h)
+        conf = knn_conf_arrays.get(knn_h)
+        if prob is not None and conf is not None:
+            buy_cond = buy_cond & (prob > knn_pt) & (conf > knn_ct)
+            sell_cond = sell_cond & (prob < (1 - knn_pt)) & (conf > knn_ct)
+
     # Trading simulation
     position = 0  # 0 = flat, 1 = long
     entry_price = 0
@@ -478,13 +623,22 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
     high_watermark = 0.0
     last_trade_bar = -min_bars_between
 
+    # Adaptive cooldown after losses
+    consecutive_losses = 0
+    use_adaptive_cooldown = params.get('use_adaptive_cooldown', False)
+    cooldown_loss_streak = params.get('cooldown_loss_streak', 2)
+    cooldown_extra_bars = params.get('cooldown_extra_bars', 5)
+
     for i in range(1, len(close_prices)):
         price = close_prices[i]
         low = low_prices[i]
 
         if position == 0:
-            # Check for entry
-            if buy_cond[i] and (i - last_trade_bar) >= min_bars_between:
+            # Check for entry (with adaptive cooldown)
+            eff_min_bars = min_bars_between
+            if use_adaptive_cooldown and consecutive_losses >= cooldown_loss_streak:
+                eff_min_bars += cooldown_extra_bars
+            if buy_cond[i] and (i - last_trade_bar) >= eff_min_bars:
                 position = 1
                 entry_price = price
                 entry_bar = i
@@ -511,14 +665,25 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
             exit_reason = None
             exit_price_override = None
 
+            # Gamma vol scaling: adapt SL/TP to gamma-predicted volatility
+            options_gamma_zone = data.get('options_gamma_zone')
+            oz_gv = params.get('oz_gamma_vol', 0.0)
+            if oz_gv > 0 and options_gamma_zone is not None:
+                vol_scale = 1 - options_gamma_zone[i] * oz_gv
+                eff_sl = max(0.1, stop_loss_pct * vol_scale)
+                eff_tp = take_profit_pct * vol_scale
+            else:
+                eff_sl = stop_loss_pct
+                eff_tp = take_profit_pct
+
             # Priority 1: Stop loss - check if intrabar low hit stop level
-            if intrabar_low_pnl <= -stop_loss_pct:
+            if intrabar_low_pnl <= -eff_sl:
                 exit_reason = 'stop_loss'
-                exit_price_override = entry_price * (1 - stop_loss_pct / 100)
+                exit_price_override = entry_price * (1 - eff_sl / 100)
             # Priority 2: Take profit - check if intrabar high hit take profit level
-            elif intrabar_high_pnl >= take_profit_pct:
+            elif intrabar_high_pnl >= eff_tp:
                 exit_reason = 'take_profit'
-                exit_price_override = entry_price * (1 + take_profit_pct / 100)
+                exit_price_override = entry_price * (1 + eff_tp / 100)
 
             # Priority 3: Trailing stop
             if not exit_reason and use_trailing_stop:
@@ -534,9 +699,17 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
                 hwm_pnl = (high_watermark - entry_price) / entry_price * 100
                 if hwm_pnl >= breakeven_trigger_pct:
                     be_price = entry_price * (1 + breakeven_offset_pct / 100)
-                    if low <= be_price:
+                    # Price must have actually reached be_price before we can exit there
+                    if high_watermark >= be_price and low <= be_price:
                         exit_reason = 'breakeven_stop'
                         exit_price_override = be_price
+
+            # Time stop: exit stale trades that haven't moved
+            if not exit_reason and params.get('use_time_stop', False):
+                ts_bars = params.get('time_stop_bars', 4)
+                ts_min_pnl = params.get('time_stop_min_pnl', 0.05)
+                if bars_held >= ts_bars and current_pnl < ts_min_pnl:
+                    exit_reason = 'time_stop'
 
             # Priority 5: Acceleration exit (requires min_hold_bars)
             if not exit_reason and use_accel_exit and current_pnl >= accel_exit_min_pnl and bars_held >= min_hold_bars:
@@ -551,12 +724,37 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
                 if accel_exit_triggered:
                     if not use_jerk_confirm or jerk[i] < -jerk_confirm_threshold:
                         exit_reason = 'accel_exit'
-            # Priority 6: Opposite signal
+            # Priority 6: Opposite signal (conditional)
             if not exit_reason and exit_opposite and sell_cond[i] and bars_held >= min_hold_bars:
-                exit_reason = 'opposite_signal'
-            # Priority 7: Midline cross
-            if not exit_reason and exit_midline and osc_smooth[i] > 0 and bars_held >= min_hold_bars:
-                exit_reason = 'midline_cross'
+                opp_mode = params.get('opp_exit_mode', 'always')
+                opp_ok = True
+                if opp_mode == 'losing_only':
+                    opp_ok = current_pnl < 0
+                elif opp_mode == 'stale_only':
+                    opp_ok = bars_held >= params.get('opp_exit_stale_bars', 5)
+                if opp_ok:
+                    exit_reason = 'opposite_signal'
+            # Priority 7: Midline cross (with consecutive bars + min PnL requirement)
+            if not exit_reason and exit_midline and bars_held >= min_hold_bars:
+                midline_exit_bars_req = params.get('midline_exit_bars', 1)
+                midline_triggered = False
+                if midline_exit_bars_req > 1:
+                    # Count consecutive bars above midline ending at i
+                    consec = 0
+                    for j in range(i, max(i - midline_exit_bars_req - 1, -1), -1):
+                        if osc_smooth[j] > 0:
+                            consec += 1
+                        else:
+                            break
+                    midline_triggered = consec >= midline_exit_bars_req
+                else:
+                    # Single bar: require actual crossover (was <= 0, now > 0)
+                    midline_triggered = osc_smooth[i] > 0 and osc_smooth[i-1] <= 0
+                # Only exit on midline if PnL meets threshold
+                if midline_triggered:
+                    midline_min_pnl = params.get('midline_exit_min_pnl', -999)
+                    if current_pnl >= midline_min_pnl:
+                        exit_reason = 'midline_cross'
 
             if exit_reason:
                 # Use override price for stop loss / take profit, otherwise use close
@@ -600,6 +798,12 @@ def run_backtest_with_params(params: dict, data: dict) -> dict:
 
                 position = 0
                 last_trade_bar = i
+
+                # Track consecutive losses for adaptive cooldown
+                if pnl < 0:
+                    consecutive_losses += 1
+                else:
+                    consecutive_losses = 0
 
     # Calculate metrics
     if not trades:
@@ -696,12 +900,102 @@ def run_walk_forward_validation(
     print(f"  Train period: {train_df.index[0]} to {train_df.index[-1]} ({len(train_df)} bars)")
     print(f"  Test period: {test_df.index[0]} to {test_df.index[-1]} ({len(test_df)} bars)")
 
+    # Precompute KNN arrays on FULL dataset (test bars need training-period neighbors)
+    full_knn_prob = None
+    full_knn_conf = None
+    try:
+        from knn_pattern_matcher import KNNPatternMatcher
+        from novel_indicators_v2 import calculate_all_novel_v2_indicators
+
+        _knn_interval = '15m'
+        if len(df) >= 2:
+            _delta = (df.index[1] - df.index[0]).total_seconds()
+            if _delta >= 86400:
+                _knn_interval = '1d'
+            elif _delta >= 3600:
+                _knn_interval = '1h'
+
+        print("\nKNN: Computing V2 features on full dataset...")
+        df_lower_full = df.copy()
+        df_lower_full.columns = [c.lower() for c in df_lower_full.columns]
+        knn_df = calculate_all_novel_v2_indicators(df_lower_full, interval=_knn_interval)
+
+        # Composite oscillator for osc_smooth/velocity/acceleration features
+        _osc_df = create_composite_oscillator_features(df)
+        _comp_col = None
+        for _c in ['osc_composite_smooth', 'composite_oscillator', 'osc_composite']:
+            if _c in _osc_df.columns:
+                _comp_col = _c
+                break
+        if _comp_col:
+            _aligned = _osc_df[_comp_col].reindex(knn_df.index).fillna(0).values
+            knn_df['osc_smooth'] = _aligned
+            _v = np.diff(_aligned, prepend=_aligned[0])
+            knn_df['velocity'] = _v
+            knn_df['acceleration'] = np.diff(_v, prepend=_v[0])
+
+        # Derived features
+        knn_df['close_pct_change'] = np.clip(
+            knn_df['close'].pct_change().fillna(0).values * 10, -1, 1
+        )
+        if 'volume' in knn_df.columns:
+            _vol_ma = knn_df['volume'].rolling(20).mean()
+            knn_df['volume_ratio'] = np.clip(
+                (knn_df['volume'] / _vol_ma.replace(0, np.nan)).fillna(1).values - 1, -1, 1
+            )
+        else:
+            knn_df['volume_ratio'] = 0.0
+
+        _tr = np.maximum(
+            knn_df['high'].values - knn_df['low'].values,
+            np.maximum(
+                np.abs(knn_df['high'].values - np.roll(knn_df['close'].values, 1)),
+                np.abs(knn_df['low'].values - np.roll(knn_df['close'].values, 1))
+            )
+        )
+        _atr = pd.Series(_tr).rolling(14).mean().values
+        _atr_pctile = pd.Series(_atr).rolling(100).apply(
+            lambda x: (x.iloc[-1] - x.min()) / (x.max() - x.min()) if x.max() != x.min() else 0.5
+        ).fillna(0.5).values
+        knn_df['atr_percentile'] = np.clip(_atr_pctile * 2 - 1, -1, 1)
+
+        matcher = KNNPatternMatcher(k=50, horizons=[4, 8, 16, 26])
+        feat_cols = matcher.get_feature_columns()
+        avail = [c for c in feat_cols if c in knn_df.columns]
+        print(f"KNN: {len(avail)}/{len(feat_cols)} features, running match_all_bars on {len(knn_df)} bars...")
+
+        import time as _t
+        _t0 = _t.time()
+        matcher.build_feature_matrix(knn_df, feat_cols)
+        knn_results = matcher.match_all_bars()
+        print(f"KNN: Completed in {_t.time() - _t0:.1f}s")
+
+        full_knn_prob = {h: knn_results[f'knn_prob_up_{h}'] for h in [4, 8, 16, 26]}
+        full_knn_conf = {h: knn_results[f'knn_confidence_{h}'] for h in [4, 8, 16, 26]}
+    except Exception as e:
+        print(f"Warning: KNN precomputation failed: {e}")
+        import traceback
+        traceback.print_exc()
+
     # Prepare train data for optimization
     print("\n" + "=" * 80)
     print("PHASE 1: OPTIMIZATION ON TRAINING DATA")
     print("=" * 80)
 
     train_data = prepare_velocity_data(train_df)
+
+    # Inject KNN arrays (sliced to train portion) — uses valid_idx alignment
+    if full_knn_prob is not None:
+        # The full KNN arrays are indexed 0..n_bars-1 (aligned to df.index)
+        # train_data covers df.iloc[:train_end_idx] but prepare_velocity_data may drop
+        # warmup bars. Use the train data length to slice from the end of the train portion.
+        train_n = len(train_data['close_prices'])
+        # The valid_idx in prepare_velocity_data drops some initial bars, so the train
+        # arrays map to the LAST train_n bars of df.iloc[:train_end_idx].
+        # Compute offset: full_knn starts at index 0 of df, train valid starts at (train_end_idx - train_n)
+        train_offset = train_end_idx - train_n
+        train_data['knn_prob_arrays'] = {h: arr[train_offset:train_end_idx] for h, arr in full_knn_prob.items()}
+        train_data['knn_confidence_arrays'] = {h: arr[train_offset:train_end_idx] for h, arr in full_knn_conf.items()}
 
     # Save data to temp file for parallel workers
     fd, data_path = tempfile.mkstemp(suffix='.joblib', prefix='velocity_wf_')
@@ -728,10 +1022,17 @@ def run_walk_forward_validation(
         'optimize_metric': optimize_metric,
         'use_extra_indicators': True,
         'all_oscillators': train_data['all_oscillators'],
+        'bar_hours': train_data.get('bar_hours'),
         'vol_regime': train_data.get('vol_regime'),
         'mfv_flow': train_data.get('mfv_flow'),
         'mfv_vel': train_data.get('mfv_vel'),
         'mfv_acc': train_data.get('mfv_acc'),
+        'options_gamma_zone': train_data.get('options_gamma_zone'),
+        'options_mp_zone': train_data.get('options_mp_zone'),
+        'options_wall_zone': train_data.get('options_wall_zone'),
+        'options_combined_zone': train_data.get('options_combined_zone'),
+        'knn_prob_arrays': train_data.get('knn_prob_arrays'),
+        'knn_confidence_arrays': train_data.get('knn_confidence_arrays'),
         'force_midline_exit': False,
         'force_opposite_exit': False,
         'sl_range': (0.5, 10.0),        # Broader: search wider SL range
@@ -796,7 +1097,22 @@ def run_walk_forward_validation(
         'accel_exit_min_pnl', 'accel_exit_lookback', 'use_jerk_confirm', 'jerk_confirm_threshold',
         'rsi_filter', 'rsi_period', 'rsi_oversold', 'rsi_overbought',
         'use_macd_confirm', 'use_bb_filter', 'use_regime_filter', 'use_fragility_filter', 'use_entropy_filter',
-        'use_mfv_filter', 'mfv_mode', 'mfv_threshold'
+        'use_mfv_filter', 'mfv_mode', 'mfv_threshold',
+        'oz_wall_bias', 'oz_gamma_vol', 'oz_extreme_thresh', 'oz_extreme_boost',
+        'use_oz_entry_filter', 'oz_entry_threshold',
+        'use_multi_osc_or',
+        'use_vel_magnitude_filter', 'min_entry_velocity',
+        'use_consensus', 'consensus_count',
+        'use_rth_filter', 'overnight_consensus_boost',
+        'use_knn_filter', 'knn_horizon', 'knn_prob_threshold', 'knn_confidence_threshold',
+        # Exit management params (must match optuna_worker.py)
+        'opp_exit_mode', 'opp_exit_stale_bars',
+        'use_time_stop', 'time_stop_bars', 'time_stop_min_pnl',
+        'midline_exit_bars', 'midline_exit_min_pnl',
+        'use_trailing_stop', 'trailing_stop_pct', 'trailing_stop_activation_pct',
+        'trailing_stop_type', 'trailing_atr_mult', 'trailing_atr_period',
+        'use_breakeven_stop', 'breakeven_trigger_pct', 'breakeven_offset_pct',
+        'use_adaptive_cooldown', 'cooldown_loss_streak', 'cooldown_extra_bars',
     ]
     best_params = {k: best_result[k] for k in param_keys if k in best_result}
 
@@ -823,6 +1139,13 @@ def run_walk_forward_validation(
     print("=" * 80)
 
     test_data = prepare_velocity_data(test_df)
+
+    # Inject KNN arrays (sliced to test portion)
+    if full_knn_prob is not None:
+        test_n = len(test_data['close_prices'])
+        test_offset = n_bars - test_n  # offset into full array
+        test_data['knn_prob_arrays'] = {h: arr[test_offset:] for h, arr in full_knn_prob.items()}
+        test_data['knn_confidence_arrays'] = {h: arr[test_offset:] for h, arr in full_knn_conf.items()}
 
     # Test top N training configs on OOS data and pick the best valid one
     # This prevents overfitting by not just taking the #1 training result
@@ -977,6 +1300,23 @@ def run_walk_forward_validation(
         print("  ✓ Consistent performance between train and test periods")
         print("  ✓ No obvious signs of overfitting")
 
+    # Convert bar-indexed trades to date-indexed trades for bundle import
+    test_dates = test_data.get('dates')
+    test_trades_dated = []
+    if test_dates is not None and 'trades' in test_result:
+        for t in test_result['trades']:
+            entry_bar = t['entry_bar']
+            exit_bar = t['exit_bar']
+            if entry_bar < len(test_dates) and exit_bar < len(test_dates):
+                test_trades_dated.append({
+                    'entry_date': str(test_dates[entry_bar]),
+                    'exit_date': str(test_dates[exit_bar]),
+                    'entry_price': float(t['entry_price']),
+                    'exit_price': float(t['exit_price']),
+                    'pnl_pct': float(t['pnl']),
+                    'exit_reason': t.get('exit_reason', 'signal')
+                })
+
     # Return results
     return {
         'ticker': ticker,
@@ -1003,6 +1343,7 @@ def run_walk_forward_validation(
             'avg_mae': test_result.get('avg_mae', 0),
             'max_mae': test_result.get('max_mae', 0)
         },
+        'test_trades': test_trades_dated,
         'is_valid': is_valid,
         'warnings': warnings
     }

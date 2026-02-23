@@ -523,8 +523,8 @@ class VelocityOptunaObjective:
             'overbought_threshold': trial.suggest_float('overbought_threshold', 0.02, 0.6),
             'stop_loss_pct': trial.suggest_float('stop_loss_pct', sl_min, sl_max),
             'take_profit_pct': trial.suggest_float('take_profit_pct', tp_min, tp_max),
-            'min_hold_bars': trial.suggest_int('min_hold_bars', 1, 10),
-            'min_bars_between': trial.suggest_int('min_bars_between', 1, 15),
+            'min_hold_bars': trial.suggest_int('min_hold_bars', 3, 12),
+            'min_bars_between': trial.suggest_int('min_bars_between', 1, 6),
             'require_accel': trial.suggest_categorical('require_accel', [True, False]),
             'extreme_zone_mult': trial.suggest_float('extreme_zone_mult', 1.1, 2.5),
             'exit_on_opposite_signal': exit_opposite,
@@ -544,8 +544,8 @@ class VelocityOptunaObjective:
             'jerk_confirm_threshold': trial.suggest_float('jerk_confirm_threshold', 0.0, 0.05),
             # Trailing stop - replaces fixed stop loss with dynamic trailing stop
             'use_trailing_stop': trial.suggest_categorical('use_trailing_stop', [True, False]),
-            'trailing_stop_pct': trial.suggest_float('trailing_stop_pct', 0.2, 3.0),
-            'trailing_stop_activation_pct': trial.suggest_float('trailing_stop_activation_pct', 0.1, 2.0),
+            'trailing_stop_pct': trial.suggest_float('trailing_stop_pct', 0.1, 1.5),
+            'trailing_stop_activation_pct': trial.suggest_float('trailing_stop_activation_pct', 0.05, 0.5),
             # Break-even stop - move SL to entry after profit reached
             'use_breakeven_stop': trial.suggest_categorical('use_breakeven_stop', [True, False]),
             'breakeven_trigger_pct': trial.suggest_float('breakeven_trigger_pct', 0.1, 2.0),
@@ -577,8 +577,10 @@ class VelocityOptunaObjective:
             'use_htf_filter': trial.suggest_categorical('use_htf_filter', [True, False]),
             'htf_slow_window': trial.suggest_int('htf_slow_window', 10, 50),
             'htf_threshold': trial.suggest_float('htf_threshold', -0.5, 0.0),
-            # #8: Midline exit delay
-            'midline_exit_bars': trial.suggest_int('midline_exit_bars', 1, 5),
+            # #8: Midline exit delay (min 2 to avoid premature exits)
+            'midline_exit_bars': trial.suggest_int('midline_exit_bars', 2, 8),
+            # #9: Midline exit min PnL — don't exit on midline if losing
+            'midline_exit_min_pnl': trial.suggest_float('midline_exit_min_pnl', -2.0, 0.5),
         })
 
         if use_extra_indicators:
@@ -651,6 +653,72 @@ class VelocityOptunaObjective:
             params['mfv_mode'] = 'velocity'
             params['mfv_threshold'] = 0.0
 
+        # Data-driven options integration: each zone used for its PROVEN purpose
+        # Wall zone = directional bias (Sharpe 0.56), Gamma = vol predictor (corr -0.34),
+        # Combined extreme = high-conviction overlay (0.20%/day edge at |0.7|+)
+        has_options = data.get('options_wall_zone') is not None
+        if has_options:
+            # Wall zone bias: shift oscillator thresholds toward wall-predicted direction
+            params['oz_wall_bias'] = trial.suggest_float('oz_wall_bias', 0.0, 0.3)
+            # Gamma zone vol scaling: adapt SL/TP to gamma-predicted volatility
+            params['oz_gamma_vol'] = trial.suggest_float('oz_gamma_vol', 0.0, 0.5)
+            # Combined extreme conviction: add signals when combined zone is extreme
+            params['oz_extreme_thresh'] = trial.suggest_float('oz_extreme_thresh', 0.5, 0.95)
+            params['oz_extreme_boost'] = trial.suggest_float('oz_extreme_boost', 0.0, 0.3)
+            # Options zone entry filter: block longs when combined zone is bearish
+            params['use_oz_entry_filter'] = trial.suggest_categorical('use_oz_entry_filter', [True, False])
+            params['oz_entry_threshold'] = trial.suggest_float('oz_entry_threshold', -0.2, 0.3) if params['use_oz_entry_filter'] else 0.0
+        else:
+            params['oz_wall_bias'] = 0.0
+            params['oz_gamma_vol'] = 0.0
+            params['oz_extreme_thresh'] = 0.7
+            params['oz_extreme_boost'] = 0.0
+            params['use_oz_entry_filter'] = False
+            params['oz_entry_threshold'] = 0.0
+
+        # KNN Pattern Matcher filter
+        knn_prob = data.get('knn_prob_arrays')
+        if knn_prob is not None:
+            params['use_knn_filter'] = trial.suggest_categorical('use_knn_filter', [True, False])
+            if params['use_knn_filter']:
+                params['knn_horizon'] = trial.suggest_categorical('knn_horizon', [4, 8, 16, 26])
+                params['knn_prob_threshold'] = trial.suggest_float('knn_prob_threshold', 0.50, 0.75)
+                params['knn_confidence_threshold'] = trial.suggest_float('knn_confidence_threshold', 0.0, 0.5)
+            else:
+                params['knn_horizon'] = 8
+                params['knn_prob_threshold'] = 0.55
+                params['knn_confidence_threshold'] = 0.1
+        else:
+            params['use_knn_filter'] = False
+            params['knn_horizon'] = 8
+            params['knn_prob_threshold'] = 0.55
+            params['knn_confidence_threshold'] = 0.1
+
+        # Multi-oscillator OR: catch blind spots where primary misses a move
+        params['use_multi_osc_or'] = trial.suggest_categorical('use_multi_osc_or', [True, False])
+
+        # Entry velocity magnitude filter: reject weak zero-crossings
+        params['use_vel_magnitude_filter'] = trial.suggest_categorical('use_vel_magnitude_filter', [True, False])
+        params['min_entry_velocity'] = trial.suggest_float('min_entry_velocity', 0.005, 0.10) if params['use_vel_magnitude_filter'] else 0.01
+
+        # RTH vs overnight signal strength
+        params['use_rth_filter'] = trial.suggest_categorical('use_rth_filter', [True, False])
+        params['overnight_consensus_boost'] = trial.suggest_int('overnight_consensus_boost', 1, 3) if params['use_rth_filter'] else 1
+
+        # Conditional opposite signal exit
+        params['opp_exit_mode'] = trial.suggest_categorical('opp_exit_mode', ['always', 'losing_only', 'stale_only'])
+        params['opp_exit_stale_bars'] = trial.suggest_int('opp_exit_stale_bars', 3, 10) if params['opp_exit_mode'] == 'stale_only' else 5
+
+        # Quick-loss time stop: exit stale trades
+        params['use_time_stop'] = trial.suggest_categorical('use_time_stop', [True, False])
+        params['time_stop_bars'] = trial.suggest_int('time_stop_bars', 2, 6) if params['use_time_stop'] else 4
+        params['time_stop_min_pnl'] = trial.suggest_float('time_stop_min_pnl', 0.0, 0.15) if params['use_time_stop'] else 0.05
+
+        # Adaptive cooldown after losses
+        params['use_adaptive_cooldown'] = trial.suggest_categorical('use_adaptive_cooldown', [True, False])
+        params['cooldown_loss_streak'] = trial.suggest_int('cooldown_loss_streak', 2, 4) if params['use_adaptive_cooldown'] else 2
+        params['cooldown_extra_bars'] = trial.suggest_int('cooldown_extra_bars', 3, 10) if params['use_adaptive_cooldown'] else 5
+
         # Select the oscillator values based on the chosen type and MTF setting
         selected_osc_type = params['oscillator_type']
         if selected_osc_type in active_oscillators:
@@ -673,7 +741,16 @@ class VelocityOptunaObjective:
                                      low_prices=data.get('low_prices'),
                                      volume=data.get('volume'),
                                      all_oscillators=active_oscillators,
-                                     vol_regime=data.get('vol_regime'))
+                                     vol_regime=data.get('vol_regime'),
+                                     mfv_flow=data.get('mfv_flow'),
+                                     mfv_vel=data.get('mfv_vel'),
+                                     options_gamma_zone=data.get('options_gamma_zone'),
+                                     options_mp_zone=data.get('options_mp_zone'),
+                                     options_wall_zone=data.get('options_wall_zone'),
+                                     options_combined_zone=data.get('options_combined_zone'),
+                                     knn_prob_arrays=data.get('knn_prob_arrays'),
+                                     knn_confidence_arrays=data.get('knn_confidence_arrays'),
+                                     bar_hours=data.get('bar_hours'))
 
         if result is None:
             return float('-inf')
@@ -723,7 +800,12 @@ class VelocityOptunaObjective:
     def _run_backtest(self, params, close_prices, osc_values, rsi_cache,
                       macd_histogram, bb_upper, bb_lower, use_extra_indicators,
                       v2_indicators=None, high_prices=None, low_prices=None,
-                      volume=None, all_oscillators=None, vol_regime=None):
+                      volume=None, all_oscillators=None, vol_regime=None,
+                      mfv_flow=None, mfv_vel=None,
+                      options_gamma_zone=None, options_mp_zone=None,
+                      options_wall_zone=None, options_combined_zone=None,
+                      knn_prob_arrays=None, knn_confidence_arrays=None,
+                      bar_hours=None):
         """Fast vectorized backtest with V2 indicator filters and signal improvements."""
         import pandas as pd
 
@@ -765,6 +847,12 @@ class VelocityOptunaObjective:
                 osc_smooth = pywt.waverec(denoised, family)[:len(osc_smooth)]
             except Exception:
                 pass
+
+        # Wall zone directional bias: shift oscillator toward wall-predicted direction
+        # Bullish wall (>0) → shift osc down → easier to hit oversold → more buy signals
+        oz_wb = params.get('oz_wall_bias', 0.0)
+        if oz_wb > 0 and options_wall_zone is not None:
+            osc_smooth = osc_smooth - options_wall_zone * oz_wb
 
         velocity = np.diff(osc_smooth, prepend=osc_smooth[0])
         acceleration = np.diff(velocity, prepend=velocity[0])
@@ -826,6 +914,37 @@ class VelocityOptunaObjective:
             buy_cond = vel_cross_up & in_oversold
             sell_cond = vel_cross_down & in_overbought
 
+        # Multi-oscillator OR: catch blind spots where primary oscillator misses a move
+        if params.get('use_multi_osc_or', False) and all_oscillators is not None:
+            osc_keys = [k for k in sorted(all_oscillators.keys()) if k != params.get('oscillator_type', 'composite')]
+            secondary_buy = np.zeros(len(close_prices), dtype=bool)
+            for sec_key in osc_keys[:8]:
+                sec_osc = all_oscillators[sec_key]
+                if vel_smoothing > 1:
+                    sec_smooth = pd.Series(sec_osc).rolling(window=vel_smoothing).mean().bfill().values
+                else:
+                    sec_smooth = sec_osc.copy()
+                if oz_wb > 0 and options_wall_zone is not None:
+                    sec_smooth = sec_smooth - options_wall_zone * oz_wb
+                sec_vel = np.diff(sec_smooth, prepend=sec_smooth[0])
+                sec_cross_up = (sec_vel > 0) & (np.roll(sec_vel, 1) <= 0)
+                sec_extreme_os = sec_smooth < (params['oversold_threshold'] * params['extreme_zone_mult'])
+                if sig_type in ('velocity_crossover_or_zone', 'zone_only'):
+                    sec_signal = sec_cross_up | sec_extreme_os
+                elif sig_type == 'any_reversal':
+                    sec_std = pd.Series(sec_vel).rolling(vel_std_window, min_periods=1).std().fillna(np.std(sec_vel)).values
+                    sec_in_os = sec_smooth < params['oversold_threshold']
+                    sec_signal = sec_cross_up | sec_extreme_os | ((sec_vel > sec_std * momentum_mult) & sec_in_os)
+                else:
+                    sec_signal = sec_cross_up | sec_extreme_os
+                secondary_buy = secondary_buy | sec_signal
+            buy_cond = buy_cond | secondary_buy
+
+        # Entry velocity magnitude filter: reject weak zero-crossings
+        if params.get('use_vel_magnitude_filter', False):
+            min_vel = params.get('min_entry_velocity', 0.01)
+            buy_cond = buy_cond & (np.abs(velocity) > min_vel)
+
         if params['require_accel']:
             buy_cond = buy_cond & (acceleration > 0)
             sell_cond = sell_cond & (acceleration < 0)
@@ -876,6 +995,17 @@ class VelocityOptunaObjective:
                 sell_votes += (o_cross_down | o_overbought).astype(int)
             buy_cond = buy_cond & (buy_votes >= consensus_count)
             sell_cond = sell_cond & (sell_votes >= consensus_count)
+
+        # RTH vs overnight signal strength: require stronger signals overnight
+        if params.get('use_rth_filter', False) and bar_hours is not None:
+            is_rth = (bar_hours >= 9) & (bar_hours < 16)
+            overnight_boost = params.get('overnight_consensus_boost', 2)
+            if params.get('use_consensus', False) and all_oscillators and len(all_oscillators) >= 3:
+                overnight_ok = buy_votes >= (consensus_count + overnight_boost)
+            else:
+                min_vel = params.get('min_entry_velocity', 0.01)
+                overnight_ok = np.abs(velocity) > min_vel * 2
+            buy_cond = buy_cond & (is_rth | overnight_ok)
 
         # === IMPROVEMENT #4: Volume confirmation ===
         if params.get('use_volume_confirm', False) and volume is not None and len(volume) == len(close_prices):
@@ -942,6 +1072,49 @@ class VelocityOptunaObjective:
             vol_thresh = params.get('vol_regime_percentile_threshold', 0.25)
             buy_cond = buy_cond & (vol_regime > vol_thresh)
 
+        # Money Flow Velocity filter
+        if params.get('use_mfv_filter', False):
+            mfv_mode = params.get('mfv_mode', 'velocity')
+            mfv_thresh = params.get('mfv_threshold', 0.0)
+            if mfv_mode == 'velocity' and mfv_vel is not None:
+                buy_cond = buy_cond & (mfv_vel > mfv_thresh)
+                sell_cond = sell_cond & (mfv_vel < -mfv_thresh)
+            elif mfv_mode == 'flow' and mfv_flow is not None:
+                buy_cond = buy_cond & (mfv_flow > mfv_thresh)
+                sell_cond = sell_cond & (mfv_flow < -mfv_thresh)
+            elif mfv_mode == 'both' and mfv_flow is not None and mfv_vel is not None:
+                buy_cond = buy_cond & (mfv_flow > mfv_thresh) & (mfv_vel > mfv_thresh)
+                sell_cond = sell_cond & (mfv_flow < -mfv_thresh) & (mfv_vel < -mfv_thresh)
+
+        # Combined zone extreme conviction: ADD signals when zone is strongly directional
+        # Data shows 0.20%/day edge at |combined_zone| > 0.7 (only ~7% of days)
+        oz_eb = params.get('oz_extreme_boost', 0.0)
+        oz_et = params.get('oz_extreme_thresh', 0.7)
+        if oz_eb > 0 and options_combined_zone is not None:
+            extreme_bull = options_combined_zone > oz_et
+            extreme_bear = options_combined_zone < -oz_et
+            # When zone is extreme, accept signals at a relaxed threshold
+            relaxed_oversold = osc_smooth < (params['oversold_threshold'] * (1 - oz_eb))
+            relaxed_overbought = osc_smooth > (params['overbought_threshold'] * (1 - oz_eb))
+            buy_cond = buy_cond | (extreme_bull & relaxed_oversold & (velocity > 0))
+            sell_cond = sell_cond | (extreme_bear & relaxed_overbought & (velocity < 0))
+
+        # Options zone entry filter: block longs when combined zone is too bearish
+        if params.get('use_oz_entry_filter', False) and options_combined_zone is not None:
+            oz_entry_thresh = params.get('oz_entry_threshold', 0.0)
+            buy_cond = buy_cond & (options_combined_zone >= oz_entry_thresh)
+
+        # KNN Pattern Matcher filter
+        if params.get('use_knn_filter', False) and knn_prob_arrays is not None:
+            knn_h = params.get('knn_horizon', 8)
+            knn_pt = params.get('knn_prob_threshold', 0.55)
+            knn_ct = params.get('knn_confidence_threshold', 0.1)
+            prob = knn_prob_arrays.get(knn_h)
+            conf = knn_confidence_arrays.get(knn_h) if knn_confidence_arrays else None
+            if prob is not None and conf is not None:
+                buy_cond = buy_cond & (prob > knn_pt) & (conf > knn_ct)
+                sell_cond = sell_cond & (prob < (1 - knn_pt)) & (conf > knn_ct)
+
         # === IMPROVEMENT #3: Pre-compute ATR for dynamic trailing stop ===
         trailing_stop_type = params.get('trailing_stop_type', 'fixed_pct')
         atr_values = None
@@ -992,6 +1165,12 @@ class VelocityOptunaObjective:
         equity_curve = [equity]
         peak_equity = equity
 
+        # Adaptive cooldown after losses
+        consecutive_losses = 0
+        use_adaptive_cooldown = params.get('use_adaptive_cooldown', False)
+        cooldown_loss_streak = params.get('cooldown_loss_streak', 2)
+        cooldown_extra_bars = params.get('cooldown_extra_bars', 5)
+
         for i in range(1, len(close_prices)):
             price = close_prices[i]
             bars_since = i - last_trade_bar
@@ -1005,12 +1184,25 @@ class VelocityOptunaObjective:
 
             if position == 1:
                 exited = False
+
+                # Gamma vol scaling: adapt SL/TP to gamma-predicted volatility
+                # Negative gamma → high vol (2x range) → widen both SL and TP
+                # Positive gamma → low vol (0.5x range) → tighten both SL and TP
+                oz_gv = params.get('oz_gamma_vol', 0.0)
+                if oz_gv > 0 and options_gamma_zone is not None:
+                    vol_scale = 1 - options_gamma_zone[i] * oz_gv
+                    eff_sl = max(0.1, params['stop_loss_pct'] * vol_scale)
+                    eff_tp = params['take_profit_pct'] * vol_scale
+                else:
+                    eff_sl = params['stop_loss_pct']
+                    eff_tp = params['take_profit_pct']
+
                 # Priority 1: Fixed Stop Loss (ALWAYS fires)
-                if params['stop_loss_pct'] > 0:
-                    sl_price_level = entry_price * (1 - params['stop_loss_pct'] / 100)
+                if eff_sl > 0:
+                    sl_price_level = entry_price * (1 - eff_sl / 100)
                     bar_low = low_prices[i] if low_prices is not None else price
                     if bar_low <= sl_price_level:
-                        pnl_pct = -params['stop_loss_pct']
+                        pnl_pct = -eff_sl
                         trades.append(pnl_pct)
                         equity *= (1 + pnl_pct / 100)
                         equity_curve.append(equity)
@@ -1019,11 +1211,11 @@ class VelocityOptunaObjective:
                         last_trade_bar = i
                         exited = True
                 # Priority 2: Take Profit (ALWAYS fires)
-                if not exited and params['take_profit_pct'] > 0:
-                    tp_price_level = entry_price * (1 + params['take_profit_pct'] / 100)
+                if not exited and eff_tp > 0:
+                    tp_price_level = entry_price * (1 + eff_tp / 100)
                     bar_high = high_prices[i] if high_prices is not None else price
                     if bar_high >= tp_price_level:
-                        pnl_pct = params['take_profit_pct']
+                        pnl_pct = eff_tp
                         trades.append(pnl_pct)
                         equity *= (1 + pnl_pct / 100)
                         equity_curve.append(equity)
@@ -1064,6 +1256,21 @@ class VelocityOptunaObjective:
                             position = 0
                             last_trade_bar = i
                             exited = True
+                # Time stop: exit stale trades that haven't moved
+                if not exited and params.get('use_time_stop', False):
+                    ts_bars = params.get('time_stop_bars', 4)
+                    ts_min_pnl = params.get('time_stop_min_pnl', 0.05)
+                    if bars_held >= ts_bars:
+                        ts_pnl = (price - entry_price) / entry_price * 100
+                        if ts_pnl < ts_min_pnl:
+                            trades.append(ts_pnl)
+                            equity *= (1 + ts_pnl / 100)
+                            equity_curve.append(equity)
+                            peak_equity = max(peak_equity, equity)
+                            position = 0
+                            last_trade_bar = i
+                            exited = True
+
                 # Remaining exits require min_hold_bars
                 if not exited and can_exit and params.get('use_accel_exit', False):
                     current_pnl = (price - entry_price) / entry_price * 100
@@ -1107,13 +1314,19 @@ class VelocityOptunaObjective:
                         position = 0
                         last_trade_bar = i
                         exited = True
-                # === IMPROVEMENT #8: Midline exit delay ===
+                # === IMPROVEMENT #8: Midline exit delay + #9: min PnL gate ===
                 midline_met = False
                 if not exited and can_exit and exit_on_midline:
                     if midline_exit_bars_required > 1:
                         midline_met = consecutive_above[i] >= midline_exit_bars_required
                     else:
                         midline_met = osc_smooth[i] > 0 and osc_smooth[i-1] <= 0
+                    # Only exit on midline if PnL meets threshold
+                    if midline_met:
+                        current_mid_pnl = (price - entry_price) / entry_price * 100
+                        midline_min_pnl = params.get('midline_exit_min_pnl', -999)
+                        if current_mid_pnl < midline_min_pnl:
+                            midline_met = False
                 if not exited and midline_met:
                     pnl_pct = (price - entry_price) / entry_price * 100
                     trades.append(pnl_pct)
@@ -1124,18 +1337,35 @@ class VelocityOptunaObjective:
                     last_trade_bar = i
                     exited = True
                 if not exited and can_exit and exit_on_opposite and sell_cond[i] and bars_since >= params['min_bars_between']:
-                    pnl_pct = (price - entry_price) / entry_price * 100
-                    trades.append(pnl_pct)
-                    equity *= (1 + pnl_pct / 100)
-                    equity_curve.append(equity)
-                    peak_equity = max(peak_equity, equity)
-                    position = 0
-                    last_trade_bar = i
-                    exited = True
+                    opp_mode = params.get('opp_exit_mode', 'always')
+                    opp_pnl = (price - entry_price) / entry_price * 100
+                    opp_ok = True
+                    if opp_mode == 'losing_only':
+                        opp_ok = opp_pnl < 0
+                    elif opp_mode == 'stale_only':
+                        opp_ok = bars_held >= params.get('opp_exit_stale_bars', 5)
+                    if opp_ok:
+                        trades.append(opp_pnl)
+                        equity *= (1 + opp_pnl / 100)
+                        equity_curve.append(equity)
+                        peak_equity = max(peak_equity, equity)
+                        position = 0
+                        last_trade_bar = i
+                        exited = True
                 if exited:
+                    # Track consecutive losses for adaptive cooldown
+                    last_pnl = trades[-1] if trades else 0
+                    if last_pnl < 0:
+                        consecutive_losses += 1
+                    else:
+                        consecutive_losses = 0
                     continue
 
-            if buy_cond[i] and position == 0 and bars_since >= params['min_bars_between']:
+            # Adaptive cooldown: increase min_bars_between after loss streaks
+            eff_min_bars = params['min_bars_between']
+            if use_adaptive_cooldown and consecutive_losses >= cooldown_loss_streak:
+                eff_min_bars += cooldown_extra_bars
+            if buy_cond[i] and position == 0 and bars_since >= eff_min_bars:
                 position = 1
                 entry_price = price
                 highest_price = price  # Reset trailing stop tracker

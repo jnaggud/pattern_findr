@@ -142,10 +142,48 @@ class MarketDataDB:
             )
         """)
 
+        # Options snapshot data (daily zones from SPY options chain)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS options_daily_zones (
+                date TEXT PRIMARY KEY,
+                spy_price REAL,
+                max_pain REAL,
+                max_pain_zone REAL,
+                gamma_zone REAL,
+                wall_zone REAL,
+                combined_zone REAL,
+                call_wall_strike REAL,
+                call_wall_oi INTEGER,
+                put_wall_strike REAL,
+                put_wall_oi INTEGER,
+                net_gamma REAL,
+                pcr_volume REAL,
+                pcr_oi REAL,
+                atm_iv REAL,
+                iv_skew REAL,
+                raw_json TEXT,
+                created_at TEXT
+            )
+        """)
+
+        # Per-strike OI snapshots (for detailed zone reconstruction)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS options_strike_oi (
+                date TEXT,
+                strike REAL,
+                call_oi INTEGER DEFAULT 0,
+                put_oi INTEGER DEFAULT 0,
+                call_gamma REAL DEFAULT 0,
+                put_gamma REAL DEFAULT 0,
+                PRIMARY KEY (date, strike)
+            )
+        """)
+
         # Create indexes for faster queries
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_date ON price_data(date)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_symbol ON price_data(symbol)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_sector_date ON sector_data(date)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_options_zones_date ON options_daily_zones(date)")
 
         conn.commit()
         # Only print init message in main process (not worker processes)
@@ -626,6 +664,127 @@ class MarketDataDB:
             'min_iv': row[4],
             'max_iv': row[5]
         }
+
+    # ========================================================================
+    # Options Snapshot Methods (daily zones from SPY options chain)
+    # ========================================================================
+
+    def save_options_snapshot(self, date: str, snapshot: dict):
+        """
+        Save a daily options snapshot with computed influence zones.
+
+        Args:
+            date: Date string (YYYY-MM-DD)
+            snapshot: Dict from polygon_manager.get_full_options_analysis() + zones
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        zones = snapshot.get('zones', {})
+        raw = snapshot.get('raw', {})
+        high_oi = raw.get('high_oi', {})
+
+        top_calls = high_oi.get('high_oi_calls', [])
+        top_puts = high_oi.get('high_oi_puts', [])
+
+        cursor.execute("""
+            INSERT OR REPLACE INTO options_daily_zones
+            (date, spy_price, max_pain, max_pain_zone, gamma_zone, wall_zone, combined_zone,
+             call_wall_strike, call_wall_oi, put_wall_strike, put_wall_oi, net_gamma,
+             pcr_volume, pcr_oi, atm_iv, iv_skew, raw_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            date,
+            snapshot.get('current_price'),
+            snapshot.get('max_pain'),
+            zones.get('max_pain_zone', 0.0),
+            zones.get('gamma_zone', 0.0),
+            zones.get('wall_zone', 0.0),
+            zones.get('combined_zone', 0.0),
+            top_calls[0]['strike'] if top_calls else None,
+            top_calls[0]['oi'] if top_calls else 0,
+            top_puts[0]['strike'] if top_puts else None,
+            top_puts[0]['oi'] if top_puts else 0,
+            snapshot.get('net_gamma', 0),
+            snapshot.get('pcr_volume', 0),
+            snapshot.get('pcr_oi', 0),
+            snapshot.get('atm_iv', 0),
+            snapshot.get('iv_skew', 0),
+            None,  # Skip raw_json to save space (can enable later)
+            datetime.now().isoformat(),
+        ))
+
+        # Save per-strike OI for the top strikes
+        for strike_list in [top_calls, top_puts]:
+            for item in strike_list:
+                strike = item.get('strike')
+                oi = item.get('oi', 0)
+                if strike:
+                    # Determine if call or put based on which list
+                    is_call = strike_list is top_calls
+                    if is_call:
+                        cursor.execute("""
+                            INSERT OR REPLACE INTO options_strike_oi
+                            (date, strike, call_oi, put_oi)
+                            VALUES (?, ?, ?,
+                                    COALESCE((SELECT put_oi FROM options_strike_oi
+                                              WHERE date=? AND strike=?), 0))
+                        """, (date, strike, oi, date, strike))
+                    else:
+                        cursor.execute("""
+                            INSERT OR REPLACE INTO options_strike_oi
+                            (date, strike, call_oi, put_oi)
+                            VALUES (?, ?,
+                                    COALESCE((SELECT call_oi FROM options_strike_oi
+                                              WHERE date=? AND strike=?), 0), ?)
+                        """, (date, strike, date, strike, oi))
+
+        conn.commit()
+        print(f"[MarketDataDB] Saved options snapshot for {date}: "
+              f"max_pain={snapshot.get('max_pain')}, "
+              f"gamma_zone={zones.get('gamma_zone', 0):.3f}")
+
+    def get_options_snapshot(self, date: str) -> Optional[Dict]:
+        """Get options snapshot for a specific date."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM options_daily_zones WHERE date = ?', (date,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        cols = [desc[0] for desc in cursor.description]
+        return dict(zip(cols, row))
+
+    def get_latest_options_snapshot(self) -> Optional[Dict]:
+        """Get most recent options snapshot."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM options_daily_zones ORDER BY date DESC LIMIT 1')
+        row = cursor.fetchone()
+        if not row:
+            return None
+        cols = [desc[0] for desc in cursor.description]
+        return dict(zip(cols, row))
+
+    def get_options_snapshots_range(self, start_date: str, end_date: str) -> pd.DataFrame:
+        """Get options snapshots for a date range (for backtesting)."""
+        conn = self._get_connection()
+        df = pd.read_sql_query(
+            'SELECT * FROM options_daily_zones WHERE date >= ? AND date <= ? ORDER BY date',
+            conn,
+            params=(start_date, end_date),
+        )
+        if not df.empty:
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.set_index('date')
+        return df
+
+    def options_snapshot_days(self) -> int:
+        """How many days of options snapshots we have."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM options_daily_zones')
+        return cursor.fetchone()[0]
 
     def close(self):
         """Close database connection."""

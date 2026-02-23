@@ -227,6 +227,42 @@ def prepare_backtest_arrays(
             buy_signals = buy_signals & (mfv_flow > mfv_thresh) & (mfv_vel > mfv_thresh)
             sell_signals = sell_signals & (mfv_flow < -mfv_thresh) & (mfv_vel < -mfv_thresh)
 
+    # --- Options Influence Zone filter ---
+    if config.get('use_options_zone_filter', False):
+        oz_mode = config.get('options_zone_mode', 'gamma')
+        oz_thresh = config.get('options_zone_threshold', 0.0)
+        zone_col_map = {
+            'gamma': 'OPTIONS_GAMMA_ZONE',
+            'max_pain': 'OPTIONS_MP_ZONE',
+            'wall': 'OPTIONS_WALL_ZONE',
+            'combined': 'OPTIONS_COMBINED_ZONE',
+        }
+        zone_col = zone_col_map.get(oz_mode, 'OPTIONS_GAMMA_ZONE')
+        if zone_col in result.columns:
+            zone = result[zone_col].values
+            if oz_mode == 'gamma':
+                buy_signals = buy_signals & (zone > oz_thresh)
+                sell_signals = sell_signals & (zone > oz_thresh)
+            elif oz_mode in ('max_pain', 'wall'):
+                buy_signals = buy_signals & (zone < -oz_thresh)
+                sell_signals = sell_signals & (zone > oz_thresh)
+            elif oz_mode == 'combined':
+                buy_signals = buy_signals & (zone > oz_thresh)
+                sell_signals = sell_signals & (zone < -oz_thresh)
+
+    # --- KNN Pattern Matcher filter ---
+    if config.get('use_knn_filter', False):
+        knn_h = config.get('knn_horizon', 8)
+        knn_pt = config.get('knn_prob_threshold', 0.55)
+        knn_ct = config.get('knn_confidence_threshold', 0.1)
+        prob_col = f'knn_prob_up_{knn_h}'
+        conf_col = f'knn_confidence_{knn_h}'
+        if prob_col in result.columns and conf_col in result.columns:
+            knn_prob = result[prob_col].values
+            knn_conf = result[conf_col].values
+            buy_signals = buy_signals & (knn_prob > knn_pt) & (knn_conf > knn_ct)
+            sell_signals = sell_signals & (knn_prob < (1 - knn_pt)) & (knn_conf > knn_ct)
+
     # Get close/high/low arrays
     close_col = 'close' if 'close' in result.columns else 'Close'
     high_col = 'high' if 'high' in result.columns else 'High'
@@ -400,7 +436,8 @@ def run_backtest(
                 if hwm_pnl >= breakeven_trigger_pct:
                     # SL is now at entry + small offset
                     be_price = entry_price * (1 + breakeven_offset_pct / 100)
-                    if low[i] <= be_price:
+                    # Price must have actually reached be_price before we can exit there
+                    if high_watermark >= be_price and low[i] <= be_price:
                         exit_reason = 'Break-Even Stop'
                         exit_price = be_price
 

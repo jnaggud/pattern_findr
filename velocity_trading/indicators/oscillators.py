@@ -34,10 +34,10 @@ try:
     )
     HAS_OSCILLATOR_MODULE = True
     HAS_OLD_COMPOSITE = True
-except ImportError:
+except Exception as e:
     HAS_OSCILLATOR_MODULE = False
     HAS_OLD_COMPOSITE = False
-    print("Warning: oscillator_predictor_page not found, using built-in calculations")
+    print(f"Warning: oscillator_predictor_page not available ({type(e).__name__}: {e}), using built-in calculations")
 
 # Import novel oscillators (ARWO, PRF, ICS, etc.)
 try:
@@ -52,9 +52,9 @@ try:
         calculate_kfif
     )
     HAS_NOVEL_OSCILLATORS = True
-except ImportError:
+except Exception as e:
     HAS_NOVEL_OSCILLATORS = False
-    print("Warning: novel_indicators not found, novel oscillators unavailable")
+    print(f"Warning: novel_indicators not available ({type(e).__name__}), novel oscillators unavailable")
 
 # Import V2 filters (Regime, Fragility, Entropy)
 try:
@@ -65,9 +65,9 @@ try:
         calculate_mfv,   # Money Flow Velocity
     )
     HAS_V2_FILTERS = True
-except ImportError:
+except Exception as e:
     HAS_V2_FILTERS = False
-    print("Warning: novel_indicators_v2 not found, V2 filters unavailable")
+    print(f"Warning: novel_indicators_v2 not available ({type(e).__name__}), V2 filters unavailable")
 
 
 def calculate_composite_oscillator(
@@ -426,6 +426,29 @@ def calculate_novel_oscillator(
             result['MFV_FLOW'] = 0.0
             result['MFV_VEL'] = 0.0
             result['MFV_ACC'] = 0.0
+
+    # Options Influence Zone filter (daily zones from SPY options chain)
+    if config.get('use_options_zone_filter'):
+        try:
+            from market_data_db import get_market_db
+            _db = get_market_db(suppress_init_message=True)
+            snap = _db.get_latest_options_snapshot()
+            if snap:
+                result['OPTIONS_GAMMA_ZONE'] = snap.get('gamma_zone', 0.0)
+                result['OPTIONS_MP_ZONE'] = snap.get('max_pain_zone', 0.0)
+                result['OPTIONS_WALL_ZONE'] = snap.get('wall_zone', 0.0)
+                result['OPTIONS_COMBINED_ZONE'] = snap.get('combined_zone', 0.0)
+            else:
+                result['OPTIONS_GAMMA_ZONE'] = 0.0
+                result['OPTIONS_MP_ZONE'] = 0.0
+                result['OPTIONS_WALL_ZONE'] = 0.0
+                result['OPTIONS_COMBINED_ZONE'] = 0.0
+        except Exception as e:
+            print(f"Warning: Options zone loading failed: {e}")
+            result['OPTIONS_GAMMA_ZONE'] = 0.0
+            result['OPTIONS_MP_ZONE'] = 0.0
+            result['OPTIONS_WALL_ZONE'] = 0.0
+            result['OPTIONS_COMBINED_ZONE'] = 0.0
 
     # Alias for compatibility with signal detection
     result['osc_smooth'] = result['JD_Osc']

@@ -89,6 +89,10 @@ class IntradayTrader(BaseTrader):
         self.last_processed_bar = None
         self._bar_processed_this_cycle = False  # Track if we processed a bar in current cycle
 
+        # min_bars_between cooldown: track last exit time to enforce cooldown
+        self.min_bars_between = self.config.get('min_bars_between', 1)
+        self._last_exit_bar_time = None  # Set on exit, checked on entry
+
     @property
     def check_interval_seconds(self) -> int:
         """Check every 30 seconds for intraday strategies."""
@@ -144,8 +148,10 @@ class IntradayTrader(BaseTrader):
         """
         Get the most recently completed intraday bar.
 
-        An intraday bar is complete when:
-        - Current time >= bar_start + interval + buffer
+        Scans backwards from the end of the dataframe to find the newest bar
+        whose end time (bar_start + interval + buffer) has passed. This avoids
+        the bug where df.iloc[-1] is an incomplete current bar, causing the
+        method to return df.iloc[-2] (one bar too old) instead of the just-completed bar.
 
         Returns:
             Tuple of (bar_data, bar_time) or (None, None)
@@ -154,54 +160,34 @@ class IntradayTrader(BaseTrader):
             return None, None
 
         now = get_current_market_time(self.ticker)
-
-        # Get the last bar in the dataframe
-        last_bar = df.iloc[-1]
-        last_bar_time = last_bar.name
-
-        # CRITICAL FIX: Data from Databento is stored in UTC, but may be read back as naive.
-        # Previously, naive timestamps were incorrectly localized to the market's timezone
-        # (e.g., 13:15 UTC treated as 13:15 Chicago = 19:15 UTC, causing 6 hour offset!)
-        # Now we correctly assume naive timestamps are UTC and convert to market timezone.
-        if last_bar_time.tzinfo is None:
-            # Data is naive but represents UTC (from Databento)
-            last_bar_time = pytz.UTC.localize(last_bar_time)
-        # Convert to market timezone for consistent comparison
         market_tz = pytz.timezone(self.market_config.get('timezone', 'America/New_York'))
-        last_bar_time = last_bar_time.astimezone(market_tz)
 
-        # Calculate when this bar ends
-        bar_end_time = last_bar_time + timedelta(minutes=self.interval_minutes)
+        # Scan backwards through the last few bars to find the most recent completed one
+        scan_limit = min(5, len(df))
+        for offset in range(scan_limit):
+            idx = len(df) - 1 - offset
+            bar = df.iloc[idx]
+            bar_time = bar.name
 
-        # Add buffer for data availability
-        bar_complete_time = bar_end_time + timedelta(seconds=self.bar_completion_buffer_seconds)
+            # Normalize timezone: naive timestamps from Databento are UTC
+            if bar_time.tzinfo is None:
+                bar_time = pytz.UTC.localize(bar_time)
+            bar_time = bar_time.astimezone(market_tz)
 
-        # Check if the bar is complete
-        if now >= bar_complete_time:
-            # Check if we already processed this bar
-            bar_key = str(last_bar_time)[:16]  # YYYY-MM-DD HH:MM
-            if self.last_processed_bar == bar_key:
-                return None, None
+            # Calculate when this bar ends
+            bar_end_time = bar_time + timedelta(minutes=self.interval_minutes)
+            bar_complete_time = bar_end_time + timedelta(seconds=self.bar_completion_buffer_seconds)
 
-            return last_bar, last_bar_time
-        else:
-            # Current bar not complete, try previous bar
-            if len(df) >= 2:
-                prev_bar = df.iloc[-2]
-                prev_bar_time = prev_bar.name
-
-                # Same timezone fix for previous bar
-                if prev_bar_time.tzinfo is None:
-                    prev_bar_time = pytz.UTC.localize(prev_bar_time)
-                prev_bar_time = prev_bar_time.astimezone(market_tz)
-
-                bar_key = str(prev_bar_time)[:16]
+            # Check if this bar is complete
+            if now >= bar_complete_time:
+                # Check if we already processed this bar
+                bar_key = str(bar_time)[:16]  # YYYY-MM-DD HH:MM
                 if self.last_processed_bar == bar_key:
                     return None, None
 
-                return prev_bar, prev_bar_time
+                return bar, bar_time
 
-            return None, None
+        return None, None
 
     def _get_unprocessed_bars(self, df: pd.DataFrame):
         """
@@ -337,6 +323,22 @@ class IntradayTrader(BaseTrader):
 
             print(f"   *** BUY SIGNAL DETECTED at {bar_key} ***")
 
+            # min_bars_between cooldown: skip entry if not enough bars since last exit
+            if self._last_exit_bar_time is not None and self.min_bars_between > 1:
+                exit_ts = pd.Timestamp(self._last_exit_bar_time)
+                bar_ts = pd.Timestamp(bar_time)
+                # Strip timezone for comparison
+                if exit_ts.tzinfo is not None:
+                    exit_ts = exit_ts.tz_convert('UTC').tz_localize(None)
+                if bar_ts.tzinfo is not None:
+                    bar_ts = bar_ts.tz_convert('UTC').tz_localize(None)
+                bars_since_exit = int((bar_ts - exit_ts).total_seconds() / (self.interval_minutes * 60))
+                if bars_since_exit < self.min_bars_between:
+                    print(f"   ⏳ Cooldown: {bars_since_exit}/{self.min_bars_between} bars since last exit, skipping")
+                    self.last_processed_bar = bar_timestamp
+                    self.pm._db.set_last_processed_bar(bar_timestamp)
+                    continue
+
             # Novel Strategy Filters (v7+): Check GBM + XGBoost confidence
             if self.novel_filters is not None and self.novel_filters.trained:
                 # v9: Set per-regime thresholds from config before checking
@@ -380,6 +382,13 @@ class IntradayTrader(BaseTrader):
             # If we entered a position, stop scanning for more entries
             if self.pm.get_current_position():
                 break
+
+    def _execute_exit(self, exit_price: float, exit_reason: str, signal_bar_time=None, is_missed: bool = False):
+        """Override to track last exit time for min_bars_between cooldown."""
+        super()._execute_exit(exit_price, exit_reason, signal_bar_time, is_missed)
+        # Record exit time for cooldown enforcement
+        from ..data.market_hours import get_current_market_time
+        self._last_exit_bar_time = signal_bar_time if signal_bar_time else get_current_market_time(self.ticker)
 
     def _calculate_sleep_time(self) -> int:
         """
@@ -614,6 +623,9 @@ def load_bundle_config(strategy_name: str) -> Optional[Dict]:
         'fragility_threshold': config.get('fragility_threshold', 0.5),
         'use_entropy_filter': config.get('use_entropy_filter', False),
         'entropy_threshold': config.get('entropy_threshold', 0.7),
+        # Volatility regime filter (ATR percentile)
+        'use_vol_regime_filter': config.get('use_vol_regime_filter', False),
+        'vol_regime_percentile_threshold': config.get('vol_regime_percentile_threshold', 0.25),
         # Acceleration exit parameters
         'use_accel_exit': config.get('use_accel_exit', False),
         'accel_exit_type': config.get('accel_exit_type', 'sign_reversal'),
@@ -622,6 +634,14 @@ def load_bundle_config(strategy_name: str) -> Optional[Dict]:
         'accel_exit_lookback': config.get('accel_exit_lookback', 1),
         'use_jerk_confirm': config.get('use_jerk_confirm', False),
         'jerk_confirm_threshold': config.get('jerk_confirm_threshold', 0.0),
+        # Trailing stop parameters (v7+)
+        'use_trailing_stop': config.get('use_trailing_stop', False),
+        'trailing_stop_pct': config.get('trailing_stop_pct', 1.0),
+        'trailing_stop_activation_pct': config.get('trailing_stop_activation_pct', 0.3),
+        # Break-even stop parameters (v7+)
+        'use_breakeven_stop': config.get('use_breakeven_stop', False),
+        'breakeven_trigger_pct': config.get('breakeven_trigger_pct', 0.3),
+        'breakeven_offset_pct': config.get('breakeven_offset_pct', 0.05),
         # Signal parameters
         'min_hold_bars': config.get('min_hold_bars', 1),
         'min_bars_between': config.get('min_bars_between', 1),

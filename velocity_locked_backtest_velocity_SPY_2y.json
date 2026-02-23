@@ -100,6 +100,11 @@
       "date": "2026-02-06 18:00:00-0600",
       "price": 694.62,
       "position": "long"
+    },
+    {
+      "date": "2026-02-17 18:00:00-0600",
+      "price": 686.3799,
+      "position": "long"
     }
   ],
   "exits": [
@@ -264,7 +269,11 @@
       "entry_date": "2026-02-06 18:00:00-0600"
     }
   ],
-  "current_position": null,
+  "current_position": {
+    "position": "long",
+    "entry_price": 686.3799,
+    "entry_date": "2026-02-18 00:00:00"
+  },
   "num_trades": 20,
   "win_rate": 90.0,
   "total_return": 26.302578837858203,

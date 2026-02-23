@@ -58,7 +58,7 @@ def create_bundle_from_results(results_path: str, bundle_name: str = None,
     config = {
         # Core identifiers
         'strategy_type': 'velocity',
-        'strategy_name': f"velocity_{ticker}_{interval}",
+        'strategy_name': bundle_name,
         'bundle_name': bundle_name,
         'ticker': ticker,
         'interval': interval,
@@ -99,6 +99,15 @@ def create_bundle_from_results(results_path: str, bundle_name: str = None,
         'use_jerk_confirm': best_params.get('use_jerk_confirm', False),
         'jerk_confirm_threshold': best_params.get('jerk_confirm_threshold', 0.0),
 
+        # Trailing stop parameters (v7+)
+        'use_trailing_stop': best_params.get('use_trailing_stop', False),
+        'trailing_stop_pct': best_params.get('trailing_stop_pct', 1.0),
+        'trailing_stop_activation_pct': best_params.get('trailing_stop_activation_pct', 0.3),
+        # Break-even stop parameters (v7+)
+        'use_breakeven_stop': best_params.get('use_breakeven_stop', False),
+        'breakeven_trigger_pct': best_params.get('breakeven_trigger_pct', 0.3),
+        'breakeven_offset_pct': best_params.get('breakeven_offset_pct', 0.05),
+
         # Filter parameters
         'rsi_filter': best_params.get('rsi_filter', 'none'),
         'rsi_period': best_params.get('rsi_period', 14),
@@ -114,6 +123,8 @@ def create_bundle_from_results(results_path: str, bundle_name: str = None,
         'fragility_threshold': best_params.get('fragility_threshold', 0.5),
         'use_entropy_filter': best_params.get('use_entropy_filter', False),
         'entropy_threshold': best_params.get('entropy_threshold', 0.7),
+        'use_vol_regime_filter': best_params.get('use_vol_regime_filter', False),
+        'vol_regime_percentile_threshold': best_params.get('vol_regime_percentile_threshold', 0.25),
 
         # Oscillator
         'oscillator_type': best_params.get('oscillator_type', 'composite'),
@@ -191,6 +202,33 @@ def create_bundle_from_results(results_path: str, bundle_name: str = None,
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=4)
 
+    # Save backtest_results.json from OOS test trades (if available)
+    # This allows the intraday trader to import exact trades instead of
+    # re-running a fresh backtest that produces different stats.
+    test_trades = results.get('test_trades', [])
+    if test_trades:
+        entries = []
+        exits = []
+        for t in test_trades:
+            entries.append({
+                'date': t['entry_date'],
+                'price': t['entry_price'],
+                'position': 'long'
+            })
+            exits.append({
+                'date': t['exit_date'],
+                'price': t['exit_price'],
+                'pnl': t['pnl_pct'],
+                'reason': t.get('exit_reason', 'signal'),
+                'entry_date': t['entry_date'],
+                'entry_price': t['entry_price']
+            })
+
+        backtest_results_path = os.path.join(bundle_path, 'backtest_results.json')
+        with open(backtest_results_path, 'w') as f:
+            json.dump({'entries': entries, 'exits': exits}, f, indent=4)
+        print(f"   Saved {len(exits)} OOS trades to backtest_results.json")
+
     return bundle_path, config
 
 
@@ -224,6 +262,14 @@ def print_bundle_summary(config: dict, bundle_path: str):
         print(f"    Threshold:   {config['accel_exit_threshold']:.4f}")
         print(f"    Min PnL:     {config['accel_exit_min_pnl']:.2f}%")
         print(f"    Jerk Confirm: {config['use_jerk_confirm']}")
+    print(f"  Trailing Stop: {config.get('use_trailing_stop', False)}")
+    if config.get('use_trailing_stop', False):
+        print(f"    Trail Pct:   {config['trailing_stop_pct']:.2f}%")
+        print(f"    Activation:  {config['trailing_stop_activation_pct']:.2f}%")
+    print(f"  Break-Even:    {config.get('use_breakeven_stop', False)}")
+    if config.get('use_breakeven_stop', False):
+        print(f"    Trigger:     {config['breakeven_trigger_pct']:.2f}%")
+        print(f"    Offset:      {config['breakeven_offset_pct']:.2f}%")
 
     print(f"\n{'─' * 70}")
     print("VALIDATION RESULTS")

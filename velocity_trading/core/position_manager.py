@@ -2392,6 +2392,25 @@ class PositionManager:
         interval = config.get('interval', '15m')
         trade_log = self.get_trade_log_csv(limit=10, local_tz=local_tz, interval=interval)
 
+        # Use WF-validated OOS stats if available in config (ground truth from optimization)
+        # Otherwise fall back to database-computed stats (from rebuild_from_backtest)
+        if config.get('wf_test_trades') and config.get('wf_test_return') is not None:
+            all_time_stats = {
+                'num_trades': config['wf_test_trades'],
+                'win_rate': config.get('wf_test_win_rate', 0),
+                'total_return': config.get('wf_test_return', 0),
+                'profit_factor': config.get('wf_test_profit_factor', 0),
+                'max_drawdown': config.get('wf_test_max_dd', 0)
+            }
+        else:
+            all_time_stats = {
+                'num_trades': all_stats.get('num_trades', 0),
+                'win_rate': all_stats.get('win_rate', 0),
+                'total_return': all_stats.get('total_return', 0),
+                'profit_factor': all_stats.get('profit_factor', 0),
+                'max_drawdown': all_time_dd
+            }
+
         return {
             'strategy_name': self.strategy_name,
             'ticker': ticker,
@@ -2401,13 +2420,7 @@ class PositionManager:
             'tp_pct': tp_pct,
             'sl_price': sl_price,
             'tp_price': tp_price,
-            'all_time': {
-                'num_trades': all_stats.get('num_trades', 0),
-                'win_rate': all_stats.get('win_rate', 0),
-                'total_return': all_stats.get('total_return', 0),
-                'profit_factor': all_stats.get('profit_factor', 0),
-                'max_drawdown': all_time_dd
-            },
+            'all_time': all_time_stats,
             'recent_2day': {
                 'num_trades': recent_stats.get('num_trades', 0),
                 'win_rate': recent_stats.get('win_rate', 0),

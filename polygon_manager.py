@@ -1008,3 +1008,74 @@ class PolygonManager:
         except Exception as e:
             print(f"❌ Full Options Analysis Error: {e}")
             return {'available': False, 'error': str(e)}
+
+    def compute_influence_zones(self, ticker: str = 'SPY') -> dict:
+        """
+        Compute options influence zones for use as trading filters.
+
+        Calls get_full_options_analysis() and normalizes key metrics
+        into three zone values, each in [-1, +1].
+
+        Returns:
+            Dict with:
+                available: bool
+                max_pain_zone: float [-1, +1] — price vs max pain
+                gamma_zone: float [-1, +1] — dealer gamma positioning
+                wall_zone: float [-1, +1] — proximity to call/put walls
+                combined_zone: float [-1, +1] — weighted average
+                raw: dict — full analysis for storage
+        """
+        analysis = self.get_full_options_analysis(ticker)
+        if not analysis.get('available'):
+            return {'available': False}
+
+        spy_price = analysis.get('current_price', 0)
+        max_pain = analysis.get('max_pain')
+        net_gamma = analysis.get('net_gamma', 0)
+        call_wall = analysis.get('highest_call_oi_strike')
+        put_wall = analysis.get('highest_put_oi_strike')
+
+        zones = {}
+
+        # Zone 1: Max Pain Proximity [-1, +1]
+        # Positive = price above max pain (bearish gravity)
+        # Negative = price below max pain (bullish gravity)
+        if max_pain and spy_price:
+            mp_dist_pct = (spy_price - max_pain) / spy_price * 100
+            zones['max_pain_zone'] = float(np.clip(mp_dist_pct / 2.0, -1, 1))
+        else:
+            zones['max_pain_zone'] = 0.0
+
+        # Zone 2: Gamma Zone [-1, +1]
+        # Positive = long gamma (dealers stabilize, mean reversion favored)
+        # Negative = short gamma (dealers amplify, trend continuation)
+        if net_gamma != 0:
+            zones['gamma_zone'] = float(np.clip(net_gamma / 5e9, -1, 1))
+        else:
+            zones['gamma_zone'] = 0.0
+
+        # Zone 3: Wall Proximity [-1, +1]
+        # Positive = near call wall (resistance overhead)
+        # Negative = near put wall (support below)
+        if call_wall and put_wall and spy_price:
+            call_dist = (call_wall - spy_price) / spy_price * 100
+            put_dist = (spy_price - put_wall) / spy_price * 100
+            if call_dist < put_dist:
+                zones['wall_zone'] = float(np.clip(1.0 - call_dist / 3.0, -1, 1))
+            else:
+                zones['wall_zone'] = float(np.clip(-(1.0 - put_dist / 3.0), -1, 1))
+        else:
+            zones['wall_zone'] = 0.0
+
+        # Combined zone: weighted average
+        zones['combined_zone'] = float(np.clip(
+            (zones['max_pain_zone'] + zones['gamma_zone'] + zones['wall_zone']) / 3.0,
+            -1, 1
+        ))
+
+        return {
+            'available': True,
+            'zones': zones,
+            **zones,
+            **analysis,
+        }

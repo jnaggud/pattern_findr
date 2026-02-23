@@ -348,10 +348,12 @@ def generate_chart(
         _format_xaxis_dates(ax3, df_plot, datetime_col, is_intraday)
 
         # === Panel 4: Equity Curve (aligned with price chart x-axis) ===
-        # CRITICAL: Uses bar numbers to align with entry/exit markers on price chart
+        # CRITICAL: Pass ALL exits so equity is a running total from trade #1.
+        # The function computes full cumulative equity but only plots the visible portion.
         ax4 = axes[3]
-        _draw_equity_curve(ax4, exits_for_equity, entries_for_equity, date_to_barnum,
-                          df_plot, is_intraday=is_intraday, interval=interval)
+        _draw_equity_curve(ax4, exits, entries, date_to_barnum,
+                          df_plot, is_intraday=is_intraday, interval=interval,
+                          chart_start=chart_start, chart_end=chart_end)
         _format_xaxis_dates(ax4, df_plot, datetime_col, is_intraday)
 
         ax4.set_ylabel("Equity ($)", color='white', fontsize=9)
@@ -1019,8 +1021,13 @@ def _find_bar_num(date_str, date_to_barnum: Dict, is_intraday: bool = True, inte
 
 
 def _draw_equity_curve(ax, exits: List[Dict], entries: List[Dict], date_to_barnum: Dict,
-                       df_plot: pd.DataFrame, is_intraday: bool = True, interval: str = '15m'):
-    """Draw equity curve aligned with price chart x-axis (bar numbers).
+                       df_plot: pd.DataFrame, is_intraday: bool = True, interval: str = '15m',
+                       chart_start=None, chart_end=None):
+    """Draw equity curve as a RUNNING TOTAL from the strategy's first trade.
+
+    Computes cumulative equity from ALL exits (trade #1 onward), then only
+    plots the portion within the chart's visible bar range. The baseline
+    reflects equity accumulated before the visible window, not $100k.
 
     CRITICAL: Uses the same bar number mapping as entry/exit markers so the
     equity curve visually aligns with trade triangles on the price chart.
@@ -1030,34 +1037,44 @@ def _draw_equity_curve(ax, exits: List[Dict], entries: List[Dict], date_to_barnu
                ha='center', va='center', color='white', fontsize=10)
         return
 
-    # Sort exits by date chronologically
+    # Sort ALL exits chronologically
     sorted_exits = sorted(exits, key=lambda x: _normalize_to_utc_naive(pd.to_datetime(x.get('date', '1970-01-01'))))
-    sorted_entries = sorted(entries, key=lambda x: _normalize_to_utc_naive(pd.to_datetime(x.get('date', '1970-01-01')))) if entries else []
 
-    # Build equity curve with bar numbers for x-axis (aligned with price chart)
-    equity_points = []  # List of (bar_num, equity_value) tuples
+    # Build full equity curve from ALL trades, tracking which ones are visible
     current_equity = STARTING_CAPITAL
+    pre_chart_equity = STARTING_CAPITAL  # equity entering the visible window
+    equity_points = []  # (bar_num, equity_value) for visible trades only
+    found_first_visible = False
 
-    # Start with first entry if available
-    if sorted_entries:
-        bar_num = _find_bar_num(sorted_entries[0].get('date'), date_to_barnum,
-                                is_intraday=is_intraday, interval=interval)
-        if bar_num is not None:
-            equity_points.append((bar_num, current_equity))
-
-    # Add each exit with its bar number
     for exit_trade in sorted_exits:
         pnl = exit_trade.get('pnl', 0)
+        equity_before = current_equity
         current_equity = current_equity * (1 + pnl / 100)
 
         bar_num = _find_bar_num(exit_trade.get('date'), date_to_barnum,
                                 is_intraday=is_intraday, interval=interval)
         if bar_num is not None:
+            # This exit is within the visible chart range
+            if not found_first_visible:
+                pre_chart_equity = equity_before  # equity before first visible trade
+                found_first_visible = True
             equity_points.append((bar_num, current_equity))
+        elif not found_first_visible:
+            # Still accumulating pre-chart equity
+            pre_chart_equity = current_equity
+
+    # Chart bar range
+    min_bar = df_plot['bar_num'].min() if 'bar_num' in df_plot.columns else 0
+    max_bar = df_plot['bar_num'].max() if 'bar_num' in df_plot.columns else 0
 
     if not equity_points:
-        ax.text(0.5, 0.5, 'No trades map to visible bars', transform=ax.transAxes,
-               ha='center', va='center', color='white', fontsize=10)
+        # No visible trades — show flat line at accumulated equity
+        ax.step([min_bar, max_bar], [pre_chart_equity, pre_chart_equity],
+                where='post', color='#00ff88', linewidth=2)
+        ax.axhline(pre_chart_equity, color='gray', linestyle='--', alpha=0.5)
+        ax.text(0.5, 0.5, f'No trades in window (equity: ${pre_chart_equity:,.0f})',
+                transform=ax.transAxes, ha='center', va='center', color='white', fontsize=10)
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x/1000:.0f}k'))
         return
 
     # Sort by bar number and extract x/y arrays
@@ -1065,26 +1082,25 @@ def _draw_equity_curve(ax, exits: List[Dict], entries: List[Dict], date_to_barnu
     bar_nums = [p[0] for p in equity_points]
     equity_vals = [p[1] for p in equity_points]
 
-    # Extend to chart edges for complete fill
-    min_bar = df_plot['bar_num'].min() if 'bar_num' in df_plot.columns else 0
-    max_bar = df_plot['bar_num'].max() if 'bar_num' in df_plot.columns else bar_nums[-1]
-
-    # Prepend start of chart at starting capital
+    # Prepend start of chart at pre-chart equity (running total up to this point)
     if bar_nums[0] > min_bar:
         bar_nums.insert(0, min_bar)
-        equity_vals.insert(0, STARTING_CAPITAL)
+        equity_vals.insert(0, pre_chart_equity)
 
     # Extend to end of chart at final equity (flat line for no-trade periods)
     if bar_nums[-1] < max_bar:
         bar_nums.append(max_bar)
         equity_vals.append(equity_vals[-1])
 
+    # Baseline = equity entering the visible window
+    baseline = pre_chart_equity
+
     # Plot with step interpolation to show discrete equity changes
     ax.step(bar_nums, equity_vals, where='post', color='#00ff88', linewidth=2)
-    ax.fill_between(bar_nums, STARTING_CAPITAL, equity_vals, step='post', alpha=0.3,
-                   color='green' if equity_vals[-1] > STARTING_CAPITAL else 'red')
+    ax.fill_between(bar_nums, baseline, equity_vals, step='post', alpha=0.3,
+                   color='green' if equity_vals[-1] > baseline else 'red')
 
-    ax.axhline(STARTING_CAPITAL, color='gray', linestyle='--', alpha=0.5)
+    ax.axhline(baseline, color='gray', linestyle='--', alpha=0.5)
 
     # Note: x-axis limits are handled by sharex=True with other panels
     # Format y-axis as currency

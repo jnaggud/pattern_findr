@@ -262,6 +262,13 @@ class BaseTrader(ABC):
         self.use_mfv_filter = self.config.get('use_mfv_filter', False)
         self.mfv_mode = self.config.get('mfv_mode', 'velocity')
         self.mfv_threshold = self.config.get('mfv_threshold', 0.0)
+        self.use_options_zone_filter = self.config.get('use_options_zone_filter', False)
+        self.options_zone_mode = self.config.get('options_zone_mode', 'gamma')
+        self.options_zone_threshold = self.config.get('options_zone_threshold', 0.0)
+        self.use_knn_filter = self.config.get('use_knn_filter', False)
+        self.knn_horizon = self.config.get('knn_horizon', 8)
+        self.knn_prob_threshold = self.config.get('knn_prob_threshold', 0.55)
+        self.knn_confidence_threshold = self.config.get('knn_confidence_threshold', 0.1)
         self.rsi_filter = self.config.get('rsi_filter', 'none')
         self.rsi_period = self.config.get('rsi_period', 14)
         self.rsi_oversold = self.config.get('rsi_oversold', 30)
@@ -880,6 +887,13 @@ class BaseTrader(ABC):
                 use_mfv_filter=self.use_mfv_filter,
                 mfv_mode=self.mfv_mode,
                 mfv_threshold=self.mfv_threshold,
+                use_options_zone_filter=self.use_options_zone_filter,
+                options_zone_mode=self.options_zone_mode,
+                options_zone_threshold=self.options_zone_threshold,
+                use_knn_filter=self.use_knn_filter,
+                knn_horizon=self.knn_horizon,
+                knn_prob_threshold=self.knn_prob_threshold,
+                knn_confidence_threshold=self.knn_confidence_threshold,
             )
 
             # Train ML entry + exit models (v7+) — needs signals computed first

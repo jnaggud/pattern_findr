@@ -74,6 +74,13 @@ def calculate_velocity_signals(
     use_mfv_filter: bool = False,
     mfv_mode: str = 'velocity',
     mfv_threshold: float = 0.0,
+    use_options_zone_filter: bool = False,
+    options_zone_mode: str = 'gamma',
+    options_zone_threshold: float = 0.0,
+    use_knn_filter: bool = False,
+    knn_horizon: int = 8,
+    knn_prob_threshold: float = 0.55,
+    knn_confidence_threshold: float = 0.1,
 ) -> pd.DataFrame:
     """
     Generate buy/sell signals based on velocity strategy.
@@ -287,6 +294,39 @@ def calculate_velocity_signals(
             mfv_v = result['MFV_VEL']
             result['buy_signal'] = result['buy_signal'] & (mfv_f > mfv_threshold) & (mfv_v > mfv_threshold)
             result['sell_signal'] = result['sell_signal'] & (mfv_f < -mfv_threshold) & (mfv_v < -mfv_threshold)
+
+    # Options Influence Zone filter: use SPY options zones as signal filter
+    if use_options_zone_filter:
+        zone_col_map = {
+            'gamma': 'OPTIONS_GAMMA_ZONE',
+            'max_pain': 'OPTIONS_MP_ZONE',
+            'wall': 'OPTIONS_WALL_ZONE',
+            'combined': 'OPTIONS_COMBINED_ZONE',
+        }
+        zone_col = zone_col_map.get(options_zone_mode, 'OPTIONS_GAMMA_ZONE')
+        if zone_col in result.columns:
+            zone = result[zone_col]
+            if options_zone_mode == 'gamma':
+                # Long gamma (+) = mean reversion favored = good for reversal signals
+                result['buy_signal'] = result['buy_signal'] & (zone > options_zone_threshold)
+                result['sell_signal'] = result['sell_signal'] & (zone > options_zone_threshold)
+            elif options_zone_mode in ('max_pain', 'wall'):
+                # Price below max pain (-) = bullish gravity → favor buys
+                result['buy_signal'] = result['buy_signal'] & (zone < -options_zone_threshold)
+                result['sell_signal'] = result['sell_signal'] & (zone > options_zone_threshold)
+            elif options_zone_mode == 'combined':
+                result['buy_signal'] = result['buy_signal'] & (zone > options_zone_threshold)
+                result['sell_signal'] = result['sell_signal'] & (zone < -options_zone_threshold)
+
+    # KNN Pattern Matcher filter: require KNN probability aligned with signal direction
+    if use_knn_filter:
+        prob_col = f'knn_prob_up_{knn_horizon}'
+        conf_col = f'knn_confidence_{knn_horizon}'
+        if prob_col in result.columns and conf_col in result.columns:
+            knn_prob = result[prob_col]
+            knn_conf = result[conf_col]
+            result['buy_signal'] = result['buy_signal'] & (knn_prob > knn_prob_threshold) & (knn_conf > knn_confidence_threshold)
+            result['sell_signal'] = result['sell_signal'] & (knn_prob < (1 - knn_prob_threshold)) & (knn_conf > knn_confidence_threshold)
 
     # Calculate signal strength based on zone depth
     result['signal_strength'] = 0.5  # Default
@@ -572,7 +612,8 @@ def check_exit_conditions(
         hwm_pnl = ((high_watermark - entry_price) / entry_price) * 100
         if hwm_pnl >= breakeven_trigger_pct:
             be_price = entry_price * (1 + breakeven_offset_pct / 100)
-            if current_price <= be_price:
+            # Price must have actually reached be_price before we can exit there
+            if high_watermark >= be_price and current_price <= be_price:
                 return True, f"Break-Even Stop ({pnl_pct:.2f}%)", current_price
 
     # 5. Acceleration Reversal Exit (early warning)
