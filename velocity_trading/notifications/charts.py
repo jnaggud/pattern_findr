@@ -260,10 +260,15 @@ def generate_chart(
 
         print(f"      Chart: {len(df_plot)} bars, all-time: {all_time_stats['num_trades']} trades, visible: {visible_stats['num_trades']} trades")
 
-        # Create figure with 4 subplots - SHARE x-axis for alignment
-        fig, axes = plt.subplots(4, 1, figsize=(14, 11),
-                                 gridspec_kw={'height_ratios': [3, 1.2, 0.8, 1.2]},
-                                 sharex=True)
+        # Create figure with 4 subplots
+        # Top 3 panels share x-axis (bar numbers), equity panel has its own (dates)
+        fig = plt.figure(figsize=(14, 11))
+        gs = fig.add_gridspec(4, 1, height_ratios=[3, 1.2, 0.8, 1.2], hspace=0.35)
+        ax0 = fig.add_subplot(gs[0])
+        ax1 = fig.add_subplot(gs[1], sharex=ax0)
+        ax2 = fig.add_subplot(gs[2], sharex=ax0)
+        ax3 = fig.add_subplot(gs[3])  # Equity: independent x-axis
+        axes = [ax0, ax1, ax2, ax3]
 
         # Dark theme (TradingView style)
         fig.patch.set_facecolor('#1a1a2e')
@@ -347,15 +352,10 @@ def generate_chart(
         ax3.set_ylabel("JD_Signal", color='white', fontsize=9)
         _format_xaxis_dates(ax3, df_plot, datetime_col, is_intraday)
 
-        # === Panel 4: Equity Curve (aligned with price chart x-axis) ===
-        # CRITICAL: Pass ALL exits so equity is a running total from trade #1.
-        # The function computes full cumulative equity but only plots the visible portion.
+        # === Panel 4: Equity Curve (ALL-TIME, independent x-axis) ===
+        # Shows cumulative equity from trade #1 to present — never resets.
         ax4 = axes[3]
-        _draw_equity_curve(ax4, exits, entries, date_to_barnum,
-                          df_plot, is_intraday=is_intraday, interval=interval,
-                          chart_start=chart_start, chart_end=chart_end)
-        _format_xaxis_dates(ax4, df_plot, datetime_col, is_intraday)
-
+        _draw_equity_curve_alltime(ax4, exits, is_intraday=is_intraday)
         ax4.set_ylabel("Equity ($)", color='white', fontsize=9)
 
         # Stats annotation at bottom: ALL-TIME stats + CHART PERIOD stats (including drawdown)
@@ -1103,6 +1103,87 @@ def _draw_equity_curve(ax, exits: List[Dict], entries: List[Dict], date_to_barnu
     ax.axhline(baseline, color='gray', linestyle='--', alpha=0.5)
 
     # Note: x-axis limits are handled by sharex=True with other panels
+    # Format y-axis as currency
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x/1000:.0f}k'))
+
+
+def _draw_equity_curve_alltime(ax, exits: List[Dict], is_intraday: bool = True):
+    """Draw ALL-TIME equity curve from the strategy's very first trade.
+
+    Unlike _draw_equity_curve which only plots the visible chart window,
+    this shows the complete equity history with its own date-based x-axis.
+    The curve is additive (compounded) from trade #1 and never resets.
+    """
+    if not exits:
+        ax.text(0.5, 0.5, 'No trades yet', transform=ax.transAxes,
+               ha='center', va='center', color='white', fontsize=10)
+        return
+
+    # Sort ALL exits chronologically
+    sorted_exits = sorted(exits, key=lambda x: _normalize_to_utc_naive(pd.to_datetime(x.get('date', '1970-01-01'))))
+
+    # Build full equity curve from trade #1
+    dates = []
+    equity_vals = []
+    current_equity = STARTING_CAPITAL
+
+    for exit_trade in sorted_exits:
+        pnl = exit_trade.get('pnl', 0)
+        current_equity = current_equity * (1 + pnl / 100)
+        try:
+            dt = pd.to_datetime(exit_trade.get('date'))
+            dt = _normalize_to_utc_naive(dt)
+            dates.append(dt)
+            equity_vals.append(current_equity)
+        except Exception:
+            continue
+
+    if not dates:
+        ax.text(0.5, 0.5, 'No valid trade dates', transform=ax.transAxes,
+               ha='center', va='center', color='white', fontsize=10)
+        return
+
+    # Prepend starting point (first trade date, starting capital)
+    first_entry_date = dates[0] - pd.Timedelta(hours=1)  # Slightly before first exit
+    dates.insert(0, first_entry_date)
+    equity_vals.insert(0, STARTING_CAPITAL)
+
+    # Plot step curve
+    ax.step(dates, equity_vals, where='post', color='#00ff88', linewidth=2)
+
+    # Fill green above starting capital, red below
+    ax.fill_between(dates, STARTING_CAPITAL, equity_vals, step='post', alpha=0.3,
+                   where=[e >= STARTING_CAPITAL for e in equity_vals],
+                   color='green', interpolate=True)
+    ax.fill_between(dates, STARTING_CAPITAL, equity_vals, step='post', alpha=0.3,
+                   where=[e < STARTING_CAPITAL for e in equity_vals],
+                   color='red', interpolate=True)
+
+    # Baseline at starting capital
+    ax.axhline(STARTING_CAPITAL, color='gray', linestyle='--', alpha=0.5)
+
+    # Current PnL annotation
+    final_equity = equity_vals[-1]
+    pnl_pct = (final_equity / STARTING_CAPITAL - 1) * 100
+    pnl_color = '#00ff88' if pnl_pct >= 0 else '#ff5252'
+    ax.text(0.98, 0.92, f'{pnl_pct:+.2f}%  (${final_equity:,.0f})',
+            transform=ax.transAxes, ha='right', va='top',
+            color=pnl_color, fontsize=9, fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='#0f3460', alpha=0.9, edgecolor=pnl_color))
+
+    # Format x-axis with dates
+    ax.tick_params(axis='x', labelsize=7, colors='white')
+    if is_intraday:
+        # For intraday: show MM/DD
+        ax.xaxis.set_major_formatter(FuncFormatter(
+            lambda x, pos: mdates.num2date(x).strftime('%m/%d') if x else ''))
+    else:
+        # For daily: show Mon YY
+        ax.xaxis.set_major_formatter(FuncFormatter(
+            lambda x, pos: mdates.num2date(x).strftime('%b %y') if x else ''))
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=8, integer=False))
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=0, ha='center')
+
     # Format y-axis as currency
     ax.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x/1000:.0f}k'))
 

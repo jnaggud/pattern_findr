@@ -657,7 +657,7 @@ def load_bundle_config(strategy_name: str) -> Optional[Dict]:
         'webhook': config.get('discord_webhook'),
         # Novel strategy filters (v7+) — only present if bundle uses novel strategies
         'novel_strategies': config.get('novel_strategies'),
-        # v10/v11 daily retrainer params
+        # v10/v11/v12b daily retrainer params
         'daily_retrain': config.get('daily_retrain', False),
         'retrain_trials': config.get('retrain_trials', 5000),
         'retrain_train_days': config.get('retrain_train_days', 30),
@@ -665,6 +665,9 @@ def load_bundle_config(strategy_name: str) -> Optional[Dict]:
         'retrain_pinned_params': config.get('retrain_pinned_params', {}),
         'retrain_optimize_exits': config.get('retrain_optimize_exits', False),
         'retrain_scoring': config.get('retrain_scoring', 'original'),
+        'retrain_pinned_toggles': config.get('retrain_pinned_toggles', {}),
+        'retrain_param_ranges': config.get('retrain_param_ranges', {}),
+        'retrain_dynamic_window': config.get('retrain_dynamic_window', False),
     }
 
     # v9 regime-aware passthrough

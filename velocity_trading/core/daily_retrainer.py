@@ -57,9 +57,16 @@ EXIT_TOGGLE_PARAMS = {
 }
 ACCEL_EXIT_PARAMS = {
     'accel_exit_type':      {'type': 'categorical', 'choices': ['sign_reversal', 'magnitude', 'both']},
-    'accel_exit_threshold': {'type': 'float', 'low': 0.0, 'high': 0.1},
-    'accel_exit_min_pnl':   {'type': 'float', 'low': 0.1, 'high': 2.0},
-    'accel_exit_lookback':  {'type': 'int',   'low': 1, 'high': 4},
+    'accel_exit_threshold': {'type': 'float', 'low': 0.0, 'high': 0.15},
+    'accel_exit_min_pnl':   {'type': 'float', 'low': 0.1, 'high': 3.0},
+    'accel_exit_lookback':  {'type': 'int',   'low': 1, 'high': 5},
+}
+# Trailing stop + breakeven numerical params — optimized when optimize_exits=True
+TRAILING_BREAKEVEN_PARAMS = {
+    'trailing_stop_pct':            {'type': 'float', 'low': 0.3, 'high': 3.0},
+    'trailing_stop_activation_pct': {'type': 'float', 'low': 0.1, 'high': 2.0},
+    'breakeven_trigger_pct':        {'type': 'float', 'low': 0.01, 'high': 1.0},
+    'breakeven_offset_pct':         {'type': 'float', 'low': 0.01, 'high': 0.5},
 }
 
 # Structural params that never change during retraining
@@ -103,6 +110,14 @@ def _worker(data_path, worker_id, trials_per_worker, fixed_config, seed_base,
     from velocity_trading.core.backtest_engine import prepare_backtest_arrays, run_backtest
 
     train_df = joblib.load(data_path)
+    param_ranges = fixed_config.get('_param_ranges', {})
+
+    def _get_range(param_name, default_spec):
+        """Get range from config overrides or default spec."""
+        if param_name in param_ranges:
+            r = param_ranges[param_name]
+            return {**default_spec, 'low': r[0], 'high': r[1]}
+        return default_spec
 
     def objective(trial):
         config = dict(fixed_config)
@@ -110,6 +125,7 @@ def _worker(data_path, worker_id, trials_per_worker, fixed_config, seed_base,
             if param_name in config.get('_pinned', {}):
                 config[param_name] = config['_pinned'][param_name]
                 continue
+            spec = _get_range(param_name, spec)
             if spec['type'] == 'float':
                 config[param_name] = trial.suggest_float(param_name, spec['low'], spec['high'])
             else:
@@ -117,17 +133,44 @@ def _worker(data_path, worker_id, trials_per_worker, fixed_config, seed_base,
 
         # Optimize exit toggles if enabled
         if optimize_exits:
+            # Only optimize toggles that aren't pinned as structural
             for toggle_name, choices in EXIT_TOGGLE_PARAMS.items():
-                config[toggle_name] = trial.suggest_categorical(toggle_name, choices)
+                if toggle_name in config.get('_pinned_toggles', {}):
+                    config[toggle_name] = config['_pinned_toggles'][toggle_name]
+                else:
+                    config[toggle_name] = trial.suggest_categorical(toggle_name, choices)
             # If accel exit chosen, also optimize its sub-params
             if config.get('use_accel_exit', False):
                 for p_name, p_spec in ACCEL_EXIT_PARAMS.items():
+                    if p_name in config.get('_pinned', {}):
+                        config[p_name] = config['_pinned'][p_name]
+                        continue
+                    p_spec = _get_range(p_name, p_spec)
                     if p_spec['type'] == 'categorical':
                         config[p_name] = trial.suggest_categorical(p_name, p_spec['choices'])
                     elif p_spec['type'] == 'float':
                         config[p_name] = trial.suggest_float(p_name, p_spec['low'], p_spec['high'])
                     else:
                         config[p_name] = trial.suggest_int(p_name, p_spec['low'], p_spec['high'])
+            # Optimize trailing/breakeven numerical params
+            if config.get('use_trailing_stop', False):
+                for p_name, p_spec in TRAILING_BREAKEVEN_PARAMS.items():
+                    if 'trailing' not in p_name:
+                        continue
+                    if p_name in config.get('_pinned', {}):
+                        config[p_name] = config['_pinned'][p_name]
+                        continue
+                    p_spec = _get_range(p_name, p_spec)
+                    config[p_name] = trial.suggest_float(p_name, p_spec['low'], p_spec['high'])
+            if config.get('use_breakeven_stop', False):
+                for p_name, p_spec in TRAILING_BREAKEVEN_PARAMS.items():
+                    if 'breakeven' not in p_name:
+                        continue
+                    if p_name in config.get('_pinned', {}):
+                        config[p_name] = config['_pinned'][p_name]
+                        continue
+                    p_spec = _get_range(p_name, p_spec)
+                    config[p_name] = trial.suggest_float(p_name, p_spec['low'], p_spec['high'])
 
         try:
             arrays = prepare_backtest_arrays(train_df, config)
@@ -137,13 +180,19 @@ def _worker(data_path, worker_id, trials_per_worker, fixed_config, seed_base,
                 take_profit_pct=config.get('take_profit_pct', 10.0),
                 min_hold_bars=config.get('min_hold_bars', 1),
                 min_bars_between=config.get('min_bars_between', 1),
-                exit_on_opposite=config.get('exit_on_opposite_signal', True),
+                exit_on_opposite=config.get('exit_on_opposite_signal', False),
                 exit_on_midline=config.get('exit_on_midline_cross', False),
                 use_accel_exit=config.get('use_accel_exit', False),
                 accel_exit_type=config.get('accel_exit_type', 'sign_reversal'),
                 accel_exit_threshold=config.get('accel_exit_threshold', 0.0),
                 accel_exit_min_pnl=config.get('accel_exit_min_pnl', 0.5),
                 accel_exit_lookback=config.get('accel_exit_lookback', 1),
+                use_trailing_stop=config.get('use_trailing_stop', False),
+                trailing_stop_pct=config.get('trailing_stop_pct', 1.0),
+                trailing_stop_activation_pct=config.get('trailing_stop_activation_pct', 0.3),
+                use_breakeven_stop=config.get('use_breakeven_stop', False),
+                breakeven_trigger_pct=config.get('breakeven_trigger_pct', 0.3),
+                breakeven_offset_pct=config.get('breakeven_offset_pct', 0.05),
                 use_jerk_confirm=config.get('use_jerk_confirm', False),
                 jerk_confirm_threshold=config.get('jerk_confirm_threshold', 0.0),
             )
@@ -205,6 +254,7 @@ class DailyRetrainer:
         self.pinned_params = pinned_params or {}
         self.optimize_exits = config.get('retrain_optimize_exits', False)
         self.scoring = config.get('retrain_scoring', 'original')
+        self.dynamic_window = config.get('retrain_dynamic_window', False)
 
         # Extract structural config (never changes)
         self.fixed_config = {}
@@ -223,6 +273,21 @@ class DailyRetrainer:
                             'accel_exit_min_pnl', 'accel_exit_lookback']:
                     if key in config:
                         self.fixed_config[key] = config[key]
+            # Carry over trailing/breakeven params if not being optimized
+            for key in ['use_trailing_stop', 'trailing_stop_pct',
+                        'trailing_stop_activation_pct', 'use_breakeven_stop',
+                        'breakeven_trigger_pct', 'breakeven_offset_pct']:
+                if key in config:
+                    self.fixed_config[key] = config[key]
+        else:
+            # When optimizing exits, carry trailing/breakeven toggles as structural
+            # (numerical params get optimized, but on/off stays fixed)
+            for key in ['use_trailing_stop', 'use_breakeven_stop']:
+                if key in config:
+                    self.fixed_config[key] = config[key]
+            # Pin exit toggles the user wants fixed (via retrain_pinned_toggles)
+            pinned_toggles = config.get('retrain_pinned_toggles', {})
+            self.fixed_config['_pinned_toggles'] = pinned_toggles
 
         if config.get('use_jerk_confirm', False):
             if 'jerk_confirm_threshold' in config:
@@ -231,8 +296,85 @@ class DailyRetrainer:
         # Store pinned params
         self.fixed_config['_pinned'] = self.pinned_params
 
+        # Store param range overrides from config
+        self.fixed_config['_param_ranges'] = config.get('retrain_param_ranges', {})
+
         self._last_retrain_date = None
         self._last_best_params = None
+
+    def _compute_dynamic_window(self, df, bars_per_day) -> int:
+        """Compute training window size based on ADX stability.
+
+        Low ADX variance (stable regime) -> longer window (up to 90d).
+        High ADX variance (shifting regime) -> shorter window (down to 15d).
+        """
+        try:
+            h = df['high'].values if 'high' in df.columns else df['High'].values
+            l = df['low'].values if 'low' in df.columns else df['Low'].values
+            c = df['close'].values if 'close' in df.columns else df['Close'].values
+
+            # Simple ADX(14) computation
+            n = len(h)
+            period = 14
+            if n < period * 3:
+                return self.train_days
+
+            plus_dm = np.zeros(n)
+            minus_dm = np.zeros(n)
+            tr = np.zeros(n)
+            tr[0] = h[0] - l[0]
+            for i in range(1, n):
+                up = h[i] - h[i - 1]
+                down = l[i - 1] - l[i]
+                plus_dm[i] = up if (up > down and up > 0) else 0.0
+                minus_dm[i] = down if (down > up and down > 0) else 0.0
+                tr[i] = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
+
+            smooth_tr = np.zeros(n)
+            smooth_plus = np.zeros(n)
+            smooth_minus = np.zeros(n)
+            smooth_tr[period] = np.sum(tr[1:period + 1])
+            smooth_plus[period] = np.sum(plus_dm[1:period + 1])
+            smooth_minus[period] = np.sum(minus_dm[1:period + 1])
+            for i in range(period + 1, n):
+                smooth_tr[i] = smooth_tr[i - 1] - smooth_tr[i - 1] / period + tr[i]
+                smooth_plus[i] = smooth_plus[i - 1] - smooth_plus[i - 1] / period + plus_dm[i]
+                smooth_minus[i] = smooth_minus[i - 1] - smooth_minus[i - 1] / period + minus_dm[i]
+
+            dx = np.zeros(n)
+            for i in range(period, n):
+                if smooth_tr[i] == 0:
+                    continue
+                pdi = 100.0 * smooth_plus[i] / smooth_tr[i]
+                mdi = 100.0 * smooth_minus[i] / smooth_tr[i]
+                di_sum = pdi + mdi
+                if di_sum > 0:
+                    dx[i] = 100.0 * abs(pdi - mdi) / di_sum
+
+            adx = np.full(n, np.nan)
+            start = period * 2
+            if start < n:
+                adx[start] = np.mean(dx[period + 1:start + 1])
+                for i in range(start + 1, n):
+                    adx[i] = (adx[i - 1] * (period - 1) + dx[i]) / period
+
+            # Sample daily ADX values from the last 60 days
+            lookback = 60 * bars_per_day
+            recent_adx = adx[-lookback:]
+            daily_samples = recent_adx[::bars_per_day]
+            daily_samples = daily_samples[~np.isnan(daily_samples)]
+
+            if len(daily_samples) < 5:
+                return self.train_days
+
+            adx_std = float(np.std(daily_samples))
+            # Map: low std (stable) -> long window, high std (shifting) -> short
+            stability = np.clip(1.0 - (adx_std - 3.0) / 12.0, 0.0, 1.0)
+            window = int(15 + stability * 75)  # 15d to 90d
+            print(f"   [Retrainer] Dynamic window: ADX std={adx_std:.1f}, stability={stability:.2f}, window={window}d")
+            return window
+        except Exception:
+            return self.train_days
 
     def needs_retrain(self) -> bool:
         """Check if we should retrain (once per trading day)."""
@@ -258,7 +400,12 @@ class DailyRetrainer:
 
         # Use trailing N days as training data
         bars_per_day = 23 * (60 // int(self.interval.replace('m', '').replace('h', '')))
-        train_bars = self.train_days * bars_per_day
+
+        train_days = self.train_days
+        if self.dynamic_window:
+            train_days = self._compute_dynamic_window(df, bars_per_day)
+
+        train_bars = train_days * bars_per_day
         train_df = df.iloc[-train_bars:] if len(df) > train_bars else df
 
         if len(train_df) < 100:
@@ -318,9 +465,20 @@ class DailyRetrainer:
         updated['last_retrained'] = datetime.now().isoformat()
         return updated
 
+    # Keys injected at runtime by the trader — never belong in the bundle file
+    RUNTIME_ONLY_KEYS = {
+        'check_interval_seconds', 'bar_completion_buffer', 'position_check_interval',
+        'use_wavelet_denoise', 'wavelet_family', 'wavelet_level', 'wavelet_threshold_mode',
+    }
+
     def save_config(self, config: Dict, strategy_dir: str):
-        """Save updated config to strategy bundle directory."""
+        """Save updated config to strategy bundle directory.
+
+        Strips runtime-only keys that the trader injects at startup
+        so the bundle file stays clean.
+        """
         config_path = os.path.join(strategy_dir, 'velocity_config.json')
+        clean = {k: v for k, v in config.items() if k not in self.RUNTIME_ONLY_KEYS}
         with open(config_path, 'w') as f:
-            json.dump(config, f, indent=4)
+            json.dump(clean, f, indent=4)
         print(f"   [Retrainer] Config saved to {config_path}")
