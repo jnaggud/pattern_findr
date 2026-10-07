@@ -43,10 +43,10 @@ except ImportError as e:
     print(f"Warning: Could not import velocity charts: {e}")
 
 # Discord webhook for FREE tier delayed signals channel
-FREE_TIER_WEBHOOK = ""
+FREE_TIER_WEBHOOK = os.environ.get("DISCORD_DELAYED_WEBHOOK_URL", "")
 
 # Secondary webhook for Haus Hedge server (delayed signals)
-HAUS_HEDGE_DELAYED_WEBHOOK = ""
+HAUS_HEDGE_DELAYED_WEBHOOK = os.environ.get("DISCORD_SECONDARY_DELAYED_WEBHOOK_URL", "")
 
 # Delay in hours before posting signals to free tier
 SIGNAL_DELAY_HOURS = 24

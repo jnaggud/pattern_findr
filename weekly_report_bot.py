@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 import requests
 
 # Discord webhook for announcements channel
-ANNOUNCEMENTS_WEBHOOK = ""
+ANNOUNCEMENTS_WEBHOOK = os.environ.get("DISCORD_ANNOUNCEMENTS_WEBHOOK_URL", "")
 
 # Strategy directories
 VELOCITY_STRATEGIES_DIR = "velocity_strategies"

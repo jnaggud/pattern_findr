@@ -60,7 +60,7 @@ velocity_trading/
 ### 1. Test the Package
 
 ```bash
-cd /Users/jeffersonduggan/Documents/Pattern_FindR
+cd pattern_findr
 
 # Verify imports work
 python -c "from velocity_trading import PositionManager, DailyTrader; print('OK')"
@@ -461,7 +461,7 @@ If issues occur after switching:
 **Import Error: module not found**
 ```bash
 # Make sure you're in the right directory
-cd /Users/jeffersonduggan/Documents/Pattern_FindR
+cd pattern_findr
 python -c "from velocity_trading import PositionManager"
 ```
 

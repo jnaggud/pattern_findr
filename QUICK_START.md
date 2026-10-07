@@ -29,7 +29,7 @@ Change the tickers list:
 ### Step 2: Save Some Strategies
 ```bash
 # Open Streamlit app
-/opt/anaconda3/envs/pattern_findr/bin/streamlit run app.py --server.port=8503
+python -m streamlit run app.py --server.port=8503
 ```
 
 1. Run optimization
@@ -75,10 +75,10 @@ cat daily_signals/signals_$(date +%Y-%m-%d).csv
 crontab -e
 
 # Run at 9:00 AM ET every weekday
-0 9 * * 1-5 /Users/jeffersonduggan/Documents/Pattern_FindR/run_daily_signals.sh
+0 9 * * 1-5 /path/to/pattern_findr/run_daily_signals.sh
 
 # Run at 4:15 PM ET every weekday (market close)
-15 16 * * 1-5 /Users/jeffersonduggan/Documents/Pattern_FindR/run_daily_signals.sh
+15 16 * * 1-5 /path/to/pattern_findr/run_daily_signals.sh
 ```
 
 Save and exit. Done! ✅

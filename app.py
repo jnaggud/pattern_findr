@@ -116,7 +116,8 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-st.title("📈 Pattern_FindR - Professional Trading Strategy Discovery")
+st.title("Pattern_FindR")
+st.caption("Strategy research, optimization, and backtesting")
 
 # === NEW PAGE NAVIGATION SYSTEM ===
 page = st.selectbox(
@@ -2013,26 +2014,22 @@ if st.session_state.get('show_saved_strategies', False):
 # --- User Inputs ---
 st.sidebar.header("User Inputs")
 
-# Ticker input with quick-select options
-col1, col2, col3 = st.sidebar.columns([3, 1, 1])
+# Ticker input and quick selections fit the sidebar without wrapping symbols.
+ticker = st.sidebar.text_input("Stock Ticker", "SPY").upper()
+col1, col2 = st.sidebar.columns(2)
 with col1:
-    ticker = st.text_input("Stock Ticker", "SPY").upper()
-    # Share ticker with ML page
-    st.session_state.main_app_ticker = ticker
-with col2:
-    st.write("")
-    st.write("Stocks:")
-    if st.button("SPY", key="btn_spy"):
+    st.caption("Stocks")
+    if st.button("SPY", key="btn_spy", use_container_width=True):
         ticker = "SPY"
-    if st.button("QQQ", key="btn_qqq"):
+    if st.button("QQQ", key="btn_qqq", use_container_width=True):
         ticker = "QQQ"
-with col3:
-    st.write("")
-    st.write("Futures:")
-    if st.button("ES=F", key="btn_es", help="E-mini S&P 500"):
+with col2:
+    st.caption("Futures")
+    if st.button("ES=F", key="btn_es", help="E-mini S&P 500", use_container_width=True):
         ticker = "ES=F"
-    if st.button("GC=F", key="btn_gc", help="Gold"):
+    if st.button("GC=F", key="btn_gc", help="Gold", use_container_width=True):
         ticker = "GC=F"
+st.session_state.main_app_ticker = ticker
 
 # Show info if futures ticker selected
 if is_futures_ticker(ticker):
@@ -2154,23 +2151,14 @@ if st.sidebar.button("Find Patterns"):
 
     try:
         logging.info(f"Fetching data for {ticker} with period={period} and interval={interval}")
-        data = yf.download(ticker, period=period, interval=interval)
+        data = load_and_validate_data(ticker, period, interval)
         
-        if data.empty:
+        if data is None or data.empty:
             st.error(f"No data found for ticker {ticker}. Please check the inputs.")
             logging.warning(f"No data returned for ticker {ticker}")
         else:
             st.success(f"Successfully downloaded data for {ticker}.")
             logging.info(f"Downloaded {len(data)} rows of data.")
-
-            # Flatten the multi-level column headers from yfinance
-            if isinstance(data.columns, pd.MultiIndex):
-                data.columns = data.columns.get_level_values(-1)
-            data.columns = pd.Index([str(c).lower() for c in data.columns])
-            data = data.reset_index()
-            data.columns = pd.Index([str(c).lower() for c in data.columns])
-            logging.info("DataFrame head after reset_index and column flattening:")
-            logging.info(data.head())
 
             # --- Pattern Recognition (on a copy to prevent data corruption) ---
             try:

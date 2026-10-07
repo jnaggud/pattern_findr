@@ -87,7 +87,7 @@ except ImportError:
 # CONSTANTS
 # ============================================================================
 
-DEFAULT_DISCORD_WEBHOOK = ""
+DEFAULT_DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 LEGAL_DISCLAIMER = (
     "\n\n_Warning: This is not financial advice. Past performance does not "

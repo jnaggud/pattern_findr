@@ -705,8 +705,14 @@ class TestBackfillLogic:
         conn.close()
 
         # Force backfill should clear then refetch
-        with patch.object(pipeline, '_fetch_historical_databento', return_value=sample_bars.iloc[:10]):
-            pipeline.backfill(days=60, force=True)
+        # Choose the mocked provider explicitly, independent of local SDKs/keys.
+        with patch('velocity_trading.data.data_pipeline.HAS_DATABENTO', True), \
+             patch('velocity_trading.data.data_pipeline.DATABENTO_API_KEY', 'test-only'), \
+             patch.object(pipeline, '_fetch_historical_databento', return_value=sample_bars.iloc[:10]) as fetch, \
+             patch.object(pipeline, '_fetch_historical_yfinance', side_effect=AssertionError('Unexpected network fallback')):
+            success, _ = pipeline.backfill(days=60, force=True)
+            assert success
+            fetch.assert_called_once()
 
         conn = sqlite3.connect(pipeline.db_path)
         cursor = conn.execute("SELECT COUNT(*) FROM ohlcv")

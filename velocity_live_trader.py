@@ -196,7 +196,7 @@ def is_futures_ticker(ticker: str) -> bool:
     return ticker.endswith('=F') or ticker in FUTURES_TICKER_MAP
 
 # Default Discord webhook (same as live_trader.py)
-DEFAULT_DISCORD_WEBHOOK = ""
+DEFAULT_DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 # Legal disclaimer appended to all Discord messages
 LEGAL_DISCLAIMER = (

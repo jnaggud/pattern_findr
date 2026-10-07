@@ -33,8 +33,8 @@ MODEL_PATH = "saved_models_v2/xgboost_BTC-USD_latest.joblib" # Placeholder
 STRATEGY_CONFIG_FILE = "strategy_config.json"
 
 # Alert Config (Replace with your actual URLs/Credentials or load from env)
-DISCORD_WEBHOOK = "" 
-POLYGON_API_KEY = "" # Paste your key here
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "")
 
 def load_strategy_config():
     if os.path.exists(STRATEGY_CONFIG_FILE):

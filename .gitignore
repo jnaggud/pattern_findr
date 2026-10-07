@@ -287,5 +287,23 @@ velocity_trading/db/
 # JSON archive (migration artifacts)
 velocity_trading/json_archive/
 
-# Claude Code project context
+# Local development configuration
 .claude/
+
+# Local tooling and generated state
+venv*/
+.env.*
+!.env.example
+CLAUDE.md
+AGENTS.md
+user_settings.json
+production_env/
+strategy_states/
+trade_state.json
+velocity_trade_state*.json
+velocity_trade_history*.json
+velocity_locked_backtest*.json
+# Deliberately curated documentation images may be committed.
+!docs/assets/
+!docs/assets/*.png
+!docs/assets/*.jpg

@@ -3489,7 +3489,7 @@ def render_oscillator_predictor_page():
 
             with save_col2:
                 # Default webhook (same as live_trader.py)
-                default_webhook = ""
+                default_webhook = os.environ.get("DISCORD_WEBHOOK_URL", "")
                 discord_webhook = st.text_input("Discord Webhook URL", value=default_webhook, key="vel_discord_webhook", type="password")
 
             with save_col3:
@@ -6738,15 +6738,15 @@ def render_strategy_discovery_section(df: pd.DataFrame):
                     st.info(f"Market: **{market_status_str}**")
 
         # Initialize Polygon manager if API key available
-        # Priority: 1) Strategy config, 2) Environment variable, 3) Hardcoded default
-        polygon_api_key = ''
+        # Priority: strategy configuration, then environment variable
+        polygon_api_key = os.environ.get("POLYGON_API_KEY", "")
         if selected_strategy_option != "Use Current Session Data":
             polygon_api_key = strategy_polygon_key
         if not polygon_api_key:
             polygon_api_key = os.environ.get('POLYGON_API_KEY', '')
         if not polygon_api_key:
-            # Default key from user's strategies
-            polygon_api_key = ''
+            # Optional environment configuration
+            polygon_api_key = os.environ.get("POLYGON_API_KEY", "")
 
         # Reuse PolygonManager instance across Streamlit reruns (preserves in-memory cache)
         polygon = None

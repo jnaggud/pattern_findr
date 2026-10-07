@@ -1,268 +1,110 @@
-# 📈 Pattern_FindR - Professional Trading Strategy Discovery
+# Pattern_FindR
 
-**Pattern_FindR** is an advanced algorithmic trading strategy discovery platform that combines deep learning pattern recognition, hyperparameter optimization, and comprehensive backtesting to identify profitable trading strategies automatically.
+**An interactive research workbench for systematic trading strategies.**
 
-## 🚀 Features
+Pattern_FindR brings market-data preparation, technical indicators, machine-learning experiments, parameter search, and backtesting into a Python application. Its Streamlit interface makes it possible to explore a strategy, inspect individual trades, and compare results with a buy-and-hold baseline.
 
-### 🤖 **AI-Powered Pattern Recognition**
-- **CNN Deep Learning Models** - Automatically detect chart patterns (head & shoulders, triangles, flags, etc.)
-- **Real-time Pattern Detection** - Generate buy/sell signals from live price data
-- **Synthetic Training Data** - Generate unlimited training examples for robust model training
+The repository also includes a modular signal-monitoring system with SQLite state storage, market-session handling, and optional Discord notifications.
 
-### 📊 **Advanced Strategy Optimization**
-- **Optuna Hyperparameter Optimization** - Find optimal strategy parameters automatically
-- **Multi-Core Parallelization** - Utilize all CPU cores for faster optimization
-- **50+ Technical Indicators** - RSI, MACD, Bollinger Bands, Stochastic, and more
-- **Intelligent Thresholds** - Dynamic buy/sell thresholds for each indicator
+![Pattern_FindR dashboard with SPY candlesticks and detected chart patterns](docs/assets/dashboard-safari.png)
 
-### 💰 **Professional Backtesting**
-- **Configurable Starting Capital** - Test strategies with any capital amount ($1K - $10M)
-- **Detailed Trade Analytics** - Position sizes, P&L, win rates, drawdowns
-- **Portfolio Evolution Charts** - Visualize performance over time
-- **Benchmark Comparisons** - Compare against buy-and-hold baseline
+*The research dashboard running in Safari with one year of SPY daily data. Pattern markers illustrate the analysis interface; they are not a performance claim.*
 
-### 💾 **Strategy Management**
-- **Persistent Storage** - Save top-performing strategies for future reference
-- **Advanced Filtering** - Search, sort, and filter saved strategies
-- **Performance Metrics** - Track returns, win rates, profit factors, and more
-- **Strategy Comparison** - Compare multiple strategies side-by-side
+## What it demonstrates
 
-## 🛠️ Installation
+- **Data engineering:** historical OHLCV ingestion, local caching, data validation, and incremental storage.
+- **Quantitative research:** indicator combinations, composite oscillators, Optuna parameter search, and walk-forward evaluation scripts.
+- **Machine learning:** scikit-learn and XGBoost experiments, plus a TensorFlow workflow for chart-pattern classification.
+- **Interactive analysis:** Plotly price charts, trade logs, equity curves, and configurable backtests in Streamlit.
+- **Application engineering:** modular position management, SQLite transactions, retry handling, and automated tests.
 
-### Prerequisites
-- **Python 3.10.13** (via conda/anaconda)
-- **Anaconda or Miniconda** (required for Apple Silicon Macs)
-- **4GB+ RAM** (8GB+ recommended for large optimizations)
-- **Multi-core CPU** (for parallel optimization)
-- **macOS 12.0+** (for Apple Silicon with tensorflow-metal support)
+## Architecture
 
-### 1. Clone the Repository
+```mermaid
+flowchart LR
+    A[Market data] --> B[Validation and caching]
+    B --> C[Indicators and models]
+    C --> D[Optimization and backtesting]
+    D --> E[Streamlit analysis]
+    D --> F[Saved strategy configuration]
+    F --> G[Signal monitoring]
+    G --> H[SQLite state and optional alerts]
+```
+
+| Area | Main entry points |
+| --- | --- |
+| Research dashboard | `app.py`, `oscillator_predictor_page.py` |
+| Indicators and optimization | `indicators.py`, `novel_indicators.py`, `optimization.py`, `optuna_worker.py` |
+| Backtesting and validation | `backtester.py`, `velocity_walkforward_validation.py` |
+| Signal monitoring | [`velocity_trading/`](velocity_trading/README.md) |
+| Automated checks | [`tests/`](tests) |
+
+## Quick start
+
+Use **Python 3.10**. The setup is intended for a local research environment; Apple Silicon macOS is the primary development platform.
+
 ```bash
 git clone https://github.com/jnaggud/pattern_findr.git
 cd pattern_findr
-```
-
-### 2. Create Conda Environment (Recommended for Apple Silicon Macs)
-```bash
-# Create conda environment with Python 3.10.13
-conda create -n pattern_findr python=3.10.13 -y
-
-# The environment will be created at:
-# /opt/anaconda3/envs/pattern_findr (or ~/miniconda3/envs/pattern_findr)
-```
-
-### 3. Install Dependencies
-```bash
-# Install TensorFlow for Apple Silicon
-/opt/anaconda3/envs/pattern_findr/bin/pip install tensorflow-macos==2.15.0 tensorflow-metal==1.2.0
-
-# Install required Python packages
-/opt/anaconda3/envs/pattern_findr/bin/pip install numpy==1.26.4 scikit-learn==1.7.0
-/opt/anaconda3/envs/pattern_findr/bin/pip install streamlit yfinance pandas plotly matplotlib mplfinance optuna
-
-# Install pandas-ta from source (specific version with Strategy class)
-/opt/anaconda3/envs/pattern_findr/bin/pip install https://www.pandas-ta.dev/assets/zip/pandas_ta-0.3.14b.tar.gz
-```
-
-### 4. Pre-trained Models Included
-The repository includes pre-trained deep learning models in the `models/` directory:
-- `bullish_engulfing_model.h5`
-- `head_and_shoulders_model.h5`
-- `inverse_head_and_shoulders_model.h5`
-
-No additional training is required unless you want to retrain models on custom data.
-
-## 🎯 Quick Start Guide
-
-### 1. Launch the Application
-```bash
-# Using the startup script (recommended)
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 ./run_app_conda.sh
-
-# OR manually using the conda environment
-/opt/anaconda3/envs/pattern_findr/bin/streamlit run app.py
-```
-The app will open in your browser at `http://localhost:8503`
-
-### 2. Configure Settings
-- **Stock Symbol**: Enter any valid ticker (e.g., AAPL, MSFT, TSLA, MSTY, MSTR)
-  - Quick-select buttons available for MSTY and MSTR
-- **Timeframe**: Select data interval (1m, 5m, 15m, 30m, 1h, 1d, 5d, 1wk, 1mo, 3mo)
-  - Intraday data (1m-1h) limited to recent periods per yfinance API constraints
-  - Daily (1d) and higher available for extended history
-- **Period**: Select historical data range (auto-adjusted for intraday intervals)
-- **Starting Capital**: Set your backtesting capital ($100K default)
-- **Optimization Method**: Choose parallelization method (joblib recommended)
-- **Number of Trials**: Set optimization iterations (5000+ for best results)
-
-### 3. Run Strategy Discovery
-1. Click **"Find and Optimize Top Strategies"**
-2. Wait for optimization to complete (progress shown in sidebar)
-3. Review top-performing strategies with detailed metrics
-4. Analyze trade logs and portfolio evolution charts
-5. Save promising strategies for future reference
-
-### 4. Strategy Analysis
-Each optimized strategy includes:
-- **Performance Metrics**: Return %, win rate, profit factor, max drawdown
-- **Interactive Charts**: Price action with entry/exit points + portfolio evolution
-- **Trade Log**: Detailed trade history with position sizes and P&L
-- **Parameter Details**: Exact indicator settings for reproduction
-
-## 📱 User Interface Guide
-
-### Sidebar Controls
-- **📈 Data Settings**: Symbol selection and data loading
-- **🎯 Optimization**: Trial count and method selection
-- **💰 Portfolio Settings**: Starting capital configuration
-- **⚡ Performance**: Multi-core utilization controls
-- **🏁 Benchmarking**: Performance testing options
-
-### Main Dashboard
-- **Strategy Results**: Top strategies ranked by performance
-- **Interactive Charts**: Dual-panel price and portfolio charts
-- **Trade Analytics**: Comprehensive trade logs with running totals
-- **Strategy Storage**: Save and manage winning strategies
-
-### Saved Strategies Viewer
-- **Search & Filter**: Find strategies by name, return %, indicators
-- **Advanced Sorting**: Sort by return, win rate, profit factor, etc.
-- **Strategy Management**: View details, compare performance, delete strategies
-
-## 🔧 Configuration Options
-
-### Optimization Settings
-```python
-# Number of optimization trials
-trials = 5000  # Recommended: 5000-10000
-
-# Parallelization methods
-methods = ['standard', 'joblib', 'advanced']
-
-# Starting capital range
-capital = 1000 to 10,000,000  # $1K to $10M
 ```
 
-### Supported Timeframes
-Pattern_FindR supports both **intraday** and **daily+** timeframes:
+The launcher uses the active Python environment and serves the dashboard at **http://localhost:8501**. Despite its historical filename, it works with either an activated virtual environment or Conda environment. Open that address in Safari on macOS.
 
-#### Intraday Intervals
-- **1m** (1 minute) - Limited to last 7 days
-- **5m** (5 minutes) - Limited to last 60 days
-- **15m** (15 minutes) - Limited to last 60 days
-- **30m** (30 minutes) - Limited to last 60 days
-- **1h** (1 hour) - Limited to last 730 days
+For Conda, create and activate a Python 3.10 environment first, then use the same installation command. See the [setup guide](REQUIREMENTS_README.md) for dependency and optional-feature details.
 
-#### Daily+ Intervals
-- **1d** (daily) - Full historical data available
-- **5d** (5 days) - Full historical data available
-- **1wk** (weekly) - Full historical data available
-- **1mo** (monthly) - Full historical data available
-- **3mo** (3 months) - Full historical data available
+### First research session
 
-**Note**: Intraday data limitations are enforced by the yfinance API. The app automatically adjusts available period options based on selected interval.
+1. Open **Strategy Optimization** and select a ticker and daily data interval.
+2. Start with a small trial count to confirm that data loading and backtesting work.
+3. Inspect trade timestamps, drawdown, and the benchmark comparison alongside total return.
+4. Save a candidate strategy and evaluate it on a separate time period before drawing conclusions.
 
-### Technical Indicators Available
-- **Momentum**: RSI, Stochastic, Williams %R, ROC
-- **Trend**: MACD, EMA, SMA, ADX, Parabolic SAR
-- **Volatility**: Bollinger Bands, ATR, Standard Deviation
-- **Volume**: OBV, Volume SMA, VWAP
-- **Pattern Recognition**: CNN-based chart patterns
-- **Advanced**: Volume-weighted patterns, price action signals
-- **Enhanced**: Multi-timeframe pattern detection
+Data availability depends on the provider. Trained model weights are **not included**. Chart-pattern inference requires locally trained models; the application provides training controls. The checked-in `chart_images/` assets use Git LFS and are retained for the training workflow. Run `git lfs pull` if you need those assets.
 
-## 💡 Best Practices
+## Configuration
 
-### Optimization Strategy
-1. **Start Small**: Begin with 1000 trials to test setup
-2. **Scale Up**: Use 5000+ trials for production strategies
-3. **Parallel Processing**: Enable multi-core for faster results
-4. **Multiple Runs**: Run optimization multiple times for robustness
+The basic dashboard can use yfinance without a paid data-provider key. Optional integrations use local configuration:
 
-### Strategy Validation
-1. **Out-of-Sample Testing**: Test on different time periods
-2. **Multiple Symbols**: Validate across different stocks/sectors
-3. **Risk Management**: Focus on drawdown and risk-adjusted returns
-4. **Walk-Forward Analysis**: Use rolling optimization windows
+```bash
+cp .env.example .env
+# Add only the credentials needed for the features you use.
+```
 
-### Performance Optimization
-1. **Use SSD Storage**: Faster I/O for data processing
-2. **Adequate RAM**: 8GB+ for large optimizations
-3. **Multi-Core CPU**: Enables significant speedup
-4. **Close Other Apps**: Maximize available resources
+The dashboard loads `.env` when available. For command-line tools, export the variables in your shell before running them. Keys and webhook URLs must stay out of committed strategy files. See [configuration notes](docs/configuration.md).
 
-## 📊 Understanding Results
+## Tests
 
-### Key Metrics
-- **Total Return %**: Overall strategy performance
-- **Win Rate**: Percentage of profitable trades
-- **Profit Factor**: Ratio of gross profits to gross losses
-- **Max Drawdown**: Largest portfolio decline from peak
-- **Sharpe Ratio**: Risk-adjusted return measurement
+```bash
+python -m pip install -r requirements-test.txt
+python -m pytest tests/unit -q
+```
 
-### Trade Analysis
-- **Position Size**: Dollar amount invested per trade
-- **Shares/Contracts**: Number of units traded
-- **Trade P&L**: Individual trade profit/loss
-- **Running Total**: Cumulative profit across all trades
+The unit suite covers position transitions, timestamp handling, market sessions, and retry behavior. Integration, regression, and stress tests are also available under `tests/`; some exercise longer workflows. Root-level research scripts named `test_*.py` are separate experiments and may fetch external data.
 
-## 🔍 Troubleshooting
+## Research scope and limitations
 
-### Environment Setup (Apple Silicon Macs)
-1. **Verify Python version**:
-   ```bash
-   /opt/anaconda3/envs/pattern_findr/bin/python --version
-   # Should show: Python 3.10.13
-   ```
+- Backtest returns are historical simulations. Results depend on data quality, signal timing, execution assumptions, and transaction-cost settings.
+- Optimization can overfit. Walk-forward and held-out evaluation should be part of any research workflow.
+- Optional research pages may require additional packages and locally trained artifacts; they are not all covered by the core unit suite.
+- Signal monitoring and brokerage order execution are separate concerns. Review any execution bridge before connecting it to an account.
+- The main application currently configures TensorFlow for CPU execution.
 
-2. **Verify TensorFlow installation**:
-   ```bash
-   /opt/anaconda3/envs/pattern_findr/bin/python -c "import tensorflow as tf; print(tf.__version__)"
-   # Should show: 2.17.0 or 2.15.0
-   ```
+This project is for research and education and does not provide investment advice or guarantee trading performance.
 
-3. **Verify pandas-ta version**:
-   ```bash
-   /opt/anaconda3/envs/pattern_findr/bin/pip list | grep pandas-ta
-   # Should show: pandas-ta 0.3.14b0
-   ```
+## Documentation
 
-### Common Issues
-1. **Slow Optimization**: Reduce trials or enable parallelization
-2. **Memory Errors**: Reduce batch size or close other applications
-3. **No Profitable Strategies**: Try different symbols or increase trials
-4. **Import Errors**: Ensure all dependencies are installed
-5. **TensorFlow Crashes**: Make sure you're using the conda environment, not system Python
+- [Documentation index](docs/README.md)
+- [Installation and dependencies](REQUIREMENTS_README.md)
+- [Dashboard user guide](USER_GUIDE.md)
+- [Velocity Trading package](velocity_trading/README.md)
+- [Contributing](CONTRIBUTING.md)
 
-### Performance Tips
-- Use joblib optimization method for best speed
-- Enable benchmark testing to find fastest method
-- Monitor CPU utilization in system monitor
-- Consider cloud computing for very large optimizations
+Questions and reproducible bug reports are welcome through [GitHub Issues](https://github.com/jnaggud/pattern_findr/issues).
 
-## 🤝 Contributing
+## License
 
-We welcome contributions! Please see our contributing guidelines for:
-- Code style requirements
-- Testing procedures
-- Feature request process
-- Bug reporting guidelines
-
-## 📄 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## ⚠️ Disclaimer
-
-**Important**: This software is for educational and research purposes only. Past performance does not guarantee future results. Always do your own research and consider consulting with a financial advisor before making investment decisions. The authors are not responsible for any financial losses incurred through the use of this software.
-
-## 📞 Support
-
-- **Issues**: Report bugs via GitHub Issues
-- **Feature Requests**: Submit via GitHub Discussions
-- **Documentation**: Check the wiki for detailed guides
-- **Community**: Join our Discord for real-time help
-
----
-
-**Happy Trading! 🚀📈**
+Project code is available under the [MIT License](LICENSE). The bundled pandas-ta code retains its own [third-party notice](THIRD_PARTY_NOTICES.md).

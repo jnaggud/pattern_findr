@@ -698,7 +698,7 @@ def load_bundle_config(strategy_name: str) -> Optional[Dict]:
 STRATEGY_CONFIGS = {}  # Intentionally empty - use bundle configs only
 
 # Test webhook for all strategies during testing
-TEST_WEBHOOK = ''
+TEST_WEBHOOK = os.environ.get("DISCORD_TEST_WEBHOOK_URL", "")
 
 
 def select_strategy_interactive():

@@ -1,103 +1,54 @@
-# Requirements Files Guide
+# Installation and dependencies
 
-This project uses multiple requirements files for different purposes:
+## Supported starting point
 
-## Files Overview
+Use Python 3.10 in a dedicated virtual environment or Conda environment. The primary development platform is Apple Silicon macOS. TensorFlow is configured for CPU execution by the main application; `tensorflow-metal` is not required for this workflow.
 
-### `requirements.txt` - Main Requirements (Exact Versions)
-- **Purpose**: Core dependencies with exact versions for production use
-- **Usage**: `pip install -r requirements.txt`
-- **When to use**: Fresh installations, production deployments, CI/CD pipelines
-
-### `requirements-lock.txt` - Complete Lock File (pip freeze)
-- **Purpose**: ALL installed packages with exact versions from `pip freeze`
-- **Usage**: `pip install -r requirements-lock.txt`  
-- **When to use**: Exact environment reproduction, debugging conflicts
-
-### `environment.yml` - Conda Environment Export (Most Comprehensive)
-- **Purpose**: Complete conda environment with conda + pip packages, channels, dependencies
-- **Usage**: `conda env create -f environment.yml`
-- **When to use**: **RECOMMENDED** for full environment reproduction (530+ packages)
-
-### `requirements.lock.txt` - Legacy Full Environment
-- **Purpose**: Old comprehensive freeze (can be removed)
-- **Status**: Replaced by requirements-lock.txt
-
-### `requirements_ml.txt` - ML Extensions
-- **Purpose**: Additional ML packages with minimum version requirements
-- **Usage**: `pip install -r requirements_ml.txt` (after main requirements)
-- **When to use**: When you need extra ML capabilities
-
-## Quick Start
-
-For new installations:
 ```bash
-# Option 1: Create complete conda environment (RECOMMENDED)
-conda env create -f environment.yml
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+./run_app_conda.sh
+```
+
+If Python 3.10 is managed by Conda:
+
+```bash
+conda create -n pattern-findr python=3.10 -y
 conda activate pattern-findr
-
-# Option 2: Install core requirements only (lightweight)
-pip install -r requirements.txt
-
-# Option 3: Install all pip packages (exact reproduction)
-pip install -r requirements-lock.txt
-
-# Optional: Add extra ML packages
-pip install -r requirements_ml.txt
+python -m pip install -r requirements.txt
+./run_app_conda.sh
 ```
 
-## Generating Lock Files
+Open http://localhost:8501 in Safari on macOS. The launcher binds to the local machine and does not open a browser automatically. To choose an interpreter explicitly, set `PATTERN_FINDR_PYTHON` to its path. Additional Streamlit arguments can be passed to the launcher.
 
-### Simple Commands (Recommended)
+## Dependency files
+
+| File | Purpose |
+| --- | --- |
+| `requirements.txt` | Core dashboard, indicators, optimization, and model libraries |
+| `requirements-test.txt` | Test runner, installed after the core environment |
+| `requirements_ml.txt` | Historical optional ML package list; assess compatibility before using it |
+| `environment.yml`, `requirements-lock.txt`, `requirements.lock.txt` | Historical development-environment exports, retained for reference rather than a portable installation recipe |
+
+The repository includes pandas-ta 0.3.14b0 and its distribution metadata because existing indicator code relies on that API. Run the application from the repository root. The setuptools pin preserves the `pkg_resources` API used by that bundled version. Do not install a newer pandas-ta release over it without testing compatibility.
+
+## Optional features
+
+- Databento and Polygon integrations require their respective packages, credentials, and data entitlements.
+- Some experimental pages use LightGBM, imbalanced-learn, MAPIE, or other optional libraries. These are not part of the core quick start. In particular, the legacy conformal helper imports `MapieClassifier`; newer MAPIE APIs are not a drop-in replacement.
+- Optional language-model and SMS integrations require their own packages and credentials.
+- Model weights are generated locally and are not included in the repository. The chart-pattern training workflow is available from the dashboard.
+- Existing chart-training images are stored with Git LFS. Install Git LFS and run `git lfs pull` when those assets are needed.
+
+## Verification
+
 ```bash
-# Generate conda environment export (most comprehensive)
-conda env export > environment.yml
-
-# Generate pip freeze lock file
-pip freeze > requirements-lock.txt
+python -m pip check
+python -m pip install -r requirements-test.txt
+python -m pytest tests/unit -q
 ```
 
-### Using Scripts
-```bash
-# Option 1: Bash script
-./update_lock.sh
+Run `tests/` explicitly: several root-level files with test-like names are research scripts that make network requests or run long experiments.
 
-# Option 2: Python script  
-python generate_lock.py
-```
-
-## Version Management
-
-- **requirements.txt**: Hand-curated core packages with exact versions
-- **environment.yml**: Complete conda environment (conda + pip packages, channels)
-- **requirements-lock.txt**: Complete `pip freeze` output for exact reproduction
-- **Recommended**: Use `environment.yml` for most comprehensive reproduction
-
-## Platform Notes
-
-- `tensorflow-metal==1.2.0`: macOS GPU acceleration (Apple Silicon)
-- For other platforms, you may need to adjust TensorFlow installation
-- Conda environment includes platform-specific builds automatically
-
-## Updating Dependencies
-
-After adding/updating packages:
-
-1. Install and test new packages
-2. Regenerate environment files:
-   ```bash
-   conda env export > environment.yml
-   pip freeze > requirements-lock.txt
-   ```
-3. Update requirements.txt if needed
-4. Test installation in clean environment:
-   ```bash
-   conda env create -f environment.yml -n test-env
-   ```
-5. Commit changes
-
-## Troubleshooting
-
-- If you get dependency conflicts, try using the full `requirements.lock.txt`
-- For Apple Silicon Macs, ensure `tensorflow-metal` is installed for GPU support
-- If packages are missing, check that you're using the correct Python environment
+Keep credentials in ignored local configuration or environment variables; see [configuration](docs/configuration.md).

@@ -363,11 +363,11 @@ def load_bundle_config(strategy_name: str) -> Optional[Dict]:
 #   2. Save the strategy (creates velocity_strategies/{name}_*/)
 #   3. Run: python -m velocity_trading.traders.daily_trader -s {name}
 #
-# The webhook URLs are preserved here for reference only.
+# Configure notification endpoints through environment variables.
 STRATEGY_CONFIGS = {}  # DEPRECATED - not used
 
 # Test webhook for all strategies during testing
-TEST_WEBHOOK = ''
+TEST_WEBHOOK = os.environ.get("DISCORD_TEST_WEBHOOK_URL", "")
 
 
 def select_strategy_interactive():

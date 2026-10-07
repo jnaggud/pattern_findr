@@ -1,0 +1,21 @@
+title = "Pattern_FindR credential checks"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "discord-webhook-url"
+description = "Discord webhook credential"
+regex = '''https://(?:canary\.|ptb\.)?discord(?:app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]{20,}'''
+keywords = ["discord.com/api/webhooks", "discordapp.com/api/webhooks"]
+
+# Verified false positives: a Conda build identifier and a JavaScript class name.
+[[allowlists]]
+description = "Conda package build metadata"
+regexTarget = "line"
+regexes = ['\basttokens=2\.0\.5=pyhd3eb1b0_0\b']
+
+[[allowlists]]
+description = "Third-party pydeck source-map class identifier"
+regexTarget = "secret"
+regexes = ['^GLTFV1Normalizer$']

@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import os
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -64,7 +65,7 @@ print("FETCHING DATA...")
 print("-" * 70)
 
 polygon = None
-POLYGON_API_KEY = ''
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "")
 
 if POLYGON_AVAILABLE:
     polygon = PolygonManager(POLYGON_API_KEY)
