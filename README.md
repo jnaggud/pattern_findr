@@ -1,5 +1,7 @@
 # Pattern_FindR
 
+[![Tests](https://github.com/jnaggud/pattern_findr/actions/workflows/tests.yml/badge.svg?branch=master)](https://github.com/jnaggud/pattern_findr/actions/workflows/tests.yml)
+
 **An interactive research workbench for systematic trading strategies.**
 
 Pattern_FindR brings market-data preparation, technical indicators, machine-learning experiments, parameter search, and backtesting into a Python application. Its Streamlit interface makes it possible to explore a strategy, inspect individual trades, and compare results with a buy-and-hold baseline.
@@ -80,10 +82,10 @@ The dashboard loads `.env` when available. For command-line tools, export the va
 
 ```bash
 python -m pip install -r requirements-test.txt
-python -m pytest tests/unit -q
+python -m pytest tests -q
 ```
 
-The unit suite covers position transitions, timestamp handling, market sessions, and retry behavior. Integration, regression, and stress tests are also available under `tests/`; some exercise longer workflows. Root-level research scripts named `test_*.py` are separate experiments and may fetch external data.
+GitHub Actions runs the full suite on Python 3.10. The tests cover position transitions, timestamp handling, market sessions, retry behavior, data loading, and dashboard chart rendering. Integration, regression, and stress tests are included under `tests/`. Root-level research scripts named `test_*.py` are separate experiments and may fetch external data.
 
 ## Research scope and limitations
 
